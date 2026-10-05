@@ -1,4 +1,4 @@
-# Agent Workflow & Git Worktree Guidelines (`AGENT.md`)
+# Agent Workflow & Git Worktree Guidelines (`AGENTS.md`)
 
 All agents working in this repository **must** use isolated **Git Worktrees** for their tasks so that concurrent agents never interfere with each other's edits, builds, or verification runs.
 
