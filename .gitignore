@@ -1,0 +1,54 @@
+# Proprietary Game Files (Mirror's Edge assets & binaries)
+*.upk
+*.me1
+*.u
+*.bik
+*.exe
+*.dll
+*.ico
+*.vdf
+
+# Build Artifacts
+target/
+build/
+bin/
+out/
+*.o
+*.obj
+*.dylib
+*.so
+*.a
+*.lib
+*.pdb
+*.dSYM/
+.build/
+.worktrees/
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE & Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Decompilation & Reverse Engineering Dumps
+decomp/
+dumps/
+disasm/
+ghidra/
+ida/
+scratch/
+*.log

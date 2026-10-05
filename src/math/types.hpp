@@ -1,0 +1,629 @@
+#pragma once
+
+#include <cstdint>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <string_view>
+
+namespace me {
+
+constexpr float PI = 3.14159265358979323846f;
+constexpr float DEG2RAD = PI / 180.0f;
+constexpr float RAD2DEG = 180.0f / PI;
+constexpr float UE_ROT2DEG = 360.0f / 65536.0f;
+constexpr float DEG2UE_ROT = 65536.0f / 360.0f;
+constexpr float UE_ROT2RAD = (2.0f * PI) / 65536.0f;
+constexpr float RAD2UE_ROT = 65536.0f / (2.0f * PI);
+
+// -----------------------------------------------------------------------------
+// 3D Vector with Unreal Engine 3 (X forward, Y right, Z up) conventions
+// -----------------------------------------------------------------------------
+struct Vec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+
+    constexpr Vec3() = default;
+    constexpr Vec3(float in_x, float in_y, float in_z) : x(in_x), y(in_y), z(in_z) {}
+
+    constexpr Vec3 operator+(const Vec3& o) const { return Vec3(x + o.x, y + o.y, z + o.z); }
+    constexpr Vec3 operator-(const Vec3& o) const { return Vec3(x - o.x, y - o.y, z - o.z); }
+    constexpr Vec3 operator*(float s) const { return Vec3(x * s, y * s, z * s); }
+    constexpr Vec3 operator/(float s) const { float inv = 1.0f / s; return Vec3(x * inv, y * inv, z * inv); }
+    constexpr Vec3 operator-() const { return Vec3(-x, -y, -z); }
+
+    Vec3& operator+=(const Vec3& o) { x += o.x; y += o.y; z += o.z; return *this; }
+    Vec3& operator-=(const Vec3& o) { x -= o.x; y -= o.y; z -= o.z; return *this; }
+    Vec3& operator*=(float s) { x *= s; y *= s; z *= s; return *this; }
+    Vec3& operator/=(float s) { float inv = 1.0f / s; x *= inv; y *= inv; z *= inv; return *this; }
+
+    constexpr bool operator==(const Vec3& o) const { return x == o.x && y == o.y && z == o.z; }
+    constexpr bool operator!=(const Vec3& o) const { return !(*this == o); }
+
+    [[nodiscard]] constexpr float dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+
+    [[nodiscard]] constexpr Vec3 cross(const Vec3& o) const {
+        return Vec3(
+            y * o.z - z * o.y,
+            z * o.x - x * o.z,
+            x * o.y - y * o.x
+        );
+    }
+
+    [[nodiscard]] float length() const { return std::sqrt(x * x + y * y + z * z); }
+    [[nodiscard]] constexpr float length_sq() const { return x * x + y * y + z * z; }
+    [[nodiscard]] float length_xy() const { return std::sqrt(x * x + y * y); }
+    [[nodiscard]] constexpr float length_xy_sq() const { return x * x + y * y; }
+
+    [[nodiscard]] Vec3 normalized() const {
+        float len = length();
+        return (len > 1e-6f) ? (*this / len) : Vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    [[nodiscard]] Vec3 normalized_xy() const {
+        float len = length_xy();
+        return (len > 1e-6f) ? Vec3(x / len, y / len, 0.0f) : Vec3(0.0f, 0.0f, 0.0f);
+    }
+
+    [[nodiscard]] float distance(const Vec3& o) const { return (*this - o).length(); }
+    [[nodiscard]] float distance_xy(const Vec3& o) const { return (*this - o).length_xy(); }
+};
+
+inline Vec3 operator*(float s, const Vec3& v) { return v * s; }
+
+// -----------------------------------------------------------------------------
+// Rotator (Pitch, Yaw, Roll in Unreal Engine 3 65536 = 360° units)
+// -----------------------------------------------------------------------------
+struct Rotator {
+    float pitch = 0.0f; // Look up/down (elevation)
+    float yaw = 0.0f;   // Look left/right (azimuth)
+    float roll = 0.0f;  // Camera tilt/banking
+
+    constexpr Rotator() = default;
+    constexpr Rotator(float p, float y, float r) : pitch(p), yaw(y), roll(r) {}
+
+    static Rotator from_degrees(float p_deg, float y_deg, float r_deg) {
+        return Rotator(p_deg * DEG2UE_ROT, y_deg * DEG2UE_ROT, r_deg * DEG2UE_ROT);
+    }
+
+    static Rotator from_radians(float p_rad, float y_rad, float r_rad) {
+        return Rotator(p_rad * RAD2UE_ROT, y_rad * RAD2UE_ROT, r_rad * RAD2UE_ROT);
+    }
+
+    [[nodiscard]] Vec3 to_degrees() const {
+        return Vec3(pitch * UE_ROT2DEG, yaw * UE_ROT2DEG, roll * UE_ROT2DEG);
+    }
+
+    [[nodiscard]] Vec3 to_radians() const {
+        return Vec3(pitch * UE_ROT2RAD, yaw * UE_ROT2RAD, roll * UE_ROT2RAD);
+    }
+
+    [[nodiscard]] Vec3 forward() const {
+        Vec3 rad = to_radians();
+        float p = rad.x;
+        float y = rad.y;
+        return Vec3(
+            std::cos(p) * std::cos(y),
+            std::cos(p) * std::sin(y),
+            std::sin(p)
+        );
+    }
+
+    [[nodiscard]] Vec3 right() const {
+        Vec3 rad = to_radians();
+        float p = rad.x;
+        float y = rad.y;
+        float r = rad.z;
+        return Vec3(
+            -std::cos(r) * std::sin(y) + std::sin(r) * std::sin(p) * std::cos(y),
+             std::cos(r) * std::cos(y) + std::sin(r) * std::sin(p) * std::sin(y),
+            -std::sin(r) * std::cos(p)
+        );
+    }
+
+    [[nodiscard]] Vec3 up() const {
+        Vec3 rad = to_radians();
+        float p = rad.x;
+        float y = rad.y;
+        float r = rad.z;
+        return Vec3(
+             std::sin(r) * std::sin(y) + std::cos(r) * std::sin(p) * std::cos(y),
+            -std::sin(r) * std::cos(y) + std::cos(r) * std::sin(p) * std::sin(y),
+             std::cos(r) * std::cos(p)
+        );
+    }
+};
+
+// -----------------------------------------------------------------------------
+// 4x4 Matrix (Column-major format for standard GPU / Metal compatibility)
+// -----------------------------------------------------------------------------
+struct Mat4 {
+    float m[16] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f
+    };
+
+    static Mat4 identity() {
+        return Mat4{};
+    }
+
+    static Mat4 translation(const Vec3& t) {
+        Mat4 r = identity();
+        r.m[12] = t.x;
+        r.m[13] = t.y;
+        r.m[14] = t.z;
+        return r;
+    }
+
+    static Mat4 scale(const Vec3& s) {
+        Mat4 r = identity();
+        r.m[0] = s.x;
+        r.m[5] = s.y;
+        r.m[10] = s.z;
+        return r;
+    }
+
+    static Mat4 rotation_x(float rad) {
+        Mat4 r = identity();
+        float c = std::cos(rad);
+        float s = std::sin(rad);
+        r.m[5] = c;
+        r.m[6] = s;
+        r.m[9] = -s;
+        r.m[10] = c;
+        return r;
+    }
+
+    static Mat4 rotation_y(float rad) {
+        Mat4 r = identity();
+        float c = std::cos(rad);
+        float s = std::sin(rad);
+        r.m[0] = c;
+        r.m[2] = -s;
+        r.m[8] = s;
+        r.m[10] = c;
+        return r;
+    }
+
+    static Mat4 rotation_z(float rad) {
+        Mat4 r = identity();
+        float c = std::cos(rad);
+        float s = std::sin(rad);
+        r.m[0] = c;
+        r.m[1] = s;
+        r.m[4] = -s;
+        r.m[5] = c;
+        return r;
+    }
+
+    static Mat4 perspective(float fov_y_rad, float aspect, float z_near, float z_far) {
+        Mat4 r{};
+        float tan_half_fov = std::tan(fov_y_rad * 0.5f);
+        r.m[0] = 1.0f / (aspect * tan_half_fov);
+        r.m[5] = 1.0f / tan_half_fov;
+        r.m[10] = z_far / (z_far - z_near);
+        r.m[11] = 1.0f;
+        r.m[14] = -(z_far * z_near) / (z_far - z_near);
+        r.m[15] = 0.0f;
+        return r;
+    }
+
+    static Mat4 look_at(const Vec3& eye, const Vec3& target, const Vec3& up) {
+        Vec3 f = (target - eye).normalized();
+        Vec3 s = up.cross(f).normalized();
+        Vec3 u = f.cross(s);
+
+        Mat4 r = identity();
+        r.m[0] = s.x;
+        r.m[4] = s.y;
+        r.m[8] = s.z;
+        r.m[12] = -s.dot(eye);
+
+        r.m[1] = u.x;
+        r.m[5] = u.y;
+        r.m[9] = u.z;
+        r.m[13] = -u.dot(eye);
+
+        r.m[2] = f.x;
+        r.m[6] = f.y;
+        r.m[10] = f.z;
+        r.m[14] = -f.dot(eye);
+
+        return r;
+    }
+
+    Mat4 operator*(const Mat4& b) const {
+        Mat4 res{};
+        for (int row = 0; row < 4; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                float sum = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    sum += m[k * 4 + row] * b.m[col * 4 + k];
+                }
+                res.m[col * 4 + row] = sum;
+            }
+        }
+        return res;
+    }
+
+    [[nodiscard]] Vec3 transform_point(const Vec3& p) const {
+        float x = m[0] * p.x + m[4] * p.y + m[8]  * p.z + m[12];
+        float y = m[1] * p.x + m[5] * p.y + m[9]  * p.z + m[13];
+        float z = m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14];
+        float w = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
+        if (std::abs(w) > 1e-6f && std::abs(w - 1.0f) > 1e-6f) {
+            float inv_w = 1.0f / w;
+            return Vec3(x * inv_w, y * inv_w, z * inv_w);
+        }
+        return Vec3(x, y, z);
+    }
+
+    [[nodiscard]] Vec3 transform_vector(const Vec3& v) const {
+        return Vec3(
+            m[0] * v.x + m[4] * v.y + m[8]  * v.z,
+            m[1] * v.x + m[5] * v.y + m[9]  * v.z,
+            m[2] * v.x + m[6] * v.y + m[10] * v.z
+        );
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Axis-Aligned Bounding Box (AABB)
+// -----------------------------------------------------------------------------
+struct AABB {
+    Vec3 min_pt{0.0f, 0.0f, 0.0f};
+    Vec3 max_pt{0.0f, 0.0f, 0.0f};
+
+    constexpr AABB() = default;
+    constexpr AABB(const Vec3& min_val, const Vec3& max_val) : min_pt(min_val), max_pt(max_val) {}
+
+    [[nodiscard]] constexpr bool intersects(const AABB& o) const {
+        return (min_pt.x <= o.max_pt.x && max_pt.x >= o.min_pt.x) &&
+               (min_pt.y <= o.max_pt.y && max_pt.y >= o.min_pt.y) &&
+               (min_pt.z <= o.max_pt.z && max_pt.z >= o.min_pt.z);
+    }
+
+    void expand(float amount) {
+        min_pt.x -= amount; min_pt.y -= amount; min_pt.z -= amount;
+        max_pt.x += amount; max_pt.y += amount; max_pt.z += amount;
+    }
+
+    void expand(const Vec3& pt) {
+        min_pt.x = std::min(min_pt.x, pt.x);
+        min_pt.y = std::min(min_pt.y, pt.y);
+        min_pt.z = std::min(min_pt.z, pt.z);
+        max_pt.x = std::max(max_pt.x, pt.x);
+        max_pt.y = std::max(max_pt.y, pt.y);
+        max_pt.z = std::max(max_pt.z, pt.z);
+    }
+
+    [[nodiscard]] constexpr Vec3 center() const {
+        return (min_pt + max_pt) * 0.5f;
+    }
+
+    [[nodiscard]] constexpr Vec3 extent() const {
+        return (max_pt - min_pt) * 0.5f;
+    }
+
+    [[nodiscard]] constexpr bool contains(const Vec3& pt) const {
+        return (pt.x >= min_pt.x && pt.x <= max_pt.x &&
+                pt.y >= min_pt.y && pt.y <= max_pt.y &&
+                pt.z >= min_pt.z && pt.z <= max_pt.z);
+    }
+
+    [[nodiscard]] bool ray_intersect(const Vec3& ray_orig, const Vec3& ray_dir, float& t_out) const {
+        float tmin = -1e30f;
+        float tmax = 1e30f;
+
+        auto check_axis = [&](float orig, float dir, float bmin, float bmax) -> bool {
+            if (std::abs(dir) < 1e-7f) {
+                return (orig >= bmin && orig <= bmax);
+            }
+            float t1 = (bmin - orig) / dir;
+            float t2 = (bmax - orig) / dir;
+            if (t1 > t2) std::swap(t1, t2);
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            return tmin <= tmax;
+        };
+
+        if (!check_axis(ray_orig.x, ray_dir.x, min_pt.x, max_pt.x)) return false;
+        if (!check_axis(ray_orig.y, ray_dir.y, min_pt.y, max_pt.y)) return false;
+        if (!check_axis(ray_orig.z, ray_dir.z, min_pt.z, max_pt.z)) return false;
+
+        if (tmax < 0.0f) return false;
+        t_out = (tmin >= 0.0f) ? tmin : 0.0f;
+        return true;
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Movement Enum & State Names matching TdPawn movement IDs
+// -----------------------------------------------------------------------------
+enum class EMovement : uint8_t {
+    MOVE_None = 0,
+    MOVE_Walking = 1,
+    MOVE_Falling = 2,
+    MOVE_Grabbing = 3,
+    MOVE_WallRunningRight = 4,
+    MOVE_WallRunningLeft = 5,
+    MOVE_WallClimbing = 6,
+    MOVE_SpringBoarding = 7,
+    MOVE_SpeedVaulting = 8,
+    MOVE_VaultOver = 9,
+    MOVE_GrabPullUp = 10,
+    MOVE_Jump = 11,
+    MOVE_WallRunJump = 12,
+    MOVE_GrabJump = 13,
+    MOVE_IntoGrab = 14,
+    MOVE_Crouch = 15,
+    MOVE_Slide = 16,
+    MOVE_Melee = 17,
+    MOVE_Snatch = 18,
+    MOVE_Barge = 19,
+    MOVE_Landing = 20,
+    MOVE_Climb = 21,
+    MOVE_180Turn = 24,
+    MOVE_180TurnInAir = 25,
+    MOVE_ZipLine = 28,
+    MOVE_Balance = 29,
+    MOVE_LedgeWalk = 30,
+    MOVE_MeleeAir = 32,
+    MOVE_DodgeJump = 33,
+    MOVE_StepUp = 37,
+    MOVE_RumpSlide = 38,
+    MOVE_MeleeSlide = 48,
+    MOVE_WallClimb180TurnJump = 50,
+    MOVE_Swing = 60,
+    MOVE_Coil = 61,
+    MOVE_MeleeWallrun = 62,
+    MOVE_SoftLanding = 78,
+    MOVE_AutoStepUp = 81,
+    MOVE_SkillRoll = 91
+};
+
+inline const char* move_state_name(EMovement m) {
+    switch (m) {
+        case EMovement::MOVE_None: return "MOVE_None";
+        case EMovement::MOVE_Walking: return "MOVE_Walking";
+        case EMovement::MOVE_Falling: return "MOVE_Falling";
+        case EMovement::MOVE_Grabbing: return "MOVE_Grabbing";
+        case EMovement::MOVE_WallRunningRight: return "MOVE_WallRunningRight";
+        case EMovement::MOVE_WallRunningLeft: return "MOVE_WallRunningLeft";
+        case EMovement::MOVE_WallClimbing: return "MOVE_WallClimbing";
+        case EMovement::MOVE_SpringBoarding: return "MOVE_SpringBoarding";
+        case EMovement::MOVE_SpeedVaulting: return "MOVE_SpeedVaulting";
+        case EMovement::MOVE_VaultOver: return "MOVE_VaultOver";
+        case EMovement::MOVE_GrabPullUp: return "MOVE_GrabPullUp";
+        case EMovement::MOVE_Jump: return "MOVE_Jump";
+        case EMovement::MOVE_WallRunJump: return "MOVE_WallRunJump";
+        case EMovement::MOVE_GrabJump: return "MOVE_GrabJump";
+        case EMovement::MOVE_IntoGrab: return "MOVE_IntoGrab";
+        case EMovement::MOVE_Crouch: return "MOVE_Crouch";
+        case EMovement::MOVE_Slide: return "MOVE_Slide";
+        case EMovement::MOVE_Melee: return "MOVE_Melee";
+        case EMovement::MOVE_Snatch: return "MOVE_Snatch";
+        case EMovement::MOVE_Barge: return "MOVE_Barge";
+        case EMovement::MOVE_Landing: return "MOVE_Landing";
+        case EMovement::MOVE_Climb: return "MOVE_Climb";
+        case EMovement::MOVE_180Turn: return "MOVE_180Turn";
+        case EMovement::MOVE_180TurnInAir: return "MOVE_180TurnInAir";
+        case EMovement::MOVE_ZipLine: return "MOVE_ZipLine";
+        case EMovement::MOVE_Balance: return "MOVE_Balance";
+        case EMovement::MOVE_LedgeWalk: return "MOVE_LedgeWalk";
+        case EMovement::MOVE_MeleeAir: return "MOVE_MeleeAir";
+        case EMovement::MOVE_DodgeJump: return "MOVE_DodgeJump";
+        case EMovement::MOVE_StepUp: return "MOVE_StepUp";
+        case EMovement::MOVE_RumpSlide: return "MOVE_RumpSlide";
+        case EMovement::MOVE_MeleeSlide: return "MOVE_MeleeSlide";
+        case EMovement::MOVE_WallClimb180TurnJump: return "MOVE_WallClimb180TurnJump";
+        case EMovement::MOVE_Swing: return "MOVE_Swing";
+        case EMovement::MOVE_Coil: return "MOVE_Coil";
+        case EMovement::MOVE_MeleeWallrun: return "MOVE_MeleeWallrun";
+        case EMovement::MOVE_SoftLanding: return "MOVE_SoftLanding";
+        case EMovement::MOVE_AutoStepUp: return "MOVE_AutoStepUp";
+        case EMovement::MOVE_SkillRoll: return "MOVE_SkillRoll";
+        default: return "MOVE_Unknown";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Mesh & Graphics Types
+// -----------------------------------------------------------------------------
+struct Vertex {
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 normal{0.0f, 0.0f, 1.0f};
+    Vec3 tangent{1.0f, 0.0f, 0.0f};
+    float u = 0.0f;
+    float v = 0.0f;
+    float u2 = 0.0f; // Lightmap UV
+    float v2 = 0.0f;
+    uint32_t color = 0xFFFFFFFF;
+};
+
+struct MeshBuffer {
+    std::string name;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    AABB bounds;
+    bool is_runner_vision = false;
+};
+
+struct SoundClip {
+    std::string name;
+    std::vector<uint8_t> pcm_data;
+    int sample_rate = 44100;
+    int channels = 2;
+    float duration = 0.0f;
+};
+
+// -----------------------------------------------------------------------------
+// Level Actor (Shared Contract across Agents 5, 6, 7)
+// -----------------------------------------------------------------------------
+struct LevelActor {
+    std::string class_name;
+    std::string object_name;
+    std::string mesh_name;
+    std::string tag;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Rotator rotation{0.0f, 0.0f, 0.0f};
+    Vec3 draw_scale_3d{1.0f, 1.0f, 1.0f};
+    float draw_scale = 1.0f;
+    AABB world_bounds;
+    bool is_collidable = true;
+    bool is_runner_vision = false;
+    bool is_checkpoint = false;
+    bool is_trigger = false;
+    bool is_zipline = false;
+    bool is_ladder = false;
+    bool is_ledge = false;
+    bool is_springboard = false;
+    bool is_balance_beam = false;
+    bool is_swing_bar = false;
+    bool is_enemy = false;
+    bool is_bag = false;
+    Vec3 end_point{0.0f, 0.0f, 0.0f};
+};
+
+// -----------------------------------------------------------------------------
+// Weapon State & Enemy Bot
+// -----------------------------------------------------------------------------
+struct WeaponState {
+    std::string name;
+    bool equipped = false;
+    bool is_heavy = false;
+    int ammo = 0;
+    int max_ammo = 0;
+    float damage = 35.0f;
+    float range = 4500.0f;
+    float cooldown = 0.0f;
+};
+
+struct EnemyBot {
+    std::string archetype; // PatrolCop, PursuitCop, RiotCop, SWAT, Heavy, Celeste
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 velocity{0.0f, 0.0f, 0.0f};
+    float yaw_deg = 0.0f;
+    float health = 100.0f;
+    bool alive = true;
+    bool stunned = false;
+    bool disarm_window = false;
+    float attack_timer = 0.0f;
+    std::string weapon_name = "Colt1911";
+};
+
+// -----------------------------------------------------------------------------
+// Movement Configuration (Exact values from DefaultPawnMovement.ini & specs)
+// -----------------------------------------------------------------------------
+struct MovementConfig {
+    float gravity = 980.0f;
+    float walk_speed = 50.0f;
+    float jog_speed = 260.0f;
+    float run_speed = 400.0f;
+    float sprint_speed = 630.0f;
+    float base_jump_z = 630.0f;
+    float base_jump_z_heavy = 430.0f;
+    float jump_add_xy = 100.0f;
+    float wallrun_min_speed = 200.0f;
+    float wallrun_initial_z = 170.0f;
+    float wallrun_accel = 820.0f;
+    float wallrun_decel = 500.0f;
+    float wallrun_max_angle_deg = 57.0f;
+    float wallrun_duration = 1.6f;
+    float wallclimb_max_angle_deg = 33.0f;
+    float wallclimb_gravity = 800.0f;
+    float wallclimb_boost_z = 320.0f;
+    float springboard_jump_z = 950.0f;
+    float slide_min_speed = 250.0f;
+    float slide_friction = 0.1f;
+    float slide_max_duration = 2.0f;
+    float coil_height_boost = 60.0f;
+    float coil_duration = 0.25f;
+    float skill_roll_min_fall = 200.0f;
+    float hard_landing_min_fall = 530.0f;
+    float uncontrolled_fall = 1000.0f;
+    float turn_180_time = 0.25f;
+    float reaction_time_dilation = 0.25f;
+    float reaction_time_drain = 8.0f;
+    float health_regen_delay = 5.0f;
+    float health_regen_rate = 25.0f;
+};
+
+// -----------------------------------------------------------------------------
+// Campaign Chapter Info
+// -----------------------------------------------------------------------------
+struct ChapterInfo {
+    std::string code;
+    std::string title;
+    std::string primary_map;
+};
+
+// -----------------------------------------------------------------------------
+// Input Frame (Mapped from Keyboard, Mouse, or Gamepad)
+// -----------------------------------------------------------------------------
+struct InputFrame {
+    float forward = 0.0f;          // +1 = forward, -1 = backward
+    float strafe = 0.0f;           // +1 = right, -1 = left
+    float look_yaw_delta = 0.0f;   // Horizontal mouse delta (degrees)
+    float look_pitch_delta = 0.0f; // Vertical mouse delta (degrees)
+    bool sprint = false;
+    bool jump = false;
+    bool crouch = false;
+    bool turn_180 = false;
+    bool melee = false;
+    bool disarm = false;
+    bool fire = false;
+    bool reaction_time = false;
+    bool look_at = false;
+};
+
+// -----------------------------------------------------------------------------
+// Player Telemetry (Every simulation tick)
+// -----------------------------------------------------------------------------
+struct PlayerTelemetry {
+    uint32_t tick = 0;
+    float sim_time = 0.0f;
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 velocity{0.0f, 0.0f, 0.0f};
+    float speed_2d = 0.0f;
+    float speed_3d = 0.0f;
+    float yaw_deg = 0.0f;
+    float pitch_deg = 0.0f;
+    float camera_roll_deg = 0.0f;
+    float fov_deg = 100.0f;
+    float eye_height = 84.0f;
+    float health = 100.0f;
+    float reaction_energy = 100.0f;
+    bool reaction_active = false;
+    bool grounded = true;
+    EMovement move_state = EMovement::MOVE_Walking;
+    Vec3 wall_normal{0.0f, 0.0f, 0.0f};
+    int active_checkpoint = 0;
+    int bags_collected = 0;
+    WeaponState weapon;
+    std::string active_subtitle;
+};
+
+// -----------------------------------------------------------------------------
+// Level Scene representation
+// -----------------------------------------------------------------------------
+struct LevelScene {
+    std::string map_name;
+    std::string chapter_title;
+    Vec3 player_spawn_pos{0.0f, 0.0f, 100.0f};
+    float player_spawn_yaw = 0.0f;
+    Vec3 sun_direction{-0.4f, 0.6f, 0.7f};
+    std::vector<LevelActor> actors;
+    std::vector<MeshBuffer> meshes;
+    std::vector<AABB> colliders;
+    std::vector<EnemyBot> enemies;
+    std::vector<Vec3> checkpoints;
+    std::vector<SoundClip> sounds;
+    std::vector<std::string> subtitles;
+};
+
+} // namespace me
