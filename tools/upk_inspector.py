@@ -501,10 +501,7 @@ class UPKPackage:
                 bool_val_int, = struct.unpack_from('<i', data, pos)
                 pos += 4
                 bool_val = bool(bool_val_int)
-            elif prop_type == 'ByteProperty':
-                e_idx, e_num = struct.unpack_from('<2i', data, pos)
-                pos += 8
-                enum_name = self.names[e_idx] if 0 <= e_idx < len(self.names) else None
+            # In UE3 v536, ByteProperty does NOT have an 8-byte enum_name in the FPropertyTag header.
 
             val_bytes = data[pos:pos + size]
             pos += size
