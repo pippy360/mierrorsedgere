@@ -5,6 +5,32 @@
 
 namespace me {
 
+namespace {
+// TdPawn collision cylinder (Radius=30), swept as its axis-aligned box like UE3 PHYS_Walking /
+// PHYS_Falling ("sweep out the axis aligned bounding box of just the CollisionComponent").
+constexpr float kPawnRadius = 30.0f;
+constexpr float kPawnHeight = 90.0f;
+constexpr float kCrouchHeight = 45.0f;
+// UE3 APawn walking constants.
+constexpr float kMaxStepHeight = 35.0f;  // Pawn.MaxStepHeight
+constexpr float kMaxFloorDist = 2.4f;    // MAXFLOORDIST
+constexpr float kWalkableFloorZ = 0.7f;  // Pawn.WalkableFloorZ
+// Floor probes start slightly above the feet so a pawn that ends a move marginally inside a floor
+// (float rounding at large world coordinates) still finds it.
+constexpr float kFloorProbeLift = 10.0f;
+// Distance kept from a blocking surface after a swept move (world units).
+constexpr float kContactSkin = 0.1f;
+// [TdGame.TdMove_SpeedVault] VaultTypes: the vaultOnto / vaultOver moves cover obstacles up to
+// MaxHeight=148 above the feet (taller ones need the VaultOverHigh moves started from a jump).
+constexpr float kVaultMaxHeight = 148.0f;
+
+// Fraction of a move of length `move_len` that stops kContactSkin short of the contact.
+float safe_fraction(float fraction, float move_len) {
+    if (move_len <= 1e-6f) return 0.0f;
+    return std::clamp(fraction - kContactSkin / move_len, 0.0f, 1.0f);
+}
+}  // namespace
+
 ParkourController::ParkourController(const MovementConfig& config)
     : m_config(config) {
     reset(Vec3(0.0f, 0.0f, 100.0f), 0.0f);
@@ -65,6 +91,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_jump_consumed = false;
     m_prev_turn_180 = false;
     m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
+    m_ledge_z = 0.0f;
+    m_base_actor = -1;
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
@@ -286,6 +314,13 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_SpeedVaulting:
             case EMovement::MOVE_VaultOver:
             case EMovement::MOVE_SpringBoarding:
+                // The vault / springboard launch carries its momentum through the move.
+                integrate_ballistic(step_dt, scene);
+                if (m_state_timer >= 0.35f) {
+                    m_telemetry.move_state = m_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
+                }
+                break;
+
             case EMovement::MOVE_180Turn:
             case EMovement::MOVE_180TurnInAir:
                 if (m_state_timer >= 0.35f) {
@@ -298,13 +333,19 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 break;
         }
 
-        // Check if grounded status changed or floor is present
-        float floor_z = 0.0f;
-        Vec3 floor_norm;
-        bool has_floor = check_ground(scene, floor_z, floor_norm);
+        // UE3 floor check: a walking pawn follows floors up to MaxStepHeight + MAXFLOORDIST below its
+        // feet (stairs, kerbs, seams between meshes); an airborne pawn lands only on floors it touches.
+        const bool low_profile = (m_telemetry.move_state == EMovement::MOVE_Crouch ||
+                                  m_telemetry.move_state == EMovement::MOVE_Slide ||
+                                  m_telemetry.move_state == EMovement::MOVE_MeleeSlide);
+        FloorHit floor;
+        const float probe_depth = m_telemetry.grounded ? (kMaxStepHeight + kMaxFloorDist) : kMaxFloorDist;
+        const bool has_floor = check_ground(scene, probe_depth, low_profile ? kCrouchHeight : kPawnHeight, floor);
+        const float floor_z = floor.z;
 
         if (has_floor && m_telemetry.velocity.z <= 50.0f &&
             m_telemetry.move_state != EMovement::MOVE_Grabbing &&
+            m_telemetry.move_state != EMovement::MOVE_GrabPullUp &&
             m_telemetry.move_state != EMovement::MOVE_ZipLine &&
             m_telemetry.move_state != EMovement::MOVE_Swing &&
             m_telemetry.move_state != EMovement::MOVE_WallClimbing) {
@@ -347,28 +388,47 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
 
             m_telemetry.position.z = floor_z;
             m_telemetry.grounded = true;
+            m_base_actor = floor.actor_index;
             m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
             if (m_telemetry.velocity.z < 0.0f) {
                 m_telemetry.velocity.z = 0.0f;
             }
         } else if (m_telemetry.move_state != EMovement::MOVE_Grabbing &&
+                   m_telemetry.move_state != EMovement::MOVE_GrabPullUp &&
                    m_telemetry.move_state != EMovement::MOVE_ZipLine &&
                    m_telemetry.move_state != EMovement::MOVE_Swing &&
                    m_telemetry.move_state != EMovement::MOVE_WallClimbing &&
                    m_telemetry.move_state != EMovement::MOVE_WallRunningLeft &&
                    m_telemetry.move_state != EMovement::MOVE_WallRunningRight) {
+            m_base_actor = -1;
             if (m_telemetry.grounded) {
                 m_telemetry.grounded = false;
                 m_air_fall_start_z = m_telemetry.position.z;
                 m_fall_peak_z = m_telemetry.position.z;
-                if (m_telemetry.move_state == EMovement::MOVE_Walking ||
-                    m_telemetry.move_state == EMovement::MOVE_Crouch) {
+            }
+            // Ground locomotion without a floor (walked / slid off an edge, or a mantle that ended
+            // short of the ledge) is falling.
+            switch (m_telemetry.move_state) {
+                case EMovement::MOVE_Walking:
+                case EMovement::MOVE_Crouch:
+                case EMovement::MOVE_AutoStepUp:
+                case EMovement::MOVE_StepUp:
+                case EMovement::MOVE_Slide:
+                case EMovement::MOVE_MeleeSlide:
+                case EMovement::MOVE_SkillRoll:
+                case EMovement::MOVE_SoftLanding:
+                case EMovement::MOVE_Landing:
                     m_telemetry.move_state = EMovement::MOVE_Falling;
-                }
+                    m_telemetry.eye_height = 84.0f;
+                    break;
+                default:
+                    break;
             }
             if (m_telemetry.position.z > m_fall_peak_z) {
                 m_fall_peak_z = m_telemetry.position.z;
             }
+        } else {
+            m_base_actor = -1;
         }
     }
 
@@ -490,188 +550,266 @@ void ParkourController::update_camera_and_inputs(const InputFrame& input, float 
 }
 
 // -----------------------------------------------------------------------------
-// Swept Continuous Collision Detection (CCD) & Tracing Subsystem
+// Swept Collision & Tracing Subsystem (real UE3 level collision)
 // -----------------------------------------------------------------------------
+// The pawn box is swept against LevelScene::collision (StaticMesh BodySetup hulls / kDOP triangles,
+// BlockingVolume brushes, BSP) and against every moving elevator part, whose collision is stored at
+// the part's initial pose and is therefore queried shifted by -offset.
 ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& capsule, const Vec3& delta, const LevelScene& scene) const {
-    TraceHit best_hit;
-    best_hit.fraction = 1.0f;
-
-    Vec3 half_extent(capsule.radius, capsule.radius, (capsule.height - capsule.bottom_offset) * 0.5f);
-    Vec3 start_center = capsule.base + Vec3(0.0f, 0.0f, capsule.bottom_offset + half_extent.z);
-    Vec3 end_center = start_center + delta;
-    Vec3 sweep_min(std::min(start_center.x, end_center.x) - half_extent.x - 2.0f,
-                   std::min(start_center.y, end_center.y) - half_extent.y - 2.0f,
-                   std::min(start_center.z, end_center.z) - half_extent.z - 2.0f);
-    Vec3 sweep_max(std::max(start_center.x, end_center.x) + half_extent.x + 2.0f,
-                   std::max(start_center.y, end_center.y) + half_extent.y + 2.0f,
-                   std::max(start_center.z, end_center.z) + half_extent.z + 2.0f);
-
-    auto test_box = [&](const AABB& box, const LevelActor* actor) {
-        if (box.max_pt.x < sweep_min.x || box.min_pt.x > sweep_max.x ||
-            box.max_pt.y < sweep_min.y || box.min_pt.y > sweep_max.y ||
-            box.max_pt.z < sweep_min.z || box.min_pt.z > sweep_max.z) {
-            return;
-        }
-        // If movement is horizontal or upward and the box top is at or below capsule base,
-        // it represents the floor under feet, not a blocking wall.
-        if (delta.z >= -1e-4f && box.max_pt.z <= capsule.base.z + 2.0f) {
-            return;
-        }
-        // If box bottom is at or above capsule top:
-        if (delta.z <= 1e-4f && box.min_pt.z >= capsule.base.z + capsule.height - 2.0f) {
-            return;
-        }
-
-        // Minkowski expansion of target box by capsule half-extent
-        AABB exp_box(box.min_pt - half_extent, box.max_pt + half_extent);
-
-        // Ray vs AABB intersection
-        float t_in = -1e30f;
-        float t_out = 1e30f;
-        Vec3 hit_norm(0.0f, 0.0f, 1.0f);
-
-        auto test_axis = [&](float s, float d, float bmin, float bmax, const Vec3& norm_neg, const Vec3& norm_pos) -> bool {
-            if (std::abs(d) < 1e-7f) {
-                return s >= bmin && s <= bmax;
-            }
-            float t1 = (bmin - s) / d;
-            float t2 = (bmax - s) / d;
-            Vec3 n1 = norm_neg;
-            Vec3 n2 = norm_pos;
-            if (t1 > t2) {
-                std::swap(t1, t2);
-                std::swap(n1, n2);
-            }
-            if (t1 > t_in) {
-                t_in = t1;
-                hit_norm = n1;
-            }
-            t_out = std::min(t_out, t2);
-            return t_in <= t_out;
-        };
-
-        if (!test_axis(start_center.x, delta.x, exp_box.min_pt.x, exp_box.max_pt.x, Vec3(-1, 0, 0), Vec3(1, 0, 0))) return;
-        if (!test_axis(start_center.y, delta.y, exp_box.min_pt.y, exp_box.max_pt.y, Vec3(0, -1, 0), Vec3(0, 1, 0))) return;
-        if (!test_axis(start_center.z, delta.z, exp_box.min_pt.z, exp_box.max_pt.z, Vec3(0, 0, -1), Vec3(0, 0, 1))) return;
-
-        if (t_in >= 0.0f && t_in < best_hit.fraction) {
-            best_hit.hit = true;
-            best_hit.fraction = t_in;
-            best_hit.normal = hit_norm;
-            best_hit.point = start_center + delta * t_in;
-            best_hit.actor = actor;
-        }
-    };
-
-    for (const auto& col : scene.colliders) {
-        test_box(col, nullptr);
-    }
-    for (const auto& act : scene.actors) {
-        if (act.is_collidable) {
-            test_box(act.world_bounds, &act);
-        }
-    }
-    for (const auto& elev : scene.elevators) {
-        Vec3 fc = elev.current_pos + elev.cab_local_offset;
-        Vec3 he = elev.cab_half_extents;
-        float h_cab = he.z * 2.0f;
-        // Hollow elevator cab floor slab and ceiling slab
-        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z - 24.0f),
-                      Vec3(fc.x + he.x, fc.y + he.y, fc.z)), nullptr);
-        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z + h_cab),
-                      Vec3(fc.x + he.x, fc.y + he.y, fc.z + h_cab + 24.0f)), nullptr);
-        // While doors are closing or the cab is moving, enclose all 4 cab walls so Faith stays safely inside
-        if (elev.state == ElevatorState::DoorsClosing || elev.state == ElevatorState::Moving) {
-            test_box(AABB(Vec3(fc.x - he.x - 12.0f, fc.y - he.y, fc.z),
-                          Vec3(fc.x - he.x + 4.0f, fc.y + he.y, fc.z + h_cab)), nullptr);
-            test_box(AABB(Vec3(fc.x + he.x - 4.0f, fc.y - he.y, fc.z),
-                          Vec3(fc.x + he.x + 12.0f, fc.y + he.y, fc.z + h_cab)), nullptr);
-            test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y - 12.0f, fc.z),
-                          Vec3(fc.x + he.x, fc.y - he.y + 4.0f, fc.z + h_cab)), nullptr);
-            test_box(AABB(Vec3(fc.x - he.x, fc.y + he.y - 4.0f, fc.z),
-                          Vec3(fc.x + he.x, fc.y + he.y + 12.0f, fc.z + h_cab)), nullptr);
-        }
-    }
-
-    return best_hit;
-}
-
-ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, const Vec3& end, const LevelScene& scene) const {
     TraceHit best;
-    best.fraction = 1.0f;
-    Vec3 dir = end - start;
-    float dist = dir.length();
-    if (dist < 1e-6f) return best;
-    Vec3 dir_norm = dir / dist;
-    Vec3 ray_min(std::min(start.x, end.x) - 1.0f, std::min(start.y, end.y) - 1.0f, std::min(start.z, end.z) - 1.0f);
-    Vec3 ray_max(std::max(start.x, end.x) + 1.0f, std::max(start.y, end.y) + 1.0f, std::max(start.z, end.z) + 1.0f);
+    const float half_z = std::max(1.0f, 0.5f * (capsule.height - capsule.bottom_offset));
+    const Vec3 extent(capsule.radius, capsule.radius, half_z);
+    const Vec3 centre = capsule.base + Vec3(0.0f, 0.0f, capsule.bottom_offset + half_z);
 
-    auto test_box = [&](const AABB& box, const LevelActor* act) {
-        if (box.max_pt.x < ray_min.x || box.min_pt.x > ray_max.x ||
-            box.max_pt.y < ray_min.y || box.min_pt.y > ray_max.y ||
-            box.max_pt.z < ray_min.z || box.min_pt.z > ray_max.z) {
-            return;
-        }
-        float t_hit = 0.0f;
-        if (box.ray_intersect(start, dir_norm, t_hit)) {
-            float frac = t_hit / dist;
-            if (frac >= 0.0f && frac < best.fraction) {
-                best.hit = true;
-                best.fraction = frac;
-                best.point = start + dir * frac;
-                best.actor = act;
-
-                // Estimate surface normal from box face
-                Vec3 c = box.center();
-                Vec3 ext = box.extent();
-                Vec3 p_rel = best.point - c;
-                float dx = std::abs(p_rel.x) - ext.x;
-                float dy = std::abs(p_rel.y) - ext.y;
-                float dz = std::abs(p_rel.z) - ext.z;
-
-                if (dx >= dy && dx >= dz) {
-                    best.normal = Vec3(p_rel.x > 0 ? 1.0f : -1.0f, 0.0f, 0.0f);
-                } else if (dy >= dx && dy >= dz) {
-                    best.normal = Vec3(0.0f, p_rel.y > 0 ? 1.0f : -1.0f, 0.0f);
-                } else {
-                    best.normal = Vec3(0.0f, 0.0f, p_rel.z > 0 ? 1.0f : -1.0f);
-                }
-            }
-        }
+    auto consider = [&](const CollisionHit& h, const Vec3& shift) {
+        if (!h.hit) return;
+        // Earliest contact wins; ties prefer the most floor-like normal (as CollisionWorld does).
+        if (best.hit && (h.time > best.fraction || (h.time == best.fraction && h.normal.z <= best.normal.z))) return;
+        best.hit = true;
+        best.start_penetrating = h.start_penetrating;
+        best.fraction = h.time;
+        best.normal = h.normal;
+        best.point = h.location + shift;
+        best.actor_index = h.actor;
+        best.actor = (h.actor >= 0 && static_cast<size_t>(h.actor) < scene.actors.size()) ? &scene.actors[h.actor] : nullptr;
     };
 
-    for (const auto& b : scene.colliders) test_box(b, nullptr);
-    for (const auto& a : scene.actors) {
-        if (a.is_collidable) test_box(a.world_bounds, &a);
+    if (scene.collision) {
+        consider(scene.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
     }
     for (const auto& elev : scene.elevators) {
-        Vec3 fc = elev.current_pos + elev.cab_local_offset;
-        Vec3 he = elev.cab_half_extents;
-        float h_cab = he.z * 2.0f;
-        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z - 24.0f),
-                      Vec3(fc.x + he.x, fc.y + he.y, fc.z)), nullptr);
-        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z + h_cab),
-                      Vec3(fc.x + he.x, fc.y + he.y, fc.z + h_cab + 24.0f)), nullptr);
+        for (const auto& part : elev.parts) {
+            if (!part.collision) continue;
+            consider(part.collision->sweep_box(centre - part.offset, delta, extent, COLL_BlockNonZeroExtent), part.offset);
+        }
     }
     return best;
 }
 
-bool ParkourController::check_ground(const LevelScene& scene, float& floor_z, Vec3& floor_normal) {
+ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, const Vec3& end, const LevelScene& scene,
+                                                         uint8_t channels) const {
+    TraceHit best;
+    if ((end - start).length_sq() < 1e-8f) return best;
+
+    auto consider = [&](const CollisionHit& h, const Vec3& shift) {
+        if (!h.hit || (best.hit && h.time >= best.fraction)) return;
+        best.hit = true;
+        best.start_penetrating = h.start_penetrating;
+        best.fraction = h.time;
+        best.normal = h.normal;
+        best.point = h.location + shift;
+        best.actor_index = h.actor;
+        best.actor = (h.actor >= 0 && static_cast<size_t>(h.actor) < scene.actors.size()) ? &scene.actors[h.actor] : nullptr;
+    };
+
+    if (scene.collision) consider(scene.collision->line_check(start, end, channels), Vec3(0.0f, 0.0f, 0.0f));
+    for (const auto& elev : scene.elevators) {
+        for (const auto& part : elev.parts) {
+            if (!part.collision) continue;
+            consider(part.collision->line_check(start - part.offset, end - part.offset, channels), part.offset);
+        }
+    }
+    return best;
+}
+
+bool ParkourController::check_ground(const LevelScene& scene, float probe_depth, float height, FloorHit& out) const {
     Capsule cap;
-    cap.base = m_telemetry.position + Vec3(0.0f, 0.0f, 10.0f); // slight upward probe
-    cap.radius = 30.0f;
-    cap.height = 90.0f;
-    cap.bottom_offset = 0.0f;
+    cap.base = m_telemetry.position + Vec3(0.0f, 0.0f, kFloorProbeLift);
+    cap.radius = kPawnRadius;
+    cap.height = height;
+    const Vec3 delta(0.0f, 0.0f, -(kFloorProbeLift + probe_depth));
+    const TraceHit hit = sweep_capsule(cap, delta, scene);
+    if (!hit.hit || hit.normal.z < kWalkableFloorZ) return false;
+    out.z = cap.base.z + delta.z * hit.fraction;
+    out.normal = hit.normal;
+    out.actor_index = hit.actor_index;
+    return true;
+}
 
-    Vec3 delta(0.0f, 0.0f, -35.0f); // probe down beneath feet
-    TraceHit hit = sweep_capsule(cap, delta, scene);
+bool ParkourController::has_room(float height, const LevelScene& scene) const {
+    return has_room_at(m_telemetry.position, height, scene);
+}
 
-    if (hit.hit && hit.normal.z >= 0.707f) {
-        floor_z = cap.base.z + delta.z * hit.fraction;
-        floor_normal = hit.normal;
+bool ParkourController::has_room_at(const Vec3& feet, float height, const LevelScene& scene) const {
+    // Lifted off the floor it rests on and shrunk slightly so resting / sliding contacts do not count.
+    constexpr float kLift = 1.0f;
+    const float half_z = 0.5f * (height - kLift);
+    const Vec3 extent(kPawnRadius - 1.0f, kPawnRadius - 1.0f, half_z);
+    const Vec3 centre = feet + Vec3(0.0f, 0.0f, kLift + half_z);
+    if (scene.collision && scene.collision->overlap_box(centre, extent, COLL_BlockNonZeroExtent)) return false;
+    for (const auto& elev : scene.elevators) {
+        for (const auto& part : elev.parts) {
+            if (part.collision && part.collision->overlap_box(centre - part.offset, extent, COLL_BlockNonZeroExtent)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Swept Movement (UE3 MoveActor / SlideAlongSurface / APawn::stepUp)
+// -----------------------------------------------------------------------------
+ParkourController::TraceHit ParkourController::move_swept(const Vec3& delta, float height, float bottom_offset,
+                                                          const LevelScene& scene) {
+    Capsule cap;
+    cap.base = m_telemetry.position;
+    cap.radius = kPawnRadius;
+    cap.height = height;
+    cap.bottom_offset = bottom_offset;
+    const TraceHit hit = sweep_capsule(cap, delta, scene);
+    m_telemetry.position += delta * (hit.hit ? safe_fraction(hit.fraction, delta.length()) : 1.0f);
+    return hit;
+}
+
+ParkourController::TraceHit ParkourController::move_and_slide(const Vec3& delta, float height, float bottom_offset,
+                                                              const LevelScene& scene) {
+    const TraceHit first = move_swept(delta, height, bottom_offset, scene);
+    if (!first.hit) return first;
+    // The blocked remainder continues along the surface, nudged off it so the next sweep does not
+    // re-detect the resting contact.
+    Vec3 remaining = delta * (1.0f - first.fraction);
+    remaining -= first.normal * remaining.dot(first.normal);
+    if (remaining.length_sq() < 1e-6f) return first;
+    const TraceHit second = move_swept(remaining + first.normal * 0.01f, height, bottom_offset, scene);
+    if (second.hit) {
+        // Crease between two surfaces: continue along their intersection line.
+        Vec3 crease = first.normal.cross(second.normal);
+        if (crease.length_sq() > 1e-6f) {
+            crease = crease.normalized();
+            const Vec3 rest = crease * (remaining * (1.0f - second.fraction)).dot(crease);
+            if (rest.length_sq() > 1e-6f) move_swept(rest, height, bottom_offset, scene);
+        }
+    }
+    return first;
+}
+
+// UE3 APawn::physWalking horizontal move: walkable ramps are followed, kerbs / stairs / seams between
+// meshes are stepped up (stepUp), walls are slid along.
+void ParkourController::walk_move(const Vec3& delta, float height, const LevelScene& scene) {
+    Vec3 remaining = delta;
+    for (int iter = 0; iter < 3 && remaining.length_sq() > 1e-6f; ++iter) {
+        const TraceHit hit = move_swept(remaining, height, 0.0f, scene);
+        if (!hit.hit) return;
+        remaining *= (1.0f - hit.fraction);
+        if (hit.normal.z >= kWalkableFloorZ) {
+            // Walkable ramp: continue parallel to the surface.
+            remaining -= hit.normal * remaining.dot(hit.normal);
+            remaining += hit.normal * 0.01f;
+            continue;
+        }
+        const float z_before = m_telemetry.position.z;
+        if (step_up(remaining, height, scene)) {
+            if (m_telemetry.position.z - z_before > 8.0f && m_telemetry.move_state == EMovement::MOVE_Walking) {
+                m_telemetry.move_state = EMovement::MOVE_AutoStepUp;
+            }
+            return;
+        }
+        // Wall: slide along it and drop the velocity component into it.
+        Vec3 n(hit.normal.x, hit.normal.y, 0.0f);
+        if (n.length_sq() < 1e-6f) return;
+        n = n.normalized();
+        remaining -= n * remaining.dot(n);
+        remaining.z = 0.0f;
+        const float vn = m_telemetry.velocity.x * n.x + m_telemetry.velocity.y * n.y;
+        if (vn < 0.0f) {
+            m_telemetry.velocity.x -= n.x * vn;
+            m_telemetry.velocity.y -= n.y * vn;
+        }
+        // Nothing left to slide (running straight into the wall): stay in contact.
+        if (remaining.length_sq() < 1e-4f) return;
+        remaining += n * 0.01f;
+    }
+}
+
+// UE3 APawn::stepUp: move up MaxStepHeight, retry the blocked move at that height, step back down.
+bool ParkourController::step_up(const Vec3& delta, float height, const LevelScene& scene) {
+    const float len = delta.length();
+    if (len < 1e-3f) return false;
+    const Vec3 start = m_telemetry.position;
+    move_swept(Vec3(0.0f, 0.0f, kMaxStepHeight), height, 0.0f, scene);
+    const float rise = m_telemetry.position.z - start.z;
+    if (rise < 1.0f) {
+        m_telemetry.position = start;
+        return false;
+    }
+    const Vec3 raised = m_telemetry.position;
+    const TraceHit fwd = move_swept(delta, height, 0.0f, scene);
+    const float advanced = (m_telemetry.position - raised).length();
+    if (fwd.hit && advanced < std::min(1.0f, 0.5f * len)) {
+        // Still blocked straight away at the raised height: a wall, not a step.
+        m_telemetry.position = start;
+        return false;
+    }
+    const TraceHit down = move_swept(Vec3(0.0f, 0.0f, -rise), height, 0.0f, scene);
+    if (down.hit && down.normal.z < kWalkableFloorZ) {
+        m_telemetry.position = start;
+        return false;
+    }
+    return true;
+}
+
+// Free ballistic flight (vault / springboard launches): gravity plus a swept move with sliding.
+void ParkourController::integrate_ballistic(float dt, const LevelScene& scene) {
+    m_telemetry.velocity.z -= m_config.gravity * dt;
+    const TraceHit hit = move_and_slide(m_telemetry.velocity * dt, kPawnHeight, 0.0f, scene);
+    if (hit.hit) {
+        const float vn = m_telemetry.velocity.dot(hit.normal);
+        if (vn < 0.0f) m_telemetry.velocity -= hit.normal * vn;
+    }
+}
+
+bool ParkourController::find_ledge_top(const Vec3& wall_normal, float max_rise, const LevelScene& scene, float& ledge_z) const {
+    Vec3 into(-wall_normal.x, -wall_normal.y, 0.0f);
+    if (into.length_sq() < 1e-6f) return false;
+    into = into.normalized();
+    const Vec3& p = m_telemetry.position;
+    // Distance to the wall face, probed low on the wall (its top may already be below the chest).
+    float wall_dist = -1.0f;
+    for (float h : {50.0f, 30.0f, 10.0f}) {
+        const Vec3 s = p + Vec3(0.0f, 0.0f, h);
+        const TraceHit w = trace_ray(s, s + into * 120.0f, scene);
+        if (w.hit && std::abs(w.normal.z) < 0.5f) {
+            wall_dist = 120.0f * w.fraction;
+            break;
+        }
+    }
+    if (wall_dist < 0.0f) return false;
+    // Walkable top just beyond the wall face.
+    for (float extra : {6.0f, 20.0f, 36.0f}) {
+        const Vec3 column = p + into * (wall_dist + extra);
+        const TraceHit h = trace_ray(column + Vec3(0.0f, 0.0f, max_rise + 10.0f), column + Vec3(0.0f, 0.0f, 5.0f), scene);
+        if (!h.hit || h.normal.z < kWalkableFloorZ || h.point.z > p.z + max_rise) continue;
+        if (!has_room_at(Vec3(column.x, column.y, h.point.z + 0.5f), kPawnHeight, scene)) continue;
+        ledge_z = h.point.z;
         return true;
     }
     return false;
+}
+
+bool ParkourController::climb_onto_ledge(const Vec3& wall_normal, float ledge_z, const LevelScene& scene) {
+    Vec3 into(-wall_normal.x, -wall_normal.y, 0.0f);
+    if (into.length_sq() < 1e-6f) return false;
+    into = into.normalized();
+    const Vec3 start = m_telemetry.position;
+    // Distance to the wall face just below the ledge lip.
+    float wall_dist = 40.0f;
+    {
+        const Vec3 s(start.x, start.y, std::max(start.z + 5.0f, ledge_z - 8.0f));
+        const TraceHit w = trace_ray(s, s + into * 120.0f, scene);
+        if (w.hit) wall_dist = 120.0f * w.fraction;
+    }
+    // Rise until the feet clear the ledge, then move over it.
+    const float rise = ledge_z + 2.0f - start.z;
+    if (rise > 0.0f) {
+        move_swept(Vec3(0.0f, 0.0f, rise), kPawnHeight, 0.0f, scene);
+        if (m_telemetry.position.z < ledge_z - 0.5f) {
+            m_telemetry.position = start;  // no headroom above the ledge
+            return false;
+        }
+    }
+    move_swept(into * (wall_dist + 15.0f), kPawnHeight, 0.0f, scene);
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -701,6 +839,7 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     }
 
     // Crouch / Slide transition
+    const bool was_crouched = (m_telemetry.move_state == EMovement::MOVE_Crouch);
     if (input.crouch) {
         float current_spd = m_telemetry.velocity.length_xy();
         if (current_spd >= m_config.slide_min_speed) {
@@ -713,6 +852,10 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
             m_telemetry.move_state = EMovement::MOVE_Crouch;
             m_telemetry.eye_height = 48.0f;
         }
+    } else if (was_crouched && !has_room(kPawnHeight, scene)) {
+        // No room to stand up (e.g. still under the airduct): stay crouched.
+        m_telemetry.move_state = EMovement::MOVE_Crouch;
+        m_telemetry.eye_height = 48.0f;
     } else {
         m_telemetry.move_state = EMovement::MOVE_Walking;
         m_telemetry.eye_height = 84.0f;
@@ -773,52 +916,9 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
         m_telemetry.velocity.y = dir.y * speed;
     }
 
-    // Continuous Swept Movement with Auto Step-Up (TdPawn: Radius=30, Height=90, MaxWallStepHeight=35)
-    Capsule cap;
-    cap.base = m_telemetry.position;
-    cap.radius = 30.0f;
-    cap.height = (m_telemetry.move_state == EMovement::MOVE_Crouch) ? 45.0f : 90.0f;
-    cap.bottom_offset = 0.0f;
-
-    Vec3 move_delta = Vec3(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f) * dt;
-    TraceHit hit = sweep_capsule(cap, move_delta, scene);
-
-    if (!hit.hit) {
-        m_telemetry.position += move_delta;
-    } else {
-        // Wall hit: test Auto Step-Up (curbs / steps up to 35 units high)
-        constexpr float MAX_STEP_UP = 35.0f;
-        Capsule step_cap = cap;
-        step_cap.base.z += MAX_STEP_UP;
-
-        TraceHit step_hit = sweep_capsule(step_cap, move_delta, scene);
-        if (!step_hit.hit) {
-            // Can step over! Elevate and proceed
-            m_telemetry.position.z += MAX_STEP_UP;
-            m_telemetry.position += move_delta;
-            m_telemetry.move_state = EMovement::MOVE_AutoStepUp;
-        } else {
-            // Slide along collision normal with secondary sweep check
-            m_telemetry.position += move_delta * std::max(0.0f, hit.fraction - 0.001f);
-            Vec3 remaining = move_delta * (1.0f - hit.fraction);
-            remaining -= hit.normal * remaining.dot(hit.normal);
-            if (remaining.length_sq() > 1e-6f) {
-                Capsule slide_cap = cap;
-                slide_cap.base = m_telemetry.position;
-                TraceHit slide_hit = sweep_capsule(slide_cap, remaining, scene);
-                if (!slide_hit.hit) {
-                    m_telemetry.position += remaining;
-                } else {
-                    m_telemetry.position += remaining * std::max(0.0f, slide_hit.fraction - 0.001f);
-                }
-            }
-
-            // Dampen velocity along normal
-            if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
-                m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
-            }
-        }
-    }
+    // UE3 physWalking: swept horizontal move with stepUp (TdPawn: Radius=30, Height=90, MaxStepHeight=35)
+    const float height = (m_telemetry.move_state == EMovement::MOVE_Crouch) ? kCrouchHeight : kPawnHeight;
+    walk_move(Vec3(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f) * dt, height, scene);
 }
 
 // -----------------------------------------------------------------------------
@@ -863,35 +963,12 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
         }
     }
 
-    // Swept displacement with slide-along-normal so touching a ledge/wall at fraction=0 never freezes Faith
-    Capsule cap;
-    cap.base = m_telemetry.position;
-    cap.radius = 30.0f;
-    cap.height = 90.0f;
-    cap.bottom_offset = (m_telemetry.move_state == EMovement::MOVE_Coil) ? m_config.coil_height_boost : 0.0f;
-
-    Vec3 delta = m_telemetry.velocity * dt;
-    TraceHit hit = sweep_capsule(cap, delta, scene);
-
-    if (!hit.hit) {
-        m_telemetry.position += delta;
-    } else {
-        m_telemetry.position += delta * std::max(0.0f, hit.fraction - 0.001f);
-        Vec3 remaining = delta * (1.0f - hit.fraction);
-        remaining -= hit.normal * remaining.dot(hit.normal);
-        if (remaining.length_sq() > 1e-6f) {
-            Capsule slide_cap = cap;
-            slide_cap.base = m_telemetry.position;
-            TraceHit slide_hit = sweep_capsule(slide_cap, remaining, scene);
-            if (!slide_hit.hit) {
-                m_telemetry.position += remaining;
-            } else {
-                m_telemetry.position += remaining * std::max(0.0f, slide_hit.fraction - 0.001f);
-            }
-        }
-        if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
-            m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
-        }
+    // Swept displacement with slide-along-surface so touching a ledge/wall never freezes Faith
+    const float bottom = (m_telemetry.move_state == EMovement::MOVE_Coil) ? m_config.coil_height_boost : 0.0f;
+    const TraceHit hit = move_and_slide(m_telemetry.velocity * dt, kPawnHeight, bottom, scene);
+    if (hit.hit) {
+        const float vn = m_telemetry.velocity.dot(hit.normal);
+        if (vn < 0.0f) m_telemetry.velocity -= hit.normal * vn;
     }
 }
 
@@ -1009,23 +1086,17 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
         return;
     }
 
-    // Sweep movement along wall (TdPawn: Radius=30, Height=90)
-    Capsule cap;
-    cap.base = m_telemetry.position;
-    cap.radius = 30.0f;
-    cap.height = 90.0f;
-    Vec3 delta = m_telemetry.velocity * dt;
-    TraceHit hit = sweep_capsule(cap, delta, scene);
-    if (!hit.hit) {
-        m_telemetry.position += delta;
-    } else {
-        m_telemetry.position += delta * std::max(0.0f, hit.fraction - 0.001f);
-        if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
-            m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+    // Swept movement along the wall (TdPawn: Radius=30, Height=90): grazing the running wall slides
+    // along it; running into an obstacle or onto a floor ends the wallrun.
+    const TraceHit hit = move_and_slide(m_telemetry.velocity * dt, kPawnHeight, 0.0f, scene);
+    if (hit.hit) {
+        const float vn = m_telemetry.velocity.dot(hit.normal);
+        if (vn < 0.0f) m_telemetry.velocity -= hit.normal * vn;
+        if (hit.normal.dot(m_wall_tangent) < -0.5f || hit.normal.z >= kWalkableFloorZ) {
+            m_wallrun_cooldown = 0.20f;
+            m_telemetry.move_state = EMovement::MOVE_Falling;
+            m_telemetry.camera_roll_deg = 0.0f;
         }
-        m_wallrun_cooldown = 0.20f;
-        m_telemetry.move_state = EMovement::MOVE_Falling;
-        m_telemetry.camera_roll_deg = 0.0f;
     }
 }
 
@@ -1103,11 +1174,15 @@ void ParkourController::update_wallclimb(const InputFrame& input, float dt, cons
     TraceHit top_check = trace_ray(chest, chest - m_telemetry.wall_normal * 80.0f, scene);
 
     if (!top_check.hit && m_telemetry.velocity.z <= 120.0f) {
-        // Clear top of ledge: auto pull up!
-        m_telemetry.position += -m_telemetry.wall_normal * 60.0f + Vec3(0, 0, 40.0f);
-        m_telemetry.move_state = EMovement::MOVE_Walking;
-        m_telemetry.velocity = -m_telemetry.wall_normal * m_config.jog_speed;
-        return;
+        // Clear top of the wall: mantle onto the ledge.
+        float ledge_z = 0.0f;
+        if (find_ledge_top(m_telemetry.wall_normal, 90.0f, scene, ledge_z) &&
+            climb_onto_ledge(m_telemetry.wall_normal, ledge_z, scene)) {
+            m_telemetry.move_state = EMovement::MOVE_Walking;
+            m_telemetry.velocity = -m_telemetry.wall_normal * m_config.jog_speed;
+            m_telemetry.velocity.z = 0.0f;
+            return;
+        }
     }
 
     if (m_telemetry.velocity.z <= -50.0f) {
@@ -1115,7 +1190,11 @@ void ParkourController::update_wallclimb(const InputFrame& input, float dt, cons
         return;
     }
 
-    m_telemetry.position.z += m_telemetry.velocity.z * dt;
+    // Climb (swept: an overhang stops the ascent)
+    const TraceHit climb_hit = move_swept(Vec3(0.0f, 0.0f, m_telemetry.velocity.z * dt), kPawnHeight, 0.0f, scene);
+    if (climb_hit.hit && m_telemetry.velocity.z > 0.0f) {
+        m_telemetry.velocity.z = 0.0f;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1171,27 +1250,16 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
         return;
     }
 
-    // Abort conditions
+    // Abort conditions (stay crouched while there is no room to stand, e.g. under the airduct)
     if (spd < 100.0f || m_slide_timer >= m_config.slide_max_duration || !input.crouch) {
-        m_telemetry.move_state = input.crouch ? EMovement::MOVE_Crouch : EMovement::MOVE_Walking;
-        m_telemetry.eye_height = input.crouch ? 48.0f : 84.0f;
+        const bool stand = !input.crouch && has_room(kPawnHeight, scene);
+        m_telemetry.move_state = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
+        m_telemetry.eye_height = stand ? 84.0f : 48.0f;
         return;
     }
 
-    Capsule cap;
-    cap.base = m_telemetry.position;
-    cap.radius = 30.0f;
-    cap.height = 45.0f; // low slide clearance!
-    cap.bottom_offset = 0.0f;
-
-    Vec3 delta = m_telemetry.velocity * dt;
-    TraceHit hit = sweep_capsule(cap, delta, scene);
-    if (!hit.hit) {
-        m_telemetry.position += delta;
-    } else {
-        m_telemetry.position += delta * hit.fraction;
-        m_telemetry.move_state = EMovement::MOVE_Crouch;
-    }
+    // Low (crouch-height) swept move: passes under ducts, steps over seams, glances off walls.
+    walk_move(Vec3(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f) * dt, kCrouchHeight, scene);
 }
 
 // -----------------------------------------------------------------------------
@@ -1212,15 +1280,19 @@ bool ParkourController::try_initiate_ledge_grab(const LevelScene& scene) {
     Vec3 ledge_top_start = fwd_hit.point - fwd_hit.normal * 15.0f + Vec3(0, 0, 50.0f);
     TraceHit down_hit = trace_ray(ledge_top_start, ledge_top_start + Vec3(0, 0, -80.0f), scene);
 
-    if (down_hit.hit && down_hit.normal.z >= 0.707f) {
+    if (down_hit.hit && down_hit.normal.z >= kWalkableFloorZ) {
         float ledge_z = down_hit.point.z;
         float diff_z = ledge_z - m_telemetry.position.z;
 
-        if (diff_z >= 40.0f && diff_z <= 120.0f) {
+        if (diff_z >= 40.0f && diff_z <= 120.0f &&
+            has_room_at(Vec3(ledge_top_start.x, ledge_top_start.y, ledge_z + 0.5f), kPawnHeight, scene)) {
+            // Hang with the hands on the lip (swept to the hanging height).
+            move_swept(Vec3(0.0f, 0.0f, (ledge_z - 80.0f) - m_telemetry.position.z), kPawnHeight, 0.0f, scene);
             m_telemetry.move_state = EMovement::MOVE_Grabbing;
-            m_telemetry.position.z = ledge_z - 80.0f; // hand hanging position
             m_telemetry.velocity = Vec3(0, 0, 0);
             m_telemetry.wall_normal = fwd_hit.normal;
+            m_ledge_z = ledge_z;
+            m_base_actor = -1;
             return true;
         }
     }
@@ -1229,7 +1301,6 @@ bool ParkourController::try_initiate_ledge_grab(const LevelScene& scene) {
 
 void ParkourController::update_ledge_grab(const InputFrame& input, float dt, const LevelScene& scene) {
     (void)dt;
-    (void)scene;
     m_telemetry.velocity = Vec3(0, 0, 0);
 
     // Pull Up
@@ -1246,8 +1317,12 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
 
     if (m_telemetry.move_state == EMovement::MOVE_GrabPullUp) {
         if (m_state_timer >= 0.25f) {
-            m_telemetry.position += -m_telemetry.wall_normal * 60.0f + Vec3(0, 0, 85.0f);
-            m_telemetry.move_state = EMovement::MOVE_Walking;
+            if (climb_onto_ledge(m_telemetry.wall_normal, m_ledge_z, scene)) {
+                m_telemetry.move_state = EMovement::MOVE_Walking;
+            } else {
+                m_telemetry.move_state = EMovement::MOVE_Falling;
+                m_telemetry.velocity = m_telemetry.wall_normal * 100.0f;
+            }
         }
     }
 }
@@ -1263,14 +1338,22 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
     for (const auto& act : scene.actors) {
         if (act.is_springboard || act.tag == "springboard") {
             if (act.world_bounds.contains(check_pt) || act.location.distance_xy(m_telemetry.position) < 140.0f) {
+                // Plant a foot on the springboard top just ahead, then launch off it.
+                float top_z = m_telemetry.position.z;
+                const Vec3 probe = m_telemetry.position + fwd * 65.0f;
+                const TraceHit top = trace_ray(probe + Vec3(0.0f, 0.0f, 150.0f), probe + Vec3(0.0f, 0.0f, -5.0f), scene);
+                if (top.hit && top.normal.z >= kWalkableFloorZ) top_z = std::max(top_z, top.point.z);
+                const float rise = std::clamp(top_z - m_telemetry.position.z + 2.0f, 0.0f, 120.0f);
+                if (rise > 0.0f) move_swept(Vec3(0.0f, 0.0f, rise), kPawnHeight, 0.0f, scene);
+
                 m_telemetry.move_state = EMovement::MOVE_SpringBoarding;
                 m_state_timer = 0.0f;
-                m_telemetry.position += fwd * 65.0f + Vec3(0.0f, 0.0f, 92.0f);
                 m_telemetry.velocity.z = m_config.springboard_jump_z; // 950 u/s!
                 float spd = std::max(m_telemetry.velocity.length_xy(), 400.0f);
                 m_telemetry.velocity.x = fwd.x * spd;
                 m_telemetry.velocity.y = fwd.y * spd;
                 m_telemetry.grounded = false;
+                m_base_actor = -1;
                 m_fall_peak_z = m_telemetry.position.z;
                 return true;
             }
@@ -1282,27 +1365,51 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
 bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelScene& scene) {
     (void)input;
     Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
-    Vec3 waist = m_telemetry.position + Vec3(0, 0, 50.0f);
 
-    TraceHit hit = trace_ray(waist, waist + fwd * 100.0f, scene);
-    if (hit.hit && std::abs(hit.normal.z) < 0.2f) {
-        // Check top of obstacle
-        Vec3 over_start = hit.point + fwd * 40.0f + Vec3(0, 0, 100.0f);
-        TraceHit top_hit = trace_ray(over_start, over_start + Vec3(0, 0, -120.0f), scene);
-
-        if (top_hit.hit && top_hit.point.z - m_telemetry.position.z <= 110.0f) {
-            bool is_sprinting = m_telemetry.velocity.length_xy() >= 350.0f;
-            m_telemetry.move_state = is_sprinting ? EMovement::MOVE_SpeedVaulting : EMovement::MOVE_VaultOver;
-
-            float boost = is_sprinting ? 80.0f : 0.0f;
-            float spd = m_telemetry.velocity.length_xy() + boost;
-            m_telemetry.velocity = fwd * spd;
-            m_telemetry.velocity.z = 250.0f;
-            m_telemetry.position += fwd * 80.0f + Vec3(0, 0, 30.0f);
-            return true;
-        }
+    // Obstacle face ahead, probed from just above step height up to the highest vaultable top:
+    // raised obstacles (e.g. airducts on stands) have no face at waist height.
+    constexpr float kVaultReach = 120.0f;  // from the pawn centre (90 past its front)
+    TraceHit hit;
+    for (float h : {50.0f, kMaxStepHeight + 5.0f, 80.0f, 110.0f, kVaultMaxHeight - 8.0f}) {
+        const Vec3 s = m_telemetry.position + Vec3(0.0f, 0.0f, h);
+        const TraceHit w = trace_ray(s, s + fwd * kVaultReach, scene);
+        if (w.hit && std::abs(w.normal.z) < 0.2f && (!hit.hit || w.fraction < hit.fraction)) hit = w;
     }
-    return false;
+    if (!hit.hit) return false;
+
+    // Top of the obstacle: the highest walkable surface just beyond its face with room for the pawn.
+    float top_z = -1.0e30f;
+    for (float depth : {4.0f, 20.0f, 40.0f}) {
+        const Vec3 column(hit.point.x + fwd.x * depth, hit.point.y + fwd.y * depth, m_telemetry.position.z);
+        const TraceHit top = trace_ray(column + Vec3(0.0f, 0.0f, kVaultMaxHeight + 20.0f),
+                                       column + Vec3(0.0f, 0.0f, kMaxStepHeight), scene);
+        if (!top.hit || top.normal.z < kWalkableFloorZ || top.point.z <= top_z) continue;
+        if (!has_room_at(Vec3(column.x, column.y, top.point.z + 0.5f), kPawnHeight, scene)) continue;
+        top_z = top.point.z;
+    }
+    const float obstacle_height = top_z - m_telemetry.position.z;
+    if (obstacle_height < kMaxStepHeight || obstacle_height > kVaultMaxHeight) return false;
+
+    // Clear the obstacle (swept rise above its top), then carry the run-up momentum over it.
+    const Vec3 start = m_telemetry.position;
+    move_swept(Vec3(0.0f, 0.0f, obstacle_height + 4.0f), kPawnHeight, 0.0f, scene);
+    if (m_telemetry.position.z < top_z + 1.0f) {
+        m_telemetry.position = start;  // no headroom above the obstacle
+        return false;
+    }
+
+    bool is_sprinting = m_telemetry.velocity.length_xy() >= 350.0f;
+    m_telemetry.move_state = is_sprinting ? EMovement::MOVE_SpeedVaulting : EMovement::MOVE_VaultOver;
+    m_state_timer = 0.0f;
+
+    float boost = is_sprinting ? 80.0f : 0.0f;
+    float spd = std::max(m_telemetry.velocity.length_xy(), m_config.jog_speed) + boost;
+    m_telemetry.velocity = fwd * spd;
+    m_telemetry.velocity.z = 250.0f;
+    m_telemetry.grounded = false;
+    m_base_actor = -1;
+    m_fall_peak_z = m_telemetry.position.z;
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -1641,7 +1748,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             Vec3 ray_dir = (fwd + right * ( std::cos(angle) * radius ) + up * ( std::sin(angle) * radius )).normalized();
             Vec3 ray_end = eye + ray_dir * ws.range;
 
-            TraceHit wall_hit = trace_ray(eye, ray_end, scene);
+            TraceHit wall_hit = trace_ray(eye, ray_end, scene, COLL_BlockZeroExtent);
             float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : ws.range;
             Vec3 tracer_end = wall_hit.hit ? wall_hit.point : (eye + ray_dir * std::min(ws.range, 2500.0f));
 
@@ -1991,7 +2098,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 Vec3 target_pt = m_telemetry.position + Vec3(0, 0, m_telemetry.eye_height * 0.75f);
 
                 // Check line of sight so enemies don't shoot through solid walls
-                TraceHit los = trace_ray(bot_muzzle, target_pt, scene);
+                TraceHit los = trace_ray(bot_muzzle, target_pt, scene, COLL_BlockZeroExtent);
                 Vec3 tracer_end = los.hit ? los.point : target_pt;
 
                 BulletTracer tr{};
@@ -2058,8 +2165,8 @@ void ParkourController::update_health_and_regen(float dt) {
 // Checkpoints, Kill Volumes & Collectibles Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
-    // 1. Fall Death / Kill Volume -> Respawn
-    if (m_telemetry.position.z < -2000.0f ||
+    // 1. Fall Death (WorldInfo.KillZ, or a lethal drop below the last checkpoint) -> Respawn
+    if (m_telemetry.position.z < scene.kill_z ||
         m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f ||
         m_telemetry.health <= 0.0f) {
         reset(m_last_checkpoint_pos, m_last_checkpoint_yaw);
@@ -2106,6 +2213,9 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
 // Interactive Elevator & Mid-Shaft Multi-Level Streaming Subsystem
 // (Reverse-engineered from *_Slc.me1 / *_Spt.me1 InterpActor + InterpTrackMove)
 // -----------------------------------------------------------------------------
+// Drives the real elevator InterpActors: the cab and the actors attached to it follow the cab
+// PosTrack, the sliding doors follow their door matinees. A pawn standing on a moving part
+// (Pawn.Base) is carried with it, exactly like UE3 based movement.
 void ParkourController::update_elevators(const InputFrame& input, float dt, LevelScene& scene) {
     m_telemetry.in_elevator = false;
     m_telemetry.active_elevator_idx = -1;
@@ -2114,25 +2224,26 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
         ElevatorInstance& elev = scene.elevators[i];
         elev.prev_pos = elev.current_pos;
 
-        Vec3 fc_prev = elev.prev_pos + elev.cab_local_offset;
-        Vec3 he = elev.cab_half_extents;
-        float h_cab = he.z * 2.0f;
+        // Cab interior (S_Elevator_01 mesh bounds) at the cab's current position.
+        const Vec3 fc_prev = elev.prev_pos + elev.cab_local_offset;
+        const Vec3 he = elev.cab_half_extents;
+        const float h_cab = he.z * 2.0f;
+        const Vec3& p = m_telemetry.position;
+        const bool player_inside = (std::abs(p.x - fc_prev.x) <= he.x - 8.0f) &&
+                                   (std::abs(p.y - fc_prev.y) <= he.y - 8.0f) &&
+                                   (p.z >= fc_prev.z - 30.0f) &&
+                                   (p.z <= fc_prev.z + h_cab + 10.0f);
 
-        bool player_inside = (std::abs(m_telemetry.position.x - fc_prev.x) <= he.x - 8.0f) &&
-                             (std::abs(m_telemetry.position.y - fc_prev.y) <= he.y - 8.0f) &&
-                             (m_telemetry.position.z >= fc_prev.z - 30.0f) &&
-                             (m_telemetry.position.z <= fc_prev.z + h_cab + 10.0f);
-
-        bool button_pressed = input.use && (player_inside || m_telemetry.position.distance(elev.button_pos) < 180.0f);
+        const bool button_pressed = input.use && (player_inside || p.distance(elev.button_pos) < 180.0f);
 
         switch (elev.state) {
             case ElevatorState::IdleStart: {
                 elev.door_open_Start = 1.0f;
                 elev.door_open_End = 0.0f;
                 // Trigger when Faith walks inside the cab and passes its center or presses E on the button
-                bool deep_inside = player_inside &&
-                                   (std::abs(m_telemetry.position.x - fc_prev.x) <= he.x * 0.65f) &&
-                                   (std::abs(m_telemetry.position.y - fc_prev.y) <= he.y * 0.65f);
+                const bool deep_inside = player_inside &&
+                                         (std::abs(p.x - fc_prev.x) <= he.x * 0.65f) &&
+                                         (std::abs(p.y - fc_prev.y) <= he.y * 0.65f);
                 if ((elev.auto_trigger_on_enter && deep_inside) || button_pressed) {
                     elev.state = ElevatorState::DoorsClosing;
                     elev.timer = 0.0f;
@@ -2143,7 +2254,7 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
 
             case ElevatorState::DoorsClosing: {
                 elev.timer += dt;
-                float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
+                const float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
                 elev.door_open_Start = 1.0f - t01;
                 elev.door_open_End = 0.0f;
                 if (elev.timer >= elev.door_duration) {
@@ -2157,7 +2268,7 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
 
             case ElevatorState::Moving: {
                 elev.timer += dt;
-                float dur = std::max(0.1f, elev.ride_duration);
+                const float dur = std::max(0.1f, elev.ride_duration);
 
                 // Evaluate UE3 InterpTrackMove PosTrack curve (Hermite smoothstep between keyframes)
                 if (elev.keyframes.size() >= 2) {
@@ -2167,23 +2278,23 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
                         elev.current_pos = elev.keyframes.back().pos;
                     } else {
                         for (size_t k = 0; k + 1 < elev.keyframes.size(); ++k) {
-                            float t0 = elev.keyframes[k].time;
-                            float t1 = elev.keyframes[k + 1].time;
+                            const float t0 = elev.keyframes[k].time;
+                            const float t1 = elev.keyframes[k + 1].time;
                             if (elev.timer >= t0 && elev.timer <= t1) {
-                                float seg_u = (t1 > t0 + 1e-5f) ? (elev.timer - t0) / (t1 - t0) : 1.0f;
-                                float s = seg_u * seg_u * (3.0f - 2.0f * seg_u);
+                                const float seg_u = (t1 > t0 + 1e-5f) ? (elev.timer - t0) / (t1 - t0) : 1.0f;
+                                const float s = seg_u * seg_u * (3.0f - 2.0f * seg_u);
                                 elev.current_pos = elev.keyframes[k].pos + (elev.keyframes[k + 1].pos - elev.keyframes[k].pos) * s;
                                 break;
                             }
                         }
                     }
                 } else {
-                    float u = std::clamp(elev.timer / dur, 0.0f, 1.0f);
-                    float s = u * u * (3.0f - 2.0f * u);
+                    const float u = std::clamp(elev.timer / dur, 0.0f, 1.0f);
+                    const float s = u * u * (3.0f - 2.0f * u);
                     elev.current_pos = elev.start_pos + (elev.end_pos - elev.start_pos) * s;
                 }
 
-                float progress = std::clamp(elev.timer / dur, 0.0f, 1.0f);
+                const float progress = std::clamp(elev.timer / dur, 0.0f, 1.0f);
 
                 // Mid-shaft Kismet SeqAct_MultiLevelStreaming / TdCheckpoint.StreamingLevels transition
                 if (!elev.streaming_triggered && progress >= 0.5f) {
@@ -2224,7 +2335,7 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
 
             case ElevatorState::DoorsOpening: {
                 elev.timer += dt;
-                float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
+                const float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
                 elev.door_open_End = t01;
                 if (elev.timer >= elev.door_duration) {
                     elev.door_open_End = 1.0f;
@@ -2241,18 +2352,45 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
             }
         }
 
-        // Carry Faith smoothly with the moving elevator cab
-        if (player_inside) {
-            Vec3 cab_delta = elev.current_pos - elev.prev_pos;
-            m_telemetry.position += cab_delta;
-            float new_floor_z = (elev.current_pos + elev.cab_local_offset).z;
-            if (m_telemetry.position.z < new_floor_z) {
-                m_telemetry.position.z = new_floor_z;
-                m_telemetry.grounded = true;
-                if (m_telemetry.velocity.z < 0.0f) {
-                    m_telemetry.velocity.z = 0.0f;
+        // Pose the real InterpActors: the cab (and everything based on it) is displaced along the cab
+        // PosTrack; sliding door leaves move along their door-matinee open offsets.
+        const Vec3 cab_offset = elev.current_pos - elev.start_pos;
+        float cab_doors_open = 0.0f;
+        if (elev.state == ElevatorState::IdleStart || elev.state == ElevatorState::DoorsClosing) {
+            cab_doors_open = elev.door_open_Start;
+        } else if (elev.state == ElevatorState::DoorsOpening || elev.state == ElevatorState::IdleEnd) {
+            cab_doors_open = elev.door_open_End;
+        }
+        for (auto& part : elev.parts) {
+            part.prev_offset = part.offset;
+            switch (part.role) {
+                case ElevatorPartRole::Cab:
+                case ElevatorPartRole::CabAttached:
+                    part.offset = cab_offset;
+                    break;
+                case ElevatorPartRole::CabDoor:
+                    part.offset = cab_offset + part.door_open_offset * cab_doors_open;
+                    break;
+                case ElevatorPartRole::StartDoor:
+                    part.offset = part.door_open_offset * elev.door_open_Start;
+                    break;
+                case ElevatorPartRole::EndDoor:
+                    part.offset = part.door_open_offset * elev.door_open_End;
+                    break;
+            }
+        }
+
+        // UE3 based movement: a pawn standing on a moving InterpActor rides with it.
+        if (m_telemetry.grounded && m_base_actor >= 0) {
+            for (const auto& part : elev.parts) {
+                if (part.actor_index == m_base_actor) {
+                    m_telemetry.position += part.offset - part.prev_offset;
+                    break;
                 }
             }
+        }
+
+        if (player_inside) {
             // Prevent false fall-damage accumulation during downward elevator rides
             m_fall_peak_z = m_telemetry.position.z;
             m_air_fall_start_z = m_telemetry.position.z;
@@ -2270,192 +2408,6 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
     }
 
     m_telemetry.streamed_sublevel_count = static_cast<int>(scene.loaded_sublevel_packages.size());
-}
-
-// -----------------------------------------------------------------------------
-// Parkour Test Course Builder: Creates a Guaranteed Rich Gauntlet
-// -----------------------------------------------------------------------------
-void ParkourController::build_parkour_test_course(LevelScene& scene) {
-    scene.map_name = "Parkour_Gauntlet_Oracle";
-    scene.chapter_title = "PROLOGUE: THE EDGE";
-    scene.player_spawn_pos = Vec3(0.0f, 0.0f, 100.0f);
-    scene.player_spawn_yaw = 0.0f;
-
-    // Clear colliders and build fresh test course
-    scene.colliders.clear();
-    scene.actors.clear();
-    scene.enemies.clear();
-    scene.checkpoints.clear();
-    scene.checkpoint_infos.clear();
-    scene.streaming_actions.clear();
-    scene.all_streaming_packages.clear();
-    scene.loaded_sublevel_packages.clear();
-    scene.elevators.clear();
-
-    // 1. Start Platform & Unobstructed 3800-unit Sprint Runway
-    scene.colliders.emplace_back(Vec3(-500.0f, -300.0f, 0.0f), Vec3(3800.0f, 300.0f, 50.0f));
-
-    // 2. Low Vault Hurdle (height 70)
-    scene.colliders.emplace_back(Vec3(3200.0f, -150.0f, 50.0f), Vec3(3250.0f, 150.0f, 120.0f));
-
-    // 3. Springboard Box (height 90, flagged springboard)
-    LevelActor springboard_actor;
-    springboard_actor.object_name = "Springboard_Box";
-    springboard_actor.location = Vec3(3600.0f, 0.0f, 95.0f);
-    springboard_actor.world_bounds = AABB(Vec3(3550.0f, -80.0f, 50.0f), Vec3(3650.0f, 80.0f, 140.0f));
-    springboard_actor.is_springboard = true;
-    springboard_actor.is_runner_vision = true;
-    springboard_actor.is_collidable = true;
-    scene.actors.push_back(springboard_actor);
-    scene.colliders.push_back(springboard_actor.world_bounds);
-
-    // 4. Canyon Gap & Wallrun Walls (Red Runner Vision)
-    scene.colliders.emplace_back(Vec3(3800.0f, -300.0f, 0.0f), Vec3(5000.0f, 300.0f, 50.0f)); // canyon floor
-
-    LevelActor left_wall;
-    left_wall.object_name = "Wallrun_Left";
-    left_wall.location = Vec3(4500.0f, -220.0f, 250.0f);
-    left_wall.world_bounds = AABB(Vec3(4000.0f, -260.0f, 50.0f), Vec3(5000.0f, -200.0f, 450.0f));
-    left_wall.is_runner_vision = true;
-    left_wall.is_collidable = true;
-    scene.actors.push_back(left_wall);
-    scene.colliders.push_back(left_wall.world_bounds);
-
-    LevelActor right_wall;
-    right_wall.object_name = "Wallrun_Right";
-    right_wall.location = Vec3(4500.0f, 220.0f, 250.0f);
-    right_wall.world_bounds = AABB(Vec3(4000.0f, 200.0f, 50.0f), Vec3(5000.0f, 260.0f, 450.0f));
-    right_wall.is_runner_vision = true;
-    right_wall.is_collidable = true;
-    scene.actors.push_back(right_wall);
-    scene.colliders.push_back(right_wall.world_bounds);
-
-    // 5. Wallclimb Tower with Top Ledge Grab
-    LevelActor tower;
-    tower.object_name = "Climb_Tower";
-    tower.location = Vec3(5400.0f, 0.0f, 275.0f);
-    tower.world_bounds = AABB(Vec3(5350.0f, -150.0f, 50.0f), Vec3(5450.0f, 150.0f, 500.0f));
-    tower.is_runner_vision = true;
-    tower.is_ledge = true;
-    tower.is_collidable = true;
-    scene.actors.push_back(tower);
-    scene.colliders.push_back(tower.world_bounds);
-
-    // Platform at top of tower
-    scene.colliders.emplace_back(Vec3(5350.0f, -200.0f, 480.0f), Vec3(5600.0f, 200.0f, 500.0f));
-
-    // 6. Zipline Cable from Tower Top to Far Rooftop
-    LevelActor zipline;
-    zipline.object_name = "Zipline_Cable";
-    zipline.location = Vec3(5500.0f, 0.0f, 520.0f);
-    zipline.end_point = Vec3(7000.0f, 0.0f, 120.0f);
-    zipline.is_zipline = true;
-    zipline.is_runner_vision = true;
-    zipline.is_collidable = false;
-    scene.actors.push_back(zipline);
-
-    // Far rooftop landing
-    scene.colliders.emplace_back(Vec3(6800.0f, -300.0f, 0.0f), Vec3(8000.0f, 300.0f, 100.0f));
-
-    // 7. Slide Barrier under Low Ventilation Duct (clearance 60 units)
-    LevelActor slide_duct;
-    slide_duct.object_name = "Slide_Duct";
-    slide_duct.location = Vec3(7300.0f, 0.0f, 220.0f);
-    slide_duct.world_bounds = AABB(Vec3(7280.0f, -250.0f, 160.0f), Vec3(7340.0f, 250.0f, 300.0f));
-    slide_duct.is_collidable = true;
-    scene.actors.push_back(slide_duct);
-    scene.colliders.push_back(slide_duct.world_bounds);
-
-    // 8. Balance Beam across Rooftop Gap
-    LevelActor balance_beam;
-    balance_beam.object_name = "Balance_Pipe";
-    balance_beam.location = Vec3(8400.0f, 0.0f, 110.0f);
-    balance_beam.world_bounds = AABB(Vec3(8000.0f, -15.0f, 90.0f), Vec3(8800.0f, 15.0f, 110.0f));
-    balance_beam.is_balance_beam = true;
-    balance_beam.is_runner_vision = true;
-    balance_beam.is_collidable = true;
-    scene.actors.push_back(balance_beam);
-    scene.colliders.push_back(balance_beam.world_bounds);
-
-    // Destination combat arena leading into the Penthouse Elevator lobby
-    scene.colliders.emplace_back(Vec3(8800.0f, -400.0f, 0.0f), Vec3(9840.0f, 400.0f, 100.0f));
-
-    // 9. Enemy Guard for Disarm Training
-    EnemyBot guard;
-    guard.archetype = "PatrolCop";
-    guard.position = Vec3(9300.0f, 0.0f, 100.0f);
-    guard.weapon_name = "Colt1911";
-    guard.health = 100.0f;
-    guard.disarm_window = true;
-    scene.enemies.push_back(guard);
-
-    // 10. Interactive Penthouse Transition Elevator (S_Elevator_01: X=9840..10080, Y=-132.5..+132.5, Z=100 -> 680)
-    // Connects the lower Combat Arena (Z=100) to the streamed Upper Penthouse Helipad Deck (Z=680).
-    ElevatorInstance penthouse_elev;
-    penthouse_elev.name = "Penthouse_Slc:mainlift";
-    penthouse_elev.source_package = "Penthouse_Spt";
-    penthouse_elev.cab_mesh_name = "S_Elevator_01";
-    penthouse_elev.start_pos = Vec3(9960.0f, 0.0f, 100.0f);
-    penthouse_elev.end_pos = Vec3(9960.0f, 0.0f, 680.0f);
-    penthouse_elev.current_pos = penthouse_elev.start_pos;
-    penthouse_elev.prev_pos = penthouse_elev.start_pos;
-    penthouse_elev.cab_local_offset = Vec3(0.0f, 0.0f, 0.0f);
-    penthouse_elev.cab_half_extents = Vec3(120.0f, 132.5f, 131.0f);
-    penthouse_elev.ride_duration = 2.0f;
-    penthouse_elev.door_duration = 0.4f;
-    penthouse_elev.keyframes = {
-        {0.0f, Vec3(9960.0f, 0.0f, 100.0f)},
-        {2.0f, Vec3(9960.0f, 0.0f, 680.0f)}
-    };
-    penthouse_elev.button_pos = Vec3(10040.0f, 95.0f, 220.0f);
-    penthouse_elev.target_checkpoint_idx = 5;
-    penthouse_elev.stream_out_packages = {"Edge_Pt1_Art", "Edge_Pt1_Lw"};
-    penthouse_elev.stream_in_packages = {"Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art"};
-    scene.elevators.push_back(penthouse_elev);
-
-    // Streamed Upper Penthouse Helipad Deck at Z = 680 (walk out of the elevator at X = 10080..11200)
-    scene.colliders.emplace_back(Vec3(10080.0f, -450.0f, 640.0f), Vec3(11200.0f, 450.0f, 680.0f));
-
-    // 11. Checkpoints & TdCheckpoint.StreamingLevels along the Gauntlet
-    scene.checkpoints.push_back(Vec3(0.0f, 0.0f, 100.0f));
-    scene.checkpoints.push_back(Vec3(3000.0f, 0.0f, 100.0f));
-    scene.checkpoints.push_back(Vec3(5400.0f, 0.0f, 550.0f));
-    scene.checkpoints.push_back(Vec3(7000.0f, 0.0f, 150.0f));
-    scene.checkpoints.push_back(Vec3(9000.0f, 0.0f, 150.0f));
-    scene.checkpoints.push_back(Vec3(10400.0f, 0.0f, 680.0f)); // Upper Penthouse Helipad checkpoint after Elevator ride
-
-    auto add_cp_info = [&](const std::string& name, int weight, bool def, const Vec3& pos,
-                           const std::vector<std::string>& levels) {
-        LevelCheckpointInfo cp;
-        cp.object_name = "TdCheckpoint_" + std::to_string(scene.checkpoint_infos.size());
-        cp.checkpoint_name = name;
-        cp.checkpoint_weight = weight;
-        cp.default_checkpoint = def;
-        cp.location = pos;
-        cp.streaming_levels = levels;
-        scene.checkpoint_infos.push_back(cp);
-    };
-    add_cp_info("Start_Runway", 1, true, Vec3(0.0f, 0.0f, 100.0f), {"Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Sky"});
-    add_cp_info("Vault_Springboard", 2, false, Vec3(3000.0f, 0.0f, 100.0f), {"Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Sky"});
-    add_cp_info("Climb_Tower_Top", 3, false, Vec3(5400.0f, 0.0f, 550.0f), {"Edge_Pt1_Art", "Edge_Slc", "Edge_Sky"});
-    add_cp_info("Zipline_Landing", 4, false, Vec3(7000.0f, 0.0f, 150.0f), {"Edge_Pt1_Art", "Edge_Slc", "Edge_Sky"});
-    add_cp_info("Elevator_Lobby", 5, false, Vec3(9000.0f, 0.0f, 150.0f), {"Edge_Pt1_Art", "Penthouse_Slc", "Penthouse_Spt", "Edge_Sky"});
-    add_cp_info("Penthouse_Helipad", 6, false, Vec3(10400.0f, 0.0f, 680.0f), {"Penthouse_Slc", "Penthouse_Spt", "Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art", "Edge_Sky"});
-
-    scene.all_streaming_packages = {
-        "Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Slc", "Penthouse_Slc",
-        "Penthouse_Spt", "Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art", "Edge_Sky"
-    };
-    scene.loaded_sublevel_packages = scene.checkpoint_infos.front().streaming_levels;
-
-    // 12. Secret Courier Bag on Top of Tower
-    LevelActor bag;
-    bag.object_name = "Secret_Runner_Bag";
-    bag.location = Vec3(5400.0f, 50.0f, 520.0f);
-    bag.world_bounds = AABB(Vec3(5380.0f, 30.0f, 500.0f), Vec3(5420.0f, 70.0f, 540.0f));
-    bag.is_bag = true;
-    bag.is_runner_vision = true;
-    scene.actors.push_back(bag);
 }
 
 } // namespace me

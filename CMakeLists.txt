@@ -34,6 +34,7 @@ set(SOURCES
     src/assets/ini_config.cpp
     src/audio/audio_engine.cpp
     src/cutscene/cutscene_player.cpp
+    src/physics/collision_world.cpp
     src/physics/parkour_controller.cpp
     src/ui/main_menu.cpp
     src/renderer/metal_renderer.mm
