@@ -215,6 +215,18 @@ struct Mat4 {
         return r;
     }
 
+    static Mat4 ortho(float left, float right, float bottom, float top, float z_near, float z_far) {
+        Mat4 r{};
+        r.m[0] = 2.0f / (right - left);
+        r.m[5] = 2.0f / (top - bottom);
+        r.m[10] = 1.0f / (z_far - z_near);
+        r.m[12] = -(right + left) / (right - left);
+        r.m[13] = -(top + bottom) / (top - bottom);
+        r.m[14] = -z_near / (z_far - z_near);
+        r.m[15] = 1.0f;
+        return r;
+    }
+
     static Mat4 look_at(const Vec3& eye, const Vec3& target, const Vec3& up) {
         Vec3 f = (target - eye).normalized();
         Vec3 s = up.cross(f).normalized();

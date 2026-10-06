@@ -167,7 +167,23 @@ struct FrameUniforms {
     float aspect;
     packed_float3 cam_up;
     float health;
+    float4x4 sun_view_proj;
+    packed_float3 mod_shadow_color;
+    float shadow_enabled;
 };
+
+struct ShadowVertexOut {
+    float4 clip_pos [[position]];
+};
+
+vertex ShadowVertexOut shadow_vertex(constant VertexIn* vertices [[buffer(0)]],
+                                     constant FrameUniforms& uniforms [[buffer(1)]],
+                                     uint vertex_id [[vertex_id]]) {
+    ShadowVertexOut out;
+    float4 world_pos4 = uniforms.model * float4(float3(vertices[vertex_id].position), 1.0);
+    out.clip_pos = uniforms.sun_view_proj * world_pos4;
+    return out;
+}
 
 struct VertexOut {
     float4 clip_pos [[position]];
@@ -287,8 +303,35 @@ vertex VertexOut world_vertex(constant VertexIn* vertices [[buffer(0)]],
     return out;
 }
 
+inline float sample_world_shadow(float3 world_pos, float3 N, constant FrameUniforms& uniforms, depth2d<float> shadow_map) {
+    if (uniforms.shadow_enabled < 0.5) return 1.0;
+    float3 Lw = normalize(float3(uniforms.sun_dir));
+    float ndl = saturate(dot(N, Lw));
+    if (ndl <= 0.001) return 0.0;
+    float3 biased_pos = world_pos + N * mix(18.0, 5.0, ndl) + Lw * 6.0;
+    float4 sc = uniforms.sun_view_proj * float4(biased_pos, 1.0);
+    float3 ndc = sc.xyz / max(sc.w, 1e-6);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    float edge = max(abs(ndc.x), abs(ndc.y));
+    if (edge >= 0.99 || ndc.z <= 0.001 || ndc.z >= 0.999) return 1.0;
+
+    constexpr sampler sh_smp(coord::normalized, filter::nearest, address::clamp_to_edge);
+    float ref_z = ndc.z - mix(0.0022, 0.0006, ndl);
+    float2 texel = float2(1.0 / 4096.0);
+    float vis = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float d = shadow_map.sample(sh_smp, uv + float2(dx, dy) * texel * 1.35);
+            vis += (ref_z <= d) ? 1.0 : 0.0;
+        }
+    }
+    vis *= (1.0 / 9.0);
+    return mix(1.0, vis, smoothstep(0.98, 0.88, edge));
+}
+
 fragment float4 world_fragment(VertexOut in [[stage_in]],
-                               constant FrameUniforms& uniforms [[buffer(0)]]) {
+                               constant FrameUniforms& uniforms [[buffer(0)]],
+                               depth2d<float> shadow_map [[texture(27)]]) {
     // Compute geometric facet normal from screen-space derivatives to guarantee crisp architectural planes
     float3 dpdx = dfdx(in.world_pos);
     float3 dpdy = dfdy(in.world_pos);
@@ -306,21 +349,23 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
 
     // Blend smooth vertex normal with crisp geometric face normal
     float3 N = normalize(mix(geo_N, vtx_N, 0.55));
-    float3 L = normalize(float3(-0.42, -0.58, 0.70));
+    float3 L = normalize(float3(uniforms.sun_dir));
+    float shadow = sample_world_shadow(in.world_pos, N, uniforms, shadow_map);
 
     // 1. Directional Sun + UE3 BasePass GetMaterialHemisphereLightTransferFull (MaterialTemplate.usf)
-    float NdotL = max(dot(N, L), 0.0);
+    float NdotL = max(dot(N, L), 0.0) * shadow;
     // Secondary directional fill so X-facing and Y-facing shadow walls have distinct tonal separation
     float side_contrast = 0.5 + 0.5 * N.x - 0.25 * N.y;
 
-    float3 sun_light = float3(0.54, 0.52, 0.49) * NdotL;
+    float3 sun_light = float3(0.56, 0.53, 0.48) * NdotL;
     float sky_hemi = saturate(N.z * 0.5 + 0.5);
     // Quadratic hemisphere transfer: w = (0.5, 0.5) + (0.5, -0.5) * N.z; w *= w
     float2 hemi_w = float2(0.5, 0.5) + float2(0.5, -0.5) * N.z;
     hemi_w *= hemi_w;
-    float3 upper_sky = float3(uniforms.sky_color) * 0.64;
+    float3 mod_azure = max(float3(uniforms.mod_shadow_color), float3(0.42, 0.65, 0.92)) * float3(0.65, 0.88, 1.18);
+    float3 upper_sky = mix(mod_azure * 0.56, float3(uniforms.sky_color) * 0.64, NdotL);
     float3 lower_sky = float3(uniforms.ground_color) * 0.44;
-    float3 sky_bounce = (upper_sky * hemi_w.x + lower_sky * hemi_w.y + float3(0.11, 0.14, 0.18)) * (0.78 + 0.22 * side_contrast);
+    float3 sky_bounce = (upper_sky * hemi_w.x + lower_sky * hemi_w.y + float3(0.06, 0.10, 0.16)) * (0.78 + 0.22 * side_contrast);
     float3 lighting = sun_light + sky_bounce;
 
     // 2. Base Albedo & Procedural Architectural Material Detailing
@@ -442,7 +487,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
 }
 
 // -----------------------------------------------------------------------------
-// 4. Post-Processing & Tone Mapping (TdToneMapping + TdMotionBlur)
+// 4. Post-Processing, SSAO & Tone Mapping (AmbientOcclusionShader + TdToneMapping + TdMotionBlur)
 // -----------------------------------------------------------------------------
 struct PostVertexOut {
     float4 position [[position]];
@@ -457,8 +502,52 @@ vertex PostVertexOut post_vertex(uint vertex_id [[vertex_id]]) {
     return out;
 }
 
+inline float post_linear_depth(float d) {
+    float ndc = saturate((d - 0.05) / 0.95);
+    return (5.0 * 65000.0) / (65000.0 - ndc * (65000.0 - 5.0));
+}
+
+// Symmetric-pair horizon Screen-Space Ambient Occlusion (AmbientOcclusionShader.usf):
+// Opposite sample pairs (uv + off, uv - off) cancel linear surface slope on flat floors/walls
+// so flat surfaces have zero self-occlusion while concave corners, curbs, solar panel bases,
+// and wall-floor junctions receive smooth cool-azure contact darkening.
+inline float compute_ssao(float2 uv, float2 frag_xy, depth2d<float> depth_tex, float aspect) {
+    constexpr sampler dsmp(coord::normalized, filter::nearest, address::clamp_to_edge);
+    float d0 = depth_tex.sample(dsmp, uv);
+    if (d0 < 0.052 || d0 > 0.9992) return 1.0;
+    float z0 = post_linear_depth(d0);
+    if (z0 > 10000.0) return 1.0;
+
+    float ign = fract(52.9829189 * fract(dot(frag_xy, float2(0.06711056, 0.00583715))));
+    float base_ang = ign * 3.14159265;
+    float max_rad = clamp(95.0 / z0, 0.0025, 0.018);
+    float max_range = clamp(z0 * 0.042, 14.0, 48.0);
+    float bias = max(1.4, z0 * 0.0016);
+    float norm_scale = max(18.0, z0 * 0.018);
+
+    float occ = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        float t = (float(i) + 0.5) * (1.0 / 8.0);
+        float r = max_rad * (0.20 + 0.80 * t);
+        float theta = base_ang + float(i) * 1.1780972;
+        float2 off = float2(cos(theta) / aspect, sin(theta)) * r;
+        float dp = depth_tex.sample(dsmp, uv + off);
+        float dn = depth_tex.sample(dsmp, uv - off);
+        if (dp < 0.052 || dn < 0.052) continue;
+        float zp = post_linear_depth(dp);
+        float zn = post_linear_depth(dn);
+        if (abs(zp - z0) < max_range && abs(zn - z0) < max_range) {
+            float concavity = z0 - 0.5 * (zp + zn);
+            occ += saturate((concavity - bias) / norm_scale);
+        }
+    }
+    float dist_fade = 1.0 - smoothstep(4500.0, 9500.0, z0);
+    return 1.0 - saturate(occ * (1.0 / 8.0) * 1.85) * dist_fade;
+}
+
 fragment float4 post_fragment(PostVertexOut in [[stage_in]],
                               texture2d<float> scene_tex [[texture(0)]],
+                              depth2d<float> depth_tex [[texture(1)]],
                               sampler smp [[sampler(0)]],
                               constant FrameUniforms& uniforms [[buffer(0)]]) {
     float2 uv = in.uv;
@@ -485,9 +574,16 @@ fragment float4 post_fragment(PostVertexOut in [[stage_in]],
         scene_color = scene_tex.sample(smp, uv).rgb;
     }
 
+    // 1b. Screen-Space Ambient Occlusion (AmbientOcclusionShader.usf - cool azure-slate crevice AO)
+    if (uniforms.shadow_enabled > 0.5) {
+        float ao = compute_ssao(uv, in.position.xy, depth_tex, max(uniforms.aspect, 1.0));
+        float3 ao_tint = mix(float3(0.24, 0.37, 0.56), float3(1.0), ao);
+        scene_color *= ao_tint;
+    }
+
     // 2. Balanced Filmic DICE Shoulder Tone Mapping (preserves highlight detail without #FFFFFF clipping)
-    float3 x = max(scene_color * 1.04, 0.0);
-    float3 toned = (x * (1.12 * x + 0.18)) / (x * (1.08 * x + 0.42) + 0.14);
+    float3 x = max(scene_color * 1.02, 0.0);
+    float3 toned = (x * (1.06 * x + 0.16)) / (x * (1.08 * x + 0.44) + 0.14);
     toned = saturate(toned);
 
     // Subtle vignette for crisp screen framing
@@ -610,6 +706,9 @@ struct FrameUniformsGPU {
     float aspect;
     PackedFloat3 cam_up;
     float health;
+    simd_float4x4 sun_view_proj;
+    PackedFloat3 mod_shadow_color;
+    float shadow_enabled;
 };
 
 struct HUDVertex {
@@ -731,6 +830,7 @@ struct MetalRenderer::Impl {
     id<MTLLibrary> shader_library = nil;
 
     // Render Pipeline States
+    id<MTLRenderPipelineState> shadow_pipeline = nil;
     id<MTLRenderPipelineState> sky_pipeline = nil;
     id<MTLRenderPipelineState> world_pipeline = nil;
     id<MTLRenderPipelineState> viewmodel_pipeline = nil;
@@ -751,6 +851,7 @@ struct MetalRenderer::Impl {
     id<MTLTexture> offscreen_color_tex = nil;
     id<MTLTexture> offscreen_depth_tex = nil;
     id<MTLTexture> scene_hdr_tex = nil; // Intermediate HDR buffer for tone mapping
+    id<MTLTexture> shadow_depth_tex = nil; // 4096x4096 real-time directional sun shadow depth map
 
     int width = 1280;
     int height = 720;
@@ -1226,6 +1327,7 @@ struct MetalRenderer::Impl {
             [enc setFragmentTexture:scene_depth_copy atIndex:matbind::kSceneDepthTexture];
             [enc setFragmentSamplerState:scene_copy_sampler atIndex:matbind::kSceneSampler];
         }
+        [enc setFragmentTexture:shadow_depth_tex atIndex:matbind::kShadowMapTexture];
     }
 
     bool compile_shaders() {
@@ -1245,6 +1347,15 @@ struct MetalRenderer::Impl {
                       << [[error localizedDescription] UTF8String] << std::endl;
             return false;
         }
+
+        // 0. Shadow Map Depth Pipeline
+        id<MTLFunction> shadowVert = [shader_library newFunctionWithName:@"shadow_vertex"];
+        MTLRenderPipelineDescriptor* shadowDesc = [[MTLRenderPipelineDescriptor alloc] init];
+        shadowDesc.vertexFunction = shadowVert;
+        shadowDesc.fragmentFunction = nil;
+        shadowDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+        shadow_pipeline = [device newRenderPipelineStateWithDescriptor:shadowDesc error:&error];
+        if (!shadow_pipeline) return false;
 
         // 1. Sky Pipeline
         id<MTLFunction> skyVert = [shader_library newFunctionWithName:@"sky_vertex"];
@@ -1394,9 +1505,19 @@ struct MetalRenderer::Impl {
                                                                                             width:width
                                                                                            height:height
                                                                                         mipmapped:NO];
-        depthDesc.usage = MTLTextureUsageRenderTarget;
+        depthDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         depthDesc.storageMode = MTLStorageModePrivate;
         offscreen_depth_tex = [device newTextureWithDescriptor:depthDesc];
+
+        if (!shadow_depth_tex) {
+            MTLTextureDescriptor* shDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                              width:4096
+                                                                                             height:4096
+                                                                                          mipmapped:NO];
+            shDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            shDesc.storageMode = MTLStorageModePrivate;
+            shadow_depth_tex = [device newTextureWithDescriptor:shDesc];
+        }
 
         MTLTextureDescriptor* colorDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                             width:width
@@ -2267,6 +2388,28 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.aspect = aspect;
         uniforms.cam_up = simd_make_float3(up.x, up.y, up.z);
 
+        // Directional Sun Orthographic Shadow Matrix (4096x4096 covering 7200x7200 UU around view frustum)
+        {
+            constexpr float kShadowExtent = 3600.0f;
+            constexpr float kTexelWorld = (kShadowExtent * 2.0f) / 4096.0f;
+            Vec3 flat_fwd(fwd.x, fwd.y, 0.0f);
+            if (flat_fwd.length() > 1e-3f) flat_fwd = flat_fwd.normalized();
+            Vec3 sh_center = cam_pos + flat_fwd * 1300.0f;
+            sh_center.x = std::floor(sh_center.x / kTexelWorld) * kTexelWorld;
+            sh_center.y = std::floor(sh_center.y / kTexelWorld) * kTexelWorld;
+            sh_center.z = std::floor(sh_center.z / kTexelWorld) * kTexelWorld;
+
+            Vec3 sun_up = (std::abs(sun_d.z) < 0.95f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f);
+            Mat4 sun_view = Mat4::look_at(sh_center + sun_d * 8000.0f, sh_center, sun_up);
+            Mat4 sun_proj = Mat4::ortho(-kShadowExtent, kShadowExtent, -kShadowExtent, kShadowExtent, 1000.0f, 15000.0f);
+            Mat4 sun_vp = sun_proj * sun_view;
+            std::memcpy(&uniforms.sun_view_proj, sun_vp.m, sizeof(float) * 16);
+        }
+        uniforms.mod_shadow_color = simd_make_float3(active_scene.mod_shadow_color.x,
+                                                     active_scene.mod_shadow_color.y,
+                                                     active_scene.mod_shadow_color.z);
+        uniforms.shadow_enabled = in_main_menu ? 0.0f : 1.0f;
+
         // ---------------------------------------------------------------------
         // Mirror's Edge materials: make the scene's material library resident
         // (texture upload + MSL compile happen once per library) and find out
@@ -2285,34 +2428,6 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 }
             }
         }
-
-        // ---------------------------------------------------------------------
-        // Pass 1: 3D Scene Geometry & Sky -> HDR Texture
-        // ---------------------------------------------------------------------
-        MTLRenderPassDescriptor* scenePass = [MTLRenderPassDescriptor renderPassDescriptor];
-        scenePass.colorAttachments[0].texture = impl_->scene_hdr_tex;
-        scenePass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        scenePass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0.65, 0.82, 0.98, 1.0);
-
-        scenePass.depthAttachment.texture = impl_->offscreen_depth_tex;
-        scenePass.depthAttachment.loadAction = MTLLoadActionClear;
-        scenePass.depthAttachment.storeAction = needs_scene_copies ? MTLStoreActionStore : MTLStoreActionDontCare;
-        scenePass.depthAttachment.clearDepth = 1.0;
-
-        id<MTLRenderCommandEncoder> enc = [cmd_buffer renderCommandEncoderWithDescriptor:scenePass];
-        [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 1.0}];
-
-        // A. Draw Sky Dome (TdDirHaze + Distant City Skyline)
-        [enc setRenderPipelineState:impl_->sky_pipeline];
-        [enc setDepthStencilState:impl_->depth_disabled_state];
-        [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-
-        // B. Draw World Meshes (BasePass + Beast Radiosity)
-        [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
-        [enc setRenderPipelineState:impl_->world_pipeline];
-        [enc setDepthStencilState:impl_->depth_write_state];
 
         auto bind_vertex_bytes_or_buffer = [&](id<MTLRenderCommandEncoder> encoder, const void* data, size_t length, NSUInteger index) {
             if (length <= 4096) {
@@ -2344,16 +2459,110 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
         }
 
+        auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
+            return s.vertex_count > 0 &&
+                   static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
+        };
+
+        // ---------------------------------------------------------------------
+        // Pass 0: Real-Time Directional Sun Shadow Map (4096x4096 Depth)
+        // ---------------------------------------------------------------------
+        if (impl_->shadow_depth_tex && impl_->shadow_pipeline && !in_main_menu) {
+            MTLRenderPassDescriptor* shadowPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            shadowPass.depthAttachment.texture = impl_->shadow_depth_tex;
+            shadowPass.depthAttachment.loadAction = MTLLoadActionClear;
+            shadowPass.depthAttachment.storeAction = MTLStoreActionStore;
+            shadowPass.depthAttachment.clearDepth = 1.0;
+
+            id<MTLRenderCommandEncoder> shEnc = [cmd_buffer renderCommandEncoderWithDescriptor:shadowPass];
+            [shEnc setViewport:(MTLViewport){0.0, 0.0, 4096.0, 4096.0, 0.0, 1.0}];
+            [shEnc setRenderPipelineState:impl_->shadow_pipeline];
+            [shEnc setDepthStencilState:impl_->depth_write_state];
+            [shEnc setDepthBias:0.0012f slopeScale:1.75f clamp:0.015f];
+            [shEnc setCullMode:MTLCullModeNone];
+            [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+
+            if (!active_scene.meshes.empty()) {
+                for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                    const auto& mesh = active_scene.meshes[i];
+                    if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                    [shEnc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
+                    if (mesh.sections.empty()) {
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                        continue;
+                    }
+                    for (const auto& s : mesh.sections) {
+                        if (!section_in_range(mesh, s)) continue;
+                        const MaterialShader* sh = nullptr;
+                        impl_->section_pipeline(s, &sh, nullptr);
+                        if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                    }
+                }
+            } else {
+                bind_vertex_bytes_or_buffer(shEnc, impl_->rooftop_mesh.data(), impl_->rooftop_mesh.size() * sizeof(Vertex), 0);
+                [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->rooftop_mesh.size()];
+                bind_vertex_bytes_or_buffer(shEnc, impl_->runner_vision_mesh.data(), impl_->runner_vision_mesh.size() * sizeof(Vertex), 0);
+                [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->runner_vision_mesh.size()];
+            }
+
+            if (!active_scene.enemies.empty()) {
+                for (const auto& bot : active_scene.enemies) {
+                    if (!bot.alive) continue;
+                    if (impl_->anim_system.is_loaded()) {
+                        impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
+                    }
+                    if (impl_->enemy_guard_mesh.empty()) continue;
+                    bind_vertex_bytes_or_buffer(shEnc, impl_->enemy_guard_mesh.data(),
+                                                impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
+                    Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+                    std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
+                    [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                    size_t v_count = impl_->enemy_guard_mesh.size();
+                    if (!impl_->anim_system.is_loaded() && bot.stunned && v_count > 108) v_count -= 108;
+                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
+                }
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            }
+
+            [shEnc endEncoding];
+        }
+
+        // ---------------------------------------------------------------------
+        // Pass 1: 3D Scene Geometry & Sky -> HDR Texture
+        // ---------------------------------------------------------------------
+        MTLRenderPassDescriptor* scenePass = [MTLRenderPassDescriptor renderPassDescriptor];
+        scenePass.colorAttachments[0].texture = impl_->scene_hdr_tex;
+        scenePass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        scenePass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        scenePass.colorAttachments[0].clearColor = MTLClearColorMake(0.65, 0.82, 0.98, 1.0);
+
+        scenePass.depthAttachment.texture = impl_->offscreen_depth_tex;
+        scenePass.depthAttachment.loadAction = MTLLoadActionClear;
+        scenePass.depthAttachment.storeAction = MTLStoreActionStore;
+        scenePass.depthAttachment.clearDepth = 1.0;
+
+        id<MTLRenderCommandEncoder> enc = [cmd_buffer renderCommandEncoderWithDescriptor:scenePass];
+        [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 1.0}];
+        [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+
+        // A. Draw Sky Dome (TdDirHaze + Distant City Skyline)
+        [enc setRenderPipelineState:impl_->sky_pipeline];
+        [enc setDepthStencilState:impl_->depth_disabled_state];
+        [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+        // B. Draw World Meshes (BasePass + Beast Radiosity)
+        [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
+        [enc setRenderPipelineState:impl_->world_pipeline];
+        [enc setDepthStencilState:impl_->depth_write_state];
+
         // Binds mesh i's vertex buffer + frame uniforms on the current encoder.
         auto bind_scene_mesh = [&](size_t i) {
             uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
             [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
             [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        };
-        auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
-            return s.vertex_count > 0 &&
-                   static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
         };
 
         if (!active_scene.meshes.empty()) {
@@ -2440,6 +2649,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // (the material sections above leave their own pipeline/depth state bound)
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
+        [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
         if (!impl_->menu_open && !active_scene.enemies.empty()) {
             for (const auto& bot : active_scene.enemies) {
                 if (!bot.alive) continue;
@@ -2548,9 +2758,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 transPass.colorAttachments[0].storeAction = MTLStoreActionStore;
                 transPass.depthAttachment.texture = impl_->offscreen_depth_tex;
                 transPass.depthAttachment.loadAction = MTLLoadActionLoad;
-                transPass.depthAttachment.storeAction = MTLStoreActionDontCare;
+                transPass.depthAttachment.storeAction = MTLStoreActionStore;
                 enc = [cmd_buffer renderCommandEncoderWithDescriptor:transPass];
                 [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
+                [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
             }
             [enc setDepthStencilState:impl_->depth_test_only_state];
             [enc setFrontFacingWinding:impl_->mat_front_winding];
@@ -2602,7 +2813,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc endEncoding];
 
         // ---------------------------------------------------------------------
-        // Pass 2: Post-Processing & Tone Mapping (HDR -> Final Output)
+        // Pass 2: Post-Processing, SSAO & Tone Mapping (HDR -> Final Output)
         // ---------------------------------------------------------------------
         MTLRenderPassDescriptor* postPass = [MTLRenderPassDescriptor renderPassDescriptor];
         postPass.colorAttachments[0].texture = final_target;
@@ -2613,6 +2824,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         id<MTLRenderCommandEncoder> postEnc = [cmd_buffer renderCommandEncoderWithDescriptor:postPass];
         [postEnc setRenderPipelineState:impl_->post_pipeline];
         [postEnc setFragmentTexture:impl_->scene_hdr_tex atIndex:0];
+        [postEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
         [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
         [postEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

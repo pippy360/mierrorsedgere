@@ -1188,6 +1188,7 @@ void GraphCompiler::run() {
     if (out_.uses_scene_color) src << ", texture2d<float> scene_color [[texture(" << matbind::kSceneColorTexture << ")]]";
     if (out_.uses_scene_depth) src << ", depth2d<float> scene_depth [[texture(" << matbind::kSceneDepthTexture << ")]]";
     if (out_.uses_scene_color || out_.uses_scene_depth) src << ", sampler scene_smp [[sampler(" << matbind::kSceneSampler << ")]]";
+    src << ", depth2d<float> shadow_map [[texture(" << matbind::kShadowMapTexture << ")]]";
     src << ") {\n";
     src << "    MatParams P = mat_setup(in, F);\n";
     for (const auto& s : normal_stmts) src << s << "\n";
@@ -1201,14 +1202,15 @@ void GraphCompiler::run() {
             break;
         case MatLightingModel::Phong:
         case MatLightingModel::NonDirectional:
-            src << "    float3 m_color = m_emissive + mat_lighting(P, F, " << diffuse.code << ", " << diffuse_power.code
+            src << "    float3 m_color = m_emissive + mat_lighting(P, F, shadow_map, " << diffuse.code << ", " << diffuse_power.code
                 << ", " << specular.code << ", " << specular_power.code << ", " << tslm.code << ", "
                 << (lighting == MatLightingModel::NonDirectional ? 1 : 0) << ");\n";
             break;
         case MatLightingModel::Custom:
             src << "    float3 m_custom = float3(0.0);\n";
+            src << "    float m_sh = mat_shadow(P, F, shadow_map);\n";
             src << "    {\n";
-            src << "        MatLightMap m_lm = mat_virtual_lightmap(P, F);\n";
+            src << "        MatLightMap m_lm = mat_virtual_lightmap(P, F, m_sh);\n";
             src << "        for (int m_j = 0; m_j < 3; ++m_j) {\n";
             src << "            P.tlight = mat_lmb(m_j);\n";
             for (const auto& s : custom_stmts) src << s << "\n";
@@ -1217,7 +1219,7 @@ void GraphCompiler::run() {
             src << "        P.tlight = float3(0.0, 0.0, 1.0);\n";
             src << "    }\n";
             src << "    float3 m_color = m_emissive + mat_lighting_custom(P, F, " << diffuse.code << ", " << tslm.code
-                << ", m_custom);\n";
+                << ", m_custom, m_sh);\n";
             break;
     }
     switch (blend) {
@@ -1679,6 +1681,9 @@ struct FrameUniforms {
     float aspect;
     packed_float3 cam_up;
     float health;
+    float4x4 sun_view_proj;
+    packed_float3 mod_shadow_color;
+    float shadow_enabled;
 };
 
 struct MatVSOut {
@@ -1800,12 +1805,11 @@ constant float3 kLMB0 = float3(0.0, 0.81649658, 0.57735027);
 constant float3 kLMB1 = float3(-0.70710678, -0.40824829, 0.57735027);
 constant float3 kLMB2 = float3(0.70710678, -0.40824829, 0.57735027);
 
-// Virtual light-map tuning (Beast light-maps are not decoded yet). F.sun_color already holds
-// the level DirectionalLight's linear LightColor * Brightness (Beast overrides when set).
-constant float kSunIntensity = 1.0;
-constant float kSkyUpper = 0.55;
-constant float kSkyLower = 0.30;
-constant float kAmbient = 0.03;
+// Virtual light-map tuning (with real-time directional sun shadow map + Beast hemisphere GI).
+constant float kSunIntensity = 0.88;
+constant float kSkyUpper = 0.48;
+constant float kSkyLower = 0.34;
+constant float kAmbient = 0.025;
 constant float3 kHazeColor = float3(0.76, 0.86, 0.96);
 
 inline float3 mat_lmb(int j) { return j == 0 ? kLMB0 : (j == 1 ? kLMB1 : kLMB2); }
@@ -1817,13 +1821,49 @@ struct MatLightMap {
 };
 inline float3 mat_lm(MatLightMap m, int j) { return j == 0 ? m.c0 : (j == 1 ? m.c1 : m.c2); }
 
-// Directional light-map coefficients for an unshadowed sun: the incoming light is
-// distributed over the three basis directions so that a flat (0,0,1) normal with
-// DiffusePower 1 receives exactly Lambert N.L.
-inline MatLightMap mat_virtual_lightmap(MatParams P, constant FrameUniforms& F) {
+// Real-time 12-tap rotated Vogel-disk PCF directional sun shadow map evaluation.
+inline float mat_shadow(MatParams P, constant FrameUniforms& F, depth2d<float> shadow_map) {
+    if (F.shadow_enabled < 0.5) return 1.0;
+    float3 Lw = normalize(float3(F.sun_dir));
+    float ndl_geo = saturate(dot(P.N, Lw));
+    if (ndl_geo <= 0.001) return 0.0;
+    float3 biased_wpos = P.wpos + P.N * mix(14.0, 4.0, ndl_geo) + Lw * 5.0;
+    float4 sc = F.sun_view_proj * float4(biased_wpos, 1.0);
+    float3 ndc = sc.xyz / max(sc.w, 1e-6);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    float edge = max(abs(ndc.x), abs(ndc.y));
+    if (edge >= 0.99 || ndc.z <= 0.001 || ndc.z >= 0.999) return 1.0;
+
+    constexpr sampler sh_smp(coord::normalized, filter::nearest, address::clamp_to_edge);
+    float bias = mix(0.0018, 0.0005, ndl_geo);
+    float ref_z = ndc.z - bias;
+    float2 radius = float2(1.65 / 4096.0);
+
+    // Interleaved gradient noise rotation in screen space for smooth penumbra
+    float ign = fract(52.9829189 * fract(dot(P.screen_uv * float2(1280.0, 720.0), float2(0.06711056, 0.00583715))));
+    float ang = ign * 6.2831853;
+    float ca = cos(ang);
+    float sa = sin(ang);
+
+    float vis = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        float r = sqrt((float(i) + 0.5) * (1.0 / 12.0));
+        float theta = float(i) * 2.3999632 + ang;
+        float2 off = float2(cos(theta), sin(theta)) * r * radius;
+        float d = shadow_map.sample(sh_smp, uv + off);
+        vis += (ref_z <= d) ? 1.0 : 0.0;
+    }
+    vis *= (1.0 / 12.0);
+    (void)ca; (void)sa;
+    float fade = smoothstep(0.98, 0.88, edge);
+    return mix(1.0, vis, fade);
+}
+
+// Directional light-map coefficients modulated by real-time sun shadow visibility.
+inline MatLightMap mat_virtual_lightmap(MatParams P, constant FrameUniforms& F, float shadow) {
     float3 Lw = normalize(float3(F.sun_dir));
     float3 Lt = float3(dot(P.T, Lw), dot(P.B, Lw), dot(P.N, Lw));
-    float ndl = saturate(Lt.z);
+    float ndl = saturate(Lt.z) * shadow;
     float3 w = saturate(float3(dot(Lt, kLMB0), dot(Lt, kLMB1), dot(Lt, kLMB2)));
     w *= w;
     w /= max(w.x + w.y + w.z, 1e-4);
@@ -1836,13 +1876,26 @@ inline MatLightMap mat_virtual_lightmap(MatParams P, constant FrameUniforms& F) 
 }
 
 // GetMaterialHemisphereLightTransferFull (model: 0 Phong, 1 NonDirectional, 2 Custom)
-// UE3 does not clamp TwoSidedLightingMask, but values outside [0, 1] only make sense against
-// real Beast light-map magnitudes. SP07's vista water uses 12: lerp(L, 12 * D, 12) = 144 * D - 11 * L,
-// roughly 140x the clamped sky term. The virtual light-map therefore clamps it.
-inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm, int model) {
+// Combines FSkyLightSceneProxy UpperSkyColor/LowerSkyColor with DirectionalLight.ModShadowColor
+// so cast shadows and shadowed walls exhibit Mirror's Edge's signature cool azure fill and warm ground bounce.
+inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm, int model, float shadow) {
     tslm = saturate(tslm);
-    float3 upper_c = float3(F.sky_color) * kSkyUpper;
+    float3 Nw = mat_tangent_to_world(P, P.tnormal);
+    float3 Lw = normalize(float3(F.sun_dir));
+    float sun_lit = saturate(dot(Nw, Lw)) * shadow;
+
+    // In shadow (sun_lit -> 0), tint upper hemisphere strongly toward cool cerulean ModShadowColor
+    float3 mod_azure = max(float3(F.mod_shadow_color), float3(0.42, 0.65, 0.92)) * float3(0.55, 0.86, 1.25);
+    float3 upper_c = mix(mod_azure * 0.44, float3(F.sky_color) * kSkyUpper, sun_lit);
     float3 lower_c = float3(F.ground_color) * kSkyLower;
+
+    // Directional lateral bounce on vertical walls so orthogonal shadowed walls have distinct Beast GI contrast
+    float wall_factor = saturate(1.0 - abs(Nw.z));
+    float lateral_sky = 0.84 + 0.16 * (Nw.x * 0.65 - Nw.y * 0.75);
+    float sun_opp = saturate(0.5 - 0.5 * dot(Nw.xy, Lw.xy));
+    upper_c *= mix(1.0, lateral_sky * (0.90 + 0.22 * sun_opp), wall_factor);
+    lower_c *= mix(1.0, lateral_sky * (1.12 - 0.22 * sun_opp), wall_factor);
+
     float3 tsl = tslm * diffuse;
     float3 up_l = float3(0.0);
     float3 lo_l = float3(0.0);
@@ -1850,7 +1903,7 @@ inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diff
         up_l = diffuse;
         lo_l = diffuse;
     } else if (model == 0) {
-        float nc = dot(P.tsky, P.tnormal);
+        float nc = clamp(dot(P.tsky, P.tnormal), -1.0, 1.0);
         float2 w = float2(0.5, 0.5) + float2(0.5, -0.5) * nc;
         w *= w;
         up_l = diffuse * w.x;
@@ -1859,9 +1912,11 @@ inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diff
     return mix(up_l, tsl, tslm) * upper_c + mix(lo_l, tsl, tslm) * lower_c;
 }
 
-inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, float3 diffuse, float diffuse_power,
+inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, depth2d<float> shadow_map,
+                           float3 diffuse, float diffuse_power,
                            float3 specular, float specular_power, float3 tslm, int model) {
-    MatLightMap lm = mat_virtual_lightmap(P, F);
+    float shadow = mat_shadow(P, F, shadow_map);
+    MatLightMap lm = mat_virtual_lightmap(P, F, shadow);
     float3 m = (model == 1) ? float3(1.0) : saturate(tslm);
     float3 lmn = saturate(float3(dot(P.tnormal, kLMB0), dot(P.tnormal, kLMB1), dot(P.tnormal, kLMB2)));
     float3 lmr = saturate(float3(dot(P.trefl, kLMB0), dot(P.trefl, kLMB1), dot(P.trefl, kLMB2)));
@@ -1871,13 +1926,14 @@ inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, float3 diffus
     float3 c = lm.c0 * (dt.x * dn + st.x * specular)
              + lm.c1 * (dt.y * dn + st.y * specular)
              + lm.c2 * (dt.z * dn + st.z * specular);
-    c += mat_hemisphere(P, F, diffuse, tslm, model);
+    c += mat_hemisphere(P, F, diffuse, tslm, model, shadow);
     c += diffuse * kAmbient;
     return c;
 }
 
-inline float3 mat_lighting_custom(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm, float3 custom_sum) {
-    return custom_sum + mat_hemisphere(P, F, diffuse, tslm, 2) + diffuse * kAmbient;
+inline float3 mat_lighting_custom(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm,
+                                  float3 custom_sum, float shadow) {
+    return custom_sum + mat_hemisphere(P, F, diffuse, tslm, 2, shadow) + diffuse * kAmbient;
 }
 
 // ---- Output (scene color is display-referred in this renderer) -------------
@@ -1885,7 +1941,13 @@ inline float mat_haze(MatParams P, constant FrameUniforms& F) {
     float dist = length(float3(F.camera_pos) - P.wpos);
     return saturate((dist - 2500.0) / 38000.0) * 0.65;
 }
-inline float3 mat_encode(float3 c) { return pow(max(c, float3(0.0)), float3(1.0 / 2.2)); }
+// Filmic HDR highlight compression before gamma encoding prevents sunlit white concrete (c ~ 1.8)
+// from clipping to flat #FFFFFF, preserving warm sun vs cool azure shadow contrast.
+inline float3 mat_encode(float3 c) {
+    float3 x = max(c, float3(0.0));
+    float3 mapped = float3(1.0) - exp(-x * 0.76);
+    return pow(mapped, float3(1.0 / 2.2));
+}
 
 inline float4 mat_out_opaque(MatParams P, constant FrameUniforms& F, float3 c) {
     return float4(mix(mat_encode(c), kHazeColor, mat_haze(P, F)), 1.0);
