@@ -2002,9 +2002,9 @@ struct MetalRenderer::Impl {
         draw_ui_quad(verts, 118.0f, h - 137.0f, 158.0f, 8.0f, simd_make_float4(0.12f, 0.15f, 0.20f, 0.85f));
         draw_ui_quad(verts, 120.0f, h - 135.0f, 154.0f * rt_pct, 4.0f, simd_make_float4(0.22f, 0.82f, 1.0f, 0.98f));
 
-        // 5. Top-Right Chapter / Checkpoint / Bags / Weapon Panel Backdrop
+        // 5. Top-Right Chapter / Checkpoint / Streaming / Bags / Weapon Panel Backdrop
         float rx = w - 335.0f;
-        draw_ui_quad(verts, rx - 14.0f, 18.0f, 332.0f, 102.0f, simd_make_float4(0.04f, 0.06f, 0.09f, 0.72f));
+        draw_ui_quad(verts, rx - 14.0f, 18.0f, 332.0f, 122.0f, simd_make_float4(0.04f, 0.06f, 0.09f, 0.72f));
         draw_ui_quad(verts, rx - 14.0f, 18.0f, 332.0f, 3.0f, simd_make_float4(0.902f, 0.078f, 0.078f, 0.95f));
 
         std::string ch_title = scene.chapter_title.empty() ? "PROLOGUE: THE EDGE" : scene.chapter_title;
@@ -2025,6 +2025,23 @@ struct MetalRenderer::Impl {
         draw_ui_text(verts, "WEAPON: " + wep_str, rx, 95.0f, 1.8f,
                      telemetry.weapon.equipped ? simd_make_float4(0.95f, 0.22f, 0.22f, 1.0f)
                                                : simd_make_float4(0.82f, 0.86f, 0.92f, 0.92f));
+
+        std::ostringstream ss_str;
+        ss_str << "STREAMED SUBLEVELS: " << std::max<int>(telemetry.streamed_sublevel_count, (int)scene.loaded_sublevel_packages.size());
+        draw_ui_text(verts, ss_str.str(), rx, 115.0f, 1.7f, simd_make_float4(0.55f, 0.85f, 1.0f, 0.95f));
+
+        // Elevator Transit Indicator when Faith is riding an interactive elevator
+        if (telemetry.in_elevator) {
+            float ex = (w - 300.0f) * 0.5f;
+            float ey = 28.0f;
+            draw_ui_quad(verts, ex, ey, 300.0f, 38.0f, simd_make_float4(0.04f, 0.06f, 0.09f, 0.82f));
+            draw_ui_quad(verts, ex, ey, 300.0f, 3.0f, simd_make_float4(0.902f, 0.078f, 0.078f, 0.95f));
+            draw_ui_text(verts, "ELEVATOR TRANSIT / STREAMING", ex + 18.0f, ey + 8.0f, 1.7f,
+                         simd_make_float4(0.96f, 0.97f, 0.99f, 0.98f));
+            draw_ui_quad(verts, ex + 18.0f, ey + 24.0f, 264.0f, 6.0f, simd_make_float4(0.16f, 0.20f, 0.26f, 0.9f));
+            draw_ui_quad(verts, ex + 18.0f, ey + 24.0f, 264.0f * std::clamp(telemetry.elevator_progress, 0.0f, 1.0f), 6.0f,
+                         simd_make_float4(0.902f, 0.078f, 0.078f, 1.0f));
+        }
 
         // 6. Active Subtitle / Tutorial Prompt Banner (Bottom Center)
         std::string prompt = telemetry.active_subtitle.empty()
@@ -2397,6 +2414,75 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+        }
+
+        // B2b. Render Interactive 3D Elevator Cabs, Sliding Doors & Runner Vision Buttons
+        if (!impl_->menu_open && !active_scene.elevators.empty()) {
+            std::vector<Vertex> elev_mesh;
+            std::vector<Vertex> elev_rv_mesh;
+            for (const auto& elev : active_scene.elevators) {
+                Vec3 fc = elev.current_pos + elev.cab_local_offset;
+                Vec3 he = elev.cab_half_extents;
+                float h_cab = he.z * 2.0f;
+
+                // Brushed stainless steel floor & ceiling with illuminated light diffuser
+                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z - 8.0f),
+                           Vec3(he.x, he.y, 8.0f), Vec3(0.80f, 0.83f, 0.87f));
+                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z + h_cab + 8.0f),
+                           Vec3(he.x, he.y, 8.0f), Vec3(0.90f, 0.92f, 0.95f));
+                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z + h_cab - 1.5f),
+                           Vec3(he.x * 0.65f, he.y * 0.65f, 1.5f), Vec3(0.99f, 0.99f, 1.0f));
+
+                // Side walls (-Y and +Y) and stainless steel interior handrails
+                append_box(elev_mesh, Vec3(fc.x, fc.y - he.y - 6.0f, fc.z + h_cab * 0.5f),
+                           Vec3(he.x, 6.0f, h_cab * 0.5f), Vec3(0.90f, 0.92f, 0.95f));
+                append_box(elev_mesh, Vec3(fc.x, fc.y + he.y + 6.0f, fc.z + h_cab * 0.5f),
+                           Vec3(he.x, 6.0f, h_cab * 0.5f), Vec3(0.90f, 0.92f, 0.95f));
+                append_box(elev_mesh, Vec3(fc.x, fc.y - he.y + 6.0f, fc.z + 95.0f),
+                           Vec3(he.x * 0.82f, 3.0f, 2.5f), Vec3(0.68f, 0.72f, 0.77f));
+                append_box(elev_mesh, Vec3(fc.x, fc.y + he.y - 6.0f, fc.z + 95.0f),
+                           Vec3(he.x * 0.82f, 3.0f, 2.5f), Vec3(0.68f, 0.72f, 0.77f));
+
+                // Sliding Lower Entry Doors (-X, S_ElevatorDoor_01: 76-unit slide per leaf)
+                float slide_start = 76.0f * elev.door_open_Start;
+                append_box(elev_mesh, Vec3(fc.x - he.x - 4.0f, fc.y - 38.5f - slide_start, fc.z + 120.0f),
+                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
+                append_box(elev_mesh, Vec3(fc.x - he.x - 4.0f, fc.y + 38.5f + slide_start, fc.z + 120.0f),
+                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
+
+                // Sliding Upper Exit Doors (+X, S_ElevatorDoor_01: 76-unit slide per leaf)
+                float slide_end = 76.0f * elev.door_open_End;
+                append_box(elev_mesh, Vec3(fc.x + he.x + 4.0f, fc.y - 38.5f - slide_end, fc.z + 120.0f),
+                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
+                append_box(elev_mesh, Vec3(fc.x + he.x + 4.0f, fc.y + 38.5f + slide_end, fc.z + 120.0f),
+                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
+
+                // Interior Control Panel & Glowing Runner Vision Elevator Button (S_ElevatorButton_Single)
+                append_box(elev_mesh, Vec3(fc.x + he.x * 0.55f, fc.y + he.y - 3.0f, fc.z + 125.0f),
+                           Vec3(14.0f, 2.0f, 24.0f), Vec3(0.22f, 0.25f, 0.30f));
+                append_box(elev_rv_mesh, Vec3(fc.x + he.x * 0.55f, fc.y + he.y - 5.5f, fc.z + 125.0f),
+                           Vec3(6.5f, 3.0f, 6.5f), Vec3(0.95f, 0.08f, 0.08f), true);
+                // Runner Vision Doorway Arch Indicator
+                append_box(elev_rv_mesh, Vec3(fc.x - he.x - 5.0f, fc.y, fc.z + h_cab - 8.0f),
+                           Vec3(5.0f, 78.0f, 6.0f), Vec3(0.95f, 0.08f, 0.08f), true);
+            }
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
+            if (!elev_mesh.empty()) {
+                uniforms.is_runner_vision = 0.0f;
+                bind_vertex_bytes_or_buffer(enc, elev_mesh.data(), elev_mesh.size() * sizeof(Vertex), 0);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:elev_mesh.size()];
+            }
+            if (!elev_rv_mesh.empty()) {
+                uniforms.is_runner_vision = 1.0f;
+                bind_vertex_bytes_or_buffer(enc, elev_rv_mesh.data(), elev_rv_mesh.size() * sizeof(Vertex), 0);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:elev_rv_mesh.size()];
+                uniforms.is_runner_vision = 0.0f;
+            }
         }
 
         // B3. Translucent / additive / modulated materials (UE3 translucency pass): drawn after

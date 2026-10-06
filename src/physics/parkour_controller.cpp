@@ -29,7 +29,11 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.move_state = EMovement::MOVE_Walking;
     m_telemetry.wall_normal = Vec3(0.0f, 0.0f, 0.0f);
     m_telemetry.active_checkpoint = 0;
+    m_telemetry.active_checkpoint_name = "";
     m_telemetry.bags_collected = 0;
+    m_telemetry.in_elevator = false;
+    m_telemetry.active_elevator_idx = -1;
+    m_telemetry.elevator_progress = 0.0f;
     m_telemetry.weapon = WeaponState{};
     m_telemetry.active_subtitle = "";
 
@@ -74,6 +78,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         } else {
             m_crouch_landing_buffer = std::max(0.0f, m_crouch_landing_buffer - step_dt);
         }
+
+        // Step interactive elevators (InterpActor + InterpTrackMove) and carry player with cab_delta
+        update_elevators(input, step_dt, scene);
 
         // State Machine Dispatch
         switch (m_telemetry.move_state) {
@@ -411,6 +418,27 @@ ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& caps
             test_box(act.world_bounds, &act);
         }
     }
+    for (const auto& elev : scene.elevators) {
+        Vec3 fc = elev.current_pos + elev.cab_local_offset;
+        Vec3 he = elev.cab_half_extents;
+        float h_cab = he.z * 2.0f;
+        // Hollow elevator cab floor slab and ceiling slab
+        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z - 24.0f),
+                      Vec3(fc.x + he.x, fc.y + he.y, fc.z)), nullptr);
+        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z + h_cab),
+                      Vec3(fc.x + he.x, fc.y + he.y, fc.z + h_cab + 24.0f)), nullptr);
+        // While doors are closing or the cab is moving, enclose all 4 cab walls so Faith stays safely inside
+        if (elev.state == ElevatorState::DoorsClosing || elev.state == ElevatorState::Moving) {
+            test_box(AABB(Vec3(fc.x - he.x - 12.0f, fc.y - he.y, fc.z),
+                          Vec3(fc.x - he.x + 4.0f, fc.y + he.y, fc.z + h_cab)), nullptr);
+            test_box(AABB(Vec3(fc.x + he.x - 4.0f, fc.y - he.y, fc.z),
+                          Vec3(fc.x + he.x + 12.0f, fc.y + he.y, fc.z + h_cab)), nullptr);
+            test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y - 12.0f, fc.z),
+                          Vec3(fc.x + he.x, fc.y - he.y + 4.0f, fc.z + h_cab)), nullptr);
+            test_box(AABB(Vec3(fc.x - he.x, fc.y + he.y - 4.0f, fc.z),
+                          Vec3(fc.x + he.x, fc.y + he.y + 12.0f, fc.z + h_cab)), nullptr);
+        }
+    }
 
     return best_hit;
 }
@@ -455,6 +483,15 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
     for (const auto& b : scene.colliders) test_box(b, nullptr);
     for (const auto& a : scene.actors) {
         if (a.is_collidable) test_box(a.world_bounds, &a);
+    }
+    for (const auto& elev : scene.elevators) {
+        Vec3 fc = elev.current_pos + elev.cab_local_offset;
+        Vec3 he = elev.cab_half_extents;
+        float h_cab = he.z * 2.0f;
+        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z - 24.0f),
+                      Vec3(fc.x + he.x, fc.y + he.y, fc.z)), nullptr);
+        test_box(AABB(Vec3(fc.x - he.x, fc.y - he.y, fc.z + h_cab),
+                      Vec3(fc.x + he.x, fc.y + he.y, fc.z + h_cab + 24.0f)), nullptr);
     }
     return best;
 }
@@ -1270,17 +1307,27 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
         return;
     }
 
-    // 2. Checkpoints
+    // 2. Checkpoints & TdCheckpoint.StreamingLevels
     for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
         if (m_telemetry.position.distance(scene.checkpoints[i]) < 180.0f) {
             if (static_cast<int>(i) > m_telemetry.active_checkpoint) {
                 m_telemetry.active_checkpoint = static_cast<int>(i);
                 m_last_checkpoint_pos = scene.checkpoints[i];
                 m_last_checkpoint_yaw = m_telemetry.yaw_deg;
-                m_telemetry.active_subtitle = "Checkpoint Reached";
+                if (i < scene.checkpoint_infos.size()) {
+                    const auto& cp = scene.checkpoint_infos[i];
+                    m_telemetry.active_checkpoint_name = cp.checkpoint_name;
+                    if (!cp.streaming_levels.empty()) {
+                        scene.loaded_sublevel_packages = cp.streaming_levels;
+                    }
+                    m_telemetry.active_subtitle = "Checkpoint: " + cp.checkpoint_name;
+                } else {
+                    m_telemetry.active_subtitle = "Checkpoint Reached";
+                }
             }
         }
     }
+    m_telemetry.streamed_sublevel_count = static_cast<int>(scene.loaded_sublevel_packages.size());
 
     // 3. Courier Bags (`is_bag`)
     for (auto& act : scene.actors) {
@@ -1290,6 +1337,176 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
             m_telemetry.active_subtitle = "Runner Bag Collected! (" + std::to_string(m_telemetry.bags_collected) + ")";
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Interactive Elevator & Mid-Shaft Multi-Level Streaming Subsystem
+// (Reverse-engineered from *_Slc.me1 / *_Spt.me1 InterpActor + InterpTrackMove)
+// -----------------------------------------------------------------------------
+void ParkourController::update_elevators(const InputFrame& input, float dt, LevelScene& scene) {
+    m_telemetry.in_elevator = false;
+    m_telemetry.active_elevator_idx = -1;
+
+    for (size_t i = 0; i < scene.elevators.size(); ++i) {
+        ElevatorInstance& elev = scene.elevators[i];
+        elev.prev_pos = elev.current_pos;
+
+        Vec3 fc_prev = elev.prev_pos + elev.cab_local_offset;
+        Vec3 he = elev.cab_half_extents;
+        float h_cab = he.z * 2.0f;
+
+        bool player_inside = (std::abs(m_telemetry.position.x - fc_prev.x) <= he.x - 8.0f) &&
+                             (std::abs(m_telemetry.position.y - fc_prev.y) <= he.y - 8.0f) &&
+                             (m_telemetry.position.z >= fc_prev.z - 30.0f) &&
+                             (m_telemetry.position.z <= fc_prev.z + h_cab + 10.0f);
+
+        bool button_pressed = input.use && (player_inside || m_telemetry.position.distance(elev.button_pos) < 180.0f);
+
+        switch (elev.state) {
+            case ElevatorState::IdleStart: {
+                elev.door_open_Start = 1.0f;
+                elev.door_open_End = 0.0f;
+                // Trigger when Faith walks inside the cab and passes its center or presses E on the button
+                bool deep_inside = player_inside &&
+                                   (std::abs(m_telemetry.position.x - fc_prev.x) <= he.x * 0.65f) &&
+                                   (std::abs(m_telemetry.position.y - fc_prev.y) <= he.y * 0.65f);
+                if ((elev.auto_trigger_on_enter && deep_inside) || button_pressed) {
+                    elev.state = ElevatorState::DoorsClosing;
+                    elev.timer = 0.0f;
+                    m_telemetry.active_subtitle = "Elevator Activated - Doors Closing";
+                }
+                break;
+            }
+
+            case ElevatorState::DoorsClosing: {
+                elev.timer += dt;
+                float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
+                elev.door_open_Start = 1.0f - t01;
+                elev.door_open_End = 0.0f;
+                if (elev.timer >= elev.door_duration) {
+                    elev.door_open_Start = 0.0f;
+                    elev.state = ElevatorState::Moving;
+                    elev.timer = 0.0f;
+                    m_telemetry.active_subtitle = "Elevator In Transit - Streaming Sublevels";
+                }
+                break;
+            }
+
+            case ElevatorState::Moving: {
+                elev.timer += dt;
+                float dur = std::max(0.1f, elev.ride_duration);
+
+                // Evaluate UE3 InterpTrackMove PosTrack curve (Hermite smoothstep between keyframes)
+                if (elev.keyframes.size() >= 2) {
+                    if (elev.timer <= elev.keyframes.front().time) {
+                        elev.current_pos = elev.keyframes.front().pos;
+                    } else if (elev.timer >= elev.keyframes.back().time) {
+                        elev.current_pos = elev.keyframes.back().pos;
+                    } else {
+                        for (size_t k = 0; k + 1 < elev.keyframes.size(); ++k) {
+                            float t0 = elev.keyframes[k].time;
+                            float t1 = elev.keyframes[k + 1].time;
+                            if (elev.timer >= t0 && elev.timer <= t1) {
+                                float seg_u = (t1 > t0 + 1e-5f) ? (elev.timer - t0) / (t1 - t0) : 1.0f;
+                                float s = seg_u * seg_u * (3.0f - 2.0f * seg_u);
+                                elev.current_pos = elev.keyframes[k].pos + (elev.keyframes[k + 1].pos - elev.keyframes[k].pos) * s;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    float u = std::clamp(elev.timer / dur, 0.0f, 1.0f);
+                    float s = u * u * (3.0f - 2.0f * u);
+                    elev.current_pos = elev.start_pos + (elev.end_pos - elev.start_pos) * s;
+                }
+
+                float progress = std::clamp(elev.timer / dur, 0.0f, 1.0f);
+
+                // Mid-shaft Kismet SeqAct_MultiLevelStreaming / TdCheckpoint.StreamingLevels transition
+                if (!elev.streaming_triggered && progress >= 0.5f) {
+                    elev.streaming_triggered = true;
+                    for (const auto& out_pkg : elev.stream_out_packages) {
+                        scene.loaded_sublevel_packages.erase(
+                            std::remove(scene.loaded_sublevel_packages.begin(),
+                                        scene.loaded_sublevel_packages.end(), out_pkg),
+                            scene.loaded_sublevel_packages.end());
+                    }
+                    for (const auto& in_pkg : elev.stream_in_packages) {
+                        if (std::find(scene.loaded_sublevel_packages.begin(),
+                                      scene.loaded_sublevel_packages.end(), in_pkg) == scene.loaded_sublevel_packages.end()) {
+                            scene.loaded_sublevel_packages.push_back(in_pkg);
+                        }
+                    }
+                    if (elev.target_checkpoint_idx >= 0 &&
+                        static_cast<size_t>(elev.target_checkpoint_idx) < scene.checkpoint_infos.size()) {
+                        const auto& dst_cp = scene.checkpoint_infos[static_cast<size_t>(elev.target_checkpoint_idx)];
+                        if (!dst_cp.streaming_levels.empty()) {
+                            scene.loaded_sublevel_packages = dst_cp.streaming_levels;
+                        }
+                        m_telemetry.active_checkpoint = std::max(m_telemetry.active_checkpoint, elev.target_checkpoint_idx);
+                        m_telemetry.active_checkpoint_name = dst_cp.checkpoint_name;
+                    }
+                    m_last_checkpoint_pos = elev.end_pos + elev.cab_local_offset + Vec3(0.0f, 0.0f, 35.0f);
+                    m_telemetry.active_subtitle = "Streamed Sublevels: " +
+                        (elev.stream_in_packages.empty() ? elev.name : elev.stream_in_packages.front());
+                }
+
+                if (elev.timer >= dur) {
+                    elev.current_pos = elev.end_pos;
+                    elev.state = ElevatorState::DoorsOpening;
+                    elev.timer = 0.0f;
+                }
+                break;
+            }
+
+            case ElevatorState::DoorsOpening: {
+                elev.timer += dt;
+                float t01 = std::clamp(elev.timer / std::max(0.1f, elev.door_duration), 0.0f, 1.0f);
+                elev.door_open_End = t01;
+                if (elev.timer >= elev.door_duration) {
+                    elev.door_open_End = 1.0f;
+                    elev.state = ElevatorState::IdleEnd;
+                    elev.timer = 0.0f;
+                    m_telemetry.active_subtitle = "Elevator Arrived - Upper Zone Loaded";
+                }
+                break;
+            }
+
+            case ElevatorState::IdleEnd: {
+                elev.door_open_End = 1.0f;
+                break;
+            }
+        }
+
+        // Carry Faith smoothly with the moving elevator cab
+        if (player_inside) {
+            Vec3 cab_delta = elev.current_pos - elev.prev_pos;
+            m_telemetry.position += cab_delta;
+            float new_floor_z = (elev.current_pos + elev.cab_local_offset).z;
+            if (m_telemetry.position.z < new_floor_z) {
+                m_telemetry.position.z = new_floor_z;
+                m_telemetry.grounded = true;
+                if (m_telemetry.velocity.z < 0.0f) {
+                    m_telemetry.velocity.z = 0.0f;
+                }
+            }
+            // Prevent false fall-damage accumulation during downward elevator rides
+            m_fall_peak_z = m_telemetry.position.z;
+            m_air_fall_start_z = m_telemetry.position.z;
+
+            m_telemetry.in_elevator = true;
+            m_telemetry.active_elevator_idx = static_cast<int>(i);
+            if (elev.state == ElevatorState::Moving) {
+                m_telemetry.elevator_progress = std::clamp(elev.timer / std::max(0.1f, elev.ride_duration), 0.0f, 1.0f);
+            } else if (elev.state == ElevatorState::DoorsOpening || elev.state == ElevatorState::IdleEnd) {
+                m_telemetry.elevator_progress = 1.0f;
+            } else {
+                m_telemetry.elevator_progress = 0.0f;
+            }
+        }
+    }
+
+    m_telemetry.streamed_sublevel_count = static_cast<int>(scene.loaded_sublevel_packages.size());
 }
 
 // -----------------------------------------------------------------------------
@@ -1306,6 +1523,11 @@ void ParkourController::build_parkour_test_course(LevelScene& scene) {
     scene.actors.clear();
     scene.enemies.clear();
     scene.checkpoints.clear();
+    scene.checkpoint_infos.clear();
+    scene.streaming_actions.clear();
+    scene.all_streaming_packages.clear();
+    scene.loaded_sublevel_packages.clear();
+    scene.elevators.clear();
 
     // 1. Start Platform & Unobstructed 3800-unit Sprint Runway
     scene.colliders.emplace_back(Vec3(-500.0f, -300.0f, 0.0f), Vec3(3800.0f, 300.0f, 50.0f));
@@ -1392,8 +1614,8 @@ void ParkourController::build_parkour_test_course(LevelScene& scene) {
     scene.actors.push_back(balance_beam);
     scene.colliders.push_back(balance_beam.world_bounds);
 
-    // Destination combat arena
-    scene.colliders.emplace_back(Vec3(8800.0f, -400.0f, 0.0f), Vec3(10000.0f, 400.0f, 100.0f));
+    // Destination combat arena leading into the Penthouse Elevator lobby
+    scene.colliders.emplace_back(Vec3(8800.0f, -400.0f, 0.0f), Vec3(9840.0f, 400.0f, 100.0f));
 
     // 9. Enemy Guard for Disarm Training
     EnemyBot guard;
@@ -1404,14 +1626,66 @@ void ParkourController::build_parkour_test_course(LevelScene& scene) {
     guard.disarm_window = true;
     scene.enemies.push_back(guard);
 
-    // 10. Checkpoints along the Gauntlet
+    // 10. Interactive Penthouse Transition Elevator (S_Elevator_01: X=9840..10080, Y=-132.5..+132.5, Z=100 -> 680)
+    // Connects the lower Combat Arena (Z=100) to the streamed Upper Penthouse Helipad Deck (Z=680).
+    ElevatorInstance penthouse_elev;
+    penthouse_elev.name = "Penthouse_Slc:mainlift";
+    penthouse_elev.source_package = "Penthouse_Spt";
+    penthouse_elev.cab_mesh_name = "S_Elevator_01";
+    penthouse_elev.start_pos = Vec3(9960.0f, 0.0f, 100.0f);
+    penthouse_elev.end_pos = Vec3(9960.0f, 0.0f, 680.0f);
+    penthouse_elev.current_pos = penthouse_elev.start_pos;
+    penthouse_elev.prev_pos = penthouse_elev.start_pos;
+    penthouse_elev.cab_local_offset = Vec3(0.0f, 0.0f, 0.0f);
+    penthouse_elev.cab_half_extents = Vec3(120.0f, 132.5f, 131.0f);
+    penthouse_elev.ride_duration = 2.0f;
+    penthouse_elev.door_duration = 0.4f;
+    penthouse_elev.keyframes = {
+        {0.0f, Vec3(9960.0f, 0.0f, 100.0f)},
+        {2.0f, Vec3(9960.0f, 0.0f, 680.0f)}
+    };
+    penthouse_elev.button_pos = Vec3(10040.0f, 95.0f, 220.0f);
+    penthouse_elev.target_checkpoint_idx = 5;
+    penthouse_elev.stream_out_packages = {"Edge_Pt1_Art", "Edge_Pt1_Lw"};
+    penthouse_elev.stream_in_packages = {"Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art"};
+    scene.elevators.push_back(penthouse_elev);
+
+    // Streamed Upper Penthouse Helipad Deck at Z = 680 (walk out of the elevator at X = 10080..11200)
+    scene.colliders.emplace_back(Vec3(10080.0f, -450.0f, 640.0f), Vec3(11200.0f, 450.0f, 680.0f));
+
+    // 11. Checkpoints & TdCheckpoint.StreamingLevels along the Gauntlet
     scene.checkpoints.push_back(Vec3(0.0f, 0.0f, 100.0f));
     scene.checkpoints.push_back(Vec3(3000.0f, 0.0f, 100.0f));
     scene.checkpoints.push_back(Vec3(5400.0f, 0.0f, 550.0f));
     scene.checkpoints.push_back(Vec3(7000.0f, 0.0f, 150.0f));
     scene.checkpoints.push_back(Vec3(9000.0f, 0.0f, 150.0f));
+    scene.checkpoints.push_back(Vec3(10400.0f, 0.0f, 680.0f)); // Upper Penthouse Helipad checkpoint after Elevator ride
 
-    // 11. Secret Courier Bag on Top of Tower
+    auto add_cp_info = [&](const std::string& name, int weight, bool def, const Vec3& pos,
+                           const std::vector<std::string>& levels) {
+        LevelCheckpointInfo cp;
+        cp.object_name = "TdCheckpoint_" + std::to_string(scene.checkpoint_infos.size());
+        cp.checkpoint_name = name;
+        cp.checkpoint_weight = weight;
+        cp.default_checkpoint = def;
+        cp.location = pos;
+        cp.streaming_levels = levels;
+        scene.checkpoint_infos.push_back(cp);
+    };
+    add_cp_info("Start_Runway", 1, true, Vec3(0.0f, 0.0f, 100.0f), {"Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Sky"});
+    add_cp_info("Vault_Springboard", 2, false, Vec3(3000.0f, 0.0f, 100.0f), {"Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Sky"});
+    add_cp_info("Climb_Tower_Top", 3, false, Vec3(5400.0f, 0.0f, 550.0f), {"Edge_Pt1_Art", "Edge_Slc", "Edge_Sky"});
+    add_cp_info("Zipline_Landing", 4, false, Vec3(7000.0f, 0.0f, 150.0f), {"Edge_Pt1_Art", "Edge_Slc", "Edge_Sky"});
+    add_cp_info("Elevator_Lobby", 5, false, Vec3(9000.0f, 0.0f, 150.0f), {"Edge_Pt1_Art", "Penthouse_Slc", "Penthouse_Spt", "Edge_Sky"});
+    add_cp_info("Penthouse_Helipad", 6, false, Vec3(10400.0f, 0.0f, 680.0f), {"Penthouse_Slc", "Penthouse_Spt", "Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art", "Edge_Sky"});
+
+    scene.all_streaming_packages = {
+        "Edge_Pt1_Art", "Edge_Pt1_Lw", "Edge_Slc", "Penthouse_Slc",
+        "Penthouse_Spt", "Edge_Pt2_Art", "Edge_Pt2_Bac", "Penthouse_Helipad_Art", "Edge_Sky"
+    };
+    scene.loaded_sublevel_packages = scene.checkpoint_infos.front().streaming_levels;
+
+    // 12. Secret Courier Bag on Top of Tower
     LevelActor bag;
     bag.object_name = "Secret_Runner_Bag";
     bag.location = Vec3(5400.0f, 50.0f, 520.0f);
@@ -1422,3 +1696,4 @@ void ParkourController::build_parkour_test_course(LevelScene& scene) {
 }
 
 } // namespace me
+

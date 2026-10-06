@@ -162,14 +162,27 @@ static void append_test_course_visuals(LevelScene& scene) {
     // 8. Balance pipe (Red Runner Vision) bridging canyon gap
     append_box_mesh(runner_vision_mesh.vertices, Vec3(8000.0f, -18.0f, 88.0f), Vec3(8800.0f, 18.0f, 112.0f));
 
-    // 9. Destination arena rooftop & helipad architectural framing
+    // 9. Destination arena rooftop & hollow Penthouse Elevator shaft framing (X=9840..10080, Z=100 -> 680)
     append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -420.0f, -1800.0f), Vec3(10100.0f, 420.0f, 0.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -400.0f, 0.0f), Vec3(10050.0f, 400.0f, 100.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -425.0f, 100.0f), Vec3(10050.0f, -395.0f, 145.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, 395.0f, 100.0f), Vec3(10050.0f, 425.0f, 145.0f));
-    // Rear penthouse wall & Runner Vision exit doors on destination arena
-    append_box_mesh(course_mesh.vertices, Vec3(9850.0f, -380.0f, 100.0f), Vec3(10050.0f, 380.0f, 460.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(9835.0f, -85.0f, 100.0f), Vec3(9852.0f, 85.0f, 310.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -400.0f, 0.0f), Vec3(9840.0f, 400.0f, 100.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -425.0f, 100.0f), Vec3(9840.0f, -395.0f, 145.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, 395.0f, 100.0f), Vec3(9840.0f, 425.0f, 145.0f));
+    // Left and right architectural shaft towers flanking the hollow elevator cab (Y=-132.5..+132.5 open)
+    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -390.0f, 100.0f), Vec3(10085.0f, -138.0f, 980.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(9835.0f,  138.0f, 100.0f), Vec3(10085.0f,  390.0f, 980.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -138.0f, 370.0f), Vec3(9855.0f,   138.0f, 980.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -390.0f, 960.0f), Vec3(10085.0f,  390.0f, 995.0f));
+
+    // 10. Streamed Upper Penthouse Helipad Deck at Z = 680 (X = 10080..11200)
+    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -460.0f, -1800.0f), Vec3(11200.0f, 460.0f, 640.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -450.0f, 640.0f), Vec3(11200.0f, 450.0f, 680.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -465.0f, 680.0f), Vec3(11200.0f, -440.0f, 725.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(10080.0f,  440.0f, 680.0f), Vec3(11200.0f,  465.0f, 725.0f));
+    append_box_mesh(course_mesh.vertices, Vec3(11175.0f, -450.0f, 680.0f), Vec3(11205.0f,  450.0f, 725.0f));
+    // Runner Vision Helipad Target Beacon at (10550, 0, 680)
+    append_box_mesh(runner_vision_mesh.vertices, Vec3(10460.0f, -90.0f, 680.0f), Vec3(10640.0f, -70.0f, 684.0f));
+    append_box_mesh(runner_vision_mesh.vertices, Vec3(10460.0f,  70.0f, 680.0f), Vec3(10640.0f,  90.0f, 684.0f));
+    append_box_mesh(runner_vision_mesh.vertices, Vec3(10535.0f, -70.0f, 680.0f), Vec3(10565.0f,  70.0f, 684.0f));
 
     // Courier bag
     append_box_mesh(runner_vision_mesh.vertices, Vec3(5380.0f, 30.0f, 505.0f), Vec3(5420.0f, 70.0f, 545.0f));
@@ -178,14 +191,14 @@ static void append_test_course_visuals(LevelScene& scene) {
     scene.meshes.push_back(runner_vision_mesh);
 }
 
-// Translate extracted level meshes so they surround the (0..10000, 0, 50) parkour course
+// Translate extracted level meshes so they surround the (0..11200, 0, 50..680) parkour course
 // while culling triangles inside the immediate parkour runway corridor so the camera view is never obstructed.
 static void align_city_meshes_around_course(LevelScene& scene, const Vec3& original_spawn) {
     Vec3 offset = Vec3(3200.0f, 0.0f, -120.0f) - original_spawn;
     auto in_corridor = [](const Vec3& p) {
-        return (p.x > -450.0f && p.x < 9950.0f &&
-                p.y > -360.0f && p.y < 360.0f &&
-                p.z > -40.0f  && p.z < 750.0f);
+        return (p.x > -450.0f && p.x < 11250.0f &&
+                p.y > -460.0f && p.y < 460.0f &&
+                p.z > -40.0f  && p.z < 1020.0f);
     };
     for (auto& mb : scene.meshes) {
         std::vector<Vertex> filtered;
@@ -308,7 +321,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << "[Oracle] Stock Audio Bank (A_Bodyfalls): " << (audio_ok ? "PASS" : "FAIL")
               << " (" << audio.get_clip_count() << " sound clips loaded)" << std::endl;
 
-    // E. Level Package Probing
+    // E. Level Package, Streaming & Elevator Probing
     UPKPackage entry_pkg(game_root + "/TdGame/CookedPC/Maps/Entry.upk");
     std::cout << "[Oracle] Entry.upk: " << (entry_pkg.is_valid() ? "PASS" : "FAIL")
               << " (" << entry_pkg.get_exports().size() << " exports)" << std::endl;
@@ -324,7 +337,26 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool sp01_ok = load_level_scene(game_root, "Maps/SP01/Edge_p.me1", sp01_scene);
     std::cout << "[Oracle] SP01/Edge_p.me1: " << (sp01_ok ? "PASS" : "FAIL")
               << " (" << sp01_scene.actors.size() << " actors, "
-              << sp01_scene.meshes.size() << " meshes)" << std::endl;
+              << sp01_scene.meshes.size() << " meshes, "
+              << sp01_scene.all_streaming_packages.size() << " streaming sublevels, "
+              << sp01_scene.checkpoint_infos.size() << " TdCheckpoints, "
+              << sp01_scene.elevators.size() << " elevators)" << std::endl;
+
+    // Verify real cooked elevator extraction from SP01/Escape_Intro-Off_Spt.me1
+    UPKPackage esc_elev_pkg(game_root + "/TdGame/CookedPC/Maps/SP01/Escape_Intro-Off_Spt.me1");
+    std::unordered_map<std::string, StaticMeshAsset> esc_meshes;
+    esc_elev_pkg.extract_static_meshes(esc_meshes);
+    std::vector<ElevatorInstance> esc_elevators;
+    esc_elev_pkg.extract_elevators(esc_meshes, esc_elevators);
+    bool real_elev_ok = !esc_elevators.empty() &&
+                        std::abs(esc_elevators.front().end_pos.z - esc_elevators.front().start_pos.z - 1680.0f) < 1.0f;
+    std::cout << "[Oracle] Escape_Intro-Off_Spt.me1 Elevator Extraction: " << (real_elev_ok ? "PASS" : "FAIL");
+    if (!esc_elevators.empty()) {
+        const auto& el = esc_elevators.front();
+        std::cout << " (" << el.name << " [" << el.cab_mesh_name << "] Z=" << el.start_pos.z
+                  << " -> " << el.end_pos.z << ", Duration=" << el.ride_duration << "s)";
+    }
+    std::cout << std::endl;
 
     // 3. Multi-Stage Deterministic Parkour Simulation & Screenshot Capture
     std::cout << "\n--- [Multi-Stage Parkour Simulation & Screenshot Capture] ---" << std::endl;
@@ -345,7 +377,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
            << ",\"speed\":" << t.speed_2d << ",\"fov\":" << t.fov_deg
            << ",\"state\":\"" << move_state_name(t.move_state) << "\""
            << ",\"roll\":" << t.camera_roll_deg << ",\"health\":" << t.health
-           << ",\"reaction\":" << t.reaction_energy << "}";
+           << ",\"reaction\":" << t.reaction_energy
+           << ",\"in_elevator\":" << (t.in_elevator ? "true" : "false")
+           << ",\"sublevels\":" << t.streamed_sublevel_count << "}";
         telemetry_log.push_back(ss.str());
     };
 
@@ -558,29 +592,83 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", Weapon=" << (controller.get_telemetry().weapon.equipped ? controller.get_telemetry().weapon.name : "None")
               << ", Reaction=" << (s7_reaction ? "ACTIVE" : "OFF") << ")" << std::endl;
 
-    // Stage 8: SP01/Edge_p.me1 Level Rendering & Chapter Select Menu
-    std::cout << "[Oracle Stage 8] Testing SP01 Level & Chapter Select Overlay..." << std::endl;
-    sp01_scene.chapter_title = "CHAPTER 0: THE EDGE";
-    PlayerTelemetry t8 = controller.get_telemetry();
-    t8.reaction_active = false;
-    t8.weapon.equipped = false;
-    t8.move_state = EMovement::MOVE_Walking;
-    t8.speed_2d = 0.0f;
-    t8.fov_deg = 90.0f;
-    t8.camera_roll_deg = 0.0f;
-    t8.pitch_deg = -2.0f;
-    t8.position = sp01_scene.player_spawn_pos + Vec3(0.0f, 0.0f, 95.0f);
-    t8.yaw_deg = 172.0f;
-    t8.active_subtitle = "Merc: Faith, the runners' route leads across the rooftops ahead.";
+    // Stage 8: Interactive Elevator Ride & Mid-Shaft Level Streaming Transition (Z = 100 -> 680)
+    std::cout << "[Oracle Stage 8] Testing Interactive Elevator Ride & Mid-Shaft Level Streaming..." << std::endl;
+    sim_scene.enemies.clear(); // clear arena guards so Faith can walk into the Penthouse Elevator unimpeded
+    controller.reset(Vec3(9780.0f, 0.0f, 100.0f), 0.0f);
 
-    renderer.render_frame(sp01_scene, t8);
+    // 8A. Walk across the open lower doorway into the Penthouse Elevator cab (X=9960, Y=0, Z=100)
+    InputFrame in8_enter{};
+    in8_enter.forward = 1.0f;
+    for (int i = 0; i < 45; ++i) {
+        controller.step(in8_enter, 1.0f / 60.0f, sim_scene);
+    }
+    // Press E / Use inside the cab and ride the elevator through DoorsClosing -> Moving -> DoorsOpening -> IdleEnd
+    InputFrame in8_ride{};
+    in8_ride.use = true;
+    controller.step(in8_ride, 1.0f / 60.0f, sim_scene);
+    in8_ride.use = false;
+
+    bool captured_mid_ride = false;
+    for (int i = 0; i < 180; ++i) {
+        controller.step(in8_ride, 1.0f / 60.0f, sim_scene);
+        log_telemetry("Stage8_Elevator_Ride");
+        if (!captured_mid_ride && !sim_scene.elevators.empty() &&
+            sim_scene.elevators.front().state == ElevatorState::DoorsOpening &&
+            sim_scene.elevators.front().door_open_End >= 0.42f) {
+            captured_mid_ride = true;
+            PlayerTelemetry t8_shot = controller.get_telemetry();
+            t8_shot.position = Vec3(9935.0f, -24.0f, sim_scene.elevators.front().current_pos.z);
+            t8_shot.yaw_deg = 20.0f;
+            t8_shot.pitch_deg = -3.0f;
+            t8_shot.in_elevator = true;
+            t8_shot.elevator_progress = 1.0f;
+            renderer.render_frame(sim_scene, t8_shot);
+            save_and_publish_png("oracle_8_elevator_level_streaming.png");
+        }
+    }
+    float cab_top_z = controller.get_position().z;
+    bool s8_elev_top = (cab_top_z >= 675.0f) && !sim_scene.elevators.empty() &&
+                       sim_scene.elevators.front().streaming_triggered;
+
+    // 8B. Walk out of the open upper elevator doors onto the streamed Upper Penthouse Helipad deck (X > 10120, Z = 680)
+    for (int i = 0; i < 50; ++i) {
+        controller.step(in8_enter, 1.0f / 60.0f, sim_scene);
+    }
+    bool s8_helipad_walkout = (controller.get_position().x >= 10100.0f) && (controller.get_position().z >= 675.0f);
+    bool s8_pass = s8_elev_top && s8_helipad_walkout && real_elev_ok;
+    std::cout << "  -> Stage 8 Result: " << (s8_pass ? "PASS" : "FAIL")
+              << " (Elevator Top Z=" << cab_top_z
+              << ", Walkout Pos=(" << controller.get_position().x << ", " << controller.get_position().z << ")"
+              << ", Streamed Sublevels=" << sim_scene.loaded_sublevel_packages.size()
+              << ", Checkpoint='" << controller.get_telemetry().active_checkpoint_name << "')" << std::endl;
+
+    // Stage 9: SP01/Edge_p.me1 Level Rendering, Checkpoint Streaming & Chapter Select Menu
+    std::cout << "[Oracle Stage 9] Testing SP01 Level, Checkpoint Streaming & Chapter Select Overlay..." << std::endl;
+    sp01_scene.chapter_title = "CHAPTER 0: THE EDGE";
+    stream_level_to_checkpoint(game_root, sp01_scene, 0);
+    PlayerTelemetry t9 = controller.get_telemetry();
+    t9.reaction_active = false;
+    t9.in_elevator = false;
+    t9.weapon.equipped = false;
+    t9.move_state = EMovement::MOVE_Walking;
+    t9.speed_2d = 0.0f;
+    t9.fov_deg = 90.0f;
+    t9.camera_roll_deg = 0.0f;
+    t9.pitch_deg = -2.0f;
+    t9.position = sp01_scene.player_spawn_pos + Vec3(0.0f, 0.0f, 95.0f);
+    t9.yaw_deg = 172.0f;
+    t9.active_subtitle = "Merc: Faith, the runners' route leads across the rooftops ahead.";
+
+    renderer.render_frame(sp01_scene, t9);
     save_and_publish_png("oracle_6_sp01_edge_level.png");
 
     renderer.set_menu_open(true);
     renderer.set_selected_chapter(1);
-    renderer.render_frame(sp01_scene, t8);
+    renderer.render_frame(sp01_scene, t9);
     save_and_publish_png("oracle_7_chapter_select_menu.png");
-    std::cout << "  -> Stage 8 Result: PASS (Rendered SP01 and Chapter Select Menu)" << std::endl;
+    renderer.set_menu_open(false);
+    std::cout << "  -> Stage 9 Result: PASS (Rendered SP01 and Chapter Select Menu)" << std::endl;
 
     // Write complete telemetry log
     std::ofstream tel_file("/tmp/me_oracle_telemetry.json");
