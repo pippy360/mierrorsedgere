@@ -14,7 +14,8 @@ The engine fuses five specialized native subsystems into a single executable (`m
    - High-throughput binary Unreal Package (`.upk` / `.me1`) parser for UE3 package version 536 / licensee version 43.
    - Built-in LZO1X-1 decompression engine resolving linear memory address spaces for multi-chunk packages (`Entry.upk`, `SP00/Tutorial_p.me1` through `SP09/Scraper_p.me1`).
    - UE3 INI and INT configuration and localization parser reading physics constants from `DefaultPawnMovement.ini`, campaign progression from `DefaultGame.ini`, and dialogue from `Subtitles.int`.
-   - Automatic sub-level slice discovery (`*_Art`, `*_Spt`, `*_Lgts`, `*_Slc`) assembling contiguous 3D rooftop geometry and swept collision hulls.
+   - Automatic sub-level slice discovery (`*_Art`, `*_Spt`, `*_Lgts`, `*_Slc`) assembling contiguous 3D rooftop geometry.
+   - Real UE3 level collision (`src/physics/collision_world.*`): StaticMesh `BodySetup` convex hulls and kDOP triangle trees (honouring `UseSimpleBoxCollision` / `UseSimpleLineCollision` / `bCollideComplex`), `BlockingVolume` brushes and BSP, with the `BlockNonZeroExtent` / `BlockZeroExtent` channels. Elevator cabs and doors are the real moving `InterpActor`s with their own collision.
    - **Material system** (`src/assets/material_system.*`, `package_manager.*`, `texture_loader.*`, `ue3_props.*`): resolves every static-mesh element's real UE3 material, including component overrides, `MaterialInstanceConstant` chains, parameters and static switches. It loads the referenced DXT/RGBA textures and cubemaps from any CookedPC package and translates each UE3 material expression graph into Metal Shading Language. The level sun comes from the level's baked `DirectionalLight`. See [`docs/MATERIAL_SYSTEM.md`](docs/MATERIAL_SYSTEM.md).
 
 2. **Discrete Kinematic Parkour Controller (`src/physics/parkour_controller.*`)**:
@@ -32,7 +33,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
      - `TdDirHaze`: Directional atmospheric sun haze, sky dome gradient, sharp corona, and horizon glare.
      - `BasePass + Beast Radiosity`: High-key white architectural aesthetic, dual-hemisphere ambient bounce (cyan sky / warm ground), and contact ambient occlusion.
      - `Runner Vision (LOI)`: Dynamic breathing scarlet red (`#E61414`) pulse on parkour targets, springboard ramps, and conduit pipes.
-     - `CH_Faith_1P`: Articulated procedural first-person viewmodel (scarlet red runner glove, forearm runner eye tattoo, split-toe tabi shoes, and dynamic weapon handling).
+     - `CH_Faith_1P`: the real skinned first-person mesh (`USkeletalMesh` + `TdAnimSet`, `src/anim/anim_system.*`), and the real skinned KrugerSec / CPF enemies and weapons.
      - `TdToneMapping & TdMotionBlur`: DICE photographic S-curve contrast scaling, radial speed blur, and low-health vignette.
      - `2D Vector HUD & Bitmap Font`: Minimalist built-in ASCII typography overlay, dynamic center reticle, momentum speedometer, health/reaction gauges, subtitle prompts, and interactive Chapter Select modal.
    - Dual-Mode: Seamless switching between interactive windowed mode (SDL2 + `CAMetalLayer` with Retina high-DPI support) and zero-copy shared memory headless mode for automated verification.
@@ -100,7 +101,7 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 ## Headless Deterministic Oracle Verification
 
-The engine features a built-in verification suite that validates assets and executes an automated, deterministic 8-stage parkour gauntlet in headless Metal mode:
+The engine features a built-in verification suite that validates assets and drives the parkour controller through 8 deterministic stages in headless Metal mode. Stages 1–7 run against the real collision of `SP00/Tutorial_p.me1` at the tutorial's own training spots; stage 8 rides the real lift in `SP01/Escape_p.me1`. No procedural test geometry is involved:
 
 ```bash
 ./build/mirrorsedge_macos --verify-all
@@ -111,14 +112,16 @@ The engine features a built-in verification suite that validates assets and exec
 2. **Audio & Map Package Audit**: Validates `A_Bodyfalls.upk`, `Entry.upk`, `SP00/Tutorial_p.me1`, and `SP01/Edge_p.me1`.
 3. **Stage 1 (Sprint Acceleration)**: Verifies momentum timer accumulation, top sprint speed (>400 u/s), and dynamic FOV widening (>100°).
 4. **Stage 2 (Speed Vault & Springboard)**: Tests hurdle clearance (`MOVE_SpeedVaulting`) and super-jump impulse (`MOVE_SpringBoarding`, `JumpZ = 950 u/s`).
-5. **Stage 3 (Wallrun & Camera Tilt)**: Validates wall engagement angle, forward acceleration, and 15° camera Dutch roll (`MOVE_WallRunningRight`).
-6. **Stage 4 (Wallclimb & Ledge Grab)**: Tests vertical wall ascent and ledge pull-up onto elevated structures (`MOVE_WallClimbing`).
+5. **Stage 3 (Wallrun & Camera Tilt)**: Wallruns along the stage-6 billboard across the rooftop gap with the 15° camera Dutch roll (`MOVE_WallRunningLeft`) and lands on the far roof.
+6. **Stage 4 (Wallclimb)**: Starts a wall climb up the stage-10 facade and checks the vertical ascent (`MOVE_WallClimbing`).
 7. **Stage 5 (Zipline & Crouch Slide)**: Verifies cable attachment, gravitational descent, rooftop landing, and low-clearance crouch slide (`MOVE_ZipLine`, `MOVE_Slide`).
 8. **Stage 6 (Mid-Air Coil & Skill Roll)**: Verifies mid-air leg retraction (`MOVE_Coil`, +60 unit boost) and buffered landing momentum retention (`MOVE_SkillRoll`).
 9. **Stage 7 (Combat Disarm & Reaction Time)**: Validates enemy disarm QTE (`MOVE_Snatch`), weapon equip (`Colt1911`), and 0.25x reaction time slow-motion dilation.
-10. **Stage 8 (Retail Level & UI Overlay)**: Renders `SP01/Edge_p.me1` map package geometry with first-person Faith viewmodel and interactive Chapter Select menu.
+10. **Stage 8 (Elevator & Level Streaming)**: Rides the real `Escape_p` main lift (`S_Elevator_01` cab and door `InterpActor`s, `PosTrack` Z 10608 → 12288), checks the mid-shaft sublevel streaming and walks out at the top.
+11. **Stage 9 (Retail Level & UI Overlay)**: Renders `SP01/Edge_p.me1` with the first-person Faith viewmodel and the interactive Chapter Select menu.
+12. **Stage 10 (Tutorial Screenshots)**: Renders six `SP00/Tutorial_p.me1` training-area screenshots.
 
-Telemetry is exported to `/tmp/me_oracle_telemetry.json` and 7 high-resolution PNG verification screenshots are exported to `screenshots/`.
+Telemetry is exported to `/tmp/me_oracle_telemetry.json` and the PNG verification screenshots (`oracle_*.png`, `tutorial_*.png`) are exported to `screenshots/`. The process exits with status 1 if any of parkour stages 1–8 fails.
 
 ---
 
