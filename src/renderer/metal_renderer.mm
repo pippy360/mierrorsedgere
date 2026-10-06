@@ -856,22 +856,64 @@ struct MetalRenderer::Impl {
         tex_default_flat_normal = make_solid_texture(128, 128, 255, 255);
         tex_default_black = make_solid_texture(0, 0, 0, 255);
 
-        MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                         size:4
-                                                                                    mipmapped:NO];
+        constexpr int kCubeDim = 64;
+        MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                         size:kCubeDim
+                                                                                    mipmapped:YES];
         cd.usage = MTLTextureUsageShaderRead;
         cd.storageMode = MTLStorageModeShared;
         tex_default_cube = [device newTextureWithDescriptor:cd];
-        uint8_t px[4 * 4 * 4];
-        for (int i = 0; i < 16; ++i) {
-            px[i * 4 + 0] = 0;
-            px[i * 4 + 1] = 0;
-            px[i * 4 + 2] = 0;
-            px[i * 4 + 3] = 255;
-        }
         for (NSUInteger face = 0; face < 6; ++face) {
-            [tex_default_cube replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 slice:face
-                                  withBytes:px bytesPerRow:16 bytesPerImage:sizeof(px)];
+            int dim = kCubeDim;
+            NSUInteger mip = 0;
+            for (;;) {
+                std::vector<uint8_t> px(static_cast<size_t>(dim) * static_cast<size_t>(dim) * 4);
+                for (int y = 0; y < dim; ++y) {
+                    const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(dim);
+                    for (int x = 0; x < dim; ++x) {
+                        const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(dim);
+                        const float sc = 2.0f * u - 1.0f;
+                        const float tc = 2.0f * v - 1.0f;
+                        float dx = 0.0f, dy = 0.0f, dz = 1.0f;
+                        switch (face) {
+                            case 0: dx =  1.0f; dy = -tc;   dz = -sc;   break;
+                            case 1: dx = -1.0f; dy = -tc;   dz =  sc;   break;
+                            case 2: dx =  sc;   dy =  1.0f; dz =  tc;   break;
+                            case 3: dx =  sc;   dy = -1.0f; dz = -tc;   break;
+                            case 4: dx =  sc;   dy = -tc;   dz =  1.0f; break;
+                            default:dx = -sc;   dy = -tc;   dz = -1.0f; break;
+                        }
+                        const float len = std::sqrt(std::max(dx * dx + dy * dy + dz * dz, 1e-12f));
+                        dx /= len; dy /= len; dz /= len;
+                        float r = 0.0f, g = 0.0f, b = 0.0f;
+                        if (dz >= 0.0f) {
+                            const float t = std::pow(1.0f - dz, 2.2f);
+                            r = 54.0f * (1.0f - t) + 224.0f * t;
+                            g = 126.0f * (1.0f - t) + 238.0f * t;
+                            b = 228.0f * (1.0f - t) + 254.0f * t;
+                        } else {
+                            const float t = std::min(1.0f, -dz * 2.5f);
+                            r = 224.0f * (1.0f - t) + 148.0f * t;
+                            g = 238.0f * (1.0f - t) + 168.0f * t;
+                            b = 254.0f * (1.0f - t) + 196.0f * t;
+                        }
+                        size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(dim) + static_cast<size_t>(x)) * 4;
+                        px[idx + 0] = static_cast<uint8_t>(std::clamp(r, 0.0f, 255.0f));
+                        px[idx + 1] = static_cast<uint8_t>(std::clamp(g, 0.0f, 255.0f));
+                        px[idx + 2] = static_cast<uint8_t>(std::clamp(b, 0.0f, 255.0f));
+                        px[idx + 3] = 255;
+                    }
+                }
+                [tex_default_cube replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(dim), static_cast<NSUInteger>(dim))
+                                    mipmapLevel:mip
+                                          slice:face
+                                      withBytes:px.data()
+                                    bytesPerRow:static_cast<NSUInteger>(dim) * 4
+                                  bytesPerImage:px.size()];
+                if (dim == 1) break;
+                dim = std::max(1, dim / 2);
+                mip++;
+            }
         }
 
         // UE3 samples each texture with its own AddressX/AddressY and trilinear/anisotropic filtering.

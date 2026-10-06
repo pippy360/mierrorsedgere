@@ -52,6 +52,15 @@ bool load_texture2d(PackageManager& pm, const UPKPackage& pkg, int32_t export_in
 bool load_texture_cube(PackageManager& pm, const UPKPackage& pkg, int32_t export_index_1based, int max_size,
                        SceneTexture& out, std::string* error = nullptr);
 
+// Synthesizes a mipmapped 2D reflection / render-target texture from a TextureRenderTarget2D
+// or TextureMovie export (which carry only metadata properties in cooked UE3 packages).
+bool load_texture_render_target2d(const UPKPackage& pkg, int32_t export_index_1based, int max_size,
+                                  SceneTexture& out, std::string* error = nullptr);
+
+// Synthesizes a 6-face mipmapped cubemap reflection texture from a TextureRenderTargetCube export.
+bool load_texture_render_target_cube(const UPKPackage& pkg, int32_t export_index_1based, int max_size,
+                                     SceneTexture& out, std::string* error = nullptr);
+
 // Decompresses a UE3 compressed-chunk payload (LZO or ZLIB) into `out`.
 bool decompress_ue3_chunks(const uint8_t* src, size_t src_len, bool lzo, size_t expected_size, std::vector<uint8_t>& out);
 

@@ -695,6 +695,37 @@ struct PlayerTelemetry {
 };
 
 // -----------------------------------------------------------------------------
+// Real-Time Planar Reflection Capture & Volume Info
+// (Reverse-engineered from SceneCaptureReflectActor / SceneCaptureReflectComponent
+// in Engine.u & UnSceneCapture.cpp @ VA 0x00f99390..0x00f9d312, and
+// TdReflectionVolume in TdGame.u @ VA 0x00f9bdde..0x00f9bed9)
+// -----------------------------------------------------------------------------
+struct SceneCaptureReflectInfo {
+    std::string actor_name;                 // e.g. "Edge_Pt2.SceneCaptureReflectActor_0"
+    std::string component_name;             // e.g. "SceneCaptureReflectComponent_0"
+    std::string texture_target;             // e.g. "M_SP01.T_EdgeReflection_01_R"
+    std::string reflection_volume;          // e.g. "Edge_Pt2.TdReflectionVolume_1" (optional DICE camera culling volume)
+    Vec3 location{0.0f, 0.0f, 0.0f};        // World position on the mirror plane
+    Rotator rotation{16384.0f, 0.0f, 0.0f}; // Default Pitch=16384 (+90 deg -> MirrorNormal = +Z)
+    Vec3 mirror_normal{0.0f, 0.0f, 1.0f};   // FRotator(Rotation).Vector()
+    float plane_w = 0.0f;                   // FPlane::W = dot(Location, MirrorNormal)
+    float scale_fov = 1.0f;
+    float near_plane = 20.0f;
+    float far_plane = 500.0f;
+    float far_culling_distance = 0.0f;
+    float max_update_dist = 0.0f;
+    float max_streaming_update_dist = 0.0f;
+    float frame_rate = 1000.0f;
+};
+
+struct ReflectionVolumeInfo {
+    std::string object_name;                // e.g. "Edge_Pt2.TdReflectionVolume_1"
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Rotator rotation{0.0f, 0.0f, 0.0f};
+    bool enabled = true;
+};
+
+// -----------------------------------------------------------------------------
 // Level Scene representation
 // -----------------------------------------------------------------------------
 struct LevelScene {
@@ -714,6 +745,8 @@ struct LevelScene {
     std::vector<std::string> all_streaming_packages;
     std::vector<std::string> loaded_sublevel_packages;
     std::vector<ElevatorInstance> elevators;
+    std::vector<SceneCaptureReflectInfo> reflection_captures;
+    std::vector<ReflectionVolumeInfo> reflection_volumes;
     std::vector<SoundClip> sounds;
     std::vector<std::string> subtitles;
     // Resolved + compiled Mirror's Edge materials and textures referenced by MeshSection::material
