@@ -120,8 +120,9 @@ The engine features a built-in verification suite that validates assets and driv
 10. **Stage 8 (Elevator & Level Streaming)**: Rides the real `Escape_p` main lift (`S_Elevator_01` cab and door `InterpActor`s, `PosTrack` Z 10608 → 12288), checks the mid-shaft sublevel streaming and walks out at the top.
 11. **Stage 9 (Retail Level & UI Overlay)**: Renders `SP01/Edge_p.me1` with the first-person Faith viewmodel and the interactive Chapter Select menu.
 12. **Stage 10 (Tutorial Screenshots)**: Renders six `SP00/Tutorial_p.me1` training-area screenshots.
+13. **Stage 11 (Cutscenes)**: Decodes a Bink (`.bik`) movie frame and its audio, and checks the synced subtitle.
 
-Telemetry is exported to `/tmp/me_oracle_telemetry.json` and the PNG verification screenshots (`oracle_*.png`, `tutorial_*.png`) are exported to `screenshots/`. The process exits with status 1 if any of parkour stages 1–8 fails.
+Telemetry is exported to `/tmp/me_oracle_telemetry.json` and the PNG verification screenshots (`oracle_*.png`, `tutorial_*.png`) are exported to `screenshots/`. The process exits with status 1 if any verified stage (parkour stages 1–8 or the cutscene stage 11) fails.
 
 ---
 

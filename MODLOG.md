@@ -385,7 +385,9 @@ Stages 1–7 run on Tutorial_p at the tutorial's own training spots; stage 8 run
 | 8 Elevator | `mainlift` cab Z 10608 → 12288, `IdleEnd`, 16 sublevels streamed, walk-out at (5746, 12288) |
 
 - `ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!`, exit status 0. A failing stage now prints
-  `N OF 8 PARKOUR STAGES FAILED` and exits with status 1.
+  `N OF 9 VERIFIED STAGES FAILED` (parkour stages 1–8 plus the cutscene stage 11 from `main`) and
+  exits with status 1.
+- Rebased onto `main` at `40a352c` (audio system + Bink cutscenes): stages 1–11 PASS.
 - `screenshots/oracle_8_elevator_level_streaming.png` shows the real `S_Elevator_01` interior with the
   `S_ElevatorDoor_01` leaves half open at the top floor.
 
