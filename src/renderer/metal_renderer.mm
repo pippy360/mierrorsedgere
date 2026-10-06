@@ -1,5 +1,6 @@
 #include "metal_renderer.hpp"
 #include "../anim/anim_system.hpp"
+#include "../assets/scene_materials.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -14,9 +15,14 @@
 #include <cmath>
 #include <string>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <climits>
+#include <mutex>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
+#include <thread>
 
 namespace me {
 
@@ -136,6 +142,7 @@ struct VertexIn {
     float u, v;
     float u2, v2;
     uint color;
+    float tangent_sign;
 };
 
 struct FrameUniforms {
@@ -609,6 +616,66 @@ static void append_box(std::vector<Vertex>& verts, const Vec3& center, const Vec
 }
 
 // -----------------------------------------------------------------------------
+// Material System GPU Helpers (scene_materials.hpp -> Metal)
+// -----------------------------------------------------------------------------
+static bool tex_format_is_bc(TexFormat f) {
+    return f == TexFormat::DXT1 || f == TexFormat::DXT3 || f == TexFormat::DXT5;
+}
+
+static MTLPixelFormat mtl_pixel_format(TexFormat f, bool srgb) {
+    switch (f) {
+        case TexFormat::DXT1: return srgb ? MTLPixelFormatBC1_RGBA_sRGB : MTLPixelFormatBC1_RGBA;
+        case TexFormat::DXT3: return srgb ? MTLPixelFormatBC2_RGBA_sRGB : MTLPixelFormatBC2_RGBA;
+        case TexFormat::DXT5: return srgb ? MTLPixelFormatBC3_RGBA_sRGB : MTLPixelFormatBC3_RGBA;
+        case TexFormat::BGRA8: return srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+        case TexFormat::G8: return srgb ? MTLPixelFormatR8Unorm_sRGB : MTLPixelFormatR8Unorm;
+        case TexFormat::V8U8: return MTLPixelFormatRG8Snorm;
+        default: return MTLPixelFormatInvalid;
+    }
+}
+
+// Bytes per row of 4x4 blocks (BC) or pixels (uncompressed) and number of such rows.
+static size_t tex_row_bytes(TexFormat f, int w) {
+    switch (f) {
+        case TexFormat::DXT1: return static_cast<size_t>(std::max(1, (w + 3) / 4)) * 8;
+        case TexFormat::DXT3:
+        case TexFormat::DXT5: return static_cast<size_t>(std::max(1, (w + 3) / 4)) * 16;
+        case TexFormat::BGRA8: return static_cast<size_t>(w) * 4;
+        case TexFormat::V8U8: return static_cast<size_t>(w) * 2;
+        default: return static_cast<size_t>(w);
+    }
+}
+static size_t tex_rows(TexFormat f, int h) {
+    return tex_format_is_bc(f) ? static_cast<size_t>(std::max(1, (h + 3) / 4)) : static_cast<size_t>(h);
+}
+
+// Number of leading mips forming a valid Metal mip chain (exact halving, enough data).
+static int tex_valid_chain(TexFormat f, const std::vector<TextureMip>& mips) {
+    if (mips.empty() || mips[0].width <= 0 || mips[0].height <= 0) return 0;
+    int n = 0;
+    for (size_t i = 0; i < mips.size(); ++i) {
+        const int w = std::max(1, mips[0].width >> i);
+        const int h = std::max(1, mips[0].height >> i);
+        if (mips[i].width != w || mips[i].height != h) break;
+        if (mips[i].data.size() < tex_row_bytes(f, w) * tex_rows(f, h)) break;
+        ++n;
+    }
+    return n;
+}
+
+static MTLSamplerAddressMode mtl_address_mode(TexAddress a) {
+    switch (a) {
+        case TexAddress::Clamp: return MTLSamplerAddressModeClampToEdge;
+        case TexAddress::Mirror: return MTLSamplerAddressModeMirrorRepeat;
+        default: return MTLSamplerAddressModeRepeat;
+    }
+}
+
+static bool mat_blend_is_translucent(MatBlendMode b) {
+    return b == MatBlendMode::Translucent || b == MatBlendMode::Additive || b == MatBlendMode::Modulate;
+}
+
+// -----------------------------------------------------------------------------
 // PIMPL Implementation
 // -----------------------------------------------------------------------------
 struct MetalRenderer::Impl {
@@ -660,6 +727,403 @@ struct MetalRenderer::Impl {
     std::string cached_map_name;
     size_t cached_total_verts = 0;
     std::vector<id<MTLBuffer>> cached_mesh_buffers;
+
+    // -------------------------------------------------------------------------
+    // Mirror's Edge material system (LevelScene::materials) GPU cache
+    // -------------------------------------------------------------------------
+    std::shared_ptr<const SceneMaterialLibrary> mat_lib;     // library currently resident on the GPU
+    std::vector<id<MTLTexture>> mat_textures;                // per SceneTexture (nil = missing -> default)
+    std::vector<id<MTLRenderPipelineState>> mat_pipelines;   // per MaterialShader (nil = failed -> legacy)
+    id<MTLTexture> tex_default_white = nil;
+    id<MTLTexture> tex_default_flat_normal = nil;
+    id<MTLTexture> tex_default_black = nil;
+    id<MTLTexture> tex_default_cube = nil;
+    id<MTLSamplerState> mat_samplers[3][3];                  // [TexAddress X][TexAddress Y]
+    id<MTLSamplerState> mat_cube_sampler = nil;
+    id<MTLSamplerState> scene_copy_sampler = nil;
+    id<MTLTexture> scene_color_copy = nil;                   // opaque scene color (SceneTexture / DestColor)
+    id<MTLTexture> scene_depth_copy = nil;                   // opaque scene depth (SceneDepth / DepthBiased*)
+
+    // UE3 culls back faces of non-two-sided materials. ME_CULL=off|cw|ccw overrides (debugging).
+    // With this renderer's view/projection, UE3 front faces are counter-clockwise on screen
+    // (verified: CCW culling only removes hidden back faces, CW culling removes ~16-58% of the image).
+    bool mat_cull_enabled = true;
+    MTLWinding mat_front_winding = MTLWindingCounterClockwise;
+
+    void configure_material_culling() {
+        if (const char* env = std::getenv("ME_CULL")) {
+            const std::string v = env;
+            if (v == "0" || v == "off" || v == "none") {
+                mat_cull_enabled = false;
+            } else if (v == "ccw") {
+                mat_front_winding = MTLWindingCounterClockwise;
+            } else if (v == "cw") {
+                mat_front_winding = MTLWindingClockwise;
+            }
+        }
+    }
+
+    MTLCompileOptions* make_compile_options() {
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        if (@available(macOS 15.0, *)) {
+            options.mathMode = MTLMathModeFast;
+        }
+        if (@available(macOS 11.0, *)) {
+            options.languageVersion = MTLLanguageVersion2_4;
+        }
+        return options;
+    }
+
+    id<MTLTexture> make_solid_texture(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                     width:4
+                                                                                    height:4
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        id<MTLTexture> t = [device newTextureWithDescriptor:d];
+        uint8_t px[4 * 4 * 4];
+        for (int i = 0; i < 16; ++i) {
+            px[i * 4 + 0] = r;
+            px[i * 4 + 1] = g;
+            px[i * 4 + 2] = b;
+            px[i * 4 + 3] = a;
+        }
+        [t replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 withBytes:px bytesPerRow:16];
+        return t;
+    }
+
+    void create_material_defaults() {
+        configure_material_culling();
+        tex_default_white = make_solid_texture(255, 255, 255, 255);
+        tex_default_flat_normal = make_solid_texture(128, 128, 255, 255);
+        tex_default_black = make_solid_texture(0, 0, 0, 255);
+
+        MTLTextureDescriptor* cd = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                         size:4
+                                                                                    mipmapped:NO];
+        cd.usage = MTLTextureUsageShaderRead;
+        cd.storageMode = MTLStorageModeShared;
+        tex_default_cube = [device newTextureWithDescriptor:cd];
+        uint8_t px[4 * 4 * 4];
+        for (int i = 0; i < 16; ++i) {
+            px[i * 4 + 0] = 0;
+            px[i * 4 + 1] = 0;
+            px[i * 4 + 2] = 0;
+            px[i * 4 + 3] = 255;
+        }
+        for (NSUInteger face = 0; face < 6; ++face) {
+            [tex_default_cube replaceRegion:MTLRegionMake2D(0, 0, 4, 4) mipmapLevel:0 slice:face
+                                  withBytes:px bytesPerRow:16 bytesPerImage:sizeof(px)];
+        }
+
+        // UE3 samples each texture with its own AddressX/AddressY and trilinear/anisotropic filtering.
+        for (int x = 0; x < 3; ++x) {
+            for (int y = 0; y < 3; ++y) {
+                MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
+                sd.minFilter = MTLSamplerMinMagFilterLinear;
+                sd.magFilter = MTLSamplerMinMagFilterLinear;
+                sd.mipFilter = MTLSamplerMipFilterLinear;
+                sd.maxAnisotropy = 8;
+                sd.sAddressMode = mtl_address_mode(static_cast<TexAddress>(x));
+                sd.tAddressMode = mtl_address_mode(static_cast<TexAddress>(y));
+                sd.rAddressMode = MTLSamplerAddressModeRepeat;
+                mat_samplers[x][y] = [device newSamplerStateWithDescriptor:sd];
+            }
+        }
+        MTLSamplerDescriptor* cs = [[MTLSamplerDescriptor alloc] init];
+        cs.minFilter = MTLSamplerMinMagFilterLinear;
+        cs.magFilter = MTLSamplerMinMagFilterLinear;
+        cs.mipFilter = MTLSamplerMipFilterLinear;
+        cs.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        cs.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        cs.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        mat_cube_sampler = [device newSamplerStateWithDescriptor:cs];
+
+        MTLSamplerDescriptor* ss = [[MTLSamplerDescriptor alloc] init];
+        ss.minFilter = MTLSamplerMinMagFilterLinear;
+        ss.magFilter = MTLSamplerMinMagFilterLinear;
+        ss.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        ss.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        scene_copy_sampler = [device newSamplerStateWithDescriptor:ss];
+    }
+
+    // Uploads one decoded UE3 texture (2D or cube, full mip chain) as a shared Metal texture.
+    id<MTLTexture> upload_scene_texture(const SceneTexture& st) {
+        if (!st.valid()) return nil;
+        const MTLPixelFormat fmt = mtl_pixel_format(st.format, st.srgb);
+        if (fmt == MTLPixelFormatInvalid) return nil;
+
+        auto apply_swizzle = [&](MTLTextureDescriptor* d) {
+            if (@available(macOS 10.15, *)) {
+                if (st.format == TexFormat::G8) {
+                    // D3DFMT_L8 samples as (L, L, L, 1)
+                    d.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+                                                              MTLTextureSwizzleRed, MTLTextureSwizzleOne);
+                } else if (st.format == TexFormat::V8U8) {
+                    // D3DFMT_V8U8 samples as (U, V, 1, 1)
+                    d.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
+                                                              MTLTextureSwizzleOne, MTLTextureSwizzleOne);
+                }
+            }
+        };
+
+        if (!st.is_cube) {
+            const int levels = tex_valid_chain(st.format, st.mips);
+            if (levels <= 0) return nil;
+            MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                                                         width:st.mips[0].width
+                                                                                        height:st.mips[0].height
+                                                                                     mipmapped:(levels > 1)];
+            d.mipmapLevelCount = levels;
+            d.usage = MTLTextureUsageShaderRead;
+            d.storageMode = MTLStorageModeShared;
+            apply_swizzle(d);
+            id<MTLTexture> t = [device newTextureWithDescriptor:d];
+            if (!t) return nil;
+            for (int i = 0; i < levels; ++i) {
+                const TextureMip& m = st.mips[i];
+                [t replaceRegion:MTLRegionMake2D(0, 0, m.width, m.height)
+                     mipmapLevel:i
+                       withBytes:m.data.data()
+                     bytesPerRow:tex_row_bytes(st.format, m.width)];
+            }
+            return t;
+        }
+
+        int levels = INT_MAX;
+        for (const auto& face : st.faces) {
+            levels = std::min(levels, tex_valid_chain(st.format, face));
+            if (face.empty() || face[0].width != st.faces[0][0].width || face[0].height != face[0].width) return nil;
+        }
+        if (levels <= 0 || levels == INT_MAX) return nil;
+        MTLTextureDescriptor* d = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:fmt
+                                                                                       size:st.faces[0][0].width
+                                                                                  mipmapped:(levels > 1)];
+        d.mipmapLevelCount = levels;
+        d.usage = MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModeShared;
+        apply_swizzle(d);
+        id<MTLTexture> t = [device newTextureWithDescriptor:d];
+        if (!t) return nil;
+        for (NSUInteger f = 0; f < 6; ++f) {
+            for (int i = 0; i < levels; ++i) {
+                const TextureMip& m = st.faces[f][i];
+                const size_t row = tex_row_bytes(st.format, m.width);
+                [t replaceRegion:MTLRegionMake2D(0, 0, m.width, m.height)
+                     mipmapLevel:i
+                           slice:f
+                       withBytes:m.data.data()
+                     bytesPerRow:row
+                   bytesPerImage:row * tex_rows(st.format, m.height)];
+            }
+        }
+        return t;
+    }
+
+    // Compiles every generated material fragment shader (grouped per library, in parallel) and
+    // builds one render pipeline per shader. Failing shaders fall back to the legacy pipeline.
+    void compile_material_shaders(const SceneMaterialLibrary& lib) {
+        const size_t n = lib.shaders.size();
+        mat_pipelines.assign(n, nil);
+        if (n == 0) return;
+
+        MTLCompileOptions* options = make_compile_options();
+        const size_t kGroupSize = 16;
+        const size_t num_groups = (n + kGroupSize - 1) / kGroupSize;
+        std::vector<id<MTLLibrary>> shader_lib(n, nil);
+        std::vector<id<MTLRenderPipelineState>> pipelines(n, nil);
+        std::mutex err_mutex;
+        std::vector<std::string> errors;
+
+        auto compile_source = [&](const std::string& body, std::string* err_out) -> id<MTLLibrary> {
+            @autoreleasepool {
+                std::string full = lib.common_source;
+                full += "\n";
+                full += body;
+                NSError* err = nil;
+                NSString* src = [NSString stringWithUTF8String:full.c_str()];
+                id<MTLLibrary> L = src ? [device newLibraryWithSource:src options:options error:&err] : nil;
+                if (!L && err_out) {
+                    *err_out = err ? [[err localizedDescription] UTF8String] : "invalid UTF-8 source";
+                }
+                return L;
+            }
+        };
+
+        auto build_pipeline = [&](size_t i) -> id<MTLRenderPipelineState> {
+            @autoreleasepool {
+                id<MTLLibrary> L = shader_lib[i];
+                if (!L) return nil;
+                const MaterialShader& sh = lib.shaders[i];
+                id<MTLFunction> vf = [L newFunctionWithName:[NSString stringWithUTF8String:lib.vertex_function.c_str()]];
+                id<MTLFunction> ff = [L newFunctionWithName:[NSString stringWithUTF8String:sh.function_name.c_str()]];
+                if (!vf || !ff) return nil;
+                MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
+                d.vertexFunction = vf;
+                d.fragmentFunction = ff;
+                d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+                d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+                if (mat_blend_is_translucent(sh.blend)) {
+                    auto* ca = d.colorAttachments[0];
+                    ca.blendingEnabled = YES;
+                    ca.rgbBlendOperation = MTLBlendOperationAdd;
+                    ca.alphaBlendOperation = MTLBlendOperationAdd;
+                    ca.sourceAlphaBlendFactor = MTLBlendFactorZero;
+                    ca.destinationAlphaBlendFactor = MTLBlendFactorOne;
+                    if (sh.blend == MatBlendMode::Translucent) {
+                        ca.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+                        ca.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    } else if (sh.blend == MatBlendMode::Additive) {
+                        ca.sourceRGBBlendFactor = MTLBlendFactorOne;
+                        ca.destinationRGBBlendFactor = MTLBlendFactorOne;
+                    } else {  // Modulate
+                        ca.sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+                        ca.destinationRGBBlendFactor = MTLBlendFactorZero;
+                    }
+                }
+                NSError* err = nil;
+                id<MTLRenderPipelineState> ps = [device newRenderPipelineStateWithDescriptor:d error:&err];
+                if (!ps) {
+                    std::lock_guard<std::mutex> lock(err_mutex);
+                    errors.push_back(sh.function_name + " (" + sh.base_material + ") pipeline: " +
+                                     (err ? [[err localizedDescription] UTF8String] : "unknown error"));
+                }
+                return ps;
+            }
+        };
+
+        std::atomic<size_t> next_group{0};
+        auto worker = [&]() {
+            for (;;) {
+                const size_t g = next_group.fetch_add(1);
+                if (g >= num_groups) return;
+                const size_t first = g * kGroupSize;
+                const size_t last = std::min(n, first + kGroupSize);
+                std::string body;
+                for (size_t i = first; i < last; ++i) {
+                    body += lib.shaders[i].source;
+                    body += "\n";
+                }
+                id<MTLLibrary> L = compile_source(body, nullptr);
+                if (L) {
+                    for (size_t i = first; i < last; ++i) shader_lib[i] = L;
+                } else {
+                    // Isolate the failing shader(s) of this group.
+                    for (size_t i = first; i < last; ++i) {
+                        std::string err;
+                        shader_lib[i] = compile_source(lib.shaders[i].source, &err);
+                        if (!shader_lib[i]) {
+                            std::lock_guard<std::mutex> lock(err_mutex);
+                            errors.push_back(lib.shaders[i].function_name + " (" + lib.shaders[i].base_material +
+                                             "): " + err);
+                        }
+                    }
+                }
+                for (size_t i = first; i < last; ++i) pipelines[i] = build_pipeline(i);
+            }
+        };
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned num_threads = static_cast<unsigned>(std::min<size_t>(num_groups, std::min(hw, 8u)));
+        std::vector<std::thread> pool;
+        pool.reserve(num_threads);
+        for (unsigned t = 0; t < num_threads; ++t) pool.emplace_back(worker);
+        for (auto& th : pool) th.join();
+
+        size_t ok = 0;
+        for (size_t i = 0; i < n; ++i) {
+            mat_pipelines[i] = pipelines[i];
+            if (pipelines[i]) ok++;
+        }
+        std::cout << "[MetalRenderer] Material shaders: " << ok << "/" << n << " compiled" << std::endl;
+        for (size_t e = 0; e < errors.size() && e < 4; ++e) {
+            std::string msg = errors[e];
+            if (msg.size() > 900) msg = msg.substr(0, 900) + " ...";
+            std::cerr << "[MetalRenderer]   shader error: " << msg << std::endl;
+        }
+    }
+
+    // Makes `lib` the resident material library (uploads textures, compiles shaders) if it changed.
+    void sync_material_library(const std::shared_ptr<const SceneMaterialLibrary>& lib) {
+        if (lib == mat_lib) return;
+        mat_lib = lib;
+        mat_textures.clear();
+        mat_pipelines.clear();
+        if (!lib) return;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t uploaded = 0;
+        mat_textures.assign(lib->textures.size(), nil);
+        for (size_t i = 0; i < lib->textures.size(); ++i) {
+            @autoreleasepool {
+                mat_textures[i] = upload_scene_texture(lib->textures[i]);
+                if (mat_textures[i]) uploaded++;
+            }
+        }
+        compile_material_shaders(*lib);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[MetalRenderer] Material library resident: " << lib->materials.size() << " materials, "
+                  << uploaded << "/" << lib->textures.size() << " textures uploaded in " << secs << " s" << std::endl;
+    }
+
+    // Returns the pipeline for a mesh section, or nil when it must use legacy procedural shading.
+    id<MTLRenderPipelineState> section_pipeline(const MeshSection& s, const MaterialShader** out_shader,
+                                                const SceneMaterial** out_material) const {
+        if (!mat_lib || s.material < 0 || static_cast<size_t>(s.material) >= mat_lib->materials.size()) return nil;
+        const SceneMaterial& m = mat_lib->materials[static_cast<size_t>(s.material)];
+        if (m.shader < 0 || static_cast<size_t>(m.shader) >= mat_pipelines.size()) return nil;
+        id<MTLRenderPipelineState> ps = mat_pipelines[static_cast<size_t>(m.shader)];
+        if (!ps) return nil;
+        if (out_shader) *out_shader = &mat_lib->shaders[static_cast<size_t>(m.shader)];
+        if (out_material) *out_material = &m;
+        return ps;
+    }
+
+    // Binds a material instance's textures, samplers and parameter uniforms.
+    void bind_material(id<MTLRenderCommandEncoder> enc, const SceneMaterial& m, const MaterialShader& sh) {
+        for (int k = 0; k < sh.num_tex2d; ++k) {
+            const int ti = (static_cast<size_t>(k) < m.tex2d.size()) ? m.tex2d[static_cast<size_t>(k)] : -1;
+            id<MTLTexture> t = (ti >= 0 && static_cast<size_t>(ti) < mat_textures.size()) ? mat_textures[static_cast<size_t>(ti)] : nil;
+            TexAddress ax = TexAddress::Wrap;
+            TexAddress ay = TexAddress::Wrap;
+            if (t) {
+                ax = mat_lib->textures[static_cast<size_t>(ti)].address_x;
+                ay = mat_lib->textures[static_cast<size_t>(ti)].address_y;
+            } else {
+                const TexDefault def = (static_cast<size_t>(k) < m.tex2d_default.size()) ? m.tex2d_default[static_cast<size_t>(k)]
+                                                                                       : TexDefault::White;
+                t = (def == TexDefault::FlatNormal) ? tex_default_flat_normal
+                    : (def == TexDefault::Black)    ? tex_default_black
+                                                    : tex_default_white;
+            }
+            [enc setFragmentTexture:t atIndex:static_cast<NSUInteger>(k)];
+            [enc setFragmentSamplerState:mat_samplers[static_cast<int>(ax) % 3][static_cast<int>(ay) % 3]
+                                 atIndex:static_cast<NSUInteger>(k)];
+        }
+        for (int j = 0; j < sh.num_texcube; ++j) {
+            const int ti = (static_cast<size_t>(j) < m.texcube.size()) ? m.texcube[static_cast<size_t>(j)] : -1;
+            id<MTLTexture> t = (ti >= 0 && static_cast<size_t>(ti) < mat_textures.size()) ? mat_textures[static_cast<size_t>(ti)] : nil;
+            if (!t) t = tex_default_cube;
+            [enc setFragmentTexture:t atIndex:static_cast<NSUInteger>(sh.num_tex2d + j)];
+            [enc setFragmentSamplerState:mat_cube_sampler atIndex:static_cast<NSUInteger>(sh.num_tex2d + j)];
+        }
+        if (sh.num_uniforms > 0) {
+            float zero_pad[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            std::vector<std::array<float, 4>> padded;
+            const void* data = m.uniforms.data();
+            if (m.uniforms.size() < static_cast<size_t>(sh.num_uniforms)) {
+                padded = m.uniforms;
+                padded.resize(static_cast<size_t>(sh.num_uniforms), {zero_pad[0], zero_pad[1], zero_pad[2], zero_pad[3]});
+                data = padded.data();
+            }
+            [enc setFragmentBytes:data length:static_cast<NSUInteger>(sh.num_uniforms) * 16 atIndex:matbind::kMaterialBuffer];
+        }
+        if (sh.uses_scene_color || sh.uses_scene_depth) {
+            [enc setFragmentTexture:scene_color_copy atIndex:matbind::kSceneColorTexture];
+            [enc setFragmentTexture:scene_depth_copy atIndex:matbind::kSceneDepthTexture];
+            [enc setFragmentSamplerState:scene_copy_sampler atIndex:matbind::kSceneSampler];
+        }
+    }
 
     bool compile_shaders() {
         NSError* error = nil;
@@ -805,6 +1269,24 @@ struct MetalRenderer::Impl {
         colorDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         colorDesc.storageMode = MTLStorageModeShared;
         offscreen_color_tex = [device newTextureWithDescriptor:colorDesc];
+
+        // Copies of the opaque scene (UE3 "resolved" SceneColor / SceneDepth) sampled by
+        // translucent materials (SceneTexture, DestColor, DepthBiasedAlpha/Blend).
+        MTLTextureDescriptor* copyColorDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+                                                                                                 width:width
+                                                                                                height:height
+                                                                                             mipmapped:NO];
+        copyColorDesc.usage = MTLTextureUsageShaderRead;
+        copyColorDesc.storageMode = MTLStorageModePrivate;
+        scene_color_copy = [device newTextureWithDescriptor:copyColorDesc];
+
+        MTLTextureDescriptor* copyDepthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                                 width:width
+                                                                                                height:height
+                                                                                             mipmapped:NO];
+        copyDepthDesc.usage = MTLTextureUsageShaderRead;
+        copyDepthDesc.storageMode = MTLStorageModePrivate;
+        scene_depth_copy = [device newTextureWithDescriptor:copyDepthDesc];
     }
 
     void generate_procedural_scene() {
@@ -1172,6 +1654,7 @@ bool MetalRenderer::init_headless(int width, int height) {
     if (!impl_->command_queue) return false;
 
     if (!impl_->compile_shaders()) return false;
+    impl_->create_material_defaults();
     impl_->allocate_render_targets();
     impl_->generate_procedural_scene();
 
@@ -1202,6 +1685,7 @@ bool MetalRenderer::init_with_metal_layer(void* ca_metal_layer, int width, int h
     if (!impl_->command_queue) return false;
 
     if (!impl_->compile_shaders()) return false;
+    impl_->create_material_defaults();
     impl_->allocate_render_targets();
     impl_->generate_procedural_scene();
 
@@ -1272,7 +1756,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         Vec3 sun_d = scene.sun_direction.normalized();
         uniforms.sun_dir = simd_make_float3(sun_d.x, sun_d.y, sun_d.z);
-        uniforms.sun_color = simd_make_float3(1.0f, 0.98f, 0.95f);
+        uniforms.sun_color = simd_make_float3(scene.sun_color.x, scene.sun_color.y, scene.sun_color.z);
         uniforms.sky_color = simd_make_float3(0.68f, 0.84f, 1.0f);
         uniforms.ground_color = simd_make_float3(0.82f, 0.84f, 0.88f);
         uniforms.speed_2d = telemetry.speed_2d;
@@ -1290,6 +1774,25 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.cam_up = simd_make_float3(up.x, up.y, up.z);
 
         // ---------------------------------------------------------------------
+        // Mirror's Edge materials: make the scene's material library resident
+        // (texture upload + MSL compile happen once per library) and find out
+        // whether this frame needs a translucency pass / opaque scene copies.
+        // ---------------------------------------------------------------------
+        impl_->sync_material_library(scene.materials);
+        bool has_translucent = false;
+        bool needs_scene_copies = false;
+        if (impl_->mat_lib) {
+            for (const auto& mesh : scene.meshes) {
+                for (const auto& s : mesh.sections) {
+                    const MaterialShader* sh = nullptr;
+                    if (!impl_->section_pipeline(s, &sh, nullptr) || !mat_blend_is_translucent(sh->blend)) continue;
+                    has_translucent = true;
+                    if (sh->uses_scene_color || sh->uses_scene_depth) needs_scene_copies = true;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
         // Pass 1: 3D Scene Geometry & Sky -> HDR Texture
         // ---------------------------------------------------------------------
         MTLRenderPassDescriptor* scenePass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1300,7 +1803,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         scenePass.depthAttachment.texture = impl_->offscreen_depth_tex;
         scenePass.depthAttachment.loadAction = MTLLoadActionClear;
-        scenePass.depthAttachment.storeAction = MTLStoreActionDontCare;
+        scenePass.depthAttachment.storeAction = needs_scene_copies ? MTLStoreActionStore : MTLStoreActionDontCare;
         scenePass.depthAttachment.clearDepth = 1.0;
 
         id<MTLRenderCommandEncoder> enc = [cmd_buffer renderCommandEncoderWithDescriptor:scenePass];
@@ -1347,16 +1850,49 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
         }
 
+        // Binds mesh i's vertex buffer + frame uniforms on the current encoder.
+        auto bind_scene_mesh = [&](size_t i) {
+            uniforms.is_runner_vision = scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
+            [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
+            [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+            [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        };
+        auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
+            return s.vertex_count > 0 &&
+                   static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
+        };
+
         if (!scene.meshes.empty()) {
+            [enc setFrontFacingWinding:impl_->mat_front_winding];
             for (size_t i = 0; i < scene.meshes.size(); ++i) {
                 const auto& mesh = scene.meshes[i];
                 if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
-                uniforms.is_runner_vision = mesh.is_runner_vision ? 1.0f : 0.0f;
-                [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
-                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                bind_scene_mesh(i);
+                if (mesh.sections.empty()) {
+                    [enc setRenderPipelineState:impl_->world_pipeline];
+                    [enc setCullMode:MTLCullModeNone];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                    continue;
+                }
+                // Opaque + masked material sections (UE3 base pass). Translucent ones are deferred.
+                for (const auto& s : mesh.sections) {
+                    if (!section_in_range(mesh, s)) continue;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    id<MTLRenderPipelineState> ps = impl_->section_pipeline(s, &sh, &m);
+                    if (ps && mat_blend_is_translucent(sh->blend)) continue;
+                    if (ps) {
+                        [enc setRenderPipelineState:ps];
+                        [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided) ? MTLCullModeBack : MTLCullModeNone];
+                        impl_->bind_material(enc, *m, *sh);
+                    } else {
+                        [enc setRenderPipelineState:impl_->world_pipeline];
+                        [enc setCullMode:MTLCullModeNone];
+                    }
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                }
             }
+            [enc setCullMode:MTLCullModeNone];
         } else {
             uniforms.is_runner_vision = 0.0f;
             bind_vertex_bytes_or_buffer(enc, impl_->rooftop_mesh.data(), impl_->rooftop_mesh.size() * sizeof(Vertex), 0);
@@ -1372,6 +1908,9 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies
+        // (the material sections above leave their own pipeline/depth state bound)
+        [enc setRenderPipelineState:impl_->world_pipeline];
+        [enc setDepthStencilState:impl_->depth_write_state];
         if (!scene.enemies.empty()) {
             for (const auto& bot : scene.enemies) {
                 if (!bot.alive) continue;
@@ -1392,6 +1931,52 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+        }
+
+        // B3. Translucent / additive / modulated materials (UE3 translucency pass): drawn after
+        // all opaque geometry, depth-tested without depth writes. Materials that read the scene
+        // (SceneTexture, DestColor, DepthBiasedAlpha) sample copies of the opaque scene.
+        if (has_translucent) {
+            if (needs_scene_copies) {
+                [enc endEncoding];
+                id<MTLBlitCommandEncoder> blit = [cmd_buffer blitCommandEncoder];
+                [blit copyFromTexture:impl_->scene_hdr_tex toTexture:impl_->scene_color_copy];
+                [blit copyFromTexture:impl_->offscreen_depth_tex toTexture:impl_->scene_depth_copy];
+                [blit endEncoding];
+
+                MTLRenderPassDescriptor* transPass = [MTLRenderPassDescriptor renderPassDescriptor];
+                transPass.colorAttachments[0].texture = impl_->scene_hdr_tex;
+                transPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                transPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                transPass.depthAttachment.texture = impl_->offscreen_depth_tex;
+                transPass.depthAttachment.loadAction = MTLLoadActionLoad;
+                transPass.depthAttachment.storeAction = MTLStoreActionDontCare;
+                enc = [cmd_buffer renderCommandEncoderWithDescriptor:transPass];
+                [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
+            }
+            [enc setDepthStencilState:impl_->depth_test_only_state];
+            [enc setFrontFacingWinding:impl_->mat_front_winding];
+            for (size_t i = 0; i < scene.meshes.size(); ++i) {
+                const auto& mesh = scene.meshes[i];
+                if (mesh.vertices.empty() || mesh.sections.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                bool mesh_bound = false;
+                for (const auto& s : mesh.sections) {
+                    if (!section_in_range(mesh, s)) continue;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    id<MTLRenderPipelineState> ps = impl_->section_pipeline(s, &sh, &m);
+                    if (!ps || !mat_blend_is_translucent(sh->blend)) continue;
+                    if (!mesh_bound) {
+                        bind_scene_mesh(i);
+                        mesh_bound = true;
+                    }
+                    [enc setRenderPipelineState:ps];
+                    [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided) ? MTLCullModeBack : MTLCullModeNone];
+                    impl_->bind_material(enc, *m, *sh);
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                }
+            }
+            [enc setCullMode:MTLCullModeNone];
         }
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])

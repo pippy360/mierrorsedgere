@@ -221,3 +221,122 @@ All 7 PNG screenshots visually confirmed via `view_file` at `screenshots/` and p
 ### 6.5 Universal Modder Compliance
 - Command: `/Users/tomnom/git/universal-modder/bin/um publish check /Users/tomnom/git/mierrorsedgere --game /Users/tomnom/mirrorsedge`
 - Result: **0 failures**, 100% clean-room repository free of proprietary assets or decompiled binaries.
+
+---
+
+## 7. Material System Reverse Engineering (agent/material-system, 2026-10-06)
+
+**Goal:** every level model renders with its real Mirror's Edge material. The full reference is in
+[`docs/MATERIAL_SYSTEM.md`](docs/MATERIAL_SYSTEM.md).
+
+### 7.1 Deliverables
+- New sources:
+  - `src/assets/ue3_props.*`: tagged-property tree and canonical object paths.
+  - `package_manager.*`: CookedPC index, lazy import loading, raw reads, export lookup.
+  - `texture_loader.*`: Texture2D/TextureCube with DXT1/3/5, A8R8G8B8, G8, V8U8.
+  - `material_system.*`: MIC chains, static switches, UE3 expression graph to MSL.
+  - `scene_materials.hpp`: the GPU contract.
+- `upk_loader.cpp`:
+  - Per-element StaticMesh decode: tangent basis with binormal sign, UVs, vertex colour.
+  - `StaticMeshComponent.Materials[]` overrides and material-binned `MeshSection`s.
+  - Mirrored-placement winding flip.
+  - Level-sun extraction.
+  - LZO1X decoder rewrite.
+- `metal_renderer.mm`:
+  - Per-shader pipelines and per-section draws.
+  - CCW back-face culling, except for two-sided materials.
+  - Translucent pass that reads opaque scene colour/depth copies.
+- `main.mm`: the course-alignment filter keeps material sections intact.
+
+### 7.2 Formats confirmed against retail data (v536 / licensee 43)
+- **ByteProperty tags carry no enum FName.** The value is an FName (size 8) or one byte.
+- **StaticMesh element:** 40 bytes plus 8 bytes per fragment:
+  `Material, EnableCollision, OldEnableCollision, bEnableShadowCasting, FirstIndex, NumTriangles, MinVertexIndex, MaxVertexIndex, MaterialIndex, Fragments[]`.
+- **Texture2D native tail:** `SourceArt` bulk data (16 bytes), `NumMips`, then per mip `{bulk header [+inline], SizeX, SizeY}`.
+  - Bulk flag `0x01`: the payload is in the canonical outermost package's file at an absolute offset, as UE3 compressed chunks (tag `0x9E2A83C1`).
+  - Bulk flags `0x02` / `0x10`: ZLIB / LZO.
+- **MIC native tail:** 2 × `{FMaterial; FStaticParameterSet}`.
+  - Static switches are 32 bytes: `{FName, Value, bOverride, GUID}`.
+  - Static component masks are 44 bytes: `{FName, R, G, B, A, bOverride, GUID}`.
+- **Canonical paths:**
+  - In cooked levels, foreign objects are rooted at `EF_ForcedExport` (`export_flags & 1`) package exports. Tutorial_p has 87 of 166 top-level exports forced.
+  - Standalone content packages store package-relative paths (M_GenericCubemaps and EngineMaterials have no forced exports).
+- **Sun:** `DirectionalLight` actors live in the `*_Lgts` packages.
+  - SP00 `Tutorial_lgts.DirectionalLight_0`: Rotation (−9648, 22544, 62805), Brightness 1.95, LightColor RGB (255, 245, 225), Baker override 2.5. Direction to sun (0.335, −0.500, 0.799).
+  - SP01 `Edge_Ext_Lgts.DirectionalLight_1`: Rotation (58256, −7539, 32768). Direction to sun (−0.575, 0.507, 0.643).
+  - Cinematic-only and PhysX-only lights clear `LightingChannels.Static`.
+
+### 7.3 Bugs found and fixed
+1. **The LZO1X decoder silently produced wrong output.**
+   - It returned true with corrupted or zero data. For example, `T_BD_08_03_NA` came out all zeros, giving "bad mip count".
+   - Fix: replaced it with a faithful port of the reference safe `lzo1x_d.ch` (M1/M2/M3/M4, first-byte > 17, bounds checks, exact length required). Failed blocks are now counted and reported.
+   - Result: 0 failures across 100 SP00/SP01 packages. SP00 colliders went from 2178 to 2405, and the SP01 skyline and radio tower appeared.
+2. **Missing engine and shared objects.**
+   - `EngineMaterials.DefaultMaterial`, the `M_GenericCubemaps` cubemaps and the `FX_TextureGeneric` textures could not be resolved: imports use canonical paths, but standalone packages store relative ones.
+   - Fix: `object_canonical_path()` plus dual-path export indexing.
+3. **Wrong culling convention.**
+   - With CW front faces, 16–58% of pixels changed compared with culling off (front faces were being removed).
+   - Fix: CCW front faces, which change only 0.3–1% of pixels (hidden back faces removed). Mirrored placements (negative scale determinant) swap triangle winding, matching UE3 `ReverseCulling`.
+
+### 7.4 Oracle results (`./build/mirrorsedge_macos --verify-all`, run from the worktree)
+- **SP00:**
+  - 2403 static meshes placed, 0 missing, 287 material sections.
+  - 273/273 materials resolved, 205 shaders, 469/469 textures (143 MB).
+  - `Material shaders: 205/205 compiled`.
+- **SP01:**
+  - 4276 meshes placed, 0 missing, 420 sections.
+  - 407/407 materials, 267 shaders, 646/647 textures (215 MB). The one failure is `M_SP01.T_EdgeReflection_01_R`, a `TextureRenderTarget2D` with no cooked pixels.
+  - `Material shaders: 267/267 compiled`.
+- **Stages 1–8:** PASS. `ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!`
+- **Timing:** material build ≈ 0.1 s per level; GPU texture upload and MSL compile ≈ 0.75 s per level.
+- **Screenshots:** `screenshots/oracle_1..7*.png` regenerated and inspected. Building facades, signage, glass, rooftop props, cranes and the skyline all render with their real textures.
+
+### 7.5 Remaining gaps
+- Beast light-maps: `LightMapTexture2D` and `FLightMap2D` in `StaticMeshComponent.LODData`. They are emulated today by a virtual light-map from the level sun.
+- Not rendered yet:
+  - DecalComponent static receivers
+  - BSP `ModelComponent`s
+  - level skeletal meshes
+  - TexCoord ≥ 2 (mapped to UV1)
+  - translucency sorting
+  - `TextureRenderTarget2D` reflections
+  - `TextureMovie` (Bink) LCD screens
+- TwoSidedLightingMask is clamped to [0, 1] until real light-maps exist (§7.7).
+
+### 7.6 All-chapter sweep (SP02–SP09)
+Every campaign map was loaded headless with the material system on. The material and shader counts come from the `[Materials]` and `[MetalRenderer]` log lines.
+
+| Chapter | Meshes placed | Materials resolved | Textures loaded | Shaders compiled |
+|---|---|---|---|---|
+| SP02 Stormdrain | 12752 | 502/502 | 799/799 | 353/353 |
+| SP03 Cranes | 9980 | 533/533 | 791/792 | 340/340 |
+| SP04 Subway | 7459 | 459/459 | 721/721 | 335/335 |
+| SP05 Mall | 7654 | 581/581 | 854/854 | 372/372 |
+| SP06 Factory | 8817 | 565/565 | 815/819 | 397/397 |
+| SP07 Boat | 8494 | 382/382 | 608/608 | 300/300 |
+| SP08 Convoy | 6616 | 498/498 | 765/766 | 323/323 |
+| SP09 Scraper | 10738 | 448/448 | 727/728 | 348/348 |
+
+- Every chapter has 0 missing meshes and 0 fallback materials.
+- Every texture failure is a runtime-only class with no cooked pixels:
+  - `TextureMovie`: the `M_LCDScreens.*` `TM_*` screens (SP03, SP06, SP08, SP09).
+  - `TextureRenderTarget2D`: `M_SP01.T_EdgeReflection_01_R` and `M_Reflections.SP06.T_TrainingFacilityMonitorReflection_01_R`.
+
+### 7.7 Lighting fixes
+4. **The sun colour was a shader constant.** Only the sun direction came from the level.
+   - Fix: `LevelScene::sun_color` now carries the DirectionalLight's linear `LightColor × Brightness`, or the Beast `BakerColor × BakerBrightness` override when set. `kSunIntensity` drops from 2.0 to 1.0, so the no-light default (2.0, 1.96, 1.9) reproduces the old look.
+   - Lighting packages are now matched by `_lgt` in the lowercased stem. That also opens SP07's singular `Boat_Chase_Lgt`, which the old `_lgts` match skipped. The geometry exclusion filter is unchanged.
+   - The per-chapter table is in `docs/MATERIAL_SYSTEM.md` §7. SP07's sun is near-black by design: `Brightness` 0, `BakerBrightness` 0.025.
+5. **SP07's sea rendered pure white.** `B_Vista.SP07.M_VistaWater_SP07` sets TwoSidedLightingMask to the constant 12.
+   - The shipped `BasePassPixelShader.usf` / `MaterialTemplate.usf` never clamp the mask. The light-map transfer is linear in M and the hemisphere term is quadratic: `lerp(L, 12·D, 12) = 144·D − 11·L`, which is 133–144× the clamped value.
+   - Fix: `saturate(M)` in the MSL prelude (`mat_lighting`, `mat_hemisphere`). The water now shows its cubemap reflections and waves.
+   - Survey of every generated shader in all ten maps (MSL dump plus runtime MIC parameter values):
+     - Texture-driven masks (trees, plastic baskets, the SP06 flag) and the constant 0.25 (bush leaves) are within [0, 1], so the clamp does not touch them.
+     - Values above 1 come only from SP07's water (12), the `M_Awning_01` `*trans` MICs and SP03's PX emissive awning (3), and `MI_Antenna_13_Red` (2).
+     - Those few instances render with full two-sided wrap instead of UE3's extrapolated transfer. This is a deliberate deviation until Beast light-maps are decoded.
+
+### 7.8 Merge with the animation system
+- Rebased onto `main` at `80c78f7` (USkeletalMesh / TdAnimSet animation system). Conflicts resolved:
+  - `parse_properties`: both branches fixed the v536 ByteProperty tag. Kept main's version, which adds FName number suffixes and `raw_bytes`.
+  - `metal_renderer.mm`: kept both includes. The enemy pass re-binds the legacy world pipeline and depth state after the material passes, then runs main's per-bot `evaluate_enemy_swat`.
+- `--verify-all`: stages 1–8 PASS after the rebase. The oracle screenshots show skeletal SWAT enemies and Faith's first-person arms inside the material-rendered levels.

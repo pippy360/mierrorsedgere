@@ -27,6 +27,10 @@ set(SOURCES
     src/main.mm
     src/anim/anim_system.cpp
     src/assets/upk_loader.cpp
+    src/assets/ue3_props.cpp
+    src/assets/package_manager.cpp
+    src/assets/texture_loader.cpp
+    src/assets/material_system.cpp
     src/assets/ini_config.cpp
     src/audio/audio_engine.cpp
     src/physics/parkour_controller.cpp
