@@ -385,6 +385,7 @@ enum class EMovement : uint8_t {
     MOVE_Climb = 21,
     MOVE_180Turn = 24,
     MOVE_180TurnInAir = 25,
+    MOVE_LayOnGround = 26,
     MOVE_ZipLine = 28,
     MOVE_Balance = 29,
     MOVE_LedgeWalk = 30,
@@ -428,6 +429,7 @@ inline const char* move_state_name(EMovement m) {
         case EMovement::MOVE_Climb: return "MOVE_Climb";
         case EMovement::MOVE_180Turn: return "MOVE_180Turn";
         case EMovement::MOVE_180TurnInAir: return "MOVE_180TurnInAir";
+        case EMovement::MOVE_LayOnGround: return "MOVE_LayOnGround";
         case EMovement::MOVE_ZipLine: return "MOVE_ZipLine";
         case EMovement::MOVE_Balance: return "MOVE_Balance";
         case EMovement::MOVE_LedgeWalk: return "MOVE_LedgeWalk";
@@ -665,36 +667,143 @@ struct EnemyBot {
 };
 
 // -----------------------------------------------------------------------------
-// Movement Configuration (Exact values from DefaultPawnMovement.ini & specs)
+// Movement Configuration (DefaultPawnMovement.ini / TdGame.u defaults)
+// Every value names the TdPawn / TdMove_* property it comes from.
 // -----------------------------------------------------------------------------
 struct MovementConfig {
-    float gravity = 980.0f;
-    float walk_speed = 50.0f;
-    float jog_speed = 260.0f;
-    float run_speed = 400.0f;
-    float sprint_speed = 630.0f;
+    // Effective pawn gravity. WorldInfo.DefaultGravityZ is -800, but every TdMove height -> speed
+    // formula reads Speed = Gravity * 2 * Sqrt(Height / Gravity) = 2 * Sqrt(800 * Height), which only
+    // reaches Height when the pawn decelerates at 1600, and DefaultGame.ini notes "1600 is the
+    // downward speed after falling 780 cm" (1600^2 / (2 * 780) = 1641). The native move code adds
+    // -GetGravityZ to the pawn's own acceleration, doubling the world value.
+    float gravity = 1600.0f;
+    float script_gravity = 800.0f;             // |GetGravityZ()| as the scripts see it
+
+    // TdPawn ground model (native GetSprintAcceleration / GetWalkAcceleration / CalcVelocity)
+    float ground_speed = 720.0f;               // Pawn.GroundSpeed (top of SpeedCurve_LightWeapon)
+    float accel_rate = 6144.0f;                // Pawn.AccelRate
+    float ground_friction = 8.0f;              // PhysicsVolume.GroundFriction
+    float braking_friction_strength = 0.5f;    // TdPlayerPawn.BrakingFrictionStrength
+    float speed_max_base_velocity = 400.0f;    // TdPawn.SpeedMaxBaseVelocity (above it: sprint energy)
+    float speed_min_base_velocity = 10.0f;     // TdPawn.SpeedMinBaseVelocity
+    float sprint_accel_factor = 30.0f;         // SpeedSprintVelocityAccelerationFactor
+    float walk_accel_factor = 7.0f;            // SpeedWalkVelocityAccelerationFactor
+    float strafe_accel_factor = 10.0f;         // SpeedStrafeVelocityAccelerationFactor
+    float energy_decel_time = 3.0f;            // SpeedEnergyDecelerationTime
+    float energy_decel_exponent = 0.5f;        // SpeedEnergyDecelerationExponent
+    float turn_decel_factor = 10.0f;           // SpeedTurnDecelerationFactor
+    float sprint_input_threshold = 0.7f;       // TdPlayerController.InputMaxSprintHeightLimit / RaduisLimit
+    float air_control = 0.025f;                // Pawn.AirControl (x AccelRate = air acceleration cap)
+    float crouch_speed_modifier = 0.2f;        // TdMove_Crouch.SpeedModifier
+    float walk_speed = 50.0f;                  // legacy TdPawn.WalkVelocity (telemetry only)
+    float jog_speed = 260.0f;                  // legacy jog threshold (telemetry only)
+    float run_speed = 400.0f;                  // = SpeedMaxBaseVelocity (FOV / skill roll floor)
+    float sprint_speed = 630.0f;               // legacy TdPawn.SprintVelocity (FOV scaling top)
+
+    // [TdGame.TdMove_Jump]
     float base_jump_z = 630.0f;
     float base_jump_z_heavy = 430.0f;
     float jump_add_xy = 100.0f;
-    float wallrun_min_speed = 200.0f;
-    float wallrun_initial_z = 170.0f;
-    float wallrun_accel = 820.0f;
-    float wallrun_decel = 500.0f;
-    float wallrun_max_angle_deg = 57.0f;
-    float wallrun_duration = 1.6f;
-    float wallclimb_max_angle_deg = 33.0f;
-    float wallclimb_gravity = 800.0f;
-    float wallclimb_boost_z = 320.0f;
-    float springboard_jump_z = 950.0f;
-    float slide_min_speed = 250.0f;
-    float slide_friction = 0.1f;
-    float slide_max_duration = 2.0f;
-    float coil_height_boost = 60.0f;
-    float coil_duration = 0.25f;
-    float skill_roll_min_fall = 200.0f;
-    float hard_landing_min_fall = 530.0f;
-    float uncontrolled_fall = 1000.0f;
-    float turn_180_time = 0.25f;
+    float jump_tap_time = 0.15f;               // TdPlayerController.JumpTapTime (jump buffer)
+    float ledge_assist_height = 112.0f;        // TdMove_Jump: precise jump onto a ledge below this
+
+    // [TdGame.TdMove_DodgeJump]
+    float dodge_jump_side_speed = 600.0f;
+    float dodge_jump_z = 300.0f;
+    float dodge_jump_inertia = 0.3f;
+
+    // [TdGame.TdMove_WallRun]
+    float wallrun_min_speed = 200.0f;          // WallRunningMinSpeed
+    float wallrun_initial_z = 170.0f;          // WallRunningHorisontalInitialZHeight: a HEIGHT budget
+    float wallrun_accel = 820.0f;              // WallRunningHorisontalAcceleration: pull-down while rising
+    float wallrun_decel = 500.0f;              // WallRunningHorisontalDeceleration: pull-down while falling
+    float wallrun_friction = 0.05f;            // WallRunningHorisontalFriction
+    float wallrun_stop_fall_speed = 500.0f;    // the run ends once falling faster than this
+    float wallrun_max_angle_deg = 57.0f;       // WallRunningForwardMaxStartAngle
+    float wallrun_side_angle_deg = 60.0f;      // WallRunningStrafeStartAngle
+    float wallrun_check_distance = 50.0f;      // WallRunningForwardCheckDistance
+    float wallrun_check_distance_mult = 1.8f;  // ContextMoveDistanceMultiplier (at GroundSpeed)
+    float wallrun_min_wall_height = 192.0f;    // MinWallHeight
+    float wallrun_jump_height = 100.0f;        // TdMove_WallrunJump.JumpHeight
+    float wallrun_jump_height_look_add = 60.0f;
+    float wallrun_jump_out = 120.0f;           // WallRunningPushOutSpeedMin
+    float wallrun_jump_out_look_add = 400.0f;
+    float wallrun_jump_forward_min = 0.1f;     // WallRunningPushForwardSpeedMin
+    float wallrun_duration = 1.6f;             // legacy telemetry only (the game has no timer)
+
+    // [TdGame.TdMove_WallClimb]
+    float wallclimb_max_angle_deg = 33.0f;     // WallClimbingVerticalStartAngle
+    float wallclimb_gravity = 800.0f;          // WallClimbingGravity (script constant, climb decel = 2x)
+    float wallclimb_max_distance = 120.0f;     // WallClimbingMaxDistance2D
+    float wallclimb_min_wall_height = 180.0f;  // MinWallHeight
+    float wallclimb_suck_in_speed = 400.0f;    // horizontal speed into the wall when entering slowly
+    float wallclimb_add_xy_height = 60.0f;     // AddOnSpeed2DHeight
+    float wallclimb_add_xy_max_speed = 650.0f; // AddOnSpeed2DMaxLimit
+    float wallclimb_add_z_height = 130.0f;     // AddOnSpeedZHeight
+    float wallclimb_boost_z = 320.0f;          // AddOnSpeedZMaxLimit
+    float wallclimb_turn_jump_window = 0.6f;   // TdMove_WallClimb180TurnJump.JumpTimeWindow
+    float wallclimb_turn_jump_out = 400.0f;
+    float wallclimb_turn_jump_height = 250.0f;
+    float wallclimb_dodge_side_speed = 150.0f; // WallClimbDodge JumpAddXY
+    float wallclimb_dodge_z = 700.0f;          // WallClimbDodge BaseJumpZ
+
+    // [TdGame.TdMove_Grab] / GrabPullUp / GrabJump
+    float grab_hang_depth = 182.8f;            // ledge top above the feet while hanging (92.8 + 90)
+    float grab_max_angle_deg = 40.0f;          // GrabMaxAngle
+    float grab_pull_up_time = 1.0f;
+    float grab_jump_height = 160.0f;
+    float grab_jump_push_min = 200.0f;
+    float grab_jump_push_max = 400.0f;
+    float grab_shimmy_speed = 56.0f;           // 60 uu per 1.07 s
+    float grab_shimmy_delay = 0.6f;            // DisableShimmyTime
+
+    // [TdGame.TdMove_SpeedVault]
+    float vault_max_handplant_time = 0.4f;     // TimeToHandPlant limit
+    float vault_time_over = 0.35f;
+    float vault_time_down = 0.3f;
+    float vault_ledge_offset_z = 25.0f;
+    float vault_min_speed = 400.0f;
+    float vault_speed_add = 80.0f;
+
+    // [TdGame.TdMove_SpringBoard]
+    float springboard_jump_z = 950.0f;         // SpringBoardJumpZ
+    float springboard_step_height = 64.0f;
+    float springboard_step_tolerance = 20.0f;
+    float springboard_obstacle_min = 80.0f;
+    float springboard_obstacle_max = 148.0f;
+    float springboard_obstacle_distance = 112.0f;
+    float springboard_check_time = 1.0f;       // CheckDistanceTime
+
+    // [TdGame.TdMove_Slide]
+    float slide_min_speed = 350.0f;            // CanDoMove: speed along the facing
+    float slide_abort_speed = 250.0f;          // SlideAbortSpeed
+    float slide_friction = 0.1f;               // FrictionModifier (x GroundFriction)
+    float slide_max_duration = 2.0f;           // SlideAbortTime
+    float slide_min_duration = 0.5f;           // an uncrouch request waits this long
+    float slide_look_turn = 0.2f;              // SlideLookTurn (fraction of the view angle per second)
+    float slide_strafe_turn_deg = 11.0f;       // 2000 rotation units per second
+
+    // [TdGame.TdMove_Coil]
+    float coil_height_boost = 60.0f;           // TotalHeightBoost
+    float coil_duration = 0.25f;               // HeightBoostDuration
+
+    // [TdGame.TdMove_Landing] / TdPawn
+    float skill_roll_min_fall = 200.0f;        // SkillRollLandingHeight
+    float soft_landing_min_fall = 300.0f;      // SoftLandingHeight
+    float hard_landing_min_fall = 530.0f;      // HardLandingHeight
+    float uncontrolled_fall = 1000.0f;         // FallingUncontrolledHeight (lethal)
+    float landing_speed_reduction = 65.0f;     // LandingSpeedReduction
+    float roll_trigger_window = 0.2f;          // TdPawn.CanSkillRoll: crouch pressed this recently
+    float roll_trigger_rearm = 0.6f;           // a press only re-arms after this long
+    float skill_roll_time = 0.5f;
+    float hard_landing_time = 1.8f;
+    float lay_on_ground_time = 1.5f;
+
+    // [TdGame.TdMove_180Turn]
+    float turn_180_time = 0.25f;               // TurnTime
+    float turn_180_friction = 0.3f;            // FrictionModifier
+
+    // Reaction time / health
     float reaction_time_dilation = 0.25f;
     float reaction_time_drain = 8.0f;
     float health_regen_delay = 5.0f;
@@ -834,7 +943,7 @@ struct PlayerTelemetry {
     float pitch_deg = 0.0f;
     float camera_roll_deg = 0.0f;
     float fov_deg = 100.0f;
-    float eye_height = 84.0f;
+    float eye_height = 166.0f;  // TdPawn: centre 90 + BaseEyeHeight 76 above the feet
     float health = 100.0f;
     float reaction_energy = 100.0f;
     bool reaction_active = false;
