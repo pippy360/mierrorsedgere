@@ -1,4 +1,5 @@
 #include "metal_renderer.hpp"
+#include "../anim/anim_system.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -653,6 +654,7 @@ struct MetalRenderer::Impl {
     // First-Person Faith Viewmodel Mesh & 3D Enemy Guard Mesh
     std::vector<Vertex> faith_viewmodel_mesh;
     std::vector<Vertex> enemy_guard_mesh;
+    AnimSystem anim_system;
 
     // Cached GPU Vertex Buffers for Scene Meshes
     std::string cached_map_name;
@@ -851,9 +853,16 @@ struct MetalRenderer::Impl {
         append_box(enemy_guard_mesh, Vec3(28, 0, 118), Vec3(12, 2.5f, 3.5f), Vec3(0.95f, 0.08f, 0.08f), true);
         append_box(enemy_guard_mesh, Vec3(42, 0, 119), Vec3(8,  1.2f, 1.5f), Vec3(0.95f, 0.08f, 0.08f), true);
         append_box(enemy_guard_mesh, Vec3(26, 0, 111), Vec3(2.5f, 1.8f, 5.0f), Vec3(0.95f, 0.08f, 0.08f), true);
+
+        // Load real UE3 USkeletalMesh & TdAnimSet assets from Mirror's Edge
+        anim_system.init_from_game_root("/Users/tomnom/mirrorsedge");
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
+        if (anim_system.is_loaded()) {
+            anim_system.evaluate_faith_1p(telemetry, faith_viewmodel_mesh);
+            if (!faith_viewmodel_mesh.empty()) return;
+        }
         faith_viewmodel_mesh.clear();
 
         float sim_time = telemetry.sim_time;
@@ -1363,19 +1372,23 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies
-        if (!scene.enemies.empty() && !impl_->enemy_guard_mesh.empty()) {
-            bind_vertex_bytes_or_buffer(enc, impl_->enemy_guard_mesh.data(),
-                                        impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
+        if (!scene.enemies.empty()) {
             for (const auto& bot : scene.enemies) {
                 if (!bot.alive) continue;
+                if (impl_->anim_system.is_loaded()) {
+                    impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
+                }
+                if (impl_->enemy_guard_mesh.empty()) continue;
+                bind_vertex_bytes_or_buffer(enc, impl_->enemy_guard_mesh.data(),
+                                            impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
-                uniforms.is_runner_vision = (bot.disarm_window && !bot.stunned) ? 0.35f : 0.0f;
+                uniforms.is_runner_vision = (bot.disarm_window && !bot.stunned && !impl_->anim_system.is_loaded()) ? 0.35f : 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
                 size_t v_count = impl_->enemy_guard_mesh.size();
-                if (bot.stunned && v_count > 108) v_count -= 108; // Omit disarmed 3-part weapon
+                if (!impl_->anim_system.is_loaded() && bot.stunned && v_count > 108) v_count -= 108;
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);

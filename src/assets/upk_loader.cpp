@@ -602,21 +602,34 @@ std::unordered_map<std::string, PropertyValue> UPKPackage::parse_properties(size
         } else if (prop_type == "BoolProperty") {
             if (ptr + 4 > end) break;
             pv.bool_val = (read_val<int32_t>(ptr, end) != 0);
-        } else if (prop_type == "ByteProperty") {
-            if (ptr + 8 > end) break;
-            int32_t e_idx = read_val<int32_t>(ptr, end);
-            read_val<int32_t>(ptr, end);
-            pv.enum_name = (e_idx >= 0 && e_idx < names_.size()) ? names_[e_idx] : "";
         }
+        // Note: In UE3 PackageVersion 536 (EngineVersion 3716), ByteProperty does NOT
+        // store an 8-byte EnumName in FPropertyTag.
 
         if (ptr + p_size > end) break;
         const uint8_t* val_ptr = ptr;
         ptr += p_size;
+        if (p_size > 0) {
+            pv.raw_bytes.assign(val_ptr, val_ptr + p_size);
+        }
 
         if (prop_type == "IntProperty" && p_size == 4) {
             std::memcpy(&pv.int_val, val_ptr, 4);
         } else if (prop_type == "FloatProperty" && p_size == 4) {
             std::memcpy(&pv.float_val, val_ptr, 4);
+        } else if (prop_type == "ByteProperty") {
+            if (p_size == 1) {
+                pv.int_val = static_cast<int32_t>(val_ptr[0]);
+            } else if (p_size == 8) {
+                int32_t bn_idx = 0, bn_num = 0;
+                std::memcpy(&bn_idx, val_ptr, 4);
+                std::memcpy(&bn_num, val_ptr + 4, 4);
+                if (bn_idx >= 0 && static_cast<size_t>(bn_idx) < names_.size()) {
+                    pv.str_val = names_[bn_idx];
+                    if (bn_num > 0) pv.str_val += "_" + std::to_string(bn_num - 1);
+                    pv.enum_name = pv.str_val;
+                }
+            }
         } else if (prop_type == "ObjectProperty" && p_size == 4) {
             int32_t obj_ref = 0;
             std::memcpy(&obj_ref, val_ptr, 4);
@@ -625,9 +638,13 @@ std::unordered_map<std::string, PropertyValue> UPKPackage::parse_properties(size
             pv.obj_ref_name = oname;
             pv.obj_ref_class = ocls;
         } else if (prop_type == "NameProperty" && p_size == 8) {
-            int32_t pn_idx = 0;
+            int32_t pn_idx = 0, pn_num = 0;
             std::memcpy(&pn_idx, val_ptr, 4);
-            pv.str_val = (pn_idx >= 0 && pn_idx < names_.size()) ? names_[pn_idx] : "";
+            std::memcpy(&pn_num, val_ptr + 4, 4);
+            if (pn_idx >= 0 && static_cast<size_t>(pn_idx) < names_.size()) {
+                pv.str_val = names_[pn_idx];
+                if (pn_num > 0) pv.str_val += "_" + std::to_string(pn_num - 1);
+            }
         } else if (prop_type == "StrProperty") {
             const uint8_t* s_read = val_ptr;
             pv.str_val = read_fstring(s_read, val_ptr + p_size);

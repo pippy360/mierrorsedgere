@@ -25,6 +25,7 @@ link_directories(
 # Source files
 set(SOURCES
     src/main.mm
+    src/anim/anim_system.cpp
     src/assets/upk_loader.cpp
     src/assets/ini_config.cpp
     src/audio/audio_engine.cpp
