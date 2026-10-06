@@ -289,7 +289,12 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cerr << "[Oracle ERROR] AudioEngine headless init failed!" << std::endl;
         return 1;
     }
-    std::cout << "[Oracle] AudioEngine initialized in headless mode." << std::endl;
+    audio.load_stock_audio(game_root);
+    audio.load_level_audio(game_root, "Maps/SP00/Tutorial_p.me1");
+    std::cout << "[Oracle] AudioEngine initialized in headless mode ("
+              << audio.get_clip_count() << " clips, "
+              << audio.get_cue_count() << " SoundCues, "
+              << audio.get_ambient_emitter_count() << " 3D AmbientSound emitters)." << std::endl;
 
     // 2. Asset Verification Checks
     std::cout << "\n--- [Asset Verification] ---" << std::endl;
@@ -868,6 +873,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         std::cout << "[Game] Loading Level: " << map_file << "..." << std::endl;
         bool loaded = load_level_scene(game_root, map_file, active_scene);
+        audio.load_level_audio(game_root, map_file);
         if (!loaded) {
             std::cout << "[Game] Using contiguous procedural training grounds." << std::endl;
             controller.build_parkour_test_course(active_scene);
@@ -1153,12 +1159,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             audio.play_effect(EAudioEffect::Gunshot);
         }
 
-        // Footstep cadence
+        // Footstep cadence (TdPhysicalMaterialFootSteps: Sneak / Walk / Run / Sprint)
         if (tel.grounded && tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
             footstep_timer += dt;
             float stride_time = std::clamp(150.0f / tel.speed_2d, 0.22f, 0.45f);
             if (footstep_timer >= stride_time) {
-                audio.play_effect(EAudioEffect::Footstep, 0.7f);
+                audio.play_footstep(ESurfaceMaterial::Concrete, tel.speed_2d, input.crouch > 0.5f, 0.75f);
                 footstep_timer = 0.0f;
             }
         } else {
