@@ -771,6 +771,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     int current_chapter_idx = std::clamp(initial_chapter, 0, 9);
     renderer.set_selected_chapter(current_chapter_idx);
 
+    ParkourController controller(move_cfg);
+
     auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path) {
         std::string map_file = custom_path;
         if (map_file.empty()) {
@@ -793,15 +795,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         bool loaded = load_level_scene(game_root, map_file, active_scene);
         if (!loaded) {
             std::cout << "[Game] Using contiguous procedural training grounds." << std::endl;
+            controller.build_parkour_test_course(active_scene);
+            append_test_course_visuals(active_scene);
+        }
+        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+        controller.get_telemetry().active_checkpoint = 0;
+        if (!active_scene.subtitles.empty() && !active_scene.subtitles[0].empty()) {
+            controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
     };
 
     load_chapter_or_level(current_chapter_idx, custom_level);
-
-    ParkourController controller(move_cfg);
-    controller.build_parkour_test_course(active_scene);
-    append_test_course_visuals(active_scene);
-    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
 
     SDL_SetRelativeMouseMode(SDL_TRUE);
     ensure_dir("screenshots");
@@ -823,12 +827,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     std::cout << "  Left Ctrl / C / Left Shift: Crouch / Slide / Mid-Air Coil / Skill Roll" << std::endl;
     std::cout << "  Q: 180° Turn" << std::endl;
     std::cout << "  Left Mouse / F: Melee Punch/Kick or Fire Weapon" << std::endl;
-    std::cout << "  Right Mouse / E: Disarm Enemy" << std::endl;
+    std::cout << "  Right Mouse / E: Disarm Enemy / Use Elevator" << std::endl;
     std::cout << "  X: Toggle Reaction Time (Slow-Motion)" << std::endl;
     std::cout << "  V / Left Alt: Runner Vision Look-At" << std::endl;
     std::cout << "  Tab / M: Toggle Chapter Select Menu" << std::endl;
     std::cout << "  1..9, 0: Directly load Chapter 0 through 9" << std::endl;
-    std::cout << "  R: Reset to Checkpoint" << std::endl;
+    std::cout << "  [ / ] (or B / N): Previous / Next Tutorial Checkpoint" << std::endl;
+    std::cout << "  R: Reset to Active Checkpoint" << std::endl;
     std::cout << "  P / F12: Screenshot PNG" << std::endl;
     std::cout << "  ESC: Quit\n" << std::endl;
 
@@ -878,7 +883,36 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     renderer.set_menu_open(menu);
                     SDL_SetRelativeMouseMode(menu ? SDL_FALSE : SDL_TRUE);
                 } else if (key == SDLK_r) {
-                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
+                                        std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
+                    Vec3 spawn = active_scene.checkpoints.empty() ? active_scene.player_spawn_pos : active_scene.checkpoints[cp];
+                    float yaw = active_scene.player_spawn_yaw;
+                    if (cp + 1 < static_cast<int>(active_scene.checkpoints.size())) {
+                        Vec3 d = active_scene.checkpoints[cp + 1] - spawn;
+                        yaw = std::atan2(d.y, d.x) * RAD2DEG;
+                    }
+                    controller.reset(spawn, yaw);
+                    controller.get_telemetry().active_checkpoint = cp;
+                    if (cp < static_cast<int>(active_scene.subtitles.size()) && !active_scene.subtitles[cp].empty()) {
+                        controller.get_telemetry().active_subtitle = active_scene.subtitles[cp];
+                    }
+                } else if (key == SDLK_RIGHTBRACKET || key == SDLK_n || key == SDLK_LEFTBRACKET || key == SDLK_b) {
+                    if (!active_scene.checkpoints.empty()) {
+                        int delta_cp = (key == SDLK_RIGHTBRACKET || key == SDLK_n) ? 1 : -1;
+                        int next_cp = std::clamp(controller.get_telemetry().active_checkpoint + delta_cp,
+                                                 0, static_cast<int>(active_scene.checkpoints.size()) - 1);
+                        Vec3 spawn = active_scene.checkpoints[next_cp];
+                        float yaw = active_scene.player_spawn_yaw;
+                        if (next_cp + 1 < static_cast<int>(active_scene.checkpoints.size())) {
+                            Vec3 d = active_scene.checkpoints[next_cp + 1] - spawn;
+                            yaw = std::atan2(d.y, d.x) * RAD2DEG;
+                        }
+                        controller.reset(spawn, yaw);
+                        controller.get_telemetry().active_checkpoint = next_cp;
+                        if (next_cp < static_cast<int>(active_scene.subtitles.size()) && !active_scene.subtitles[next_cp].empty()) {
+                            controller.get_telemetry().active_subtitle = active_scene.subtitles[next_cp];
+                        }
+                    }
                 } else if (key == SDLK_p || key == SDLK_F12) {
                     auto t = std::time(nullptr);
                     std::ostringstream ss;
@@ -891,9 +925,6 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     current_chapter_idx = sel;
                     renderer.set_selected_chapter(sel);
                     load_chapter_or_level(sel, "");
-                    controller.build_parkour_test_course(active_scene);
-                    append_test_course_visuals(active_scene);
-                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
                 }
             }
         }
@@ -912,7 +943,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             if (controller.get_weapon().equipped) input.fire = true;
             else input.melee = true;
         }
-        if (state[SDL_SCANCODE_E]) input.disarm = true;
+        if (state[SDL_SCANCODE_E]) {
+            input.disarm = true;
+            input.use = true;
+        }
         if (state[SDL_SCANCODE_V] || state[SDL_SCANCODE_LALT]) input.look_at = true;
 
         // Alternate look keys
