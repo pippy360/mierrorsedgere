@@ -1824,10 +1824,11 @@ inline float3 mat_lm(MatLightMap m, int j) { return j == 0 ? m.c0 : (j == 1 ? m.
 // Real-time 12-tap rotated Vogel-disk PCF directional sun shadow map evaluation.
 inline float mat_shadow(MatParams P, constant FrameUniforms& F, depth2d<float> shadow_map) {
     if (F.shadow_enabled < 0.5) return 1.0;
+    float bias_scale = (F.shadow_enabled > 1.5) ? 0.06 : 1.0;
     float3 Lw = normalize(float3(F.sun_dir));
     float ndl_geo = saturate(dot(P.N, Lw));
     if (ndl_geo <= 0.001) return 0.0;
-    float3 biased_wpos = P.wpos + P.N * mix(14.0, 4.0, ndl_geo) + Lw * 5.0;
+    float3 biased_wpos = P.wpos + P.N * (mix(14.0, 4.0, ndl_geo) * bias_scale) + Lw * (5.0 * bias_scale);
     float4 sc = F.sun_view_proj * float4(biased_wpos, 1.0);
     float3 ndc = sc.xyz / max(sc.w, 1e-6);
     float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);

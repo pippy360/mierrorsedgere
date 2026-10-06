@@ -832,6 +832,10 @@ struct MetalRenderer::Impl {
     id<MTLTexture> ui_panel_bg_tex = nil;
     id<MTLTexture> ui_faith_art_tex = nil;
     id<MTLTexture> ui_chapter_tex[10] = {nil};
+    std::vector<id<MTLTexture>> ui_font_headline_thick_tex;
+    std::vector<id<MTLTexture>> ui_font_headline_light_tex;
+    std::vector<id<MTLTexture>> ui_font_medium_italic_tex;
+    std::vector<id<MTLTexture>> ui_font_small_italic_tex;
 
     struct UITextureBatch {
         id<MTLTexture> tex = nil;
@@ -1537,6 +1541,17 @@ struct MetalRenderer::Impl {
             for (int i = 0; i < 10; ++i) {
                 ui_chapter_tex[i] = upload_scene_texture(main_menu.chapter_preview_texture(i));
             }
+            auto upload_font_pages = [&](const UIMultiFont& f, std::vector<id<MTLTexture>>& out) {
+                out.clear();
+                out.reserve(f.pages.size());
+                for (const auto& st : f.pages) {
+                    out.push_back(upload_scene_texture(st));
+                }
+            };
+            upload_font_pages(main_menu.headline_thick_font(), ui_font_headline_thick_tex);
+            upload_font_pages(main_menu.headline_light_font(), ui_font_headline_light_tex);
+            upload_font_pages(main_menu.medium_italic_font(),  ui_font_medium_italic_tex);
+            upload_font_pages(main_menu.small_italic_font(),   ui_font_small_italic_tex);
             main_menu_gpu_ready = true;
         }
     }
@@ -1579,6 +1594,70 @@ struct MetalRenderer::Impl {
         UITexVertex p3 = {{x,     y + h}, {u0, v1}, tint};
         batch->verts.push_back(p0); batch->verts.push_back(p1); batch->verts.push_back(p2);
         batch->verts.push_back(p0); batch->verts.push_back(p2); batch->verts.push_back(p3);
+    }
+
+    // Renders authentic UE3 MultiFont glyph atlases (UI_Fonts_Final.upk: Helvetica_Headline_Thick_Italic,
+    // Helvetica_Headline_Light_Italic, Helvetica_Medium_Italic, Helvetica_Small_Bold_Italic).
+    float draw_multifont_text(std::vector<UITextureBatch>& tex_batches,
+                              std::vector<HUDVertex>& fallback_verts,
+                              const UIMultiFont& font,
+                              const std::vector<id<MTLTexture>>& pages,
+                              const std::string& text,
+                              float start_x,
+                              float start_y,
+                              float target_px_height,
+                              simd_float4 color,
+                              bool drop_shadow = true) {
+        if (!font.valid() || pages.empty()) {
+            draw_ui_text_italic(fallback_verts, text, start_x, start_y,
+                                std::max(1.0f, target_px_height / 9.0f), color, drop_shadow);
+            return static_cast<float>(text.size()) * target_px_height * 0.6f;
+        }
+
+        const float scale = target_px_height / std::max(12.0f, font.base_line_height);
+        const float space_advance = target_px_height * 0.28f;
+        const float tracking = target_px_height * 0.025f;
+
+        auto emit_pass = [&](float ox, float oy, simd_float4 pass_col) -> float {
+            float pen_x = start_x + ox;
+            float pen_y = start_y + oy;
+            for (unsigned char ch : text) {
+                if (ch == ' ') {
+                    pen_x += space_advance;
+                    continue;
+                }
+                if (ch < 32) continue;
+                const UIFontGlyph& g = font.glyphs[ch];
+                if (g.w <= 0 || g.h <= 0 || g.page >= pages.size() || !pages[g.page]) {
+                    pen_x += space_advance * 0.8f;
+                    continue;
+                }
+                id<MTLTexture> tex = pages[g.page];
+                float tw = static_cast<float>(tex.width);
+                float th = static_cast<float>(tex.height);
+                float u0 = static_cast<float>(g.u) / tw;
+                float v0 = static_cast<float>(g.v) / th;
+                float u1 = static_cast<float>(g.u + g.w) / tw;
+                float v1 = static_cast<float>(g.v + g.h) / th;
+
+                float gw = static_cast<float>(g.w) * scale;
+                float gh = static_cast<float>(g.h) * scale;
+                float gy = pen_y + static_cast<float>(g.v_offset) * scale;
+
+                // Negative alpha triggers UI alpha-mask tinting (s.a * -tint.w) in ui_tex_fragment
+                simd_float4 mask_tint = simd_make_float4(pass_col.x, pass_col.y, pass_col.z, -pass_col.w);
+                add_ui_tex_quad(tex_batches, tex, pen_x, gy, gw, gh, u0, v0, u1, v1, mask_tint);
+                pen_x += gw + tracking;
+            }
+            return pen_x - (start_x + ox);
+        };
+
+        if (drop_shadow) {
+            float sh_off = std::max(1.2f, target_px_height * 0.055f);
+            simd_float4 sh_col = simd_make_float4(0.03f, 0.05f, 0.09f, color.w * 0.65f);
+            emit_pass(sh_off, sh_off, sh_col);
+        }
+        return emit_pass(0.0f, 0.0f, color);
     }
 
     void draw_ui_text_raw(std::vector<HUDVertex>& verts, const std::string& text, float start_x, float start_y,
@@ -1649,8 +1728,8 @@ struct MetalRenderer::Impl {
     }
 
     // -------------------------------------------------------------------------
-    // Authentic Mirror's Edge Frontend UI (TdMainMenu + TdLoadLevel + TdLoadCheckpoint)
-    // Rendered over the live 3D City of Glass (Maps/Menu/TdMainMenu.me1)
+    // Authentic Mirror's Edge Frontend UI (TdMainMenu + TdLoadLevel)
+    // Layout & Typography faithful to TdUI_FrontEnd.upk & UI_Fonts_Final.upk
     // -------------------------------------------------------------------------
     void draw_main_menu_ui(std::vector<HUDVertex>& bg_verts,
                            std::vector<UITextureBatch>& tex_batches,
@@ -1660,291 +1739,207 @@ struct MetalRenderer::Impl {
         tex_batches.clear();
         fg_verts.clear();
 
-        float w = float(width);
-        float h = float(height);
+        const float w = float(width);
+        const float h = float(height);
+        const float sx = w / 1280.0f;
+        const float sy = h / 720.0f;
 
-        const simd_float4 runner_red   = simd_make_float4(0.902f, 0.078f, 0.078f, 0.96f); // #E61414
-        const simd_float4 dark_slate   = simd_make_float4(0.09f,  0.11f,  0.14f,  0.94f); // #171C24
-        const simd_float4 frost_panel  = simd_make_float4(0.94f,  0.96f,  0.98f,  0.86f);
-        const simd_float4 frost_row    = simd_make_float4(0.84f,  0.87f,  0.91f,  0.82f);
-        const simd_float4 pure_white   = simd_make_float4(1.0f,   1.0f,   1.0f,   1.0f);
-        const simd_float4 text_dark    = simd_make_float4(0.09f,  0.11f,  0.15f,  0.98f);
-        const simd_float4 text_muted   = simd_make_float4(0.32f,  0.37f,  0.44f,  0.95f);
-        const simd_float4 text_silver  = simd_make_float4(0.82f,  0.86f,  0.92f,  0.95f);
+        const simd_float4 runner_red   = simd_make_float4(0.890f, 0.078f, 0.078f, 0.96f); // #E31414
+        const simd_float4 dark_ink     = simd_make_float4(0.110f, 0.135f, 0.175f, 0.96f);
+        const simd_float4 muted_ink    = simd_make_float4(0.240f, 0.285f, 0.350f, 0.92f);
+        const simd_float4 pure_white   = simd_make_float4(1.000f, 1.000f, 1.000f, 1.00f);
+        const simd_float4 row_strip    = simd_make_float4(0.960f, 0.975f, 0.992f, 0.62f);
+        const simd_float4 col_veil     = simd_make_float4(0.955f, 0.970f, 0.988f, 0.42f);
+        const simd_float4 dark_bar     = simd_make_float4(0.085f, 0.105f, 0.140f, 0.86f);
 
-        // =====================================================================
-        // 1. TOP HEADER BAR (TdMainMenu Navigation Strip + StartTitleImage Logo)
-        // =====================================================================
-        draw_ui_skew_quad(bg_verts, 20.0f, 16.0f, w - 40.0f, 56.0f, 12.0f, frost_panel);
-        draw_ui_skew_quad(fg_verts, 20.0f, 70.0f, w - 40.0f, 3.0f,  1.0f,  runner_red);
-        draw_ui_skew_quad(fg_verts, 32.0f, 16.0f, w - 40.0f, 2.0f,  1.0f,  dark_slate);
+        const UIMultiFont& f_head_thick = main_menu.headline_thick_font();
+        const UIMultiFont& f_head_light = main_menu.headline_light_font();
+        const UIMultiFont& f_med_italic = main_menu.medium_italic_font();
+        const UIMultiFont& f_sml_italic = main_menu.small_italic_font();
 
-        // Left Logo Block (Dark charcoal skewed badge + StartTitleImage / Runner Star)
-        draw_ui_skew_quad(bg_verts, 26.0f, 20.0f, 212.0f, 48.0f, 10.0f, dark_slate);
-        draw_ui_skew_quad(fg_verts, 26.0f, 20.0f, 5.0f,   48.0f, 10.0f, runner_red);
-        if (ui_logo_tex) {
-            // Render authentic StartTitleImage Runner Star using alpha-mask tint mode (-1.0 alpha)
-            add_ui_tex_quad(tex_batches, ui_logo_tex, 38.0f, 22.0f, 44.0f, 44.0f,
-                            0.0f, 0.0f, 0.24f, 1.0f,
-                            simd_make_float4(0.95f, 0.10f, 0.10f, -1.0f));
-        }
-        draw_ui_text_italic(fg_verts, "MIRROR'S", 90.0f, 27.0f, 1.9f, pure_white, true);
-        draw_ui_text_italic(fg_verts, "EDGE",     90.0f, 45.0f, 2.1f, runner_red, true);
-
-        // 4 Main Menu Category Tabs (TdGameUI.int [TdUIScene_MainMenu])
-        static const char* MENU_TABS[4] = {"STORY", "RACE", "OPTIONS", "EXTRAS"};
-        float tab_x = 256.0f;
-        for (int t = 0; t < 4; ++t) {
-            bool is_active_tab = (t == 0); // STORY tab active
-            float tab_w = (t == 2) ? 132.0f : 114.0f;
-            draw_ui_skew_quad(bg_verts, tab_x, 25.0f, tab_w, 38.0f, 9.0f,
-                              is_active_tab ? runner_red : frost_row);
-            draw_ui_text_italic(fg_verts, MENU_TABS[t], tab_x + 22.0f, 37.0f, 2.0f,
-                                is_active_tab ? pure_white : text_dark, is_active_tab);
-            tab_x += tab_w + 12.0f;
-        }
-
-        // Top-Right Scene & Camera Breadcrumb
-        int sel = std::clamp(selected_chapter, 0, 9);
+        const int sel = std::clamp(selected_chapter, 0, 9);
         const MenuChapterEntry& cur_ch = main_menu.get_chapter(sel);
 
-        draw_ui_text_italic(fg_verts, "STORY  /  LOAD CHAPTER", w - 434.0f, 26.0f, 1.95f, text_dark, false);
-        std::string map_crumb = "3D CITY: TDMAINMENU.ME1 | " + cur_ch.map_filename;
-        for (char& c : map_crumb) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        draw_ui_text_italic(fg_verts, map_crumb, w - 434.0f, 49.0f, 1.25f, text_muted, false);
-
         // =====================================================================
-        // 2. LEFT COLUMN: STORY SUBMENU & 10-CHAPTER SELECTOR (TdLoadLevel)
+        // 1. TOP-LEFT OFFICIAL MIRROR'S EDGE LOGO (StartTitleImage from TdMainMenu.me1)
         // =====================================================================
-        float lx = 26.0f;
-        float ly = 86.0f;
-        float lw = 382.0f;
-        float lh = 566.0f;
-
-        draw_ui_quad(bg_verts, lx, ly, lw, lh, frost_panel);
-        draw_ui_quad(fg_verts, lx, ly, 4.0f, lh, runner_red);
-        draw_ui_quad(fg_verts, lx + lw - 2.0f, ly, 2.0f, lh, dark_slate);
-        draw_ui_quad(fg_verts, lx, ly + lh - 2.0f, lw, 2.0f, dark_slate);
-
-        // Subtle Faith Vector Art Watermark (UI/TdUIResources_FrontEnd.upk -> T_Faith_03)
-        if (ui_faith_art_tex) {
-            add_ui_tex_quad(tex_batches, ui_faith_art_tex,
-                            lx + 10.0f, ly + lh - 290.0f, 280.0f, 280.0f,
-                            0.0f, 0.0f, 1.0f, 1.0f,
-                            simd_make_float4(1.0f, 1.0f, 1.0f, 0.16f));
+        const float logo_x = 92.0f * sx;
+        const float logo_y = 36.0f * sy;
+        const float logo_h = 54.0f * sy;
+        const float logo_w = logo_h * 4.0f; // Native 4:1 aspect ratio (256x64 / 512x128)
+        if (ui_logo_tex) {
+            // Left 24% of StartTitleImage is the iconic Runner Star (tinted Scarlet Red)
+            add_ui_tex_quad(tex_batches, ui_logo_tex,
+                            logo_x, logo_y, logo_w * 0.24f, logo_h,
+                            0.0f, 0.0f, 0.24f, 1.0f,
+                            simd_make_float4(0.89f, 0.08f, 0.08f, -1.0f));
+            // Right 76% of StartTitleImage is the official MIRROR'S EDGE wordmark
+            add_ui_tex_quad(tex_batches, ui_logo_tex,
+                            logo_x + logo_w * 0.24f + 1.5f * sx, logo_y + 1.5f * sy, logo_w * 0.76f, logo_h,
+                            0.24f, 0.0f, 1.0f, 1.0f,
+                            simd_make_float4(1.0f, 1.0f, 1.0f, -0.75f));
+            add_ui_tex_quad(tex_batches, ui_logo_tex,
+                            logo_x + logo_w * 0.24f, logo_y, logo_w * 0.76f, logo_h,
+                            0.24f, 0.0f, 1.0f, 1.0f,
+                            simd_make_float4(0.11f, 0.13f, 0.17f, -0.98f));
         }
 
-        // Section Header
-        draw_ui_skew_quad(bg_verts, lx + 12.0f, ly + 10.0f, lw - 24.0f, 30.0f, 7.0f, dark_slate);
-        draw_ui_text_italic(fg_verts, "SELECT CHAPTER", lx + 26.0f, ly + 18.0f, 1.85f, pure_white, true);
-        draw_ui_text_italic(fg_verts, "CAMPAIGN", lx + lw - 118.0f, ly + 19.0f, 1.6f, runner_red, true);
+        // =====================================================================
+        // 2. LEFT SAFE-REGION: TdLoadLevel CHAPTER SELECTOR (Minimalist DICE Style)
+        // =====================================================================
+        const float lx = 96.0f * sx;
+        const float ly = 104.0f * sy;
+        const float lw = 336.0f * sx;
 
-        // 10 Playable Chapters (Prologue + Chapters 1..9 from UIDataProvider_TdMaps)
+        // Section Title ("PLAY CHAPTER") + thin scarlet architectural rule
+        draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
+                            config_title_or("LOAD CHAPTER"), lx, ly, 23.0f * sy, dark_ink, false);
+        draw_ui_skew_quad(fg_verts, lx - 4.0f * sx, ly + 28.0f * sy, lw, 2.5f * sy, 3.0f * sx, runner_red);
+
+        const float list_top = ly + 38.0f * sy;
+        const float row_step = 35.5f * sy;
+        const float row_h    = 31.0f * sy;
+
         for (int i = 0; i < 10; ++i) {
             const MenuChapterEntry& ch = main_menu.get_chapter(i);
-            float row_y = ly + 48.0f + float(i) * 43.0f;
-            bool is_sel = (i == sel);
+            const float ry = list_top + float(i) * row_step;
+            const bool is_sel = (i == sel);
+
+            std::string ch_upper = ch.map_name;
+            for (char& c : ch_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
             if (is_sel) {
-                // Active Chapter: Forward-slanted Scarlet Red parallelogram bar
-                draw_ui_skew_quad(fg_verts, lx + 8.0f, row_y, lw - 14.0f, 38.0f, 9.0f, runner_red);
-                draw_ui_skew_quad(fg_verts, lx + 8.0f, row_y, 5.0f, 38.0f, 9.0f, pure_white);
-
-                std::string label = "> " + ch.map_name;
-                for (char& c : label) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                draw_ui_text_italic(fg_verts, label, lx + 22.0f, row_y + 7.0f, 1.85f, pure_white, true);
-
-                std::string sub = "MAP: " + ch.map_filename + " | " +
-                                  std::to_string(ch.checkpoints.size()) + " CHECKPOINTS";
-                for (char& c : sub) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                draw_ui_text_italic(fg_verts, sub, lx + 22.0f, row_y + 24.0f, 1.15f,
-                                    simd_make_float4(1.0f, 0.92f, 0.92f, 0.96f), true);
+                // Active chapter: iconic forward-slanted Scarlet Red bar + pure white thick italic text
+                draw_ui_skew_quad(bg_verts, lx - 8.0f * sx, ry, lw + 18.0f * sx, row_h, 9.0f * sx, runner_red);
+                draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
+                                    ch_upper, lx + 8.0f * sx, ry + 5.5f * sy, 18.5f * sy, pure_white, true);
             } else {
-                // Unselected Chapter: Frosted slate parallelogram with high-contrast dark text
-                draw_ui_skew_quad(bg_verts, lx + 14.0f, row_y + 3.0f, lw - 26.0f, 33.0f, 7.5f, frost_row);
-                draw_ui_skew_quad(fg_verts, lx + 14.0f, row_y + 3.0f, 3.0f, 33.0f, 7.5f, dark_slate);
-                std::string ch_upper = ch.map_name;
-                for (char& c : ch_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                draw_ui_text_italic(fg_verts, ch_upper, lx + 26.0f, row_y + 13.0f, 1.68f, text_dark, false);
+                // Unselected chapter: subtle translucent glass veil + dark medium italic text
+                draw_ui_skew_quad(bg_verts, lx, ry + 1.5f * sy, lw, row_h - 3.0f * sy, 7.5f * sx, row_strip);
+                draw_multifont_text(tex_batches, fg_verts, f_med_italic, ui_font_medium_italic_tex,
+                                    ch_upper, lx + 8.0f * sx, ry + 6.5f * sy, 16.0f * sy, dark_ink, false);
             }
         }
 
-        // Tutorial Row + Runner Vision Status Footer inside Left Panel
-        float tut_y = ly + 48.0f + 10.0f * 43.0f + 4.0f;
-        draw_ui_skew_quad(bg_verts, lx + 14.0f, tut_y, lw - 26.0f, 28.0f, 6.0f,
-                          simd_make_float4(0.16f, 0.19f, 0.24f, 0.88f));
-        draw_ui_text_italic(fg_verts, "TRAINING: TUTORIAL_P.ME1 (RUNNER BASICS)",
-                            lx + 24.0f, tut_y + 8.0f, 1.4f, text_silver, true);
-
-        draw_ui_quad(bg_verts, lx + 10.0f, ly + lh - 46.0f, lw - 20.0f, 36.0f, dark_slate);
-        draw_ui_text_italic(fg_verts, "RUNNER VISION: FULL RED HIGHLIGHT",
-                            lx + 20.0f, ly + lh - 39.0f, 1.35f, pure_white, true);
-        std::string mi_upper = cur_ch.material_instance_tag;
-        for (char& c : mi_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        draw_ui_text_italic(fg_verts, "3D DISTRICT PARAM: " + mi_upper + " [SELECTED=1]",
-                            lx + 20.0f, ly + lh - 23.0f, 1.25f, runner_red, true);
-
         // =====================================================================
-        // 3. CENTER VIEWPORT: 3D CITY OF GLASS CALLOUT (TdSupersMessage)
+        // 3. RIGHT SAFE-REGION: CHAPTER PREVIEW HALFTONE PHOTO & STATS (TdLoadLevel)
         // =====================================================================
-        // Keep the center of the screen open so TdMainMenu.me1's 3D skyscrapers
-        // and the Runner Vision Red highlighted district shine unobstructed!
-        float cx_badge = 424.0f;
-        float cy_badge = h - 128.0f;
-        float cw_badge = 384.0f;
-        float ch_badge = 60.0f;
+        const float rw = 368.0f * sx;
+        const float rx = w - 96.0f * sx - rw;
+        const float ry = 104.0f * sy;
 
-        draw_ui_skew_quad(bg_verts, cx_badge, cy_badge, cw_badge, ch_badge, 12.0f,
-                          simd_make_float4(0.06f, 0.08f, 0.11f, 0.84f));
-        draw_ui_skew_quad(fg_verts, cx_badge, cy_badge, 5.0f, ch_badge, 12.0f, runner_red);
+        std::string cur_upper = cur_ch.map_name;
+        for (char& c : cur_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
+                            cur_upper, rx, ry, 23.0f * sy, runner_red, false);
+        draw_ui_skew_quad(fg_verts, rx - 4.0f * sx, ry + 28.0f * sy, rw, 2.5f * sy, 3.0f * sx, dark_ink);
 
-        std::string dist_hdr = "CITY OF GLASS  //  " + cur_ch.map_name;
-        for (char& c : dist_hdr) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        draw_ui_text_italic(fg_verts, dist_hdr, cx_badge + 18.0f, cy_badge + 10.0f, 1.6f, pure_white, true);
-
-        // Flatten newlines in TdSupersMessage into single-line telemetry string
+        // Localized district timestamp (e.g. "West Arlington 5.21am")
         std::string supers_flat = cur_ch.district_timestamp;
         for (char& c : supers_flat) {
             if (c == '\n') c = ' ';
         }
-        if (supers_flat.length() > 44) supers_flat = supers_flat.substr(0, 44);
-        draw_ui_text_italic(fg_verts, supers_flat, cx_badge + 18.0f, cy_badge + 30.0f, 1.35f,
-                            simd_make_float4(0.45f, 0.85f, 1.0f, 0.98f), true);
-        draw_ui_text_italic(fg_verts, "KISMET EVENT: " + cur_ch.level_event,
-                            cx_badge + 18.0f, cy_badge + 45.0f, 1.2f, text_silver, true);
+        draw_multifont_text(tex_batches, fg_verts, f_head_light, ui_font_headline_light_tex,
+                            supers_flat, rx + 2.0f * sx, ry + 35.0f * sy, 19.0f * sy, dark_ink, false);
 
-        // =====================================================================
-        // 4. RIGHT COLUMN: CHAPTER PREVIEW, CHECKPOINTS & STATS (TdLoadLevel)
-        // =====================================================================
-        float rx = w - 434.0f;
-        float ry = 86.0f;
-        float rw = 408.0f;
-        float rh = 566.0f;
-
-        draw_ui_quad(bg_verts, rx, ry, rw, rh, frost_panel);
-        draw_ui_quad(fg_verts, rx, ry, 2.0f, rh, dark_slate);
-        draw_ui_quad(fg_verts, rx + rw - 4.0f, ry, 4.0f, rh, runner_red);
-        draw_ui_quad(fg_verts, rx, ry + rh - 2.0f, rw, 2.0f, dark_slate);
-
-        // Chapter Title Header Bar
-        draw_ui_skew_quad(fg_verts, rx + 10.0f, ry + 10.0f, rw - 24.0f, 32.0f, 8.0f, runner_red);
-        std::string cur_title_upper = cur_ch.map_name;
-        for (char& c : cur_title_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        draw_ui_text_italic(fg_verts, cur_title_upper, rx + 24.0f, ry + 19.0f, 1.95f, pure_white, true);
-
-        // Chapter Halftone Preview Photograph (Maps/Menu/TdMainMenu.me1 -> Level1b_CP1..Level9_CP1)
-        float img_x = rx + 14.0f;
-        float img_y = ry + 50.0f;
-        float img_w = rw - 28.0f;
-        float img_h = 192.0f;
-
-        draw_ui_quad(bg_verts, img_x - 2.0f, img_y - 2.0f, img_w + 4.0f, img_h + 4.0f, dark_slate);
+        // Halftone Chapter Preview Photograph (UI/TdUIResources_CheckpointImages.upk)
+        const float img_x = rx;
+        const float img_y = ry + 64.0f * sy;
+        const float img_w = rw;
+        const float img_h = 184.0f * sy;
+        draw_ui_quad(bg_verts, img_x - 3.0f * sx, img_y - 3.0f * sy, img_w + 6.0f * sx, img_h + 6.0f * sy,
+                     simd_make_float4(1.0f, 1.0f, 1.0f, 0.78f));
         if (ui_chapter_tex[sel]) {
             add_ui_tex_quad(tex_batches, ui_chapter_tex[sel],
                             img_x, img_y, img_w, img_h,
-                            0.0f, 0.05f, 1.0f, 0.98f, pure_white);
-        } else {
-            draw_ui_quad(bg_verts, img_x, img_y, img_w, img_h, simd_make_float4(0.18f, 0.22f, 0.28f, 1.0f));
-        }
-        // Photo caption pill
-        draw_ui_skew_quad(fg_verts, img_x + 8.0f, img_y + img_h - 26.0f, 224.0f, 20.0f, 5.0f,
-                          simd_make_float4(0.06f, 0.08f, 0.11f, 0.88f));
-        draw_ui_text_italic(fg_verts, "PREVIEW: " + cur_ch.preview_tex_name,
-                            img_x + 16.0f, img_y + img_h - 21.0f, 1.3f, pure_white, true);
-
-        // Checkpoints Sub-List (TdLoadCheckpoint / DefaultGame.ini Checkpoints[])
-        float cp_hdr_y = img_y + img_h + 10.0f;
-        draw_ui_skew_quad(bg_verts, rx + 12.0f, cp_hdr_y, rw - 26.0f, 26.0f, 6.0f, dark_slate);
-        draw_ui_text_italic(fg_verts, "CHAPTER CHECKPOINTS  (TDLOADCHECKPOINT)",
-                            rx + 22.0f, cp_hdr_y + 7.0f, 1.5f, pure_white, true);
-
-        size_t max_cp = std::min<size_t>(cur_ch.checkpoints.size(), 5);
-        for (size_t c = 0; c < max_cp; ++c) {
-            const auto& cp = cur_ch.checkpoints[c];
-            float cy = cp_hdr_y + 32.0f + float(c) * 34.0f;
-            bool cp_sel = (c == 0);
-
-            if (cp_sel) {
-                draw_ui_skew_quad(bg_verts, rx + 12.0f, cy, rw - 26.0f, 30.0f, 6.5f, dark_slate);
-                draw_ui_skew_quad(fg_verts, rx + 12.0f, cy, 4.0f, 30.0f, 6.5f, runner_red);
-            } else {
-                draw_ui_skew_quad(bg_verts, rx + 14.0f, cy + 1.0f, rw - 30.0f, 28.0f, 6.0f, frost_row);
-            }
-
-            char badge = static_cast<char>('A' + c);
-            std::string cp_title = std::string("[") + badge + "] " + cp.friendly_name;
-            for (char& ch_c : cp_title) ch_c = static_cast<char>(std::toupper(static_cast<unsigned char>(ch_c)));
-
-            draw_ui_text_italic(fg_verts, cp_title, rx + 22.0f, cy + 4.0f, 1.45f,
-                                cp_sel ? runner_red : text_dark, cp_sel);
-
-            std::string desc = cp.description;
-            if (desc.length() > 44) desc = desc.substr(0, 41) + "...";
-            draw_ui_text_italic(fg_verts, desc, rx + 24.0f, cy + 17.0f, 1.2f,
-                                cp_sel ? pure_white : text_muted, cp_sel);
+                            0.0f, 0.04f, 1.0f, 0.98f, pure_white);
         }
 
-        // Chapter Statistics Footer Card (SpeedRunTime + BagsFound with Icon_Time & Icon_Bag)
-        float st_x = rx + 12.0f;
-        float st_y = ry + rh - 108.0f;
-        float st_w = rw - 24.0f;
-        float st_h = 96.0f;
+        // Compact Speed Run Time & Runner Bags Stats Strip (TdLoadLevel.LevelStatsPanel)
+        const float st_y = img_y + img_h + 12.0f * sy;
+        const float st_h = 56.0f * sy;
+        draw_ui_skew_quad(bg_verts, rx, st_y, rw, st_h, 12.0f * sx, dark_bar);
+        draw_ui_skew_quad(fg_verts, rx, st_y, 4.0f * sx, st_h, 12.0f * sx, runner_red);
 
-        draw_ui_quad(bg_verts, st_x, st_y, st_w, st_h, dark_slate);
-        draw_ui_quad(fg_verts, st_x, st_y, st_w, 3.0f, runner_red);
-
-        // Left Stat: Speed Run Time + Icon_Time (UI/TdUIResources.upk alpha-mask tinted pure white)
         if (ui_time_tex) {
             add_ui_tex_quad(tex_batches, ui_time_tex,
-                            st_x + 10.0f, st_y + 14.0f, 36.0f, 36.0f,
+                            rx + 18.0f * sx, st_y + 10.0f * sy, 34.0f * sy, 34.0f * sy,
                             0.0f, 0.0f, 1.0f, 1.0f,
-                            simd_make_float4(1.0f, 1.0f, 1.0f, -1.0f));
+                            simd_make_float4(1.0f, 1.0f, 1.0f, -0.95f));
         }
-        draw_ui_text_italic(fg_verts, "QUALIFYING TIME", st_x + 52.0f, st_y + 14.0f, 1.35f, text_silver, true);
-        draw_ui_text_italic(fg_verts, cur_ch.speedrun_target_time, st_x + 52.0f, st_y + 30.0f, 2.05f, pure_white, true);
-        draw_ui_text_italic(fg_verts, "BEST TIME:  05:14:82", st_x + 14.0f, st_y + 58.0f, 1.45f, runner_red, true);
-        draw_ui_text_italic(fg_verts, "SPEED RUN:  UNLOCKED", st_x + 14.0f, st_y + 76.0f, 1.3f, text_silver, true);
+        draw_multifont_text(tex_batches, fg_verts, f_sml_italic, ui_font_small_italic_tex,
+                            main_menu.config().speed_run_time_label,
+                            rx + 58.0f * sx, st_y + 9.0f * sy, 12.5f * sy,
+                            simd_make_float4(0.76f, 0.81f, 0.88f, 0.95f), true);
+        draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
+                            cur_ch.speedrun_target_time,
+                            rx + 58.0f * sx, st_y + 24.0f * sy, 20.0f * sy, pure_white, true);
 
-        // Divider
-        draw_ui_quad(fg_verts, st_x + st_w * 0.54f, st_y + 12.0f, 2.0f, st_h - 24.0f,
-                     simd_make_float4(0.25f, 0.29f, 0.35f, 0.9f));
-
-        // Right Stat: Runner Bags Found + Icon_Bag (UI/TdUIResources.upk alpha-mask tinted Runner Gold)
-        float bag_x = st_x + st_w * 0.57f;
+        const float bag_x = rx + rw * 0.56f;
         if (ui_bag_tex) {
             add_ui_tex_quad(tex_batches, ui_bag_tex,
-                            bag_x, st_y + 12.0f, 40.0f, 40.0f,
+                            bag_x, st_y + 10.0f * sy, 34.0f * sy, 34.0f * sy,
                             0.0f, 0.0f, 1.0f, 1.0f,
-                            simd_make_float4(1.0f, 0.85f, 0.20f, -1.0f));
+                            simd_make_float4(1.0f, 0.84f, 0.16f, -0.98f));
         }
-        int bags_found = std::clamp(telemetry.bags_collected, 1, 3);
-        draw_ui_text_italic(fg_verts, "BAGS FOUND", bag_x + 46.0f, st_y + 14.0f, 1.35f, text_silver, true);
+        const int bags_found = std::clamp(telemetry.bags_collected, 1, 3);
+        draw_multifont_text(tex_batches, fg_verts, f_sml_italic, ui_font_small_italic_tex,
+                            main_menu.config().bags_found_label,
+                            bag_x + 42.0f * sx, st_y + 9.0f * sy, 12.5f * sy,
+                            simd_make_float4(0.76f, 0.81f, 0.88f, 0.95f), true);
         std::string bag_str = std::to_string(bags_found) + " / 3";
-        draw_ui_text_italic(fg_verts, bag_str, bag_x + 46.0f, st_y + 31.0f, 2.15f,
-                            simd_make_float4(1.0f, 0.86f, 0.22f, 1.0f), true);
+        draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
+                            bag_str, bag_x + 42.0f * sx, st_y + 24.0f * sy, 20.0f * sy,
+                            simd_make_float4(1.0f, 0.85f, 0.18f, 1.0f), true);
 
-        // 3 Runner Bag Slot Indicators
-        for (int b = 0; b < 3; ++b) {
-            bool collected = (b < bags_found);
-            float bx = bag_x + float(b) * 48.0f;
-            float by = st_y + 62.0f;
-            draw_ui_skew_quad(fg_verts, bx, by, 40.0f, 20.0f, 4.0f,
-                              collected ? runner_red : simd_make_float4(0.20f, 0.24f, 0.30f, 0.95f));
-            draw_ui_text_italic(fg_verts, collected ? "BAG" : "---", bx + 7.0f, by + 5.0f, 1.25f, pure_white, true);
+        // =====================================================================
+        // 4. LOWER-THIRD 4 ICONIC MIRROR'S EDGE CATEGORY COLUMNS (TdMainMenu)
+        //    Exact X coordinates from TdUI_FrontEnd.upk: 96, 368, 640, 912 .. 1184
+        // =====================================================================
+        const float nav_y = 528.0f * sy;
+        const float nav_h = 62.0f * sy;
+        const float col_w = 272.0f * sx;
+        static const char* kNavCaptions[4] = {"STORY", "RACE", "OPTIONS", "EXTRAS"};
+
+        for (int c = 0; c < 4; ++c) {
+            const float cx = (96.0f + float(c) * 272.0f) * sx;
+            const bool active = (c == 0);
+            draw_ui_skew_quad(bg_verts, cx, nav_y, col_w - 6.0f * sx, nav_h, 14.0f * sx,
+                              active ? runner_red : col_veil);
+            draw_ui_skew_quad(fg_verts, cx, nav_y, 3.0f * sx, nav_h, 14.0f * sx,
+                              active ? pure_white : dark_ink);
+
+            const std::string& cap = (c < static_cast<int>(main_menu.tabs().size()))
+                ? main_menu.tabs()[c].caption
+                : std::string(kNavCaptions[c]);
+            draw_multifont_text(tex_batches, fg_verts,
+                                active ? f_head_thick : f_head_light,
+                                active ? ui_font_headline_thick_tex : ui_font_headline_light_tex,
+                                cap,
+                                cx + 22.0f * sx,
+                                nav_y + (active ? 16.0f : 18.0f) * sy,
+                                (active ? 28.0f : 25.0f) * sy,
+                                active ? pure_white : dark_ink,
+                                active);
         }
 
         // =====================================================================
-        // 5. BOTTOM ACTION CALLOUT BUTTONS (TdUIScene ButtonBar)
+        // 5. BOTTOM SAFE-REGION BUTTON BAR (TdUIButtonBar at y = 635.4..666)
         // =====================================================================
-        float btn_y = h - 52.0f;
-        draw_ui_skew_quad(fg_verts, 424.0f, btn_y, 250.0f, 36.0f, 8.0f, runner_red);
-        draw_ui_text_italic(fg_verts, "[ENTER] LAUNCH CHAPTER", 442.0f, btn_y + 11.0f, 1.75f, pure_white, true);
+        const float btn_y = 636.0f * sy;
+        const float btn_h = 30.0f * sy;
 
-        draw_ui_skew_quad(fg_verts, 688.0f, btn_y, 262.0f, 36.0f, 8.0f, dark_slate);
-        draw_ui_text_italic(fg_verts, "[UP / DOWN] SELECT CHAPTER", 704.0f, btn_y + 11.0f, 1.70f, pure_white, true);
+        draw_ui_skew_quad(bg_verts, 628.0f * sx, btn_y, 556.0f * sx, btn_h, 7.0f * sx, dark_bar);
+        draw_ui_skew_quad(fg_verts, 628.0f * sx, btn_y, 4.0f * sx, btn_h, 7.0f * sx, runner_red);
 
-        draw_ui_skew_quad(fg_verts, 964.0f, btn_y, 266.0f, 36.0f, 8.0f, dark_slate);
-        draw_ui_text_italic(fg_verts, "[TAB / ESC] RESUME GAME", 982.0f, btn_y + 11.0f, 1.70f, pure_white, true);
+        draw_multifont_text(tex_batches, fg_verts, f_med_italic, ui_font_medium_italic_tex,
+                            "[ENTER] PLAY CHAPTER      [UP / DOWN] SELECT      [ESC] RESUME",
+                            646.0f * sx, btn_y + 6.5f * sy, 15.0f * sy, pure_white, true);
+    }
+
+    std::string config_title_or(const char* fallback) const {
+        const std::string& t = main_menu.config().load_chapter_title;
+        return t.empty() ? std::string(fallback) : t;
     }
 
     void draw_hud(std::vector<HUDVertex>& verts, const LevelScene& scene, const PlayerTelemetry& telemetry) {
@@ -2251,13 +2246,13 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.aspect = aspect;
         uniforms.cam_up = simd_make_float3(up.x, up.y, up.z);
 
-        // Directional Sun Orthographic Shadow Matrix (4096x4096 covering 7200x7200 UU around view frustum)
+        // Directional Sun Orthographic Shadow Matrix (4096x4096 covering view frustum)
         {
-            constexpr float kShadowExtent = 3600.0f;
-            constexpr float kTexelWorld = (kShadowExtent * 2.0f) / 4096.0f;
+            const float kShadowExtent = in_main_menu ? 2400.0f : 3600.0f;
+            const float kTexelWorld = (kShadowExtent * 2.0f) / 4096.0f;
             Vec3 flat_fwd(fwd.x, fwd.y, 0.0f);
             if (flat_fwd.length() > 1e-3f) flat_fwd = flat_fwd.normalized();
-            Vec3 sh_center = cam_pos + flat_fwd * 1300.0f;
+            Vec3 sh_center = in_main_menu ? Vec3(0.0f, 0.0f, 120.0f) : (cam_pos + flat_fwd * 1300.0f);
             sh_center.x = std::floor(sh_center.x / kTexelWorld) * kTexelWorld;
             sh_center.y = std::floor(sh_center.y / kTexelWorld) * kTexelWorld;
             sh_center.z = std::floor(sh_center.z / kTexelWorld) * kTexelWorld;
@@ -2271,7 +2266,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.mod_shadow_color = simd_make_float3(active_scene.mod_shadow_color.x,
                                                      active_scene.mod_shadow_color.y,
                                                      active_scene.mod_shadow_color.z);
-        uniforms.shadow_enabled = in_main_menu ? 0.0f : 1.0f;
+        uniforms.shadow_enabled = in_main_menu ? 2.0f : 1.0f;
 
         // ---------------------------------------------------------------------
         // Mirror's Edge materials: make the scene's material library resident
@@ -2281,7 +2276,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         impl_->sync_material_library(active_scene.materials);
         bool has_translucent = false;
         bool needs_scene_copies = false;
-        if (impl_->mat_lib && !in_main_menu) {
+        if (impl_->mat_lib) {
             for (const auto& mesh : active_scene.meshes) {
                 for (const auto& s : mesh.sections) {
                     const MaterialShader* sh = nullptr;
@@ -2347,7 +2342,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // ---------------------------------------------------------------------
         // Pass 0: Real-Time Directional Sun Shadow Map (4096x4096 Depth)
         // ---------------------------------------------------------------------
-        if (impl_->shadow_depth_tex && impl_->shadow_pipeline && !in_main_menu) {
+        if (impl_->shadow_depth_tex && impl_->shadow_pipeline) {
             MTLRenderPassDescriptor* shadowPass = [MTLRenderPassDescriptor renderPassDescriptor];
             shadowPass.depthAttachment.texture = impl_->shadow_depth_tex;
             shadowPass.depthAttachment.loadAction = MTLLoadActionClear;
@@ -2377,8 +2372,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 for (const auto& s : mesh.sections) {
                     if (!section_in_range(mesh, s)) continue;
                     const MaterialShader* sh = nullptr;
-                    impl_->section_pipeline(s, &sh, nullptr);
+                    const SceneMaterial* m = nullptr;
+                    impl_->section_pipeline(s, &sh, &m);
                     if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
+                    if (m && (m->name.find("Skydome") != std::string::npos || m->name.find("skydome") != std::string::npos)) continue;
                     [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
                 }
             }
@@ -2457,36 +2454,6 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
                     continue;
                 }
-                if (in_main_menu) {
-                    // For TdMainMenu.me1's 3D City of Glass, use directional Sun + Beast azure sky-bounce
-                    // + Runner Vision Scarlet Red highlighting on the selected chapter's MI_SP0*_01 section.
-                    [enc setRenderPipelineState:impl_->world_pipeline];
-                    [enc setCullMode:MTLCullModeNone];
-                    for (const auto& s : mesh.sections) {
-                        if (!section_in_range(mesh, s)) continue;
-                        std::string mname;
-                        if (active_scene.materials && s.material >= 0 &&
-                            static_cast<size_t>(s.material) < active_scene.materials->materials.size()) {
-                            mname = active_scene.materials->materials[static_cast<size_t>(s.material)].name;
-                            for (char& c : mname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        }
-                        bool is_sel_district = (!active_mi_tag.empty() && mname.find(active_mi_tag) != std::string::npos);
-                        uniforms.is_runner_vision = is_sel_district ? 1.0f : 0.0f;
-                        if (mname.find("water") != std::string::npos) {
-                            uniforms.actor_tint = simd_make_float3(0.22f, 0.56f, 0.90f);
-                        } else if (mname.find("mountain") != std::string::npos) {
-                            uniforms.actor_tint = simd_make_float3(0.76f, 0.84f, 0.94f);
-                        } else {
-                            uniforms.actor_tint = simd_make_float3(0.96f, 0.97f, 0.99f);
-                        }
-                        [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                        [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
-                    }
-                    uniforms.is_runner_vision = 0.0f;
-                    uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
-                    continue;
-                }
                 // Opaque + masked material sections (UE3 base pass). Translucent ones are deferred.
                 for (const auto& s : mesh.sections) {
                     if (!section_in_range(mesh, s)) continue;
@@ -2496,8 +2463,20 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     if (ps && mat_blend_is_translucent(sh->blend)) continue;
                     if (ps) {
                         [enc setRenderPipelineState:ps];
-                        [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided) ? MTLCullModeBack : MTLCullModeNone];
+                        [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided && !in_main_menu) ? MTLCullModeBack : MTLCullModeNone];
                         impl_->bind_material(enc, *m, *sh);
+                        if (in_main_menu && sh->num_uniforms > 0 && !active_mi_tag.empty()) {
+                            std::string mname = m->name;
+                            for (char& c : mname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                            if (mname.find(active_mi_tag) != std::string::npos) {
+                                std::vector<std::array<float, 4>> dyn_u = m->uniforms;
+                                dyn_u.resize(static_cast<size_t>(sh->num_uniforms), {0.0f, 0.0f, 0.0f, 0.0f});
+                                dyn_u[0][0] = 1.0f; // UE3 MaterialInstanceConstant scalar parameter 'Selected' = 1.0
+                                [enc setFragmentBytes:dyn_u.data()
+                                               length:static_cast<NSUInteger>(sh->num_uniforms) * 16
+                                              atIndex:matbind::kMaterialBuffer];
+                            }
+                        }
                     } else {
                         [enc setRenderPipelineState:impl_->world_pipeline];
                         [enc setCullMode:MTLCullModeNone];
