@@ -1,6 +1,7 @@
 #include "metal_renderer.hpp"
 #include "../anim/anim_system.hpp"
 #include "../assets/scene_materials.hpp"
+#include "../ui/main_menu.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -533,6 +534,42 @@ vertex HUDVertexOut hud_vertex(HUDVertexIn in [[stage_in]],
 fragment float4 hud_fragment(HUDVertexOut in [[stage_in]]) {
     return in.color;
 }
+
+// -----------------------------------------------------------------------------
+// 6. Textured 2D UI Pipeline (TdUIScene / UI/TdUIResources.upk / TdMainMenu.me1)
+// -----------------------------------------------------------------------------
+struct UITexVertexIn {
+    float2 position [[attribute(0)]];
+    float2 uv       [[attribute(1)]];
+    float4 color    [[attribute(2)]];
+};
+
+struct UITexVertexOut {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+};
+
+vertex UITexVertexOut ui_tex_vertex(UITexVertexIn in [[stage_in]],
+                                    constant float2& screen_size [[buffer(1)]]) {
+    UITexVertexOut out;
+    out.position = float4((in.position.x / screen_size.x) * 2.0 - 1.0,
+                          1.0 - (in.position.y / screen_size.y) * 2.0,
+                          0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+fragment float4 ui_tex_fragment(UITexVertexOut in [[stage_in]],
+                                texture2d<float> tex [[texture(0)]],
+                                sampler samp [[sampler(0)]]) {
+    float4 s = tex.sample(samp, in.uv);
+    if (in.color.w < 0.0) {
+        return float4(in.color.rgb, s.a * (-in.color.w));
+    }
+    return s * in.color;
+}
 )msl";
 
 // -----------------------------------------------------------------------------
@@ -573,6 +610,12 @@ struct FrameUniformsGPU {
 
 struct HUDVertex {
     simd_float2 position;
+    simd_float4 color;
+};
+
+struct UITexVertex {
+    simd_float2 position;
+    simd_float2 uv;
     simd_float4 color;
 };
 
@@ -689,6 +732,7 @@ struct MetalRenderer::Impl {
     id<MTLRenderPipelineState> viewmodel_pipeline = nil;
     id<MTLRenderPipelineState> post_pipeline = nil;
     id<MTLRenderPipelineState> hud_pipeline = nil;
+    id<MTLRenderPipelineState> ui_tex_pipeline = nil;
 
     // Depth Stencil States
     id<MTLDepthStencilState> depth_write_state = nil;
@@ -710,9 +754,22 @@ struct MetalRenderer::Impl {
     bool initialized = false;
     uint64_t frame_index = 0;
 
-    // Menu state
+    // Menu state & Frontend UI System (TdMainMenu.me1 + UI/TdUI_FrontEnd.upk)
     bool menu_open = false;
     int selected_chapter = 1;
+    MainMenuSystem main_menu;
+    bool main_menu_gpu_ready = false;
+    id<MTLTexture> ui_logo_tex = nil;
+    id<MTLTexture> ui_bag_tex = nil;
+    id<MTLTexture> ui_time_tex = nil;
+    id<MTLTexture> ui_panel_bg_tex = nil;
+    id<MTLTexture> ui_faith_art_tex = nil;
+    id<MTLTexture> ui_chapter_tex[10] = {nil};
+
+    struct UITextureBatch {
+        id<MTLTexture> tex = nil;
+        std::vector<UITexVertex> verts;
+    };
 
     // Procedural Fallback Cityscape Meshes
     std::vector<Vertex> rooftop_mesh;
@@ -1218,6 +1275,39 @@ struct MetalRenderer::Impl {
         hud_pipeline = [device newRenderPipelineStateWithDescriptor:hudDesc error:&error];
         if (!hud_pipeline) return false;
 
+        // 6. Textured 2D UI Pipeline (TdUIScene / UI/TdUIResources.upk)
+        id<MTLFunction> uiTexVert = [shader_library newFunctionWithName:@"ui_tex_vertex"];
+        id<MTLFunction> uiTexFrag = [shader_library newFunctionWithName:@"ui_tex_fragment"];
+
+        MTLVertexDescriptor* uiTexVertexDesc = [MTLVertexDescriptor vertexDescriptor];
+        uiTexVertexDesc.attributes[0].format = MTLVertexFormatFloat2;
+        uiTexVertexDesc.attributes[0].offset = offsetof(UITexVertex, position);
+        uiTexVertexDesc.attributes[0].bufferIndex = 0;
+        uiTexVertexDesc.attributes[1].format = MTLVertexFormatFloat2;
+        uiTexVertexDesc.attributes[1].offset = offsetof(UITexVertex, uv);
+        uiTexVertexDesc.attributes[1].bufferIndex = 0;
+        uiTexVertexDesc.attributes[2].format = MTLVertexFormatFloat4;
+        uiTexVertexDesc.attributes[2].offset = offsetof(UITexVertex, color);
+        uiTexVertexDesc.attributes[2].bufferIndex = 0;
+        uiTexVertexDesc.layouts[0].stride = sizeof(UITexVertex);
+        uiTexVertexDesc.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
+
+        MTLRenderPipelineDescriptor* uiTexDesc = [[MTLRenderPipelineDescriptor alloc] init];
+        uiTexDesc.vertexFunction = uiTexVert;
+        uiTexDesc.fragmentFunction = uiTexFrag;
+        uiTexDesc.vertexDescriptor = uiTexVertexDesc;
+        uiTexDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        uiTexDesc.colorAttachments[0].blendingEnabled = YES;
+        uiTexDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        uiTexDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        uiTexDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        uiTexDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+        uiTexDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        uiTexDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+
+        ui_tex_pipeline = [device newRenderPipelineStateWithDescriptor:uiTexDesc error:&error];
+        if (!ui_tex_pipeline) return false;
+
         // Depth Stencil States
         MTLDepthStencilDescriptor* dsWrite = [[MTLDepthStencilDescriptor alloc] init];
         dsWrite.depthCompareFunction = MTLCompareFunctionLessEqual;
@@ -1440,6 +1530,23 @@ struct MetalRenderer::Impl {
         }
     }
 
+    void ensure_main_menu_loaded() {
+        if (!main_menu.is_loaded()) {
+            main_menu.init("/Users/tomnom/mirrorsedge");
+        }
+        if (!main_menu_gpu_ready) {
+            ui_logo_tex      = upload_scene_texture(main_menu.logo_texture());
+            ui_bag_tex       = upload_scene_texture(main_menu.icon_bag_texture());
+            ui_time_tex      = upload_scene_texture(main_menu.icon_time_texture());
+            ui_panel_bg_tex  = upload_scene_texture(main_menu.panel_bg_texture());
+            ui_faith_art_tex = upload_scene_texture(main_menu.faith_art_texture());
+            for (int i = 0; i < 10; ++i) {
+                ui_chapter_tex[i] = upload_scene_texture(main_menu.chapter_preview_texture(i));
+            }
+            main_menu_gpu_ready = true;
+        }
+    }
+
     void draw_ui_quad(std::vector<HUDVertex>& verts, float x, float y, float w, float h, simd_float4 color) {
         HUDVertex v0 = {{x, y}, color};
         HUDVertex v1 = {{x + w, y}, color};
@@ -1449,13 +1556,44 @@ struct MetalRenderer::Impl {
         verts.push_back(v0); verts.push_back(v2); verts.push_back(v3);
     }
 
+    // Forward-slanted parallelogram matching Mirror's Edge TdUIScene / StickSlant UI bars
+    void draw_ui_skew_quad(std::vector<HUDVertex>& verts, float x, float y, float w, float h,
+                           float slant_dx, simd_float4 color) {
+        HUDVertex v0 = {{x + slant_dx, y}, color};
+        HUDVertex v1 = {{x + w + slant_dx, y}, color};
+        HUDVertex v2 = {{x + w, y + h}, color};
+        HUDVertex v3 = {{x, y + h}, color};
+        verts.push_back(v0); verts.push_back(v1); verts.push_back(v2);
+        verts.push_back(v0); verts.push_back(v2); verts.push_back(v3);
+    }
+
+    void add_ui_tex_quad(std::vector<UITextureBatch>& batches, id<MTLTexture> tex,
+                         float x, float y, float w, float h,
+                         float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f,
+                         simd_float4 tint = simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f)) {
+        if (!tex) return;
+        UITextureBatch* batch = nullptr;
+        if (!batches.empty() && batches.back().tex == tex) {
+            batch = &batches.back();
+        } else {
+            batches.push_back(UITextureBatch{tex, {}});
+            batch = &batches.back();
+        }
+        UITexVertex p0 = {{x,     y},     {u0, v0}, tint};
+        UITexVertex p1 = {{x + w, y},     {u1, v0}, tint};
+        UITexVertex p2 = {{x + w, y + h}, {u1, v1}, tint};
+        UITexVertex p3 = {{x,     y + h}, {u0, v1}, tint};
+        batch->verts.push_back(p0); batch->verts.push_back(p1); batch->verts.push_back(p2);
+        batch->verts.push_back(p0); batch->verts.push_back(p2); batch->verts.push_back(p3);
+    }
+
     void draw_ui_text_raw(std::vector<HUDVertex>& verts, const std::string& text, float start_x, float start_y,
-                          float scale, simd_float4 color) {
+                          float scale, simd_float4 color, float italic_shear = 0.0f) {
         float cur_x = start_x;
         float cur_y = start_y;
         float char_w = 5.0f * scale;
         float char_h = 7.0f * scale;
-        float spacing = 1.0f * scale;
+        float spacing = 1.15f * scale;
 
         for (char ch : text) {
             if (ch == '\n') {
@@ -1470,7 +1608,8 @@ struct MetalRenderer::Impl {
                 uint8_t line = FONT_5X7[idx][col];
                 for (int row = 0; row < 7; ++row) {
                     if ((line >> row) & 1) {
-                        float px = cur_x + col * scale;
+                        float shear_x = (6.0f - float(row)) * scale * italic_shear;
+                        float px = cur_x + col * scale + shear_x;
                         float py = cur_y + row * scale;
                         draw_ui_quad(verts, px, py, scale, scale, color);
                     }
@@ -1484,8 +1623,18 @@ struct MetalRenderer::Impl {
                       float scale, simd_float4 color) {
         // High-contrast dark drop shadow for 100% legibility over bright sky & white rooftops
         simd_float4 shadow_col = simd_make_float4(0.02f, 0.03f, 0.05f, color.w * 0.85f);
-        draw_ui_text_raw(verts, text, start_x + 1.5f, start_y + 1.5f, scale, shadow_col);
-        draw_ui_text_raw(verts, text, start_x, start_y, scale, color);
+        draw_ui_text_raw(verts, text, start_x + 1.5f, start_y + 1.5f, scale, shadow_col, 0.0f);
+        draw_ui_text_raw(verts, text, start_x, start_y, scale, color, 0.0f);
+    }
+
+    // Forward-slanted italic sans-serif typography matching UI_Fonts_Final.Menus.Fonts_Positec
+    void draw_ui_text_italic(std::vector<HUDVertex>& verts, const std::string& text, float start_x, float start_y,
+                             float scale, simd_float4 color, bool dark_shadow = true, float shear = 0.22f) {
+        if (dark_shadow) {
+            simd_float4 shadow_col = simd_make_float4(0.02f, 0.03f, 0.05f, color.w * 0.82f);
+            draw_ui_text_raw(verts, text, start_x + 1.4f, start_y + 1.4f, scale, shadow_col, shear);
+        }
+        draw_ui_text_raw(verts, text, start_x, start_y, scale, color, shear);
     }
 
     void draw_ui_reticle(std::vector<HUDVertex>& verts, float cx, float cy, bool is_target, float pulse) {
@@ -1503,6 +1652,305 @@ struct MetalRenderer::Impl {
         draw_ui_quad(verts, cx + d, cy - 1.0f, len, 2.0f, color);
         draw_ui_quad(verts, cx - 1.0f, cy - d - len, 2.0f, len, color);
         draw_ui_quad(verts, cx - 1.0f, cy + d, 2.0f, len, color);
+    }
+
+    // -------------------------------------------------------------------------
+    // Authentic Mirror's Edge Frontend UI (TdMainMenu + TdLoadLevel + TdLoadCheckpoint)
+    // Rendered over the live 3D City of Glass (Maps/Menu/TdMainMenu.me1)
+    // -------------------------------------------------------------------------
+    void draw_main_menu_ui(std::vector<HUDVertex>& bg_verts,
+                           std::vector<UITextureBatch>& tex_batches,
+                           std::vector<HUDVertex>& fg_verts,
+                           const PlayerTelemetry& telemetry) {
+        bg_verts.clear();
+        tex_batches.clear();
+        fg_verts.clear();
+
+        float w = float(width);
+        float h = float(height);
+
+        const simd_float4 runner_red   = simd_make_float4(0.902f, 0.078f, 0.078f, 0.96f); // #E61414
+        const simd_float4 dark_slate   = simd_make_float4(0.09f,  0.11f,  0.14f,  0.94f); // #171C24
+        const simd_float4 frost_panel  = simd_make_float4(0.94f,  0.96f,  0.98f,  0.86f);
+        const simd_float4 frost_row    = simd_make_float4(0.84f,  0.87f,  0.91f,  0.82f);
+        const simd_float4 pure_white   = simd_make_float4(1.0f,   1.0f,   1.0f,   1.0f);
+        const simd_float4 text_dark    = simd_make_float4(0.09f,  0.11f,  0.15f,  0.98f);
+        const simd_float4 text_muted   = simd_make_float4(0.32f,  0.37f,  0.44f,  0.95f);
+        const simd_float4 text_silver  = simd_make_float4(0.82f,  0.86f,  0.92f,  0.95f);
+
+        // =====================================================================
+        // 1. TOP HEADER BAR (TdMainMenu Navigation Strip + StartTitleImage Logo)
+        // =====================================================================
+        draw_ui_skew_quad(bg_verts, 20.0f, 16.0f, w - 40.0f, 56.0f, 12.0f, frost_panel);
+        draw_ui_skew_quad(fg_verts, 20.0f, 70.0f, w - 40.0f, 3.0f,  1.0f,  runner_red);
+        draw_ui_skew_quad(fg_verts, 32.0f, 16.0f, w - 40.0f, 2.0f,  1.0f,  dark_slate);
+
+        // Left Logo Block (Dark charcoal skewed badge + StartTitleImage / Runner Star)
+        draw_ui_skew_quad(bg_verts, 26.0f, 20.0f, 212.0f, 48.0f, 10.0f, dark_slate);
+        draw_ui_skew_quad(fg_verts, 26.0f, 20.0f, 5.0f,   48.0f, 10.0f, runner_red);
+        if (ui_logo_tex) {
+            // Render authentic StartTitleImage Runner Star using alpha-mask tint mode (-1.0 alpha)
+            add_ui_tex_quad(tex_batches, ui_logo_tex, 38.0f, 22.0f, 44.0f, 44.0f,
+                            0.0f, 0.0f, 0.24f, 1.0f,
+                            simd_make_float4(0.95f, 0.10f, 0.10f, -1.0f));
+        }
+        draw_ui_text_italic(fg_verts, "MIRROR'S", 90.0f, 27.0f, 1.9f, pure_white, true);
+        draw_ui_text_italic(fg_verts, "EDGE",     90.0f, 45.0f, 2.1f, runner_red, true);
+
+        // 4 Main Menu Category Tabs (TdGameUI.int [TdUIScene_MainMenu])
+        static const char* MENU_TABS[4] = {"STORY", "RACE", "OPTIONS", "EXTRAS"};
+        float tab_x = 256.0f;
+        for (int t = 0; t < 4; ++t) {
+            bool is_active_tab = (t == 0); // STORY tab active
+            float tab_w = (t == 2) ? 132.0f : 114.0f;
+            draw_ui_skew_quad(bg_verts, tab_x, 25.0f, tab_w, 38.0f, 9.0f,
+                              is_active_tab ? runner_red : frost_row);
+            draw_ui_text_italic(fg_verts, MENU_TABS[t], tab_x + 22.0f, 37.0f, 2.0f,
+                                is_active_tab ? pure_white : text_dark, is_active_tab);
+            tab_x += tab_w + 12.0f;
+        }
+
+        // Top-Right Scene & Camera Breadcrumb
+        int sel = std::clamp(selected_chapter, 0, 9);
+        const MenuChapterEntry& cur_ch = main_menu.get_chapter(sel);
+
+        draw_ui_text_italic(fg_verts, "STORY  /  LOAD CHAPTER", w - 434.0f, 26.0f, 1.95f, text_dark, false);
+        std::string map_crumb = "3D CITY: TDMAINMENU.ME1 | " + cur_ch.map_filename;
+        for (char& c : map_crumb) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        draw_ui_text_italic(fg_verts, map_crumb, w - 434.0f, 49.0f, 1.25f, text_muted, false);
+
+        // =====================================================================
+        // 2. LEFT COLUMN: STORY SUBMENU & 10-CHAPTER SELECTOR (TdLoadLevel)
+        // =====================================================================
+        float lx = 26.0f;
+        float ly = 86.0f;
+        float lw = 382.0f;
+        float lh = 566.0f;
+
+        draw_ui_quad(bg_verts, lx, ly, lw, lh, frost_panel);
+        draw_ui_quad(fg_verts, lx, ly, 4.0f, lh, runner_red);
+        draw_ui_quad(fg_verts, lx + lw - 2.0f, ly, 2.0f, lh, dark_slate);
+        draw_ui_quad(fg_verts, lx, ly + lh - 2.0f, lw, 2.0f, dark_slate);
+
+        // Subtle Faith Vector Art Watermark (UI/TdUIResources_FrontEnd.upk -> T_Faith_03)
+        if (ui_faith_art_tex) {
+            add_ui_tex_quad(tex_batches, ui_faith_art_tex,
+                            lx + 10.0f, ly + lh - 290.0f, 280.0f, 280.0f,
+                            0.0f, 0.0f, 1.0f, 1.0f,
+                            simd_make_float4(1.0f, 1.0f, 1.0f, 0.16f));
+        }
+
+        // Section Header
+        draw_ui_skew_quad(bg_verts, lx + 12.0f, ly + 10.0f, lw - 24.0f, 30.0f, 7.0f, dark_slate);
+        draw_ui_text_italic(fg_verts, "SELECT CHAPTER", lx + 26.0f, ly + 18.0f, 1.85f, pure_white, true);
+        draw_ui_text_italic(fg_verts, "CAMPAIGN", lx + lw - 118.0f, ly + 19.0f, 1.6f, runner_red, true);
+
+        // 10 Playable Chapters (Prologue + Chapters 1..9 from UIDataProvider_TdMaps)
+        for (int i = 0; i < 10; ++i) {
+            const MenuChapterEntry& ch = main_menu.get_chapter(i);
+            float row_y = ly + 48.0f + float(i) * 43.0f;
+            bool is_sel = (i == sel);
+
+            if (is_sel) {
+                // Active Chapter: Forward-slanted Scarlet Red parallelogram bar
+                draw_ui_skew_quad(fg_verts, lx + 8.0f, row_y, lw - 14.0f, 38.0f, 9.0f, runner_red);
+                draw_ui_skew_quad(fg_verts, lx + 8.0f, row_y, 5.0f, 38.0f, 9.0f, pure_white);
+
+                std::string label = "> " + ch.map_name;
+                for (char& c : label) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                draw_ui_text_italic(fg_verts, label, lx + 22.0f, row_y + 7.0f, 1.85f, pure_white, true);
+
+                std::string sub = "MAP: " + ch.map_filename + " | " +
+                                  std::to_string(ch.checkpoints.size()) + " CHECKPOINTS";
+                for (char& c : sub) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                draw_ui_text_italic(fg_verts, sub, lx + 22.0f, row_y + 24.0f, 1.15f,
+                                    simd_make_float4(1.0f, 0.92f, 0.92f, 0.96f), true);
+            } else {
+                // Unselected Chapter: Frosted slate parallelogram with high-contrast dark text
+                draw_ui_skew_quad(bg_verts, lx + 14.0f, row_y + 3.0f, lw - 26.0f, 33.0f, 7.5f, frost_row);
+                draw_ui_skew_quad(fg_verts, lx + 14.0f, row_y + 3.0f, 3.0f, 33.0f, 7.5f, dark_slate);
+                std::string ch_upper = ch.map_name;
+                for (char& c : ch_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                draw_ui_text_italic(fg_verts, ch_upper, lx + 26.0f, row_y + 13.0f, 1.68f, text_dark, false);
+            }
+        }
+
+        // Tutorial Row + Runner Vision Status Footer inside Left Panel
+        float tut_y = ly + 48.0f + 10.0f * 43.0f + 4.0f;
+        draw_ui_skew_quad(bg_verts, lx + 14.0f, tut_y, lw - 26.0f, 28.0f, 6.0f,
+                          simd_make_float4(0.16f, 0.19f, 0.24f, 0.88f));
+        draw_ui_text_italic(fg_verts, "TRAINING: TUTORIAL_P.ME1 (RUNNER BASICS)",
+                            lx + 24.0f, tut_y + 8.0f, 1.4f, text_silver, true);
+
+        draw_ui_quad(bg_verts, lx + 10.0f, ly + lh - 46.0f, lw - 20.0f, 36.0f, dark_slate);
+        draw_ui_text_italic(fg_verts, "RUNNER VISION: FULL RED HIGHLIGHT",
+                            lx + 20.0f, ly + lh - 39.0f, 1.35f, pure_white, true);
+        std::string mi_upper = cur_ch.material_instance_tag;
+        for (char& c : mi_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        draw_ui_text_italic(fg_verts, "3D DISTRICT PARAM: " + mi_upper + " [SELECTED=1]",
+                            lx + 20.0f, ly + lh - 23.0f, 1.25f, runner_red, true);
+
+        // =====================================================================
+        // 3. CENTER VIEWPORT: 3D CITY OF GLASS CALLOUT (TdSupersMessage)
+        // =====================================================================
+        // Keep the center of the screen open so TdMainMenu.me1's 3D skyscrapers
+        // and the Runner Vision Red highlighted district shine unobstructed!
+        float cx_badge = 424.0f;
+        float cy_badge = h - 128.0f;
+        float cw_badge = 384.0f;
+        float ch_badge = 60.0f;
+
+        draw_ui_skew_quad(bg_verts, cx_badge, cy_badge, cw_badge, ch_badge, 12.0f,
+                          simd_make_float4(0.06f, 0.08f, 0.11f, 0.84f));
+        draw_ui_skew_quad(fg_verts, cx_badge, cy_badge, 5.0f, ch_badge, 12.0f, runner_red);
+
+        std::string dist_hdr = "CITY OF GLASS  //  " + cur_ch.map_name;
+        for (char& c : dist_hdr) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        draw_ui_text_italic(fg_verts, dist_hdr, cx_badge + 18.0f, cy_badge + 10.0f, 1.6f, pure_white, true);
+
+        // Flatten newlines in TdSupersMessage into single-line telemetry string
+        std::string supers_flat = cur_ch.district_timestamp;
+        for (char& c : supers_flat) {
+            if (c == '\n') c = ' ';
+        }
+        if (supers_flat.length() > 44) supers_flat = supers_flat.substr(0, 44);
+        draw_ui_text_italic(fg_verts, supers_flat, cx_badge + 18.0f, cy_badge + 30.0f, 1.35f,
+                            simd_make_float4(0.45f, 0.85f, 1.0f, 0.98f), true);
+        draw_ui_text_italic(fg_verts, "KISMET EVENT: " + cur_ch.level_event,
+                            cx_badge + 18.0f, cy_badge + 45.0f, 1.2f, text_silver, true);
+
+        // =====================================================================
+        // 4. RIGHT COLUMN: CHAPTER PREVIEW, CHECKPOINTS & STATS (TdLoadLevel)
+        // =====================================================================
+        float rx = w - 434.0f;
+        float ry = 86.0f;
+        float rw = 408.0f;
+        float rh = 566.0f;
+
+        draw_ui_quad(bg_verts, rx, ry, rw, rh, frost_panel);
+        draw_ui_quad(fg_verts, rx, ry, 2.0f, rh, dark_slate);
+        draw_ui_quad(fg_verts, rx + rw - 4.0f, ry, 4.0f, rh, runner_red);
+        draw_ui_quad(fg_verts, rx, ry + rh - 2.0f, rw, 2.0f, dark_slate);
+
+        // Chapter Title Header Bar
+        draw_ui_skew_quad(fg_verts, rx + 10.0f, ry + 10.0f, rw - 24.0f, 32.0f, 8.0f, runner_red);
+        std::string cur_title_upper = cur_ch.map_name;
+        for (char& c : cur_title_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        draw_ui_text_italic(fg_verts, cur_title_upper, rx + 24.0f, ry + 19.0f, 1.95f, pure_white, true);
+
+        // Chapter Halftone Preview Photograph (Maps/Menu/TdMainMenu.me1 -> Level1b_CP1..Level9_CP1)
+        float img_x = rx + 14.0f;
+        float img_y = ry + 50.0f;
+        float img_w = rw - 28.0f;
+        float img_h = 192.0f;
+
+        draw_ui_quad(bg_verts, img_x - 2.0f, img_y - 2.0f, img_w + 4.0f, img_h + 4.0f, dark_slate);
+        if (ui_chapter_tex[sel]) {
+            add_ui_tex_quad(tex_batches, ui_chapter_tex[sel],
+                            img_x, img_y, img_w, img_h,
+                            0.0f, 0.05f, 1.0f, 0.98f, pure_white);
+        } else {
+            draw_ui_quad(bg_verts, img_x, img_y, img_w, img_h, simd_make_float4(0.18f, 0.22f, 0.28f, 1.0f));
+        }
+        // Photo caption pill
+        draw_ui_skew_quad(fg_verts, img_x + 8.0f, img_y + img_h - 26.0f, 224.0f, 20.0f, 5.0f,
+                          simd_make_float4(0.06f, 0.08f, 0.11f, 0.88f));
+        draw_ui_text_italic(fg_verts, "PREVIEW: " + cur_ch.preview_tex_name,
+                            img_x + 16.0f, img_y + img_h - 21.0f, 1.3f, pure_white, true);
+
+        // Checkpoints Sub-List (TdLoadCheckpoint / DefaultGame.ini Checkpoints[])
+        float cp_hdr_y = img_y + img_h + 10.0f;
+        draw_ui_skew_quad(bg_verts, rx + 12.0f, cp_hdr_y, rw - 26.0f, 26.0f, 6.0f, dark_slate);
+        draw_ui_text_italic(fg_verts, "CHAPTER CHECKPOINTS  (TDLOADCHECKPOINT)",
+                            rx + 22.0f, cp_hdr_y + 7.0f, 1.5f, pure_white, true);
+
+        size_t max_cp = std::min<size_t>(cur_ch.checkpoints.size(), 5);
+        for (size_t c = 0; c < max_cp; ++c) {
+            const auto& cp = cur_ch.checkpoints[c];
+            float cy = cp_hdr_y + 32.0f + float(c) * 34.0f;
+            bool cp_sel = (c == 0);
+
+            if (cp_sel) {
+                draw_ui_skew_quad(bg_verts, rx + 12.0f, cy, rw - 26.0f, 30.0f, 6.5f, dark_slate);
+                draw_ui_skew_quad(fg_verts, rx + 12.0f, cy, 4.0f, 30.0f, 6.5f, runner_red);
+            } else {
+                draw_ui_skew_quad(bg_verts, rx + 14.0f, cy + 1.0f, rw - 30.0f, 28.0f, 6.0f, frost_row);
+            }
+
+            char badge = static_cast<char>('A' + c);
+            std::string cp_title = std::string("[") + badge + "] " + cp.friendly_name;
+            for (char& ch_c : cp_title) ch_c = static_cast<char>(std::toupper(static_cast<unsigned char>(ch_c)));
+
+            draw_ui_text_italic(fg_verts, cp_title, rx + 22.0f, cy + 4.0f, 1.45f,
+                                cp_sel ? runner_red : text_dark, cp_sel);
+
+            std::string desc = cp.description;
+            if (desc.length() > 44) desc = desc.substr(0, 41) + "...";
+            draw_ui_text_italic(fg_verts, desc, rx + 24.0f, cy + 17.0f, 1.2f,
+                                cp_sel ? pure_white : text_muted, cp_sel);
+        }
+
+        // Chapter Statistics Footer Card (SpeedRunTime + BagsFound with Icon_Time & Icon_Bag)
+        float st_x = rx + 12.0f;
+        float st_y = ry + rh - 108.0f;
+        float st_w = rw - 24.0f;
+        float st_h = 96.0f;
+
+        draw_ui_quad(bg_verts, st_x, st_y, st_w, st_h, dark_slate);
+        draw_ui_quad(fg_verts, st_x, st_y, st_w, 3.0f, runner_red);
+
+        // Left Stat: Speed Run Time + Icon_Time (UI/TdUIResources.upk alpha-mask tinted pure white)
+        if (ui_time_tex) {
+            add_ui_tex_quad(tex_batches, ui_time_tex,
+                            st_x + 10.0f, st_y + 14.0f, 36.0f, 36.0f,
+                            0.0f, 0.0f, 1.0f, 1.0f,
+                            simd_make_float4(1.0f, 1.0f, 1.0f, -1.0f));
+        }
+        draw_ui_text_italic(fg_verts, "QUALIFYING TIME", st_x + 52.0f, st_y + 14.0f, 1.35f, text_silver, true);
+        draw_ui_text_italic(fg_verts, cur_ch.speedrun_target_time, st_x + 52.0f, st_y + 30.0f, 2.05f, pure_white, true);
+        draw_ui_text_italic(fg_verts, "BEST TIME:  05:14:82", st_x + 14.0f, st_y + 58.0f, 1.45f, runner_red, true);
+        draw_ui_text_italic(fg_verts, "SPEED RUN:  UNLOCKED", st_x + 14.0f, st_y + 76.0f, 1.3f, text_silver, true);
+
+        // Divider
+        draw_ui_quad(fg_verts, st_x + st_w * 0.54f, st_y + 12.0f, 2.0f, st_h - 24.0f,
+                     simd_make_float4(0.25f, 0.29f, 0.35f, 0.9f));
+
+        // Right Stat: Runner Bags Found + Icon_Bag (UI/TdUIResources.upk alpha-mask tinted Runner Gold)
+        float bag_x = st_x + st_w * 0.57f;
+        if (ui_bag_tex) {
+            add_ui_tex_quad(tex_batches, ui_bag_tex,
+                            bag_x, st_y + 12.0f, 40.0f, 40.0f,
+                            0.0f, 0.0f, 1.0f, 1.0f,
+                            simd_make_float4(1.0f, 0.85f, 0.20f, -1.0f));
+        }
+        int bags_found = std::clamp(telemetry.bags_collected, 1, 3);
+        draw_ui_text_italic(fg_verts, "BAGS FOUND", bag_x + 46.0f, st_y + 14.0f, 1.35f, text_silver, true);
+        std::string bag_str = std::to_string(bags_found) + " / 3";
+        draw_ui_text_italic(fg_verts, bag_str, bag_x + 46.0f, st_y + 31.0f, 2.15f,
+                            simd_make_float4(1.0f, 0.86f, 0.22f, 1.0f), true);
+
+        // 3 Runner Bag Slot Indicators
+        for (int b = 0; b < 3; ++b) {
+            bool collected = (b < bags_found);
+            float bx = bag_x + float(b) * 48.0f;
+            float by = st_y + 62.0f;
+            draw_ui_skew_quad(fg_verts, bx, by, 40.0f, 20.0f, 4.0f,
+                              collected ? runner_red : simd_make_float4(0.20f, 0.24f, 0.30f, 0.95f));
+            draw_ui_text_italic(fg_verts, collected ? "BAG" : "---", bx + 7.0f, by + 5.0f, 1.25f, pure_white, true);
+        }
+
+        // =====================================================================
+        // 5. BOTTOM ACTION CALLOUT BUTTONS (TdUIScene ButtonBar)
+        // =====================================================================
+        float btn_y = h - 52.0f;
+        draw_ui_skew_quad(fg_verts, 424.0f, btn_y, 250.0f, 36.0f, 8.0f, runner_red);
+        draw_ui_text_italic(fg_verts, "[ENTER] LAUNCH CHAPTER", 442.0f, btn_y + 11.0f, 1.75f, pure_white, true);
+
+        draw_ui_skew_quad(fg_verts, 688.0f, btn_y, 262.0f, 36.0f, 8.0f, dark_slate);
+        draw_ui_text_italic(fg_verts, "[UP / DOWN] SELECT CHAPTER", 704.0f, btn_y + 11.0f, 1.70f, pure_white, true);
+
+        draw_ui_skew_quad(fg_verts, 964.0f, btn_y, 266.0f, 36.0f, 8.0f, dark_slate);
+        draw_ui_text_italic(fg_verts, "[TAB / ESC] RESUME GAME", 982.0f, btn_y + 11.0f, 1.70f, pure_white, true);
     }
 
     void draw_hud(std::vector<HUDVertex>& verts, const LevelScene& scene, const PlayerTelemetry& telemetry) {
@@ -1587,47 +2035,6 @@ struct MetalRenderer::Impl {
         float banner_x = (w - banner_w) * 0.5f;
         draw_ui_quad(verts, banner_x, h - 42.0f, banner_w, 28.0f, simd_make_float4(0.04f, 0.06f, 0.09f, 0.80f));
         draw_ui_text(verts, prompt, banner_x + 20.0f, h - 35.0f, 1.8f, simd_make_float4(0.98f, 0.98f, 0.98f, 1.0f));
-
-        // 7. Chapter Select Menu Overlay (when menu_open is true)
-        if (menu_open) {
-            draw_ui_quad(verts, 0, 0, w, h, simd_make_float4(0.02f, 0.03f, 0.05f, 0.72f));
-
-            float mw = 460.0f;
-            float mh = 380.0f;
-            float mx = (w - mw) * 0.5f;
-            float my = (h - mh) * 0.5f;
-
-            draw_ui_quad(verts, mx, my, mw, mh, simd_make_float4(0.07f, 0.09f, 0.12f, 0.94f));
-            draw_ui_quad(verts, mx, my, mw, 4.0f, simd_make_float4(0.902f, 0.078f, 0.078f, 1.0f));
-
-            draw_ui_text(verts, "MIRROR'S EDGE - CHAPTER SELECT", mx + 25.0f, my + 25.0f, 2.2f,
-                         simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
-
-            static const char* CHAPTERS[10] = {
-                "0. PROLOGUE: TUTORIAL",
-                "1. CHAPTER 1: FLIGHT",
-                "2. CHAPTER 2: JACKNIFE",
-                "3. CHAPTER 3: HEAT",
-                "4. CHAPTER 4: ROPEBURN",
-                "5. CHAPTER 5: NEW EDEN",
-                "6. CHAPTER 6: PIRANDELLO KRUGER",
-                "7. CHAPTER 7: THE BOAT",
-                "8. CHAPTER 8: KATE",
-                "9. CHAPTER 9: THE SHARD"
-            };
-
-            for (int i = 0; i < 10; ++i) {
-                float iy = my + 70.0f + float(i) * 28.0f;
-                bool is_sel = (i == selected_chapter);
-                if (is_sel) {
-                    draw_ui_quad(verts, mx + 20.0f, iy - 4.0f, mw - 40.0f, 24.0f,
-                                 simd_make_float4(0.902f, 0.078f, 0.078f, 0.92f));
-                }
-                draw_ui_text(verts, CHAPTERS[i], mx + 30.0f, iy, 1.8f,
-                             is_sel ? simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f)
-                                    : simd_make_float4(0.82f, 0.86f, 0.92f, 0.90f));
-            }
-        }
     }
 };
 
@@ -1725,10 +2132,34 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         id<MTLCommandBuffer> cmd_buffer = [impl_->command_queue commandBuffer];
 
         // ---------------------------------------------------------------------
+        // Main Menu / Load Chapter State: Switch to TdMainMenu.me1 3D City
+        // ---------------------------------------------------------------------
+        bool in_main_menu = false;
+        if (impl_->menu_open) {
+            impl_->ensure_main_menu_loaded();
+            impl_->main_menu.update_selected_chapter_highlight(impl_->selected_chapter);
+            in_main_menu = impl_->main_menu.has_city_scene();
+        }
+        const LevelScene& active_scene = in_main_menu ? impl_->main_menu.city_scene() : scene;
+
+        // ---------------------------------------------------------------------
         // Camera View & Projection Matrices (Unreal Engine to Metal Canonical)
         // ---------------------------------------------------------------------
         Vec3 cam_pos = telemetry.position + Vec3(0.0f, 0.0f, telemetry.eye_height);
         Rotator rot = Rotator::from_degrees(telemetry.pitch_deg, telemetry.yaw_deg, telemetry.camera_roll_deg);
+        float fov_deg = telemetry.fov_deg;
+        float near_plane = 5.0f;
+        float far_plane = 65000.0f;
+
+        if (in_main_menu) {
+            const MenuChapterEntry& cam_ch = impl_->main_menu.get_chapter(impl_->selected_chapter);
+            cam_pos = cam_ch.camera_location;
+            rot = cam_ch.camera_rotation;
+            fov_deg = 70.0f;
+            near_plane = 10.0f;
+            far_plane = 400000.0f;
+        }
+
         Vec3 fwd = rot.forward();
         Vec3 right = rot.right();
         Vec3 up = rot.up();
@@ -1736,8 +2167,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         Mat4 view = Mat4::look_at(cam_pos, target, up);
         float aspect = float(impl_->width) / float(impl_->height);
-        float fov_rad = telemetry.fov_deg * DEG2RAD;
-        Mat4 proj = Mat4::perspective(fov_rad, aspect, 5.0f, 65000.0f);
+        float fov_rad = fov_deg * DEG2RAD;
+        Mat4 proj = Mat4::perspective(fov_rad, aspect, near_plane, far_plane);
         Mat4 vp = proj * view;
 
         // Viewmodel camera matrix
@@ -1754,14 +2185,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.camera_pos = simd_make_float3(cam_pos.x, cam_pos.y, cam_pos.z);
         uniforms.sim_time = telemetry.sim_time;
 
-        Vec3 sun_d = scene.sun_direction.normalized();
+        Vec3 sun_d = active_scene.sun_direction.normalized();
         uniforms.sun_dir = simd_make_float3(sun_d.x, sun_d.y, sun_d.z);
-        uniforms.sun_color = simd_make_float3(scene.sun_color.x, scene.sun_color.y, scene.sun_color.z);
+        uniforms.sun_color = simd_make_float3(active_scene.sun_color.x, active_scene.sun_color.y, active_scene.sun_color.z);
         uniforms.sky_color = simd_make_float3(0.68f, 0.84f, 1.0f);
         uniforms.ground_color = simd_make_float3(0.82f, 0.84f, 0.88f);
-        uniforms.speed_2d = telemetry.speed_2d;
-        uniforms.reaction_active = telemetry.reaction_active ? 1.0f : 0.0f;
-        uniforms.health = telemetry.health;
+        uniforms.speed_2d = impl_->menu_open ? 0.0f : telemetry.speed_2d;
+        uniforms.reaction_active = (!impl_->menu_open && telemetry.reaction_active) ? 1.0f : 0.0f;
+        uniforms.health = impl_->menu_open ? 100.0f : telemetry.health;
         uniforms.exposure = 1.0f;
         uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
         uniforms.runner_vision_strength = 0.0f;
@@ -1778,11 +2209,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // (texture upload + MSL compile happen once per library) and find out
         // whether this frame needs a translucency pass / opaque scene copies.
         // ---------------------------------------------------------------------
-        impl_->sync_material_library(scene.materials);
+        impl_->sync_material_library(active_scene.materials);
         bool has_translucent = false;
         bool needs_scene_copies = false;
-        if (impl_->mat_lib) {
-            for (const auto& mesh : scene.meshes) {
+        if (impl_->mat_lib && !in_main_menu) {
+            for (const auto& mesh : active_scene.meshes) {
                 for (const auto& s : mesh.sections) {
                     const MaterialShader* sh = nullptr;
                     if (!impl_->section_pipeline(s, &sh, nullptr) || !mat_blend_is_translucent(sh->blend)) continue;
@@ -1831,14 +2262,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         // Rebuild GPU vertex buffer cache only when scene meshes change
         size_t total_scene_verts = 0;
-        for (const auto& m : scene.meshes) total_scene_verts += m.vertices.size();
+        for (const auto& m : active_scene.meshes) total_scene_verts += m.vertices.size();
 
-        if (scene.map_name != impl_->cached_map_name || total_scene_verts != impl_->cached_total_verts ||
-            impl_->cached_mesh_buffers.size() != scene.meshes.size()) {
-            impl_->cached_map_name = scene.map_name;
+        if (active_scene.map_name != impl_->cached_map_name || total_scene_verts != impl_->cached_total_verts ||
+            impl_->cached_mesh_buffers.size() != active_scene.meshes.size()) {
+            impl_->cached_map_name = active_scene.map_name;
             impl_->cached_total_verts = total_scene_verts;
             impl_->cached_mesh_buffers.clear();
-            for (const auto& m : scene.meshes) {
+            for (const auto& m : active_scene.meshes) {
                 if (m.vertices.empty()) {
                     impl_->cached_mesh_buffers.push_back(nil);
                 } else {
@@ -1852,7 +2283,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         // Binds mesh i's vertex buffer + frame uniforms on the current encoder.
         auto bind_scene_mesh = [&](size_t i) {
-            uniforms.is_runner_vision = scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
+            uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
             [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
             [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -1862,16 +2293,51 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                    static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
         };
 
-        if (!scene.meshes.empty()) {
+        if (!active_scene.meshes.empty()) {
             [enc setFrontFacingWinding:impl_->mat_front_winding];
-            for (size_t i = 0; i < scene.meshes.size(); ++i) {
-                const auto& mesh = scene.meshes[i];
+            std::string active_mi_tag = in_main_menu
+                ? impl_->main_menu.get_chapter(impl_->selected_chapter).material_instance_tag
+                : "";
+            for (char& c : active_mi_tag) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+            for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
                 bind_scene_mesh(i);
                 if (mesh.sections.empty()) {
                     [enc setRenderPipelineState:impl_->world_pipeline];
                     [enc setCullMode:MTLCullModeNone];
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                    continue;
+                }
+                if (in_main_menu) {
+                    // For TdMainMenu.me1's 3D City of Glass, use directional Sun + Beast azure sky-bounce
+                    // + Runner Vision Scarlet Red highlighting on the selected chapter's MI_SP0*_01 section.
+                    [enc setRenderPipelineState:impl_->world_pipeline];
+                    [enc setCullMode:MTLCullModeNone];
+                    for (const auto& s : mesh.sections) {
+                        if (!section_in_range(mesh, s)) continue;
+                        std::string mname;
+                        if (active_scene.materials && s.material >= 0 &&
+                            static_cast<size_t>(s.material) < active_scene.materials->materials.size()) {
+                            mname = active_scene.materials->materials[static_cast<size_t>(s.material)].name;
+                            for (char& c : mname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        }
+                        bool is_sel_district = (!active_mi_tag.empty() && mname.find(active_mi_tag) != std::string::npos);
+                        uniforms.is_runner_vision = is_sel_district ? 1.0f : 0.0f;
+                        if (mname.find("water") != std::string::npos) {
+                            uniforms.actor_tint = simd_make_float3(0.22f, 0.56f, 0.90f);
+                        } else if (mname.find("mountain") != std::string::npos) {
+                            uniforms.actor_tint = simd_make_float3(0.76f, 0.84f, 0.94f);
+                        } else {
+                            uniforms.actor_tint = simd_make_float3(0.96f, 0.97f, 0.99f);
+                        }
+                        [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                    }
+                    uniforms.is_runner_vision = 0.0f;
+                    uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                     continue;
                 }
                 // Opaque + masked material sections (UE3 base pass). Translucent ones are deferred.
@@ -1907,12 +2373,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->runner_vision_mesh.size()];
         }
 
-        // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies
+        // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies (only during gameplay)
         // (the material sections above leave their own pipeline/depth state bound)
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
-        if (!scene.enemies.empty()) {
-            for (const auto& bot : scene.enemies) {
+        if (!impl_->menu_open && !active_scene.enemies.empty()) {
+            for (const auto& bot : active_scene.enemies) {
                 if (!bot.alive) continue;
                 if (impl_->anim_system.is_loaded()) {
                     impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
@@ -1956,8 +2422,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
             [enc setDepthStencilState:impl_->depth_test_only_state];
             [enc setFrontFacingWinding:impl_->mat_front_winding];
-            for (size_t i = 0; i < scene.meshes.size(); ++i) {
-                const auto& mesh = scene.meshes[i];
+            for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || mesh.sections.empty() || !impl_->cached_mesh_buffers[i]) continue;
                 bool mesh_bound = false;
                 for (const auto& s : mesh.sections) {
@@ -1980,23 +2446,25 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
-        impl_->build_faith_viewmodel(telemetry);
-        if (!impl_->faith_viewmodel_mesh.empty()) {
-            [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 0.05}];
-            [enc setRenderPipelineState:impl_->viewmodel_pipeline];
-            [enc setDepthStencilState:impl_->depth_write_state];
-            std::memcpy(&uniforms.view_proj, vm_vp.m, sizeof(float) * 16);
-            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
-            uniforms.camera_pos = simd_make_float3(0.0f, 0.0f, 0.0f);
-            uniforms.is_runner_vision = 0.0f;
-            uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
+        if (!impl_->menu_open) {
+            impl_->build_faith_viewmodel(telemetry);
+            if (!impl_->faith_viewmodel_mesh.empty()) {
+                [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 0.05}];
+                [enc setRenderPipelineState:impl_->viewmodel_pipeline];
+                [enc setDepthStencilState:impl_->depth_write_state];
+                std::memcpy(&uniforms.view_proj, vm_vp.m, sizeof(float) * 16);
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                uniforms.camera_pos = simd_make_float3(0.0f, 0.0f, 0.0f);
+                uniforms.is_runner_vision = 0.0f;
+                uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
 
-            bind_vertex_bytes_or_buffer(enc, impl_->faith_viewmodel_mesh.data(),
-                                        impl_->faith_viewmodel_mesh.size() * sizeof(Vertex), 0);
-            [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-            [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->faith_viewmodel_mesh.size()];
-            uniforms.camera_pos = simd_make_float3(cam_pos.x, cam_pos.y, cam_pos.z);
+                bind_vertex_bytes_or_buffer(enc, impl_->faith_viewmodel_mesh.data(),
+                                            impl_->faith_viewmodel_mesh.size() * sizeof(Vertex), 0);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->faith_viewmodel_mesh.size()];
+                uniforms.camera_pos = simd_make_float3(cam_pos.x, cam_pos.y, cam_pos.z);
+            }
         }
 
         [enc endEncoding];
@@ -2018,17 +2486,48 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
         // ---------------------------------------------------------------------
-        // Pass 3: 2D HUD & Font Overlay (Vector / ASCII Bitmap Quads)
+        // Pass 3: 2D HUD & Frontend UI Overlay (TdMainMenu / TdLoadLevel / HUD)
         // ---------------------------------------------------------------------
-        std::vector<HUDVertex> hud_verts;
-        impl_->draw_hud(hud_verts, scene, telemetry);
+        simd_float2 screen_size = simd_make_float2(float(impl_->width), float(impl_->height));
+        if (impl_->menu_open) {
+            std::vector<HUDVertex> bg_verts;
+            std::vector<MetalRenderer::Impl::UITextureBatch> tex_batches;
+            std::vector<HUDVertex> fg_verts;
+            impl_->draw_main_menu_ui(bg_verts, tex_batches, fg_verts, telemetry);
 
-        if (!hud_verts.empty()) {
-            [postEnc setRenderPipelineState:impl_->hud_pipeline];
-            simd_float2 screen_size = simd_make_float2(float(impl_->width), float(impl_->height));
-            bind_vertex_bytes_or_buffer(postEnc, hud_verts.data(), hud_verts.size() * sizeof(HUDVertex), 0);
-            [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
-            [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:hud_verts.size()];
+            if (!bg_verts.empty()) {
+                [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                bind_vertex_bytes_or_buffer(postEnc, bg_verts.data(), bg_verts.size() * sizeof(HUDVertex), 0);
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:bg_verts.size()];
+            }
+            if (!tex_batches.empty() && impl_->ui_tex_pipeline) {
+                [postEnc setRenderPipelineState:impl_->ui_tex_pipeline];
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+                for (const auto& batch : tex_batches) {
+                    if (!batch.tex || batch.verts.empty()) continue;
+                    [postEnc setFragmentTexture:batch.tex atIndex:0];
+                    bind_vertex_bytes_or_buffer(postEnc, batch.verts.data(), batch.verts.size() * sizeof(UITexVertex), 0);
+                    [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:batch.verts.size()];
+                }
+            }
+            if (!fg_verts.empty()) {
+                [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                bind_vertex_bytes_or_buffer(postEnc, fg_verts.data(), fg_verts.size() * sizeof(HUDVertex), 0);
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:fg_verts.size()];
+            }
+        } else {
+            std::vector<HUDVertex> hud_verts;
+            impl_->draw_hud(hud_verts, scene, telemetry);
+
+            if (!hud_verts.empty()) {
+                [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                bind_vertex_bytes_or_buffer(postEnc, hud_verts.data(), hud_verts.size() * sizeof(HUDVertex), 0);
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:hud_verts.size()];
+            }
         }
 
         [postEnc endEncoding];
