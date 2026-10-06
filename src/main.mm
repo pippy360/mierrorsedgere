@@ -275,10 +275,11 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", Apex Z=" << spring_apex_z << ")" << std::endl;
 
     // Stage 3: Wallrun along the stage-6 billboard (S_RunnerSign_02) across the rooftop gap
+    // Native FindWallForward requires angling into the wall (up to 57°); kick off mid-run onto the stage-7 roof.
     std::cout << "[Oracle Stage 3] Testing Wallrun & 15° Camera Tilt..." << std::endl;
-    controller.reset(Vec3(-100.0f, -6110.0f, 4224.0f), 180.0f);
-    controller.set_velocity(Vec3(-550.0f, 0.0f, 0.0f));
-    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= -280.0f; });
+    controller.reset(Vec3(-100.0f, -6180.0f, 4224.0f), 160.0f);
+    controller.set_velocity(Vec3(-517.0f, 188.0f, 0.0f));
+    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= -275.0f; });
     controller.step(in_run_jump, kDt, sim_scene);
     log_telemetry("Stage3_Wallrun_Start");
     const EMovement s3_state = controller.get_move_state();
@@ -292,8 +293,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     renderer.render_frame(sim_scene, controller.get_telemetry());
     save_and_publish_png("oracle_3_wallrun_tilt.png");
 
-    // Ride the wallrun out over the gap (x in [-1100, -400] has no floor) onto the stage-7 roof
-    step_until(in_run, 240, sim_scene, [&] { return controller.is_grounded(); });
+    // Ride the billboard wallrun over the gap and kick off onto the stage-7 roof (z = 4224)
+    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= -770.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
+    step_until(in_run, 180, sim_scene, [&] { return controller.is_grounded(); });
     const Vec3 s3_land = controller.get_position();
     bool s3_cleared_gap = controller.is_grounded() && s3_land.x < -1150.0f && std::abs(s3_land.z - 4224.0f) < 2.0f;
     bool s3_pass = s3_wallrun && (s3_max_roll >= 10.0f) && s3_cleared_gap;
@@ -350,9 +353,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     const float zip_travel = controller.get_position().distance(zip_grab);
     bool s5_zip_ride = s5_zip && (controller.get_move_state() == EMovement::MOVE_ZipLine) && zip_travel > 600.0f;
 
-    // Slide toward the airduct across the stage-3 roof
-    controller.reset(Vec3(208.0f, -7744.0f, 5760.0f), 0.0f);
-    for (int i = 0; i < 40; ++i) {
+    // Sprint up and slide under the clear middle of the stage-3 airduct (S_AirductSystem_02e)
+    controller.reset(Vec3(208.0f, -7790.0f, 5760.0f), 0.0f);
+    for (int i = 0; i < 100; ++i) {
         controller.step(in_run, kDt, sim_scene);
     }
     InputFrame in5_slide{};
@@ -362,7 +365,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s5_slide = (controller.get_move_state() == EMovement::MOVE_Slide);
     log_telemetry("Stage5_Slide");
     const float slide_start_x = controller.get_position().x;
-    for (int i = 0; i < 70; ++i) {
+    for (int i = 0; i < 50; ++i) {
         controller.step(in5_slide, kDt, sim_scene);
     }
     const float slide_dist = controller.get_position().x - slide_start_x;
@@ -373,13 +376,15 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << " (ZipLine=" << (s5_zip ? "OK" : "NO") << ", Ride=" << zip_travel << " u"
               << ", Slide=" << (s5_slide ? "OK" : "NO") << ", Slide Distance=" << slide_dist << " u)" << std::endl;
 
-    // Stage 6: Mid-Air Coil & Skill Roll: run off the top of S_RunnerRamp_01 into the pit beyond
-    // the starting roof (5840 -> 5409)
+    // Stage 6: Mid-Air Coil & Skill Roll: jump off the stage-15 high platform onto the roof below
+    // (6144 -> 5760 = 384 u drop), coil mid-air, and time crouch within 0.2 s before touchdown.
     std::cout << "[Oracle Stage 6] Testing Mid-Air Coil & Skill Roll..." << std::endl;
-    controller.reset(Vec3(-1500.0f, -7903.8f, 5760.0f), 0.0f);
-    controller.set_velocity(Vec3(630.0f, 0.0f, 0.0f));
-    step_until(in_run, 240, sim_scene, [&] { return !controller.is_grounded(); });
+    controller.reset(Vec3(-8900.0f, -5280.0f, 6144.0f), 90.0f);
+    for (int i = 0; i < 35; ++i) {
+        controller.step(in_run, kDt, sim_scene);
+    }
     const float s6_launch_z = controller.get_position().z;
+    controller.step(in_run_jump, kDt, sim_scene);
 
     InputFrame in6{};
     in6.crouch = true;
@@ -388,8 +393,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s6_coil = (controller.get_move_state() == EMovement::MOVE_Coil);
     log_telemetry("Stage6_Coil");
 
-    // Keep crouch held (crouch landing buffer) through the touchdown for the skill roll
-    step_until(in6, 180, sim_scene, [&] { return controller.is_grounded(); });
+    // Release crouch while descending so the roll trigger can re-arm (0.6 s cooldown), then press
+    // crouch within 0.2 s of touchdown (TdPawn.CanSkillRoll) for the skill roll.
+    step_until(in_run, 120, sim_scene, [&] { return controller.get_position().z <= 5860.0f; });
+    step_until(in6, 60, sim_scene, [&] { return controller.is_grounded(); });
     bool s6_roll = (controller.get_move_state() == EMovement::MOVE_SkillRoll);
     log_telemetry("Stage6_SkillRoll");
     const float s6_drop = s6_launch_z - controller.get_position().z;

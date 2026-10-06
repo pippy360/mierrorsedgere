@@ -284,54 +284,101 @@ bool load_movement_config_from_ini(const std::string& ini_path, MovementConfig& 
         return false;
     }
 
-    out_config.gravity = 980.0f;
-    out_config.walk_speed = 50.0f;
-    out_config.jog_speed = 260.0f;
-    out_config.run_speed = 400.0f;
-    out_config.sprint_speed = 630.0f;
+    // The MovementConfig defaults already mirror the shipped DefaultPawnMovement.ini; the ini only
+    // overrides the values it actually carries. Values that live in native code or in other ini
+    // files (gravity, the ground speed curve, the camera/eye heights) keep their defaults.
+    const MovementConfig defaults;
+    auto read = [&](const char* section, const char* key, float fallback) {
+        return ini.get_float(section, key, fallback);
+    };
 
-    // [TdGame.TdMove_Jump]
-    out_config.base_jump_z = ini.get_float("TdGame.TdMove_Jump", "BaseJumpZ", 630.0f);
-    out_config.base_jump_z_heavy = ini.get_float("TdGame.TdMove_Jump", "BaseJumpZHeavy", 430.0f);
-    out_config.jump_add_xy = ini.get_float("TdGame.TdMove_Jump", "JumpAddXY", 100.0f);
-
-    // [TdGame.TdMove_WallRun]
-    out_config.wallrun_min_speed = ini.get_float("TdGame.TdMove_WallRun", "WallRunningMinSpeed", 200.0f);
-    out_config.wallrun_initial_z = ini.get_float("TdGame.TdMove_WallRun", "WallRunningHorisontalInitialZHeight", 170.0f);
-    out_config.wallrun_accel = ini.get_float("TdGame.TdMove_WallRun", "WallRunningHorisontalAcceleration", 820.0f);
-    out_config.wallrun_decel = ini.get_float("TdGame.TdMove_WallRun", "WallRunningHorisontalDeceleration", 500.0f);
-    out_config.wallrun_max_angle_deg = ini.get_float("TdGame.TdMove_WallRun", "WallRunningForwardMaxStartAngle", 57.0f);
-    out_config.wallrun_duration = 1.6f;
-
-    // [TdGame.TdMove_WallClimb]
-    out_config.wallclimb_max_angle_deg = ini.get_float("TdGame.TdMove_WallClimb", "WallClimbingVerticalStartAngle", 33.0f);
-    out_config.wallclimb_gravity = ini.get_float("TdGame.TdMove_WallClimb", "WallClimbingGravity", 800.0f);
-    out_config.wallclimb_boost_z = ini.get_float("TdGame.TdMove_WallClimb", "AddOnSpeedZMaxLimit", 320.0f);
-
-    // [TdGame.TdMove_SpringBoard]
-    out_config.springboard_jump_z = ini.get_float("TdGame.TdMove_SpringBoard", "SpringBoardJumpZ", 950.0f);
-
-    // [TdGame.TdMove_Slide]
-    out_config.slide_min_speed = ini.get_float("TdGame.TdMove_Slide", "SlideAbortSpeed", 250.0f);
-    out_config.slide_friction = ini.get_float("TdGame.TdMove_Slide", "FrictionModifier", 0.1f);
-    out_config.slide_max_duration = ini.get_float("TdGame.TdMove_Slide", "SlideAbortTime", 2.0f);
-
-    // [TdGame.TdMove_Coil]
-    out_config.coil_height_boost = ini.get_float("TdGame.TdMove_Coil", "TotalHeightBoost", 60.0f);
-    out_config.coil_duration = ini.get_float("TdGame.TdMove_Coil", "CoilTime", 0.5f);
-
-    // [TdGame.TdMove_Landing]
-    out_config.skill_roll_min_fall = ini.get_float("TdGame.TdMove_Landing", "SkillRollLandingHeight", 200.0f);
-    out_config.hard_landing_min_fall = ini.get_float("TdGame.TdMove_Landing", "HardLandingHeight", 530.0f);
-    out_config.uncontrolled_fall = 1000.0f;
+    // [TdGame.TdMove_Crouch]
+    out_config.crouch_speed_modifier = read("TdGame.TdMove_Crouch", "SpeedModifier", defaults.crouch_speed_modifier);
 
     // [TdGame.TdMove_180Turn]
-    out_config.turn_180_time = ini.get_float("TdGame.TdMove_180Turn", "TurnTime", 0.25f);
+    out_config.turn_180_time = read("TdGame.TdMove_180Turn", "TurnTime", defaults.turn_180_time);
+    out_config.turn_180_friction = read("TdGame.TdMove_180Turn", "FrictionModifier", defaults.turn_180_friction);
 
-    out_config.reaction_time_dilation = 0.25f;
-    out_config.reaction_time_drain = 8.0f;
-    out_config.health_regen_delay = 5.0f;
-    out_config.health_regen_rate = 25.0f;
+    // [TdGame.TdMove_Jump]
+    out_config.base_jump_z = read("TdGame.TdMove_Jump", "BaseJumpZ", defaults.base_jump_z);
+    out_config.base_jump_z_heavy = read("TdGame.TdMove_Jump", "BaseJumpZHeavy", defaults.base_jump_z_heavy);
+    out_config.jump_add_xy = read("TdGame.TdMove_Jump", "JumpAddXY", defaults.jump_add_xy);
+
+    // [TdGame.TdMove_DodgeJump]
+    out_config.dodge_jump_z = read("TdGame.TdMove_DodgeJump", "BaseJumpZ", defaults.dodge_jump_z);
+    out_config.dodge_jump_side_speed = read("TdGame.TdMove_DodgeJump", "JumpAddXY", defaults.dodge_jump_side_speed);
+    out_config.dodge_jump_inertia = read("TdGame.TdMove_DodgeJump", "DodgeJumpInertiaConservation", defaults.dodge_jump_inertia);
+
+    // [TdGame.TdMove_SpringBoard]
+    out_config.springboard_jump_z = read("TdGame.TdMove_SpringBoard", "SpringBoardJumpZ", defaults.springboard_jump_z);
+    out_config.springboard_obstacle_min = read("TdGame.TdMove_SpringBoard", "SpringBoardMinHeight", defaults.springboard_obstacle_min);
+    out_config.springboard_obstacle_max = read("TdGame.TdMove_SpringBoard", "SpringBoardMaxHeight", defaults.springboard_obstacle_max);
+    out_config.springboard_step_height = read("TdGame.TdMove_SpringBoard", "IntermediateFootPlantHeight", defaults.springboard_step_height);
+    out_config.springboard_obstacle_distance = read("TdGame.TdMove_SpringBoard", "IntermediateFootPlantDistance", defaults.springboard_obstacle_distance);
+    out_config.springboard_check_time = read("TdGame.TdMove_SpringBoard", "CheckDistanceTime", defaults.springboard_check_time);
+
+    // [TdGame.TdPhysicsMove]
+    out_config.wallrun_check_distance_mult = read("TdGame.TdPhysicsMove", "ContextMoveDistanceMultiplier", defaults.wallrun_check_distance_mult);
+
+    // [TdGame.TdMove_WallRun]
+    out_config.wallrun_check_distance = read("TdGame.TdMove_WallRun", "WallRunningForwardCheckDistance", defaults.wallrun_check_distance);
+    out_config.wallrun_min_wall_height = read("TdGame.TdMove_WallRun", "WallRunningMinWallHeight", defaults.wallrun_min_wall_height);
+    out_config.wallrun_min_speed = read("TdGame.TdMove_WallRun", "WallRunningMinSpeed", defaults.wallrun_min_speed);
+    out_config.wallrun_stop_fall_speed = -read("TdGame.TdMove_WallRun", "WallRunningVelocityStopLimit", -defaults.wallrun_stop_fall_speed);
+    out_config.wallrun_max_angle_deg = read("TdGame.TdMove_WallRun", "WallRunningForwardMaxStartAngle", defaults.wallrun_max_angle_deg);
+    out_config.wallrun_side_angle_deg = read("TdGame.TdMove_WallRun", "WallRunningStrafeStartAngle", defaults.wallrun_side_angle_deg);
+    out_config.wallrun_friction = read("TdGame.TdMove_WallRun", "WallRunningHorisontalFriction", defaults.wallrun_friction);
+    out_config.wallrun_initial_z = read("TdGame.TdMove_WallRun", "WallRunningHorisontalInitialZHeight", defaults.wallrun_initial_z);
+    out_config.wallrun_accel = read("TdGame.TdMove_WallRun", "WallRunningHorisontalAcceleration", defaults.wallrun_accel);
+    out_config.wallrun_decel = read("TdGame.TdMove_WallRun", "WallRunningHorisontalDeceleration", defaults.wallrun_decel);
+
+    // [TdGame.TdMove_WallrunJump]
+    out_config.wallrun_jump_height = read("TdGame.TdMove_WallrunJump", "WallRunningJumpOffZHeightForward", defaults.wallrun_jump_height);
+    out_config.wallrun_jump_height_look_add = read("TdGame.TdMove_WallrunJump", "WallRunningJumpOffZHeightMaxAddTurned", defaults.wallrun_jump_height_look_add);
+    out_config.wallrun_jump_out = read("TdGame.TdMove_WallrunJump", "WallRunningPushAwaySpeedNoob", defaults.wallrun_jump_out);
+    out_config.wallrun_jump_out_look_add = read("TdGame.TdMove_WallrunJump", "WallRunningPushAwaySpeedProAdd", defaults.wallrun_jump_out_look_add);
+    out_config.wallrun_jump_forward_min = read("TdGame.TdMove_WallrunJump", "WallRunningPushForwardSpeedMin", defaults.wallrun_jump_forward_min);
+
+    // [TdGame.TdMove_WallClimb]
+    out_config.wallclimb_max_distance = read("TdGame.TdMove_WallClimb", "WallClimbingMaxDistance2D", defaults.wallclimb_max_distance);
+    out_config.wallclimb_max_angle_deg = read("TdGame.TdMove_WallClimb", "WallClimbingVerticalStartAngle", defaults.wallclimb_max_angle_deg);
+    out_config.wallclimb_add_xy_height = read("TdGame.TdMove_WallClimb", "AddOnSpeed2DHeight", defaults.wallclimb_add_xy_height);
+    out_config.wallclimb_add_xy_max_speed = read("TdGame.TdMove_WallClimb", "AddOnSpeed2DMaxLimit", defaults.wallclimb_add_xy_max_speed);
+    out_config.wallclimb_add_z_height = read("TdGame.TdMove_WallClimb", "AddOnSpeedZHeight", defaults.wallclimb_add_z_height);
+    out_config.wallclimb_boost_z = read("TdGame.TdMove_WallClimb", "AddOnSpeedZMaxLimit", defaults.wallclimb_boost_z);
+    out_config.wallclimb_gravity = read("TdGame.TdMove_WallClimb", "WallClimbingGravity", defaults.wallclimb_gravity);
+    out_config.wallclimb_min_wall_height = read("TdGame.TdMove_WallClimb", "MinWallHeight", defaults.wallclimb_min_wall_height);
+
+    // [TdGame.TdMove_WallClimbDodgeJump] / [TdGame.TdMove_WallClimb180TurnJump]
+    out_config.wallclimb_dodge_z = read("TdGame.TdMove_WallClimbDodgeJump", "BaseJumpZ", defaults.wallclimb_dodge_z);
+    out_config.wallclimb_dodge_side_speed = read("TdGame.TdMove_WallClimbDodgeJump", "JumpAddXY", defaults.wallclimb_dodge_side_speed);
+    out_config.wallclimb_turn_jump_height = read("TdGame.TdMove_WallClimb180TurnJump", "JumpOffZHeight", defaults.wallclimb_turn_jump_height);
+    out_config.wallclimb_turn_jump_out = read("TdGame.TdMove_WallClimb180TurnJump", "JumpPushAwaySpeed", defaults.wallclimb_turn_jump_out);
+    out_config.wallclimb_turn_jump_window = read("TdGame.TdMove_WallClimb180TurnJump", "JumpTimeWindow", defaults.wallclimb_turn_jump_window);
+
+    // [TdGame.TdMove_Grab] / [TdGame.TdMove_GrabJump]
+    out_config.grab_max_angle_deg = read("TdGame.TdMove_Grab", "GrabMaxAngle", defaults.grab_max_angle_deg);
+    out_config.grab_jump_height = read("TdGame.TdMove_GrabJump", "GrabJumpOffZHeight", defaults.grab_jump_height);
+    out_config.grab_jump_push_min = read("TdGame.TdMove_GrabJump", "GrabJumpPushAwayMinSpeed", defaults.grab_jump_push_min);
+    out_config.grab_jump_push_max = read("TdGame.TdMove_GrabJump", "GrabJumpPushAwayMaxSpeed", defaults.grab_jump_push_max);
+
+    // [TdGame.TdMove_SpeedVault] (the per-type VaultTypes rows are structs; keep the vaultOver row)
+    out_config.vault_max_handplant_time = read("TdGame.TdMove_SpeedVault", "MaxTimeToLedge", defaults.vault_max_handplant_time);
+
+    // [TdGame.TdMove_Slide]
+    out_config.slide_abort_speed = read("TdGame.TdMove_Slide", "SlideAbortSpeed", defaults.slide_abort_speed);
+    out_config.slide_max_duration = read("TdGame.TdMove_Slide", "SlideAbortTime", defaults.slide_max_duration);
+    out_config.slide_friction = read("TdGame.TdMove_Slide", "FrictionModifier", defaults.slide_friction);
+
+    // [TdGame.TdMove_Coil]
+    out_config.coil_height_boost = read("TdGame.TdMove_Coil", "TotalHeightBoost", defaults.coil_height_boost);
+    out_config.coil_duration = read("TdGame.TdMove_Coil", "HeightBoostDuration", defaults.coil_duration);
+
+    // [TdGame.TdMove_Landing]
+    out_config.landing_speed_reduction = read("TdGame.TdMove_Landing", "LandingSpeedReduction", defaults.landing_speed_reduction);
+    out_config.hard_landing_min_fall = read("TdGame.TdMove_Landing", "HardLandingHeight", defaults.hard_landing_min_fall);
+    out_config.soft_landing_min_fall = read("TdGame.TdMove_Landing", "SoftLandingHeight", defaults.soft_landing_min_fall);
+    out_config.skill_roll_min_fall = read("TdGame.TdMove_Landing", "SkillRollLandingHeight", defaults.skill_roll_min_fall);
 
     return true;
 }
