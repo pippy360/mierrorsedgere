@@ -1,15 +1,38 @@
 #include "upk_loader.hpp"
+#include "material_system.hpp"
+#include "package_manager.hpp"
+#include "ue3_props.hpp"
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <set>
 #include <zlib.h>
 
 namespace me {
 
 namespace {
+
+// IEEE 754 binary16 -> float (FVector2DHalf texture coordinates)
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (h >> 15) & 1u;
+    const uint32_t exp = (h >> 10) & 0x1Fu;
+    const uint32_t mant = h & 0x3FFu;
+    float f;
+    if (exp == 0) {
+        f = std::ldexp(static_cast<float>(mant), -24);
+    } else if (exp == 31) {
+        f = mant ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+    } else {
+        f = std::ldexp(static_cast<float>(mant | 0x400u), static_cast<int>(exp) - 25);
+    }
+    return sign ? -f : f;
+}
 
 // Helper to safely read little-endian primitives
 template <typename T>
@@ -111,164 +134,165 @@ void add_box_mesh(std::vector<Vertex>& verts, std::vector<uint32_t>& indices,
 } // namespace
 
 // -----------------------------------------------------------------------------
-// Pure C++20 LZO1X-1 Decompressor
+// Pure C++20 LZO1X Decompressor
+//
+// Faithful port of the reference decoder (lzo1x_d.ch, "safe" variant: every input
+// read, output write and look-behind distance is bounds checked). Handles all
+// LZO1X instruction forms, including the 3-byte M1 match that may follow a
+// literal run (distance 0x801 + ...), which LZO1X-999 compressed packages use.
+// Returns true only if the stream decodes to exactly `expected_len` bytes.
 // -----------------------------------------------------------------------------
 bool UPKPackage::lzo1x_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t expected_len) {
     if (!src || src_len == 0 || !dst || expected_len == 0) {
         return false;
     }
 
-    size_t ip = 0;
-    size_t op = 0;
-    size_t state = 0;
+    const uint8_t* ip = src;
+    const uint8_t* const ip_end = src + src_len;
+    uint8_t* op = dst;
+    uint8_t* const op_end = dst + expected_len;
+    size_t t = 0;
+    size_t dist = 0;
+    const uint8_t* m_pos = nullptr;
 
-    uint8_t b = src[ip++];
+#define LZO_NEED_IP(n)                                                                  \
+    do {                                                                                \
+        if (static_cast<size_t>(ip_end - ip) < static_cast<size_t>(n)) return false;    \
+    } while (0)
+#define LZO_NEED_OP(n)                                                                  \
+    do {                                                                                \
+        if (static_cast<size_t>(op_end - op) < static_cast<size_t>(n)) return false;    \
+    } while (0)
+#define LZO_LOOKBEHIND(d)                                                               \
+    do {                                                                                \
+        if ((d) == 0 || (d) > static_cast<size_t>(op - dst)) return false;              \
+    } while (0)
 
-    if (b > 17) {
-        size_t t = b - 17;
-        if (ip + t > src_len || op + t > expected_len) return false;
-        std::memcpy(dst + op, src + ip, t);
+    if (*ip > 17) {
+        t = static_cast<size_t>(*ip++) - 17;
+        if (t < 4) goto match_next;
+        LZO_NEED_OP(t);
+        LZO_NEED_IP(t + 1);
+        std::memcpy(op, ip, t);
         op += t;
         ip += t;
-        if (ip >= src_len) return (op <= expected_len);
-        b = src[ip++];
-        state = 0;
+        goto first_literal_run;
     }
 
-    while (ip <= src_len) {
-        if (b < 16) {
-            if (state == 0) {
-                size_t t = b;
+    for (;;) {
+        LZO_NEED_IP(1);
+        t = *ip++;
+        if (t >= 16) goto match;
+        // Literal run of t + 3 bytes (t == 0: extended length)
+        if (t == 0) {
+            for (;;) {
+                LZO_NEED_IP(1);
+                if (*ip != 0) break;
+                t += 255;
+                ip++;
+            }
+            t += 15 + static_cast<size_t>(*ip++);
+        }
+        LZO_NEED_OP(t + 3);
+        LZO_NEED_IP(t + 3 + 1);  // literals + next instruction
+        std::memcpy(op, ip, t + 3);
+        op += t + 3;
+        ip += t + 3;
+
+    first_literal_run:
+        t = *ip++;
+        if (t >= 16) goto match;
+        // M1 after a literal run: 3 bytes at distance 1 + 0x0800 + (t >> 2) + (next << 2)
+        LZO_NEED_IP(1);
+        dist = 1 + 0x0800 + (t >> 2) + (static_cast<size_t>(*ip++) << 2);
+        LZO_LOOKBEHIND(dist);
+        LZO_NEED_OP(3);
+        m_pos = op - dist;
+        op[0] = m_pos[0];
+        op[1] = m_pos[1];
+        op[2] = m_pos[2];
+        op += 3;
+        goto match_done;
+
+        for (;;) {
+        match:
+            if (t >= 64) {
+                // M2: 3..8 bytes, distance 1..0x800
+                LZO_NEED_IP(1);
+                dist = 1 + ((t >> 2) & 7) + (static_cast<size_t>(*ip++) << 3);
+                t = (t >> 5) - 1;
+            } else if (t >= 32) {
+                // M3: distance 1..0x4000
+                t &= 31;
                 if (t == 0) {
-                    while (ip < src_len && src[ip] == 0) {
+                    for (;;) {
+                        LZO_NEED_IP(1);
+                        if (*ip != 0) break;
                         t += 255;
                         ip++;
                     }
-                    if (ip >= src_len) return false;
-                    t += 15 + src[ip++];
+                    t += 31 + static_cast<size_t>(*ip++);
                 }
-                t += 3;
-                if (ip + t > src_len || op + t > expected_len) return false;
-                std::memcpy(dst + op, src + ip, t);
-                op += t;
-                ip += t;
-                if (ip >= src_len) break;
-                b = src[ip++];
-                if (b < 16) {
-                    if (ip >= src_len) return false;
-                    size_t m_dist = 1 + (b >> 2) + (static_cast<size_t>(src[ip++]) << 2);
-                    if (m_dist > op || op + 2 > expected_len) return false;
-                    dst[op] = dst[op - m_dist];
-                    dst[op + 1] = dst[op - m_dist + 1];
-                    op += 2;
-                    size_t trailing = b & 3;
-                    if (trailing > 0) {
-                        if (ip + trailing > src_len || op + trailing > expected_len) return false;
-                        std::memcpy(dst + op, src + ip, trailing);
-                        op += trailing;
-                        ip += trailing;
+                LZO_NEED_IP(2);
+                dist = 1 + (static_cast<size_t>(ip[0]) >> 2) + (static_cast<size_t>(ip[1]) << 6);
+                ip += 2;
+            } else if (t >= 16) {
+                // M4: distance 0x4001..0xBFFF (offset 0 = end of stream)
+                const size_t high = (t & 8) << 11;
+                t &= 7;
+                if (t == 0) {
+                    for (;;) {
+                        LZO_NEED_IP(1);
+                        if (*ip != 0) break;
+                        t += 255;
+                        ip++;
                     }
-                    state = trailing;
-                    if (ip >= src_len) break;
-                    b = src[ip++];
-                    continue;
-                } else {
-                    state = 0;
+                    t += 7 + static_cast<size_t>(*ip++);
                 }
+                LZO_NEED_IP(2);
+                dist = high + (static_cast<size_t>(ip[0]) >> 2) + (static_cast<size_t>(ip[1]) << 6);
+                ip += 2;
+                if (dist == 0) goto eof_found;
+                dist += 0x4000;
             } else {
-                if (ip >= src_len) return false;
-                size_t m_dist = 1 + (b >> 2) + (static_cast<size_t>(src[ip++]) << 2);
-                if (m_dist > op || op + 2 > expected_len) return false;
-                dst[op] = dst[op - m_dist];
-                dst[op + 1] = dst[op - m_dist + 1];
+                // M1 after a match's trailing literals: 2 bytes at distance 1 + (t >> 2) + (next << 2)
+                LZO_NEED_IP(1);
+                dist = 1 + (t >> 2) + (static_cast<size_t>(*ip++) << 2);
+                LZO_LOOKBEHIND(dist);
+                LZO_NEED_OP(2);
+                m_pos = op - dist;
+                op[0] = m_pos[0];
+                op[1] = m_pos[1];
                 op += 2;
-                size_t trailing = b & 3;
-                if (trailing > 0) {
-                    if (ip + trailing > src_len || op + trailing > expected_len) return false;
-                    std::memcpy(dst + op, src + ip, trailing);
-                    op += trailing;
-                    ip += trailing;
-                }
-                state = trailing;
-                if (ip >= src_len) break;
-                b = src[ip++];
-                continue;
+                goto match_done;
             }
+
+            // Copy t + 2 bytes; source and destination may overlap (run-length style), so go bytewise.
+            LZO_LOOKBEHIND(dist);
+            LZO_NEED_OP(t + 2);
+            m_pos = op - dist;
+            for (size_t k = 0; k < t + 2; ++k) op[k] = m_pos[k];
+            op += t + 2;
+
+        match_done:
+            t = ip[-2] & 3;  // trailing literal count lives in the low bits of the instruction / offset byte
+            if (t == 0) break;
+
+        match_next:
+            LZO_NEED_OP(t);
+            LZO_NEED_IP(t + 1);  // trailing literals + next instruction
+            for (size_t k = 0; k < t; ++k) op[k] = ip[k];
+            op += t;
+            ip += t;
+            t = *ip++;
         }
-
-        size_t m_len = 0;
-        size_t m_dist = 0;
-        size_t trailing = 0;
-
-        if (b >= 64) {
-            // M2
-            m_len = ((b >> 5) - 1) + 2;
-            if (ip >= src_len) return false;
-            m_dist = 1 + ((b >> 2) & 7) + (static_cast<size_t>(src[ip++]) << 3);
-            trailing = b & 3;
-        } else if (b >= 32) {
-            // M3
-            m_len = b & 31;
-            if (m_len == 0) {
-                while (ip < src_len && src[ip] == 0) {
-                    m_len += 255;
-                    ip++;
-                }
-                if (ip >= src_len) return false;
-                m_len += 31 + src[ip++];
-            }
-            m_len += 2;
-            if (ip + 2 > src_len) return false;
-            uint8_t lo = src[ip++];
-            uint8_t hi = src[ip++];
-            m_dist = 1 + (lo >> 2) + (static_cast<size_t>(hi) << 6);
-            trailing = lo & 3;
-        } else if (b >= 16) {
-            // M4
-            m_len = b & 7;
-            if (m_len == 0) {
-                while (ip < src_len && src[ip] == 0) {
-                    m_len += 255;
-                    ip++;
-                }
-                if (ip >= src_len) return false;
-                m_len += 7 + src[ip++];
-            }
-            m_len += 2;
-            size_t dist_high = static_cast<size_t>(b & 8) << 11;
-            if (ip + 2 > src_len) return false;
-            uint8_t lo = src[ip++];
-            uint8_t hi = src[ip++];
-            size_t m_off = (lo >> 2) | (static_cast<size_t>(hi) << 6);
-            if (m_off == 0) {
-                // EOF marker
-                break;
-            }
-            m_dist = 0x4000 + dist_high + m_off;
-            trailing = lo & 3;
-        } else {
-            return false;
-        }
-
-        if (m_dist > op || op + m_len > expected_len) return false;
-        for (size_t i = 0; i < m_len; ++i) {
-            dst[op + i] = dst[op - m_dist + i];
-        }
-        op += m_len;
-
-        if (trailing > 0) {
-            if (ip + trailing > src_len || op + trailing > expected_len) return false;
-            std::memcpy(dst + op, src + ip, trailing);
-            op += trailing;
-            ip += trailing;
-        }
-
-        state = trailing;
-        if (ip >= src_len) break;
-        b = src[ip++];
     }
 
-    return true;
+eof_found:
+#undef LZO_NEED_IP
+#undef LZO_NEED_OP
+#undef LZO_LOOKBEHIND
+    return op == op_end;
 }
 
 // -----------------------------------------------------------------------------
@@ -373,6 +397,8 @@ bool UPKPackage::load_from_file(const std::string& file_path) {
         file.seekg(0, std::ios::beg);
         file.read(reinterpret_cast<char*>(data_.data()), first_u_off);
 
+        size_t failed_blocks = 0;
+        size_t total_blocks = 0;
         for (const auto& c : chunks) {
             file.seekg(c.c_off, std::ios::beg);
             uint32_t c_magic, blk_sz, tot_comp, tot_uncomp;
@@ -396,21 +422,30 @@ bool UPKPackage::load_from_file(const std::string& file_path) {
             for (const auto& [s_comp, s_uncomp] : sub_blks) {
                 std::vector<uint8_t> comp_buf(s_comp);
                 file.read(reinterpret_cast<char*>(comp_buf.data()), s_comp);
+                total_blocks++;
 
+                bool ok = false;
                 if (cur_u_off + s_uncomp <= data_.size()) {
                     if (compression_flags_ & 0x02) {
                         // LZO
-                        lzo1x_decompress(comp_buf.data(), s_comp, data_.data() + cur_u_off, s_uncomp);
+                        ok = lzo1x_decompress(comp_buf.data(), s_comp, data_.data() + cur_u_off, s_uncomp);
                     } else if (compression_flags_ & 0x01) {
                         // ZLIB
                         uLongf dest_len = s_uncomp;
-                        uncompress(data_.data() + cur_u_off, &dest_len, comp_buf.data(), s_comp);
+                        ok = uncompress(data_.data() + cur_u_off, &dest_len, comp_buf.data(), s_comp) == Z_OK &&
+                             dest_len == s_uncomp;
                     } else {
                         std::memcpy(data_.data() + cur_u_off, comp_buf.data(), std::min<size_t>(s_comp, s_uncomp));
+                        ok = true;
                     }
                 }
+                if (!ok) failed_blocks++;
                 cur_u_off += s_uncomp;
             }
+        }
+        if (failed_blocks > 0) {
+            std::cerr << "[UPKPackage] " << file_path << ": " << failed_blocks << "/" << total_blocks
+                      << " compressed blocks failed to decompress" << std::endl;
         }
     }
 
@@ -475,7 +510,7 @@ bool UPKPackage::parse_header_and_tables(const uint8_t* buf, size_t len) {
             read_val<int32_t>(imp_ptr, end);
             int32_t outer_idx = read_val<int32_t>(imp_ptr, end);
             int32_t obj_idx = read_val<int32_t>(imp_ptr, end);
-            read_val<int32_t>(imp_ptr, end);
+            int32_t obj_num = read_val<int32_t>(imp_ptr, end);
 
             FObjectImport imp;
             imp.index = i;
@@ -483,6 +518,7 @@ bool UPKPackage::parse_header_and_tables(const uint8_t* buf, size_t len) {
             imp.class_name = (cls_idx >= 0 && cls_idx < names_.size()) ? names_[cls_idx] : std::to_string(cls_idx);
             imp.outer_index = outer_idx;
             imp.object_name = (obj_idx >= 0 && obj_idx < names_.size()) ? names_[obj_idx] : std::to_string(obj_idx);
+            imp.object_number = obj_num;
             imports_.push_back(imp);
         }
     }
@@ -830,6 +866,25 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     }
                 }
             }
+
+            // StaticMeshComponent.Materials[] overrides the mesh's per-element materials
+            // (UStaticMeshComponent::GetMaterial). An instance that serializes the array replaces
+            // the archetype's array entirely; otherwise the archetype's value is inherited.
+            auto read_component_materials = [&](int32_t idx, bool& found) {
+                std::vector<std::string> out;
+                UPropertyList list;
+                parse_export_properties(*this, idx, list);
+                if (const UProperty* m = find_prop(list, "Materials")) {
+                    found = true;
+                    for (int32_t ref : m->ints) out.push_back(ref != 0 ? object_canonical_path(*this, ref) : std::string());
+                }
+                return out;
+            };
+            bool has_materials = false;
+            a.material_overrides = read_component_materials(comp_idx, has_materials);
+            if (!has_materials && comp_exp.archetype > 0 && static_cast<size_t>(comp_exp.archetype) <= exports_.size()) {
+                a.material_overrides = read_component_materials(comp_exp.archetype, has_materials);
+            }
         }
 
         // Classification
@@ -1018,12 +1073,25 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         std::memcpy(&elem_cnt, rem + cur, 4);
         cur += 4;
         if (elem_cnt < 0 || elem_cnt > 64) continue;
+        // FStaticMeshElement: Material, EnableCollision, OldEnableCollision, bEnableShadowCasting,
+        // FirstIndex, NumTriangles, MinVertexIndex, MaxVertexIndex, MaterialIndex, Fragments[]
+        struct RawElement {
+            int32_t material_ref = 0;
+            int32_t first_index = 0;
+            int32_t num_triangles = 0;
+        };
+        std::vector<RawElement> raw_elems;
         bool elem_ok = true;
         for (int32_t e = 0; e < elem_cnt; ++e) {
             if (cur + 40 > rem_len) { elem_ok = false; break; }
+            RawElement re;
+            std::memcpy(&re.material_ref, rem + cur, 4);
+            std::memcpy(&re.first_index, rem + cur + 16, 4);
+            std::memcpy(&re.num_triangles, rem + cur + 20, 4);
             int32_t frag_cnt = 0;
             std::memcpy(&frag_cnt, rem + cur + 36, 4);
             if (frag_cnt < 0 || frag_cnt > 10000) { elem_ok = false; break; }
+            raw_elems.push_back(re);
             cur += 40 + static_cast<size_t>(frag_cnt) * 8;
         }
         if (!elem_ok || cur + 16 > rem_len) continue;
@@ -1082,7 +1150,37 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         int32_t num_tris = ib_cnt / 3;
         asset.triangles.reserve(static_cast<size_t>(num_tris) * 3);
 
-        for (int32_t t = 0; t < num_tris; ++t) {
+        // v536 FStaticMeshFullVertex: TangentX(FPackedNormal) TangentZ(FPackedNormal, W = binormal sign)
+        // FColor(B,G,R,A; inline until the separate color stream of v615) UV[NumTexCoords]
+        // (FVector2DHalf, or FVector2D when bUseFullPrecisionUVs).
+        const size_t uv_size = full_prec ? 8 : 4;
+        const int64_t uv_off_signed = static_cast<int64_t>(smvb_stride) - static_cast<int64_t>(num_uv) * static_cast<int64_t>(uv_size);
+        const bool uv_layout_ok = num_uv >= 1 && num_uv <= 8 && uv_off_signed >= 8;
+        const size_t uv_off = uv_layout_ok ? static_cast<size_t>(uv_off_signed) : 0;
+        const bool has_color = uv_layout_ok && uv_off >= 12;
+
+        auto read_uv = [&](const uint8_t* sv, int32_t channel, float& u, float& v) {
+            u = 0.0f;
+            v = 0.0f;
+            if (!uv_layout_ok || channel >= num_uv) return;
+            const uint8_t* p = sv + uv_off + static_cast<size_t>(channel) * uv_size;
+            if (full_prec) {
+                std::memcpy(&u, p, 4);
+                std::memcpy(&v, p + 4, 4);
+            } else {
+                uint16_t h[2];
+                std::memcpy(h, p, 4);
+                u = half_to_float(h[0]);
+                v = half_to_float(h[1]);
+            }
+        };
+        auto unpack_normal = [](const uint8_t* b) {
+            return Vec3(static_cast<float>(b[0]) / 127.5f - 1.0f,
+                        static_cast<float>(b[1]) / 127.5f - 1.0f,
+                        static_cast<float>(b[2]) / 127.5f - 1.0f);
+        };
+
+        auto emit_triangle = [&](int32_t t) {
             uint32_t idx[3] = {0, 0, 0};
             if (ib_sz == 2) {
                 uint16_t s[3];
@@ -1094,7 +1192,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
             if (idx[0] >= static_cast<uint32_t>(pos_num) ||
                 idx[1] >= static_cast<uint32_t>(pos_num) ||
                 idx[2] >= static_cast<uint32_t>(pos_num)) {
-                continue;
+                return;
             }
 
             Vec3 p[3];
@@ -1113,25 +1211,46 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
                 Vertex v{};
                 v.position = p[k];
                 const uint8_t* sv = rem + smvb_data_off + idx[k] * static_cast<size_t>(smvb_stride);
-                // Unpack TangentZ at +4
-                Vec3 tz(
-                    (static_cast<float>(sv[4]) - 127.5f) / 127.5f,
-                    (static_cast<float>(sv[5]) - 127.5f) / 127.5f,
-                    (static_cast<float>(sv[6]) - 127.5f) / 127.5f
-                );
+                Vec3 tz = unpack_normal(sv + 4);
                 if (tz.length_sq() > 0.25f) {
                     v.normal = tz.normalized();
                 } else {
                     v.normal = (face_n.length_sq() > 0.1f) ? face_n : Vec3(0.0f, 0.0f, 1.0f);
                 }
-                v.tangent = Vec3(1.0f, 0.0f, 0.0f);
-                if (full_prec != 0 && smvb_stride >= 20) {
-                    std::memcpy(&v.u, sv + 12, 4);
-                    std::memcpy(&v.v, sv + 16, 4);
-                }
-                v.color = 0xFFFFFFFF;
+                Vec3 tx = unpack_normal(sv);
+                v.tangent = (tx.length_sq() > 0.25f) ? tx.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+                v.tangent_sign = (sv[7] >= 128) ? 1.0f : -1.0f;
+                read_uv(sv, 0, v.u, v.v);
+                read_uv(sv, 1, v.u2, v.v2);
+                v.color = has_color ? (static_cast<uint32_t>(sv[10]) | (static_cast<uint32_t>(sv[9]) << 8) |
+                                       (static_cast<uint32_t>(sv[8]) << 16) | (static_cast<uint32_t>(sv[11]) << 24))
+                                    : 0xFFFFFFFFu;
                 asset.triangles.push_back(v);
             }
+        };
+
+        // Emit triangles grouped by LOD0 element (one material each). Element indices are kept
+        // stable (even when empty) because StaticMeshComponent.Materials[] is indexed by them.
+        for (const auto& re : raw_elems) {
+            StaticMeshElement el;
+            el.material = (re.material_ref != 0) ? object_canonical_path(*this, re.material_ref) : std::string();
+            el.first_vertex = static_cast<uint32_t>(asset.triangles.size());
+            const int64_t t0 = std::clamp<int64_t>(re.first_index / 3, 0, num_tris);
+            const int64_t t1 = std::clamp<int64_t>(t0 + std::max(re.num_triangles, 0), t0, num_tris);
+            for (int64_t t = t0; t < t1; ++t) emit_triangle(static_cast<int32_t>(t));
+            el.vertex_count = static_cast<uint32_t>(asset.triangles.size()) - el.first_vertex;
+            asset.elements.push_back(std::move(el));
+        }
+        if (asset.triangles.empty()) {
+            // No usable element table: draw the whole index buffer with the first element's material.
+            StaticMeshElement el;
+            if (!raw_elems.empty() && raw_elems.front().material_ref != 0) {
+                el.material = object_canonical_path(*this, raw_elems.front().material_ref);
+            }
+            for (int32_t t = 0; t < num_tris; ++t) emit_triangle(t);
+            el.vertex_count = static_cast<uint32_t>(asset.triangles.size());
+            asset.elements.clear();
+            asset.elements.push_back(std::move(el));
         }
 
         if (!asset.triangles.empty()) {
@@ -1146,7 +1265,8 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
 void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                                      std::vector<MeshBuffer>& out_meshes,
                                      std::vector<AABB>& out_colliders,
-                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib) {
+                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib,
+                                     std::vector<std::string>* out_material_paths) {
     out_meshes.clear();
     out_colliders.clear();
 
@@ -1171,9 +1291,35 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
     rv_batch.name = "UE3_Level_RunnerVision_Geometry";
     rv_batch.is_runner_vision = true;
 
+    // Material sections: vertices are binned per scene material (-1 = procedural palette shading)
+    // and concatenated at the end so every material is one contiguous draw.
+    const bool use_materials = (out_material_paths != nullptr);
+    std::unordered_map<std::string, int32_t> material_ids;
+    if (use_materials) {
+        for (size_t i = 0; i < out_material_paths->size(); ++i) {
+            material_ids.emplace(to_lower((*out_material_paths)[i]), static_cast<int32_t>(i));
+        }
+    }
+    auto material_id = [&](const std::string& path) -> int32_t {
+        std::string key = to_lower(path);
+        auto it = material_ids.find(key);
+        if (it != material_ids.end()) return it->second;
+        const int32_t id = static_cast<int32_t>(out_material_paths->size());
+        out_material_paths->push_back(path);
+        material_ids.emplace(std::move(key), id);
+        return id;
+    };
+    std::map<int32_t, std::vector<Vertex>> world_bins;
+    std::map<int32_t, std::vector<Vertex>> rv_bins;
+    std::vector<uint32_t> scratch_indices;
+
     Vec3 overall_min(1e9f, 1e9f, 1e9f);
     Vec3 overall_max(-1e9f, -1e9f, -1e9f);
     bool has_real_meshes = (mesh_lib && !mesh_lib->empty());
+    size_t placed_meshes = 0;
+    size_t missing_meshes = 0;
+    size_t fallback_boxes = 0;
+    std::map<std::string, int> missing_names;
 
     for (auto& a : actors) {
         if (std::abs(a.location.x) > 150000.0f || std::abs(a.location.y) > 150000.0f) continue;
@@ -1218,10 +1364,14 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
             auto it = mesh_lib->find(low_mesh);
             if (it != mesh_lib->end() && !it->second.triangles.empty()) {
                 sm = &it->second;
+            } else {
+                missing_meshes++;
+                missing_names[low_mesh]++;
             }
         }
 
         if (sm) {
+            placed_meshes++;
             // UE3 FScaleRotationTranslationMatrix exact transformation:
             // Local Scale -> Rotation(Pitch, Yaw, Roll) -> Translation(Location)
             Vec3 scale(a.draw_scale * a.draw_scale_3d.x,
@@ -1238,27 +1388,63 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
             Vec3 axis_y(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp);
             Vec3 axis_z(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp);
 
-            Vec3 norm_sign(scale.x < 0.0f ? -1.0f : 1.0f,
-                           scale.y < 0.0f ? -1.0f : 1.0f,
-                           scale.z < 0.0f ? -1.0f : 1.0f);
+            // Normals transform with the inverse transpose (R * S^-1); tangents with R * S.
+            // A mirroring scale (negative determinant) flips the binormal handedness.
+            auto safe_inv = [](float s) { return (std::abs(s) > 1e-12f) ? 1.0f / s : 0.0f; };
+            const Vec3 inv_scale(safe_inv(scale.x), safe_inv(scale.y), safe_inv(scale.z));
+            const float det_sign = (scale.x * scale.y * scale.z < 0.0f) ? -1.0f : 1.0f;
 
-            std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
             AABB actor_aabb(Vec3(1e9f, 1e9f, 1e9f), Vec3(-1e9f, -1e9f, -1e9f));
 
-            for (const auto& lv : sm->triangles) {
+            auto emit_vertex = [&](std::vector<Vertex>& dst, const Vertex& lv, bool keep_vertex_color) {
                 Vec3 sp_pos(lv.position.x * scale.x, lv.position.y * scale.y, lv.position.z * scale.z);
                 Vec3 wp = a.location + axis_x * sp_pos.x + axis_y * sp_pos.y + axis_z * sp_pos.z;
 
-                Vec3 sn(lv.normal.x * norm_sign.x, lv.normal.y * norm_sign.y, lv.normal.z * norm_sign.z);
-                Vec3 wn = (axis_x * sn.x + axis_y * sn.y + axis_z * sn.z).normalized();
+                Vec3 wn = axis_x * (lv.normal.x * inv_scale.x) + axis_y * (lv.normal.y * inv_scale.y) +
+                          axis_z * (lv.normal.z * inv_scale.z);
+                Vec3 wt = axis_x * (lv.tangent.x * scale.x) + axis_y * (lv.tangent.y * scale.y) +
+                          axis_z * (lv.tangent.z * scale.z);
 
                 Vertex wv = lv;
                 wv.position = wp;
-                wv.normal = wn;
-                wv.color = color;
-                dst_verts.push_back(wv);
+                wv.normal = (wn.length_sq() > 1e-20f) ? wn.normalized() : Vec3(0.0f, 0.0f, 1.0f);
+                wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+                wv.tangent_sign = lv.tangent_sign * det_sign;
+                if (!keep_vertex_color) wv.color = color;
+                dst.push_back(wv);
 
                 actor_aabb.expand(wp);
+            };
+            // Emits whole triangles; mirrored instances (negative determinant) reverse the vertex
+            // order so world-space winding stays consistent (UE3 flips the cull mode instead).
+            auto emit_range = [&](std::vector<Vertex>& dst, uint32_t first, uint32_t count, bool keep_vertex_color) {
+                const uint32_t end = std::min<uint32_t>(first + count, static_cast<uint32_t>(sm->triangles.size()));
+                for (uint32_t i = first; i + 2 < end; i += 3) {
+                    emit_vertex(dst, sm->triangles[i], keep_vertex_color);
+                    if (det_sign < 0.0f) {
+                        emit_vertex(dst, sm->triangles[i + 2], keep_vertex_color);
+                        emit_vertex(dst, sm->triangles[i + 1], keep_vertex_color);
+                    } else {
+                        emit_vertex(dst, sm->triangles[i + 1], keep_vertex_color);
+                        emit_vertex(dst, sm->triangles[i + 2], keep_vertex_color);
+                    }
+                }
+            };
+
+            if (use_materials) {
+                // UStaticMeshComponent::GetMaterial(ElementIndex): component override, else the
+                // element's material, else the engine default material ("" here).
+                auto& bins = a.is_runner_vision ? rv_bins : world_bins;
+                for (size_t e = 0; e < sm->elements.size(); ++e) {
+                    const auto& el = sm->elements[e];
+                    if (el.vertex_count == 0) continue;
+                    const bool overridden = e < a.material_overrides.size() && !a.material_overrides[e].empty();
+                    const int32_t mat = material_id(overridden ? a.material_overrides[e] : el.material);
+                    emit_range(bins[mat], el.first_vertex, el.vertex_count, true);
+                }
+            } else {
+                std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
+                emit_range(dst_verts, 0, static_cast<uint32_t>(sm->triangles.size()), false);
             }
 
             if (actor_aabb.min_pt.x <= actor_aabb.max_pt.x) {
@@ -1284,13 +1470,54 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
             Vec3 b_max = a.location + Vec3(w, d, h);
             AABB box_bounds(b_min, b_max);
             a.world_bounds = box_bounds;
+            fallback_boxes++;
 
-            std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
-            std::vector<uint32_t>& dst_idx = a.is_runner_vision ? rv_batch.indices : world_batch.indices;
-            add_box_mesh(dst_verts, dst_idx, b_min, b_max, color);
+            if (use_materials) {
+                auto& bins = a.is_runner_vision ? rv_bins : world_bins;
+                add_box_mesh(bins[-1], scratch_indices, b_min, b_max, color);
+            } else {
+                std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
+                std::vector<uint32_t>& dst_idx = a.is_runner_vision ? rv_batch.indices : world_batch.indices;
+                add_box_mesh(dst_verts, dst_idx, b_min, b_max, color);
+            }
 
             if (a.is_collidable) {
                 out_colliders.push_back(box_bounds);
+            }
+        }
+    }
+
+    if (use_materials) {
+        auto flush_bins = [](MeshBuffer& mb, std::map<int32_t, std::vector<Vertex>>& bins) {
+            size_t total = 0;
+            for (const auto& [mat, verts] : bins) total += verts.size();
+            mb.vertices.reserve(total);
+            for (auto& [mat, verts] : bins) {
+                if (verts.empty()) continue;
+                MeshSection s;
+                s.first_vertex = static_cast<uint32_t>(mb.vertices.size());
+                s.vertex_count = static_cast<uint32_t>(verts.size());
+                s.material = mat;
+                mb.vertices.insert(mb.vertices.end(), verts.begin(), verts.end());
+                mb.sections.push_back(s);
+                std::vector<Vertex>().swap(verts);
+            }
+        };
+        flush_bins(world_batch, world_bins);
+        flush_bins(rv_batch, rv_bins);
+    }
+
+    if (has_real_meshes) {
+        size_t sections = world_batch.sections.size() + rv_batch.sections.size();
+        std::cout << "[Level] " << placed_meshes << " static meshes placed, " << missing_meshes
+                  << " missing (" << missing_names.size() << " unique), " << fallback_boxes << " fallback boxes, "
+                  << sections << " material sections" << std::endl;
+        if (std::getenv("ME_MATERIAL_VERBOSE") && !missing_names.empty()) {
+            std::vector<std::pair<int, std::string>> top;
+            for (const auto& [n, c] : missing_names) top.emplace_back(c, n);
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 12; ++i) {
+                std::cout << "[Level]   missing mesh '" << top[i].second << "' x" << top[i].first << std::endl;
             }
         }
     }
@@ -1302,6 +1529,88 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
     if (!rv_batch.vertices.empty()) {
         rv_batch.bounds = AABB(overall_min, overall_max);
         out_meshes.push_back(std::move(rv_batch));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Level sun: the dominant DirectionalLight of the level
+// -----------------------------------------------------------------------------
+// Mirror's Edge keeps its sun in the *_Lgts streaming packages (e.g. Tutorial_lgts,
+// Edge_Ext_Lgts). The actor stores Rotation (UE units, 65536 = 360 deg) plus optional
+// Beast overrides (bUseBakerColorAndBrightness, BakerColor, BakerBrightness); the
+// DirectionalLightComponent stores Brightness, LightColor, LightingChannels and
+// bHasLightEverBeenBuiltIntoLightMap. Cinematic-only / PhysX-only lights clear the
+// Static lighting channel, so the light that was baked into the light-maps wins.
+namespace {
+struct LevelSun {
+    bool found = false;
+    float score = -1e30f;
+    Vec3 direction{-0.4f, 0.6f, 0.7f};  // world-space direction *towards* the sun
+    Vec3 color{2.0f, 1.96f, 1.9f};      // linear RGB * brightness
+    std::string source;
+};
+}  // namespace
+
+static float srgb_byte_to_linear(float c01) {
+    // FLinearColor(FColor) uses a pow(x, 2.2) table in UE3.
+    return std::pow(std::max(c01, 0.0f), 2.2f);
+}
+
+static void scan_level_suns(const UPKPackage& pkg, LevelSun& best) {
+    const auto& exports = pkg.get_exports();
+    for (size_t i = 0; i < exports.size(); ++i) {
+        const int32_t idx = static_cast<int32_t>(i) + 1;
+        const std::string cls = object_class_name(pkg, idx);
+        if (cls.find("DirectionalLight") == std::string::npos || cls.find("Component") != std::string::npos) continue;
+
+        UPropertyList actor_props;
+        parse_export_properties(pkg, idx, actor_props);
+        const int32_t comp_idx = prop_object(actor_props, "LightComponent");
+        if (comp_idx <= 0) continue;  // components always live in the same package as the actor
+        UPropertyList comp_props;
+        parse_export_properties(pkg, comp_idx, comp_props);
+
+        if (!prop_bool(comp_props, "bEnabled", true)) continue;
+        bool affects_static = true;  // LightComponent default: LightingChannels=(BSP,Static,Dynamic)
+        if (const UProperty* lc = find_prop(comp_props, "LightingChannels")) {
+            affects_static = prop_bool(lc->fields, "Static", true);
+        }
+        const bool baked = prop_bool(comp_props, "bHasLightEverBeenBuiltIntoLightMap", false);
+
+        // Colour: Beast overrides when present (they are what the light-maps were baked with).
+        float rgb[3] = {1.0f, 1.0f, 1.0f};
+        float brightness = prop_float(comp_props, "Brightness", 1.0f);
+        if (const UProperty* c = find_prop(comp_props, "LightColor")) {
+            for (int k = 0; k < 3; ++k) rgb[k] = c->v[k];
+        }
+        if (prop_bool(actor_props, "bUseBakerColorAndBrightness", false)) {
+            brightness = prop_float(actor_props, "BakerBrightness", brightness);
+            if (const UProperty* c = find_prop(actor_props, "BakerColor")) {
+                for (int k = 0; k < 3; ++k) rgb[k] = c->v[k];
+            }
+        }
+
+        const float score = (baked ? 1000.0f : 0.0f) + (affects_static ? 100.0f : 0.0f) + brightness;
+        if (best.found && score <= best.score) continue;
+
+        // FRotationMatrix(Rotation).GetAxis(0) is the direction the light travels.
+        int32_t pitch = 0, yaw = 0;
+        if (const UProperty* r = find_prop(actor_props, "Rotation")) {
+            pitch = r->vi[0];
+            yaw = r->vi[1];
+        }
+        const float kUnit = 3.14159265358979f / 32768.0f;
+        const float p = static_cast<float>(pitch) * kUnit;
+        const float y = static_cast<float>(yaw) * kUnit;
+        const Vec3 forward(std::cos(p) * std::cos(y), std::cos(p) * std::sin(y), std::sin(p));
+        if (-forward.z < 0.05f) continue;  // a sun below the horizon cannot be the key light
+
+        best.found = true;
+        best.score = score;
+        best.direction = Vec3(-forward.x, -forward.y, -forward.z);
+        best.color = Vec3(srgb_byte_to_linear(rgb[0]) * brightness, srgb_byte_to_linear(rgb[1]) * brightness,
+                          srgb_byte_to_linear(rgb[2]) * brightness);
+        best.source = package_name_of(pkg) + "." + export_object_name(pkg, idx);
     }
 }
 
@@ -1323,8 +1632,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         return false;
     }
 
-    UPKPackage master_pkg(main_path.string());
-    if (!master_pkg.is_valid()) {
+    auto master_pkg = std::make_shared<UPKPackage>(main_path.string());
+    if (!master_pkg->is_valid()) {
         return false;
     }
 
@@ -1335,13 +1644,32 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.checkpoints.clear();
     out_scene.sounds.clear();
     out_scene.enemies.clear();
+    out_scene.materials.reset();
+
+    // Package manager rooted at CookedPC: keeps the level packages alive and resolves material /
+    // texture objects that live in other packages (content packages, engine packages).
+    // Set ME_NO_MATERIALS=1 to skip the material system (procedural shading only).
+    fs::path cooked_root = root / "TdGame" / "CookedPC";
+    for (fs::path p = main_path.parent_path(); !p.empty() && p != p.root_path(); p = p.parent_path()) {
+        if (to_lower(p.filename().string()) == "cookedpc") {
+            cooked_root = p;
+            break;
+        }
+    }
+    std::unique_ptr<PackageManager> pm;
+    if (std::getenv("ME_NO_MATERIALS") == nullptr) {
+        pm = std::make_unique<PackageManager>(cooked_root.string());
+        pm->add_loaded(main_path.stem().string(), master_pkg);
+    }
 
     std::unordered_map<std::string, StaticMeshAsset> mesh_library;
 
     // Extract from master package
-    master_pkg.extract_static_meshes(mesh_library);
-    auto master_actors = master_pkg.extract_actors();
-    auto master_sounds = master_pkg.extract_audio();
+    master_pkg->extract_static_meshes(mesh_library);
+    auto master_actors = master_pkg->extract_actors();
+    auto master_sounds = master_pkg->extract_audio();
+    LevelSun level_sun;
+    scan_level_suns(*master_pkg, level_sun);
 
     out_scene.actors.insert(out_scene.actors.end(), master_actors.begin(), master_actors.end());
     out_scene.sounds.insert(out_scene.sounds.end(), master_sounds.begin(), master_sounds.end());
@@ -1377,7 +1705,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     };
 
     // 1. From AdditionalPackagesToCook in master package header
-    for (const auto& add_pkg : master_pkg.get_additional_packages()) {
+    for (const auto& add_pkg : master_pkg->get_additional_packages()) {
         if (!should_load_subpkg(add_pkg)) continue;
         fs::path p = map_dir / (add_pkg + ".me1");
         if (fs::exists(p)) sub_packages.insert(p.string());
@@ -1404,16 +1732,58 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     size_t loaded_sub = 0;
     for (const auto& sub_path : sub_packages) {
         if (loaded_sub++ >= 32) break;
-        UPKPackage sub_pkg(sub_path);
-        if (!sub_pkg.is_valid()) continue;
+        auto sub_pkg = std::make_shared<UPKPackage>(sub_path);
+        if (!sub_pkg->is_valid()) continue;
 
-        sub_pkg.extract_static_meshes(mesh_library);
-        auto sub_actors = sub_pkg.extract_actors();
+        sub_pkg->extract_static_meshes(mesh_library);
+        auto sub_actors = sub_pkg->extract_actors();
         out_scene.actors.insert(out_scene.actors.end(), sub_actors.begin(), sub_actors.end());
+        scan_level_suns(*sub_pkg, level_sun);
+        if (pm) pm->add_loaded(fs::path(sub_path).stem().string(), sub_pkg);
+    }
+
+    // The sun lives in the *_Lgts lighting packages, which carry no geometry: open them for lights only.
+    if (fs::exists(map_dir)) {
+        std::vector<fs::path> light_packages;
+        for (const auto& entry : fs::directory_iterator(map_dir)) {
+            if (!entry.is_regular_file()) continue;
+            const std::string ext = entry.path().extension().string();
+            if (ext != ".me1" && ext != ".upk") continue;
+            const std::string low = to_lower(entry.path().stem().string());
+            // Covers *_Lgts, *_lgts, *_LGTs, *_Lgts_Pt1 and the odd *_Lgt (SP07 Boat_Chase_Lgt).
+            if (low.rfind(low_prefix, 0) != 0 || low.find("_lgt") == std::string::npos) continue;
+            if (low.find("_loc_") != std::string::npos) continue;
+            light_packages.push_back(entry.path());
+        }
+        std::sort(light_packages.begin(), light_packages.end());
+        for (const auto& lp : light_packages) {
+            UPKPackage light_pkg(lp.string());
+            if (light_pkg.is_valid()) scan_level_suns(light_pkg, level_sun);
+        }
+    }
+    if (level_sun.found) {
+        out_scene.sun_direction = level_sun.direction.normalized();
+        out_scene.sun_color = level_sun.color;
+        std::cout << "[Level] Sun from " << level_sun.source << ": direction (" << out_scene.sun_direction.x << ", "
+                  << out_scene.sun_direction.y << ", " << out_scene.sun_direction.z << "), linear colour ("
+                  << out_scene.sun_color.x << ", " << out_scene.sun_color.y << ", " << out_scene.sun_color.z << ")"
+                  << std::endl;
     }
 
     // Construct real 3D UStaticMesh rooftop geometry and colliders (populating each actor's transformed world_bounds)
-    generate_rooftop_level_geometry(out_scene.actors, out_scene.meshes, out_scene.colliders, &mesh_library);
+    std::vector<std::string> material_paths;
+    generate_rooftop_level_geometry(out_scene.actors, out_scene.meshes, out_scene.colliders, &mesh_library,
+                                    pm ? &material_paths : nullptr);
+
+    // Resolve, translate and load every material referenced by the level geometry
+    // (ME_MATERIAL_VERBOSE=1 prints per-material diagnostics, ME_MAX_TEXTURE_SIZE caps mip size).
+    if (pm && !material_paths.empty()) {
+        MaterialBuildOptions mopts;
+        if (const char* v = std::getenv("ME_MATERIAL_VERBOSE")) mopts.verbose = (v[0] != '\0' && v[0] != '0');
+        if (const char* s = std::getenv("ME_MAX_TEXTURE_SIZE")) mopts.max_texture_size = std::max(16, std::atoi(s));
+        out_scene.materials = build_scene_materials(*pm, material_paths, mopts);
+    }
+    pm.reset();
 
     // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry
     bool found_start = false;

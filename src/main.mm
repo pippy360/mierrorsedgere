@@ -182,29 +182,53 @@ static void append_test_course_visuals(LevelScene& scene) {
 // while culling triangles inside the immediate parkour runway corridor so the camera view is never obstructed.
 static void align_city_meshes_around_course(LevelScene& scene, const Vec3& original_spawn) {
     Vec3 offset = Vec3(3200.0f, 0.0f, -120.0f) - original_spawn;
+    auto in_corridor = [](const Vec3& p) {
+        return (p.x > -450.0f && p.x < 9950.0f &&
+                p.y > -360.0f && p.y < 360.0f &&
+                p.z > -40.0f  && p.z < 750.0f);
+    };
     for (auto& mb : scene.meshes) {
         std::vector<Vertex> filtered;
         filtered.reserve(mb.vertices.size());
-        for (size_t i = 0; i + 2 < mb.vertices.size(); i += 3) {
-            Vertex v0 = mb.vertices[i];
-            Vertex v1 = mb.vertices[i + 1];
-            Vertex v2 = mb.vertices[i + 2];
-            v0.position += offset;
-            v1.position += offset;
-            v2.position += offset;
 
-            auto in_corridor = [](const Vec3& p) {
-                return (p.x > -450.0f && p.x < 9950.0f &&
-                        p.y > -360.0f && p.y < 360.0f &&
-                        p.z > -40.0f  && p.z < 750.0f);
-            };
-            Vec3 mid = (v0.position + v1.position + v2.position) * (1.0f / 3.0f);
-            if (in_corridor(v0.position) || in_corridor(v1.position) || in_corridor(v2.position) || in_corridor(mid)) {
-                continue;
+        // Offsets + culls the triangles of [first, first + count) and appends the survivors.
+        auto filter_range = [&](size_t first, size_t count) {
+            const size_t end = std::min(mb.vertices.size(), first + count);
+            for (size_t i = first; i + 2 < end; i += 3) {
+                Vertex v0 = mb.vertices[i];
+                Vertex v1 = mb.vertices[i + 1];
+                Vertex v2 = mb.vertices[i + 2];
+                v0.position += offset;
+                v1.position += offset;
+                v2.position += offset;
+
+                Vec3 mid = (v0.position + v1.position + v2.position) * (1.0f / 3.0f);
+                if (in_corridor(v0.position) || in_corridor(v1.position) || in_corridor(v2.position) || in_corridor(mid)) {
+                    continue;
+                }
+                filtered.push_back(v0);
+                filtered.push_back(v1);
+                filtered.push_back(v2);
             }
-            filtered.push_back(v0);
-            filtered.push_back(v1);
-            filtered.push_back(v2);
+        };
+
+        if (mb.sections.empty()) {
+            filter_range(0, mb.vertices.size());
+        } else {
+            // Material sections: filter each section independently and rebuild its vertex range.
+            std::vector<MeshSection> sections;
+            sections.reserve(mb.sections.size());
+            for (const MeshSection& s : mb.sections) {
+                const size_t before = filtered.size();
+                filter_range(s.first_vertex, s.vertex_count);
+                const size_t kept = filtered.size() - before;
+                if (kept == 0) continue;
+                MeshSection ns = s;
+                ns.first_vertex = static_cast<uint32_t>(before);
+                ns.vertex_count = static_cast<uint32_t>(kept);
+                sections.push_back(ns);
+            }
+            mb.sections.swap(sections);
         }
         mb.vertices.swap(filtered);
     }

@@ -5,9 +5,12 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
 #include <string_view>
 
 namespace me {
+
+struct SceneMaterialLibrary;  // assets/scene_materials.hpp
 
 constexpr float PI = 3.14159265358979323846f;
 constexpr float DEG2RAD = PI / 180.0f;
@@ -443,6 +446,15 @@ struct Vertex {
     float u2 = 0.0f; // Lightmap UV
     float v2 = 0.0f;
     uint32_t color = 0xFFFFFFFF;
+    float tangent_sign = 1.0f; // Binormal = cross(normal, tangent) * tangent_sign (UE3 TangentZ.w)
+};
+
+// A contiguous range of MeshBuffer::vertices drawn with one scene material
+// (index into LevelScene::materials->materials, -1 = legacy procedural shading).
+struct MeshSection {
+    uint32_t first_vertex = 0;
+    uint32_t vertex_count = 0;
+    int32_t material = -1;
 };
 
 struct MeshBuffer {
@@ -451,6 +463,7 @@ struct MeshBuffer {
     std::vector<uint32_t> indices;
     AABB bounds;
     bool is_runner_vision = false;
+    std::vector<MeshSection> sections; // empty = whole buffer uses legacy procedural shading
 };
 
 struct SoundClip {
@@ -487,6 +500,8 @@ struct LevelActor {
     bool is_enemy = false;
     bool is_bag = false;
     Vec3 end_point{0.0f, 0.0f, 0.0f};
+    // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
+    std::vector<std::string> material_overrides;
 };
 
 // -----------------------------------------------------------------------------
@@ -616,7 +631,8 @@ struct LevelScene {
     std::string chapter_title;
     Vec3 player_spawn_pos{0.0f, 0.0f, 100.0f};
     float player_spawn_yaw = 0.0f;
-    Vec3 sun_direction{-0.4f, 0.6f, 0.7f};
+    Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
+    Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     std::vector<LevelActor> actors;
     std::vector<MeshBuffer> meshes;
     std::vector<AABB> colliders;
@@ -624,6 +640,8 @@ struct LevelScene {
     std::vector<Vec3> checkpoints;
     std::vector<SoundClip> sounds;
     std::vector<std::string> subtitles;
+    // Resolved + compiled Mirror's Edge materials and textures referenced by MeshSection::material
+    std::shared_ptr<const SceneMaterialLibrary> materials;
 };
 
 } // namespace me

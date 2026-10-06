@@ -21,6 +21,7 @@ struct FObjectImport {
     std::string class_name;
     int32_t outer_index = 0;
     std::string object_name;
+    int32_t object_number = 0; // FName number (N > 0 means suffix "_{N-1}")
 };
 
 struct FObjectExport {
@@ -62,12 +63,20 @@ struct PropertyValue {
     std::vector<uint8_t> raw_bytes;
 };
 
+// One LOD0 FStaticMeshElement: a material and the triangles drawn with it.
+struct StaticMeshElement {
+    std::string material;       // full object path of Element.Material ("" = None -> engine default material)
+    uint32_t first_vertex = 0;  // range in StaticMeshAsset::triangles
+    uint32_t vertex_count = 0;
+};
+
 struct StaticMeshAsset {
     std::string name;
     Vec3 bounds_origin{0.0f, 0.0f, 0.0f};
     Vec3 bounds_extent{100.0f, 100.0f, 100.0f};
     float bounds_radius = 173.2f;
-    std::vector<Vertex> triangles; // 3 vertices per triangle in local space
+    std::vector<Vertex> triangles; // 3 vertices per triangle in local space, grouped by element
+    std::vector<StaticMeshElement> elements;
 };
 
 class UPKPackage {
@@ -124,11 +133,15 @@ private:
 // -----------------------------------------------------------------------------
 bool load_level_scene(const std::string& game_root, const std::string& map_rel_path, LevelScene& out_scene);
 
-// Helper to construct a contiguous, playable 3D rooftop mesh around extracted actors
+// Helper to construct a contiguous, playable 3D rooftop mesh around extracted actors.
+// When `out_material_paths` is non-null, real static meshes are emitted as per-material
+// MeshSections whose `material` indexes into *out_material_paths (full object paths,
+// "" = engine default material); fallback boxes use material -1 (procedural shading).
 void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                                      std::vector<MeshBuffer>& out_meshes,
                                      std::vector<AABB>& out_colliders,
-                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib = nullptr);
+                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib = nullptr,
+                                     std::vector<std::string>* out_material_paths = nullptr);
 
 } // namespace me
 

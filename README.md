@@ -15,6 +15,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
    - Built-in LZO1X-1 decompression engine resolving linear memory address spaces for multi-chunk packages (`Entry.upk`, `SP00/Tutorial_p.me1` through `SP09/Scraper_p.me1`).
    - UE3 INI and INT configuration and localization parser reading physics constants from `DefaultPawnMovement.ini`, campaign progression from `DefaultGame.ini`, and dialogue from `Subtitles.int`.
    - Automatic sub-level slice discovery (`*_Art`, `*_Spt`, `*_Lgts`, `*_Slc`) assembling contiguous 3D rooftop geometry and swept collision hulls.
+   - **Material system** (`src/assets/material_system.*`, `package_manager.*`, `texture_loader.*`, `ue3_props.*`): resolves every static-mesh element's real UE3 material, including component overrides, `MaterialInstanceConstant` chains, parameters and static switches. It loads the referenced DXT/RGBA textures and cubemaps from any CookedPC package and translates each UE3 material expression graph into Metal Shading Language. The level sun comes from the level's baked `DirectionalLight`. See [`docs/MATERIAL_SYSTEM.md`](docs/MATERIAL_SYSTEM.md).
 
 2. **Discrete Kinematic Parkour Controller (`src/physics/parkour_controller.*`)**:
    - 120 Hz fixed substepping physics engine implementing 100% authentic *Mirror's Edge* movement mechanics:
@@ -27,6 +28,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
 
 3. **Apple Metal 3.0 Graphics Engine (`src/renderer/metal_renderer.*`)**:
    - Native Apple Metal shader pipelines written in Metal Shading Language (MSL):
+     - `Generated UE3 materials`: one pipeline per translated material shader, drawn per mesh section with back-face culling (two-sided materials excepted). Opaque/Masked sections go in the base pass. Translucent/Additive/Modulate sections go in a second pass that reads copies of scene colour and depth.
      - `TdDirHaze`: Directional atmospheric sun haze, sky dome gradient, sharp corona, and horizon glare.
      - `BasePass + Beast Radiosity`: High-key white architectural aesthetic, dual-hemisphere ambient bounce (cyan sky / warm ground), and contact ambient occlusion.
      - `Runner Vision (LOI)`: Dynamic breathing scarlet red (`#E61414`) pulse on parkour targets, springboard ramps, and conduit pipes.
