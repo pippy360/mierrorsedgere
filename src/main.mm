@@ -595,19 +595,36 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     controller.step(in7, 1.0f / 60.0f, sim_scene);
     log_telemetry("Stage7_Disarm");
 
-    bool s7_disarm = (controller.get_move_state() == EMovement::MOVE_Snatch || controller.get_telemetry().weapon.equipped);
+    bool s7_disarm = (controller.get_move_state() == EMovement::MOVE_Snatch && controller.get_telemetry().weapon.equipped);
     bool s7_reaction = controller.get_telemetry().reaction_active;
-    bool s7_pass = s7_disarm && s7_reaction;
-    if (s7_disarm && !sim_scene.enemies.empty()) {
-        sim_scene.enemies[0].stunned = true;
-        sim_scene.enemies[0].disarm_window = false;
-    }
 
     renderer.render_frame(sim_scene, controller.get_telemetry());
     save_and_publish_png("oracle_5_combat_disarm_reaction.png");
+
+    // Verify all 11 retail firearms equip, fire with 3D tracers, and render 1P/3P animations
+    int weapons_verified = 0;
+    for (int w = 0; w < 11; ++w) {
+        InputFrame in_cyc{};
+        in_cyc.cycle_weapon_dir = 1;
+        controller.step(in_cyc, 1.0f / 60.0f, sim_scene);
+        // Step past equip cooldown and fire a round
+        for (int f = 0; f < 15; ++f) {
+            InputFrame in_wait{};
+            controller.step(in_wait, 1.0f / 60.0f, sim_scene);
+        }
+        InputFrame in_fire{};
+        in_fire.fire = true;
+        controller.step(in_fire, 1.0f / 60.0f, sim_scene);
+        if (controller.get_telemetry().weapon.equipped && controller.get_telemetry().weapon.fired_this_tick) {
+            weapons_verified++;
+        }
+        renderer.render_frame(sim_scene, controller.get_telemetry());
+    }
+
+    bool s7_pass = s7_disarm && s7_reaction && (weapons_verified == 11);
     std::cout << "  -> Stage 7 Result: " << (s7_pass ? "PASS" : "FAIL")
               << " (Disarm=" << (s7_disarm ? "OK" : "NO")
-              << ", Weapon=" << (controller.get_telemetry().weapon.equipped ? controller.get_telemetry().weapon.name : "None")
+              << ", WeaponsVerified=" << weapons_verified << "/11"
               << ", Reaction=" << (s7_reaction ? "ACTIVE" : "OFF") << ")" << std::endl;
 
     // Stage 8: Interactive Elevator Ride & Mid-Shaft Level Streaming Transition (Z = 100 -> 680)
@@ -931,7 +948,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         input.disarm = true;
                     }
                 }
-            } else if (ev.type == SDL_KEYDOWN) {
+            } else if (ev.type == SDL_MOUSEWHEEL) {
+                if (!renderer.is_menu_open() && ev.wheel.y != 0) {
+                    input.cycle_weapon_dir = (ev.wheel.y > 0) ? 1 : -1;
+                }
+            } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
                 SDL_Keycode key = ev.key.keysym.sym;
                 if (key == SDLK_ESCAPE) {
                     if (renderer.is_menu_open()) {
@@ -944,6 +965,14 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     bool menu = !renderer.is_menu_open();
                     renderer.set_menu_open(menu);
                     SDL_SetRelativeMouseMode(menu ? SDL_FALSE : SDL_TRUE);
+                } else if (key == SDLK_t) {
+                    input.cycle_weapon_dir = 1;
+                } else if (key == SDLK_y) {
+                    input.cycle_weapon_dir = -1;
+                } else if (key == SDLK_g || key == SDLK_BACKSPACE) {
+                    input.drop_weapon = true;
+                } else if (key == SDLK_h) {
+                    input.spawn_combat_squad = true;
                 } else if (key == SDLK_r) {
                     int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
                                         std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
@@ -991,8 +1020,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
         }
 
-        // Keyboard State Polling
+        // Keyboard & Mouse Button State Polling (supports held LMB for full-auto weapons)
         const Uint8* state = SDL_GetKeyboardState(nullptr);
+        Uint32 mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
+        if ((mouse_buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) && frame_counter >= 15 &&
+            !renderer.is_menu_open() && SDL_GetRelativeMouseMode() == SDL_TRUE &&
+            controller.get_weapon().equipped) {
+            input.fire = true;
+        }
+
         if (state[SDL_SCANCODE_W] || state[SDL_SCANCODE_UP]) input.forward += 1.0f;
         if (state[SDL_SCANCODE_S] || state[SDL_SCANCODE_DOWN]) input.forward -= 1.0f;
         if (state[SDL_SCANCODE_D] || state[SDL_SCANCODE_RIGHT]) input.strafe += 1.0f;
@@ -1093,7 +1129,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 case EMovement::MOVE_WallRunningRight: audio.play_effect(EAudioEffect::Wallrun); break;
                 case EMovement::MOVE_SpeedVaulting:
                 case EMovement::MOVE_VaultOver:
-                case EMovement::MOVE_SpringBoarding: audio.play_effect(EAudioEffect::Vault); break;
+                case EMovement::MOVE_SpringBoarding:
+                case EMovement::MOVE_Melee:
+                case EMovement::MOVE_MeleeAir:
+                case EMovement::MOVE_MeleeWallrun:
+                case EMovement::MOVE_Barge: audio.play_effect(EAudioEffect::Vault); break;
                 case EMovement::MOVE_Slide:
                 case EMovement::MOVE_MeleeSlide: audio.play_effect(EAudioEffect::Slide); break;
                 case EMovement::MOVE_SkillRoll: audio.play_effect(EAudioEffect::SkillRoll); break;
@@ -1109,7 +1149,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             prev_checkpoint = tel.active_checkpoint;
         }
 
-        if (input.fire) {
+        if (tel.weapon.fired_this_tick) {
             audio.play_effect(EAudioEffect::Gunshot);
         }
 

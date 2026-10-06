@@ -35,6 +35,14 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.active_elevator_idx = -1;
     m_telemetry.elevator_progress = 0.0f;
     m_telemetry.weapon = WeaponState{};
+    m_telemetry.combat_anim_time = 0.0f;
+    m_telemetry.combat_anim_duration = 0.45f;
+    m_telemetry.melee_variant = 0;
+    m_telemetry.snatch_from_back = false;
+    m_telemetry.melee_hit_confirmed = false;
+    m_telemetry.disarm_prompt_visible = false;
+    m_telemetry.hit_marker_timer = 0.0f;
+    m_telemetry.damage_flash_timer = 0.0f;
     m_telemetry.active_subtitle = "";
 
     m_momentum_timer = 0.0f;
@@ -51,12 +59,94 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_fall_peak_z = spawn_pos.z;
     m_crouch_landing_buffer = 0.0f;
     m_melee_cooldown = 0.0f;
+    m_melee_combo_index = 0;
+    m_melee_combo_reset_timer = 0.0f;
+    m_weapon_cycle_index = -1;
     m_jump_consumed = false;
     m_prev_turn_180 = false;
     m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
+}
+
+void ParkourController::equip_weapon(const std::string& weapon_name) {
+    struct WeaponSpec {
+        const char* id;
+        const char* display;
+        EWeaponFireMode fire_mode;
+        int max_ammo;
+        float fire_interval;
+        float damage_near;
+        float damage_far;
+        float falloff_start;
+        float falloff_end;
+        float max_range;
+        int pellet_count;
+        float spread_rad;
+        float recoil_pitch;
+        bool is_heavy;
+        bool is_two_handed;
+        float mobility_scale;
+    };
+
+    // Reverse-engineered from TdGame/Config/DefaultWeapons.ini & TdSharedContent.u
+    static const WeaponSpec kWeaponSpecs[] = {
+        {"Colt1911",     "M1911 .45 Pistol",        EWeaponFireMode::SemiAuto,   8,   0.22f, 45.0f, 25.0f, 1200.0f, 3000.0f, 10000.0f, 1,  0.018f, 1.8f, false, false, 0.92f},
+        {"Glock18",      "G18C Machine Pistol",     EWeaponFireMode::FullAuto,   19,  0.08f, 22.0f, 10.0f,  800.0f, 2200.0f,  8000.0f, 1,  0.045f, 1.0f, false, false, 0.92f},
+        {"BerettaM93R",  "93R Burst Pistol",        EWeaponFireMode::Burst3,     20,  0.085f,30.0f, 15.0f, 1000.0f, 2500.0f,  9000.0f, 1,  0.028f, 1.1f, false, false, 0.92f},
+        {"SteyrTMP",     "Steyr TMP Tactical SMG",  EWeaponFireMode::FullAuto,   30,  0.066f,20.0f,  9.0f,  800.0f, 2200.0f,  8000.0f, 1,  0.048f, 0.85f,false, false, 0.90f},
+        {"MP5K",         "HK MP5K Submachine Gun",  EWeaponFireMode::FullAuto,   30,  0.075f,26.0f, 13.0f, 1000.0f, 2800.0f,  9000.0f, 1,  0.035f, 1.0f, false, true,  0.86f},
+        {"G36C",         "HK G36C Assault Rifle",   EWeaponFireMode::FullAuto,   30,  0.08f, 36.0f, 18.0f, 1800.0f, 4500.0f, 12000.0f, 1,  0.024f, 1.3f, true,  true,  0.72f},
+        {"FNSCARL",      "FN SCAR-L Carbine",       EWeaponFireMode::FullAuto,   20,  0.096f,42.0f, 24.0f, 2000.0f, 5000.0f, 13000.0f, 1,  0.020f, 1.55f,true,  true,  0.70f},
+        {"Remington870", "Remington 870 Shotgun",   EWeaponFireMode::PumpAction, 7,   0.82f, 18.0f,  4.0f,  400.0f, 1500.0f,  3000.0f, 10, 0.092f, 4.0f, true,  true,  0.72f},
+        {"Neostead",     "Neostead 2000 Shotgun",   EWeaponFireMode::PumpAction, 12,  0.62f, 16.0f,  4.0f,  450.0f, 1600.0f,  3200.0f, 10, 0.082f, 3.4f, true,  true,  0.72f},
+        {"FNMinimi",     "M249 SAW Squad LMG",      EWeaponFireMode::FullAuto,   100, 0.075f,38.0f, 20.0f, 2000.0f, 5000.0f, 13000.0f, 1,  0.046f, 1.4f, true,  true,  0.62f},
+        {"M95",          "Barrett M95 .50 BMG",     EWeaponFireMode::BoltAction, 5,   1.25f, 160.0f,120.0f,4000.0f, 9000.0f, 15000.0f, 1,  0.004f, 6.0f, true,  true,  0.58f}
+    };
+
+    const WeaponSpec* matched = &kWeaponSpecs[0];
+    int matched_idx = 0;
+    for (int i = 0; i < static_cast<int>(sizeof(kWeaponSpecs) / sizeof(kWeaponSpecs[0])); ++i) {
+        if (weapon_name.find(kWeaponSpecs[i].id) != std::string::npos) {
+            matched = &kWeaponSpecs[i];
+            matched_idx = i;
+            break;
+        }
+    }
+    // Additional substring aliases
+    if (weapon_name.find("Glock") != std::string::npos) { matched = &kWeaponSpecs[1]; matched_idx = 1; }
+    else if (weapon_name.find("Beretta") != std::string::npos || weapon_name.find("93R") != std::string::npos) { matched = &kWeaponSpecs[2]; matched_idx = 2; }
+    else if (weapon_name.find("TMP") != std::string::npos || weapon_name.find("Steyr") != std::string::npos) { matched = &kWeaponSpecs[3]; matched_idx = 3; }
+    else if (weapon_name.find("SCAR") != std::string::npos) { matched = &kWeaponSpecs[6]; matched_idx = 6; }
+    else if (weapon_name.find("Remington") != std::string::npos || weapon_name.find("870") != std::string::npos) { matched = &kWeaponSpecs[7]; matched_idx = 7; }
+    else if (weapon_name.find("Minimi") != std::string::npos || weapon_name.find("M249") != std::string::npos) { matched = &kWeaponSpecs[9]; matched_idx = 9; }
+    else if (weapon_name.find("Barret") != std::string::npos || weapon_name.find("M95") != std::string::npos) { matched = &kWeaponSpecs[10]; matched_idx = 10; }
+
+    m_weapon_cycle_index = matched_idx;
+
+    WeaponState ws{};
+    ws.equipped = true;
+    ws.name = matched->id;
+    ws.display_name = matched->display;
+    ws.fire_mode = matched->fire_mode;
+    ws.ammo = matched->max_ammo;
+    ws.max_ammo = matched->max_ammo;
+    ws.cooldown = 0.15f;
+    ws.fire_interval = matched->fire_interval;
+    ws.range = matched->max_range;
+    ws.falloff_start = matched->falloff_start;
+    ws.falloff_end = matched->falloff_end;
+    ws.damage = matched->damage_near;
+    ws.damage_far = matched->damage_far;
+    ws.pellet_count = matched->pellet_count;
+    ws.spread_rad = matched->spread_rad;
+    ws.recoil_pitch_deg = matched->recoil_pitch;
+    ws.is_heavy = matched->is_heavy;
+    ws.is_two_handed = matched->is_two_handed;
+    ws.mobility_scale = matched->mobility_scale;
+    ws.equip_timer = 0.35f; // trigger 1P unholster animation
+    m_telemetry.weapon = ws;
 }
 
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
@@ -82,6 +172,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         remaining_time -= step_dt;
 
         m_state_timer += step_dt;
+        m_telemetry.combat_anim_time = m_state_timer;
         m_wallrun_cooldown = std::max(0.0f, m_wallrun_cooldown - step_dt);
         if (input.crouch) {
             m_crouch_landing_buffer = 0.35f;
@@ -110,6 +201,49 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_DodgeJump:
                 update_air_locomotion(input, step_dt, scene);
                 break;
+
+            case EMovement::MOVE_MeleeAir:
+            case EMovement::MOVE_MeleeWallrun: {
+                EMovement combat_air_state = m_telemetry.move_state;
+                float saved_timer = m_state_timer;
+                update_air_locomotion(input, step_dt, scene);
+                if (m_telemetry.move_state == EMovement::MOVE_Falling ||
+                    m_telemetry.move_state == EMovement::MOVE_Jump) {
+                    if (saved_timer < m_telemetry.combat_anim_duration) {
+                        m_telemetry.move_state = combat_air_state;
+                        m_state_timer = saved_timer;
+                        m_telemetry.combat_anim_time = saved_timer;
+                    }
+                }
+                break;
+            }
+
+            case EMovement::MOVE_Melee:
+            case EMovement::MOVE_Barge: {
+                EMovement combat_gnd_state = m_telemetry.move_state;
+                float saved_timer = m_state_timer;
+                update_ground_locomotion(input, step_dt, scene);
+                if (m_telemetry.move_state == EMovement::MOVE_Walking ||
+                    m_telemetry.move_state == EMovement::MOVE_Crouch ||
+                    m_telemetry.move_state == EMovement::MOVE_AutoStepUp) {
+                    if (saved_timer < m_telemetry.combat_anim_duration) {
+                        m_telemetry.move_state = combat_gnd_state;
+                        m_state_timer = saved_timer;
+                        m_telemetry.combat_anim_time = saved_timer;
+                    }
+                }
+                break;
+            }
+
+            case EMovement::MOVE_Snatch: {
+                // Smoothly damp velocity during weapon disarm animation (SnatchFwd / SnatchBack)
+                m_telemetry.velocity.x *= std::max(0.0f, 1.0f - 10.0f * step_dt);
+                m_telemetry.velocity.y *= std::max(0.0f, 1.0f - 10.0f * step_dt);
+                if (m_state_timer >= m_telemetry.combat_anim_duration) {
+                    m_telemetry.move_state = m_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
+                }
+                break;
+            }
 
             case EMovement::MOVE_WallRunningLeft:
             case EMovement::MOVE_WallRunningRight:
@@ -152,11 +286,6 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_SpeedVaulting:
             case EMovement::MOVE_VaultOver:
             case EMovement::MOVE_SpringBoarding:
-            case EMovement::MOVE_Snatch:
-            case EMovement::MOVE_Melee:
-            case EMovement::MOVE_MeleeAir:
-            case EMovement::MOVE_MeleeWallrun:
-            case EMovement::MOVE_Barge:
             case EMovement::MOVE_180Turn:
             case EMovement::MOVE_180TurnInAir:
                 if (m_state_timer >= 0.35f) {
@@ -608,9 +737,9 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
         }
     }
 
-    // Weapon mobility penalties
+    // Weapon mobility penalties (from DefaultWeapons.ini MovementSpeedMultiplier)
     if (m_telemetry.weapon.equipped) {
-        target_speed *= m_telemetry.weapon.is_heavy ? 0.70f : 0.90f;
+        target_speed *= m_telemetry.weapon.mobility_scale;
     }
 
     // Movement direction from view angles
@@ -842,11 +971,15 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
         return;
     }
 
-    // Wallrun Kick
+    // Wallrun Kick (TdMove_MeleeWallrun)
     if (input.melee) {
-        m_wallrun_cooldown = 0.15f;
+        m_wallrun_cooldown = 0.20f;
         m_telemetry.move_state = EMovement::MOVE_MeleeWallrun;
-        m_telemetry.velocity = m_telemetry.wall_normal * 200.0f + m_wall_tangent * 350.0f + Vec3(0, 0, -200.0f);
+        m_state_timer = 0.0f;
+        m_telemetry.combat_anim_time = 0.0f;
+        m_telemetry.combat_anim_duration = 0.55f;
+        m_melee_cooldown = 0.55f;
+        m_telemetry.velocity = m_telemetry.wall_normal * 260.0f + m_wall_tangent * 380.0f + Vec3(0, 0, 140.0f);
         m_telemetry.camera_roll_deg = 0.0f;
         return;
     }
@@ -986,22 +1119,37 @@ void ParkourController::update_wallclimb(const InputFrame& input, float dt, cons
 }
 
 // -----------------------------------------------------------------------------
-// Slide & Low-Friction Crouch Movement Subsystem
+// Slide & Low-Friction Crouch Movement Subsystem (TdMove_Slide / TdMove_MeleeSlide)
 // -----------------------------------------------------------------------------
 void ParkourController::update_slide(const InputFrame& input, float dt, LevelScene& scene) {
     m_slide_timer += dt;
 
-    // Slide Melee Kick
-    if (input.melee) {
+    // Slide Melee Kick (`MeleeSlide`: sweeps enemies off their feet with `HitMeleeSlide`)
+    if (input.melee && m_telemetry.move_state != EMovement::MOVE_MeleeSlide) {
         m_telemetry.move_state = EMovement::MOVE_MeleeSlide;
-        m_melee_cooldown = 0.5f;
+        m_state_timer = 0.0f;
+        m_telemetry.combat_anim_time = 0.0f;
+        m_telemetry.combat_anim_duration = 0.55f;
+        m_melee_cooldown = 0.55f;
 
-        // Hit nearby bot
         for (auto& bot : scene.enemies) {
-            if (bot.alive && m_telemetry.position.distance(bot.position) < 180.0f) {
-                bot.health -= 60.0f;
+            if (bot.alive && m_telemetry.position.distance(bot.position) < 200.0f) {
+                bot.health -= 65.0f;
                 bot.stunned = true;
-                if (bot.health <= 0.0f) bot.alive = false;
+                bot.disarm_window = true;
+                bot.attack_timer = 0.0f;
+                bot.anim_timer = 0.0f;
+                bot.active_anim_seq = "HitMeleeSlide";
+                m_telemetry.melee_hit_confirmed = true;
+                m_telemetry.hit_marker_timer = 0.25f;
+                if (bot.health <= 0.0f) {
+                    bot.alive = false;
+                    bot.anim_state = EEnemyAnimState::KnockedOut;
+                    m_telemetry.active_subtitle = "Slide Kick Knockout!";
+                } else {
+                    bot.anim_state = EEnemyAnimState::HitStagger;
+                    m_telemetry.active_subtitle = "Slide Kick Hit! Enemy Staggered (Press Right-Click / E to Disarm)";
+                }
             }
         }
     }
@@ -1254,98 +1402,499 @@ void ParkourController::update_skill_roll(const InputFrame& input, float dt) {
 }
 
 // -----------------------------------------------------------------------------
-// Combat, Firearms & Disarm Subsystem
+// Combat, Firearms, Ballistics & Disarm Subsystem
+// (Reverse-engineered from TdGame.u TdMove_Melee*, TdMove_Disarm, TdWeapon & DefaultWeapons.ini)
 // -----------------------------------------------------------------------------
 void ParkourController::update_combat_and_weapons(const InputFrame& input, float dt, LevelScene& scene) {
-    if (m_telemetry.weapon.cooldown > 0.0f) {
-        m_telemetry.weapon.cooldown -= dt;
+    WeaponState& ws = m_telemetry.weapon;
+    ws.fired_this_tick = false;
+
+    if (ws.cooldown > 0.0f) ws.cooldown = std::max(0.0f, ws.cooldown - dt);
+    if (ws.fire_anim_timer > 0.0f) ws.fire_anim_timer = std::max(0.0f, ws.fire_anim_timer - dt);
+    if (ws.equip_timer > 0.0f) ws.equip_timer = std::max(0.0f, ws.equip_timer - dt);
+    if (ws.muzzle_flash_timer > 0.0f) ws.muzzle_flash_timer = std::max(0.0f, ws.muzzle_flash_timer - dt);
+    if (m_melee_cooldown > 0.0f) m_melee_cooldown = std::max(0.0f, m_melee_cooldown - dt);
+    if (m_melee_combo_reset_timer > 0.0f) {
+        m_melee_combo_reset_timer -= dt;
+        if (m_melee_combo_reset_timer <= 0.0f) m_melee_combo_index = 0;
     }
-    if (m_melee_cooldown > 0.0f) {
-        m_melee_cooldown -= dt;
+    if (m_telemetry.hit_marker_timer > 0.0f) m_telemetry.hit_marker_timer = std::max(0.0f, m_telemetry.hit_marker_timer - dt);
+    if (m_telemetry.damage_flash_timer > 0.0f) m_telemetry.damage_flash_timer = std::max(0.0f, m_telemetry.damage_flash_timer - dt);
+
+    // Finish weapon throwaway drop animation
+    if (ws.drop_timer > 0.0f) {
+        ws.drop_timer -= dt;
+        if (ws.drop_timer <= 0.0f) {
+            ws.drop_timer = 0.0f;
+            ws.equipped = false;
+            ws.name = "None";
+            ws.display_name = "Unarmed";
+            ws.is_heavy = false;
+            ws.is_two_handed = false;
+        }
     }
 
-    // 1. Weapon Disarm QTE (`input.disarm`)
-    if (input.disarm) {
-        for (auto& bot : scene.enemies) {
-            if (bot.alive && bot.disarm_window && m_telemetry.position.distance(bot.position) < 200.0f) {
-                // Execute MOVE_Snatch: snatch weapon into Faith's hands!
-                m_telemetry.move_state = EMovement::MOVE_Snatch;
-                m_state_timer = 0.0f;
+    // Update 3D bullet tracers in the level scene
+    for (auto it = scene.active_tracers.begin(); it != scene.active_tracers.end();) {
+        it->timer -= dt;
+        if (it->timer <= 0.0f) {
+            it = scene.active_tracers.erase(it);
+        } else {
+            ++it;
+        }
+    }
 
-                bot.disarm_window = false;
-                bot.stunned = true;
-                bot.health -= 40.0f;
-                if (bot.health <= 0.0f) bot.alive = false;
+    // Update 3D dropped weapons physics on the ground
+    for (auto& dw : scene.dropped_weapons) {
+        if (!dw.grounded) {
+            dw.velocity.z -= m_config.gravity * dt;
+            dw.position += dw.velocity * dt;
+            dw.yaw_deg += 180.0f * dt;
+            TraceHit ghit = trace_ray(dw.position + Vec3(0, 0, 25.0f), dw.position - Vec3(0, 0, 35.0f), scene);
+            if (ghit.hit && dw.position.z <= ghit.point.z + 4.0f) {
+                dw.position.z = ghit.point.z + 3.0f;
+                dw.velocity = Vec3(0, 0, 0);
+                dw.grounded = true;
+            } else if (dw.position.z < m_telemetry.position.z - 600.0f) {
+                dw.grounded = true;
+            }
+        }
+    }
 
-                // Equip enemy's weapon
-                m_telemetry.weapon.equipped = true;
-                m_telemetry.weapon.name = bot.weapon_name;
-                m_telemetry.weapon.ammo = (bot.weapon_name.find("Colt") != std::string::npos) ? 7 : 30;
-                m_telemetry.weapon.max_ammo = m_telemetry.weapon.ammo;
-                m_telemetry.weapon.damage = (bot.weapon_name.find("Colt") != std::string::npos) ? 45.0f : 35.0f;
-                m_telemetry.weapon.is_heavy = (bot.weapon_name.find("G36") != std::string::npos ||
-                                              bot.weapon_name.find("Remington") != std::string::npos ||
-                                              bot.weapon_name.find("Minimi") != std::string::npos);
+    // 0A. Cycle through all 11 retail Mirror's Edge weapons (`T` / `Y` / MouseWheel)
+    static const char* kAllWeapons[11] = {
+        "Colt1911", "Glock18", "BerettaM93R", "SteyrTMP", "MP5K",
+        "G36C", "FNSCARL", "Remington870", "Neostead", "FNMinimi", "M95"
+    };
+    if (input.cycle_weapon_dir != 0) {
+        int next_idx = m_weapon_cycle_index + input.cycle_weapon_dir;
+        if (next_idx < 0) next_idx = 10;
+        if (next_idx >= 11) next_idx = 0;
+        equip_weapon(kAllWeapons[next_idx]);
+        m_telemetry.active_subtitle = "Equipped: " + m_telemetry.weapon.display_name +
+                                      " (" + std::to_string(m_telemetry.weapon.ammo) + " RDS)";
+    }
 
-                m_telemetry.active_subtitle = "Weapon Disarmed: " + m_telemetry.weapon.name;
+    // 0B. Spawn KrugerSec Combat Squad ahead of Faith (`H` key) for live combat testing
+    if (input.spawn_combat_squad) {
+        Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
+        Vec3 right = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).right();
+        static const char* kSquadWeapons[4] = {"G36C", "Remington870", "MP5K", "Colt1911"};
+        static const char* kSquadArchetypes[4] = {"Assault_SWAT", "Support_Shotgun", "PatrolCop_SMG", "PatrolCop"};
+        for (int i = 0; i < 3; ++i) {
+            EnemyBot guard{};
+            guard.archetype = kSquadArchetypes[i % 4];
+            guard.weapon_name = kSquadWeapons[(i + static_cast<int>(m_telemetry.tick)) % 4];
+            float lateral = (i - 1) * 140.0f;
+            Vec3 spawn_pt = m_telemetry.position + fwd * (420.0f + i * 90.0f) + right * lateral;
+            TraceHit f_hit = trace_ray(spawn_pt + Vec3(0, 0, 120.0f), spawn_pt - Vec3(0, 0, 220.0f), scene);
+            if (f_hit.hit) spawn_pt.z = f_hit.point.z;
+            guard.position = spawn_pt;
+            guard.home_position = spawn_pt;
+            guard.yaw_deg = m_telemetry.yaw_deg + 180.0f;
+            guard.health = 100.0f;
+            guard.max_health = 100.0f;
+            guard.alive = true;
+            guard.disarm_window = (i == 0);
+            guard.anim_state = EEnemyAnimState::AimFire;
+            scene.enemies.push_back(guard);
+        }
+        m_telemetry.active_subtitle = "KrugerSec Tactical Squad Deployed Ahead!";
+    }
+
+    // 0C. Manual Weapon Drop / Throwaway (`G` / `Backspace` or Right-Click when no disarm target is in range)
+    auto drop_current_weapon = [&](const std::string& reason) {
+        if (!ws.equipped || ws.drop_timer > 0.0f) return;
+        DroppedWeapon dw{};
+        dw.weapon_name = ws.name;
+        dw.ammo = ws.ammo;
+        Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
+        Vec3 right = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).right();
+        dw.position = m_telemetry.position + Vec3(0, 0, 55.0f) + fwd * 32.0f + right * 14.0f;
+        dw.velocity = fwd * 220.0f + right * 45.0f + Vec3(0, 0, 90.0f);
+        dw.yaw_deg = m_telemetry.yaw_deg + 35.0f;
+        dw.grounded = false;
+        scene.dropped_weapons.push_back(dw);
+
+        ws.drop_timer = 0.25f; // plays 1P `throwaway` animation before clearing `ws.equipped`
+        ws.is_heavy = false;
+        ws.mobility_scale = 1.0f;
+        m_telemetry.active_subtitle = reason;
+    };
+
+    if (input.drop_weapon && ws.equipped) {
+        drop_current_weapon("Dropped " + ws.display_name);
+    }
+
+    // 0D. Pick up a DroppedWeapon from the ground when pressing Use (`E`) or Disarm while unarmed
+    if (!ws.equipped && (input.use || input.disarm)) {
+        for (auto it = scene.dropped_weapons.begin(); it != scene.dropped_weapons.end(); ++it) {
+            if (it->ammo > 0 && m_telemetry.position.distance(it->position) < 135.0f) {
+                std::string picked_name = it->weapon_name;
+                int picked_ammo = it->ammo;
+                scene.dropped_weapons.erase(it);
+                equip_weapon(picked_name);
+                ws.ammo = picked_ammo;
+                m_telemetry.active_subtitle = "Picked up " + ws.display_name + " (" + std::to_string(ws.ammo) + " RDS)";
                 break;
             }
         }
     }
 
-    // 2. Firearm Shooting (`input.fire`)
-    if (input.fire && m_telemetry.weapon.equipped && m_telemetry.weapon.cooldown <= 0.0f) {
-        if (m_telemetry.weapon.ammo > 0) {
-            m_telemetry.weapon.ammo--;
-            m_telemetry.weapon.cooldown = 0.20f;
-
-            // Trace bullet ray
-            Rotator rot = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f);
-            Vec3 eye = m_telemetry.position + Vec3(0, 0, m_telemetry.eye_height);
-            Vec3 bullet_end = eye + rot.forward() * m_telemetry.weapon.range;
-
-            TraceHit wall_hit = trace_ray(eye, bullet_end, scene);
-            float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : m_telemetry.weapon.range;
-
-            // Damage enemies intersecting ray
-            for (auto& bot : scene.enemies) {
-                if (bot.alive) {
-                    Vec3 to_bot = bot.position - eye;
-                    float proj = to_bot.dot(rot.forward());
-                    if (proj > 0.0f && proj <= max_dist) {
-                        Vec3 closest = eye + rot.forward() * proj;
-                        if (closest.distance(bot.position + Vec3(0, 0, 50)) < 60.0f) {
-                            bot.health -= m_telemetry.weapon.damage;
-                            if (bot.health <= 0.0f) bot.alive = false;
-                        }
-                    }
-                }
+    // Check if any nearby enemy is currently in a Disarmable state (or can be stealth-snatched from behind)
+    m_telemetry.disarm_prompt_visible = false;
+    EnemyBot* disarm_candidate = nullptr;
+    bool candidate_from_back = false;
+    for (auto& bot : scene.enemies) {
+        if (!bot.alive || bot.weapon_name == "None" || bot.weapon_name.empty()) continue;
+        float dist = m_telemetry.position.distance(bot.position);
+        if (dist < 210.0f) {
+            Vec3 bot_fwd(std::cos(bot.yaw_deg * DEG2RAD), std::sin(bot.yaw_deg * DEG2RAD), 0.0f);
+            Vec3 bot_to_player = (m_telemetry.position - bot.position).normalized_xy();
+            bool behind_enemy = (bot_fwd.dot(bot_to_player) < -0.25f);
+            if (bot.disarm_window || bot.stunned || behind_enemy) {
+                m_telemetry.disarm_prompt_visible = true;
+                disarm_candidate = &bot;
+                candidate_from_back = behind_enemy;
+                break;
             }
-        } else {
-            // Weapon empty: auto drop!
-            m_telemetry.weapon.equipped = false;
-            m_telemetry.active_subtitle = "Weapon Empty - Dropped";
         }
     }
 
-    // 3. Melee Strikes (`input.melee`)
-    if (input.melee && m_melee_cooldown <= 0.0f && !m_telemetry.weapon.equipped) {
-        m_melee_cooldown = 0.40f;
-        if (!m_telemetry.grounded) {
-            m_telemetry.move_state = EMovement::MOVE_MeleeAir;
-        } else {
-            m_telemetry.move_state = EMovement::MOVE_Melee;
+    // 1. Weapon Disarm QTE (`input.disarm` -> `TdMove_Disarm` / `MOVE_Snatch`: `SnatchFwd` or `SnatchBack`)
+    if (input.disarm) {
+        if (disarm_candidate != nullptr) {
+            EnemyBot& bot = *disarm_candidate;
+            m_telemetry.move_state = EMovement::MOVE_Snatch;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = 0.68f;
+            m_telemetry.snatch_from_back = candidate_from_back;
+            m_telemetry.hit_marker_timer = 0.35f;
+
+            // Orient Faith toward the enemy being disarmed
+            Vec3 to_bot = (bot.position - m_telemetry.position).normalized_xy();
+            if (to_bot.length_sq() > 1e-4f) {
+                m_telemetry.yaw_deg = std::atan2(to_bot.y, to_bot.x) * RAD2DEG;
+            }
+
+            std::string snatched_wep = bot.weapon_name;
+            bot.disarm_window = false;
+            bot.stunned = true;
+            bot.attack_timer = 0.0f;
+            bot.anim_timer = 0.0f;
+            bot.active_anim_seq = candidate_from_back ? "SnatchBack" : "SnatchFwd";
+
+            bool is_trainer = (bot.archetype.find("TutorialTrainer") != std::string::npos ||
+                               bot.archetype.find("Celeste") != std::string::npos);
+            if (is_trainer) {
+                // Celeste sparring partner gets disarmed and recovers after the drill
+                bot.anim_state = EEnemyAnimState::BeingDisarmed;
+                bot.health = std::max(25.0f, bot.health - 25.0f);
+            } else {
+                // Standard KrugerSec guard is knocked out cold by Faith's disarm takedown!
+                bot.health = 0.0f;
+                bot.alive = false;
+                bot.weapon_name = "None";
+                bot.anim_state = EEnemyAnimState::KnockedOut;
+            }
+
+            equip_weapon(snatched_wep);
+            m_telemetry.active_subtitle = std::string(candidate_from_back ? "Stealth Disarm (" : "Weapon Disarmed (") +
+                                          ws.display_name + ")!";
+        } else if (ws.equipped && ws.drop_timer <= 0.0f && !input.use) {
+            // In Mirror's Edge, pressing the Disarm/Secondary button while holding a gun with no enemy in range tosses the gun
+            drop_current_weapon("Tossed " + ws.display_name);
+        }
+    }
+
+    // 2. Firearm Shooting & Ballistics (`input.fire`)
+    if (!input.fire) {
+        ws.trigger_released = true;
+    }
+
+    auto fire_single_shot = [&]() {
+        if (ws.ammo <= 0) return;
+        ws.ammo--;
+        ws.fired_this_tick = true;
+        ws.fire_anim_timer = std::min(0.32f, std::max(0.14f, ws.fire_interval));
+        ws.muzzle_flash_timer = 0.065f;
+
+        Rotator view_rot = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f);
+        Vec3 fwd = view_rot.forward();
+        Vec3 right = view_rot.right();
+        Vec3 up = view_rot.up();
+        Vec3 eye = m_telemetry.position + Vec3(0, 0, m_telemetry.eye_height);
+        Vec3 muzzle_world = eye + fwd * 36.0f + right * 11.0f - up * 9.0f;
+
+        int pellets = std::max(1, ws.pellet_count);
+        bool any_hit = false;
+        bool any_kill = false;
+
+        for (int p = 0; p < pellets; ++p) {
+            // Deterministic golden-ratio spiral cone spread for multi-pellet shotguns and automatic fire
+            float spread = ws.spread_rad * (m_telemetry.reaction_active ? 0.45f : 1.0f);
+            float angle = static_cast<float>(p) * 2.3999632f + static_cast<float>(m_telemetry.tick) * 0.71f;
+            float radius = (pellets > 1)
+                ? spread * std::sqrt((static_cast<float>(p) + 0.5f) / static_cast<float>(pellets))
+                : spread * 0.35f * std::sin(static_cast<float>(m_telemetry.tick) * 1.7f);
+            Vec3 ray_dir = (fwd + right * ( std::cos(angle) * radius ) + up * ( std::sin(angle) * radius )).normalized();
+            Vec3 ray_end = eye + ray_dir * ws.range;
+
+            TraceHit wall_hit = trace_ray(eye, ray_end, scene);
+            float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : ws.range;
+            Vec3 tracer_end = wall_hit.hit ? wall_hit.point : (eye + ray_dir * std::min(ws.range, 2500.0f));
+
+            // Ray-Capsule intersection against living enemies (Headshot & Torso hitboxes)
+            EnemyBot* hit_bot = nullptr;
+            float best_bot_dist = max_dist;
+            bool is_headshot = false;
+
+            for (auto& bot : scene.enemies) {
+                if (!bot.alive) continue;
+                Vec3 bot_center = bot.position + Vec3(0, 0, 52.0f);
+                Vec3 to_bot = bot_center - eye;
+                float proj = to_bot.dot(ray_dir);
+                if (proj > 0.0f && proj < best_bot_dist) {
+                    Vec3 closest = eye + ray_dir * proj;
+                    float dist_xy = closest.distance_xy(bot.position);
+                    float rel_z = closest.z - bot.position.z;
+                    if (dist_xy < 48.0f && rel_z >= -10.0f && rel_z <= 105.0f) {
+                        best_bot_dist = proj;
+                        hit_bot = &bot;
+                        is_headshot = (rel_z >= 72.0f);
+                        tracer_end = closest;
+                    }
+                }
+            }
+
+            if (hit_bot != nullptr) {
+                any_hit = true;
+                // Distance damage falloff from DefaultWeapons.ini
+                float t_falloff = 0.0f;
+                if (best_bot_dist > ws.falloff_start && ws.falloff_end > ws.falloff_start) {
+                    t_falloff = std::clamp((best_bot_dist - ws.falloff_start) / (ws.falloff_end - ws.falloff_start), 0.0f, 1.0f);
+                }
+                float dmg = ws.damage + (ws.damage_far - ws.damage) * t_falloff;
+                if (is_headshot) dmg *= 2.0f;
+
+                hit_bot->health -= dmg;
+                hit_bot->stunned = true;
+                hit_bot->attack_timer = 0.0f;
+                hit_bot->anim_timer = 0.0f;
+                hit_bot->active_anim_seq = (p % 2 == 0) ? "HitMeleeRight" : "HitMeleeLeft";
+
+                if (hit_bot->health <= 0.0f) {
+                    bool is_trainer = (hit_bot->archetype.find("TutorialTrainer") != std::string::npos ||
+                                       hit_bot->archetype.find("Celeste") != std::string::npos);
+                    if (is_trainer) {
+                        hit_bot->health = 100.0f;
+                        hit_bot->anim_state = EEnemyAnimState::HitStagger;
+                    } else {
+                        hit_bot->alive = false;
+                        hit_bot->anim_state = EEnemyAnimState::KnockedOut;
+                        any_kill = true;
+                        // Drop the enemy's weapon onto the ground if they had one
+                        if (!hit_bot->weapon_name.empty() && hit_bot->weapon_name != "None") {
+                            DroppedWeapon dw{};
+                            dw.weapon_name = hit_bot->weapon_name;
+                            dw.ammo = 15;
+                            dw.position = hit_bot->position + Vec3(0, 0, 45.0f);
+                            dw.velocity = ray_dir * 90.0f + Vec3(0, 0, 80.0f);
+                            dw.yaw_deg = hit_bot->yaw_deg + 45.0f;
+                            dw.grounded = false;
+                            scene.dropped_weapons.push_back(dw);
+                            hit_bot->weapon_name = "None";
+                        }
+                    }
+                } else {
+                    hit_bot->anim_state = EEnemyAnimState::HitStagger;
+                }
+            }
+
+            // Spawn 3D BulletTracer in world
+            BulletTracer tr{};
+            tr.start_pos = muzzle_world;
+            tr.end_pos = tracer_end;
+            tr.timer = 0.09f;
+            tr.max_time = 0.09f;
+            tr.hit_enemy = (hit_bot != nullptr);
+            tr.from_player = true;
+            scene.active_tracers.push_back(tr);
         }
 
-        Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
+        if (any_hit) {
+            m_telemetry.hit_marker_timer = 0.22f;
+            if (any_kill) {
+                m_telemetry.active_subtitle = "Target Neutralized (" + ws.display_name + ")";
+            }
+        }
+
+        // Apply authentic camera recoil kick (TdSkelControlRecoil + view pitch kick)
+        m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + ws.recoil_pitch_deg * 0.45f, -85.0f, 85.0f);
+        float yaw_jitter = ((m_telemetry.tick % 2 == 0) ? 1.0f : -1.0f) * ws.recoil_pitch_deg * 0.12f;
+        m_telemetry.yaw_deg += yaw_jitter;
+    };
+
+    // Continue active 3-round burst for Beretta M93R
+    if (ws.equipped && ws.drop_timer <= 0.0f && ws.burst_remaining > 0 && ws.cooldown <= 0.0f) {
+        if (ws.ammo > 0) {
+            ws.burst_remaining--;
+            fire_single_shot();
+            ws.cooldown = (ws.burst_remaining > 0) ? ws.fire_interval : 0.24f;
+        } else {
+            ws.burst_remaining = 0;
+        }
+    } else if (input.fire && ws.equipped && ws.drop_timer <= 0.0f && ws.cooldown <= 0.0f) {
+        bool can_pull = (ws.fire_mode == EWeaponFireMode::FullAuto) || ws.trigger_released;
+        if (can_pull) {
+            ws.trigger_released = false;
+            ws.equip_timer = 0.0f;
+            if (ws.ammo > 0) {
+                if (ws.fire_mode == EWeaponFireMode::Burst3) {
+                    ws.burst_remaining = std::min(2, ws.ammo - 1);
+                }
+                fire_single_shot();
+                ws.cooldown = ws.fire_interval;
+            } else {
+                // Empty magazine: play `standfireempty` click and toss empty weapon (`throwaway`)
+                drop_current_weapon(ws.display_name + " Empty - Tossed");
+            }
+        }
+    }
+
+    // 3. Wallrun Kick Hit Detection (while airborne in MOVE_MeleeWallrun)
+    if (m_telemetry.move_state == EMovement::MOVE_MeleeWallrun && m_state_timer < 0.35f) {
         for (auto& bot : scene.enemies) {
-            if (bot.alive && m_telemetry.position.distance(bot.position) < 180.0f) {
-                float dot = fwd.dot((bot.position - m_telemetry.position).normalized());
-                if (dot > 0.5f) {
-                    float dmg = (m_telemetry.move_state == EMovement::MOVE_MeleeAir) ? 100.0f : 35.0f;
+            if (bot.alive && m_telemetry.position.distance(bot.position) < 195.0f) {
+                bot.health -= 90.0f;
+                bot.stunned = true;
+                bot.disarm_window = true;
+                bot.attack_timer = 0.0f;
+                bot.anim_timer = 0.0f;
+                bot.active_anim_seq = "HitMeleeWallrunRight";
+                m_telemetry.melee_hit_confirmed = true;
+                m_telemetry.hit_marker_timer = 0.28f;
+                if (bot.health <= 0.0f) {
+                    bot.alive = false;
+                    bot.anim_state = EEnemyAnimState::KnockedOut;
+                    m_telemetry.active_subtitle = "Wallrun Kick Knockout!";
+                } else {
+                    bot.anim_state = EEnemyAnimState::HitStagger;
+                }
+            }
+        }
+    }
+
+    // 4. Context-Sensitive Unarmed Melee Strikes (`input.melee`: Combo Punch/Kick, Crouch Uppercut, Jump Kick, Barge)
+    if (input.melee && m_melee_cooldown <= 0.0f && (!ws.equipped || ws.drop_timer > 0.0f) &&
+        m_telemetry.move_state != EMovement::MOVE_MeleeSlide &&
+        m_telemetry.move_state != EMovement::MOVE_MeleeWallrun) {
+
+        Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
+        m_telemetry.melee_hit_confirmed = false;
+
+        if (!m_telemetry.grounded) {
+            // Airborne Flying Jump Kick (`TdMove_MeleeAir`: `JumpKickStart` -> `JumpKickEnd`)
+            m_telemetry.move_state = EMovement::MOVE_MeleeAir;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = 0.62f;
+            m_melee_cooldown = 0.62f;
+
+            // Lunge forward in mid-air toward target
+            m_telemetry.velocity += fwd * 140.0f + Vec3(0, 0, 60.0f);
+        } else if (m_telemetry.move_state == EMovement::MOVE_Crouch || input.crouch) {
+            // Crouch Uppercut (`MeleeCrouchHitUppercut`)
+            m_telemetry.move_state = EMovement::MOVE_Melee;
+            m_telemetry.melee_variant = 3;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = 0.48f;
+            m_melee_cooldown = 0.48f;
+            m_telemetry.velocity += fwd * 160.0f;
+        } else {
+            // Standing 3-Hit Combo (`MeleeStartRight` -> `MeleeHitLeft` -> `MeleeStartKick`)
+            m_telemetry.move_state = EMovement::MOVE_Melee;
+            m_telemetry.melee_variant = m_melee_combo_index % 3;
+            m_melee_combo_index = (m_melee_combo_index + 1) % 3;
+            m_melee_combo_reset_timer = 1.35f;
+
+            float dur = (m_telemetry.melee_variant == 2) ? 0.56f : 0.42f;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = dur;
+            m_melee_cooldown = dur * 0.90f;
+            m_telemetry.velocity += fwd * ((m_telemetry.melee_variant == 2) ? 220.0f : 140.0f);
+        }
+
+        // Melee Hit Detection & Target Magnetism (from DefaultAIMeleeAttacks.ini)
+        for (auto& bot : scene.enemies) {
+            if (!bot.alive) continue;
+            float reach = (m_telemetry.move_state == EMovement::MOVE_MeleeAir) ? 225.0f : 195.0f;
+            float dist = m_telemetry.position.distance(bot.position);
+            if (dist < reach) {
+                Vec3 dir_to_bot = (bot.position - m_telemetry.position).normalized_xy();
+                float dot = fwd.dot(dir_to_bot);
+                if (dot > 0.35f || dist < 95.0f) {
+                    m_telemetry.melee_hit_confirmed = true;
+                    m_telemetry.hit_marker_timer = 0.25f;
+
+                    float dmg = 34.0f;
+                    const char* hit_seq = "HitMeleeRight";
+                    if (m_telemetry.move_state == EMovement::MOVE_MeleeAir) {
+                        dmg = 100.0f;
+                        hit_seq = "HitMeleeInAir_High";
+                        // Bounce off enemy chest slightly after landing a flying jump kick
+                        m_telemetry.velocity = -dir_to_bot * 160.0f + Vec3(0, 0, 210.0f);
+                    } else if (m_telemetry.melee_variant == 3) {
+                        dmg = 50.0f;
+                        hit_seq = "HitMeleeCrouchSweep";
+                    } else if (m_telemetry.melee_variant == 2) {
+                        dmg = 55.0f;
+                        hit_seq = "HitMeleeSoccerKick";
+                    } else if (m_telemetry.melee_variant == 1) {
+                        dmg = 38.0f;
+                        hit_seq = "HitMeleeLeft";
+                    }
+
                     bot.health -= dmg;
                     bot.stunned = true;
-                    if (bot.health <= 0.0f) bot.alive = false;
+                    bot.disarm_window = true; // Staggering an enemy opens their red disarm window!
+                    bot.attack_timer = 0.0f;
+                    bot.anim_timer = 0.0f;
+                    bot.active_anim_seq = hit_seq;
+
+                    bool is_trainer = (bot.archetype.find("TutorialTrainer") != std::string::npos ||
+                                       bot.archetype.find("Celeste") != std::string::npos);
+                    if (bot.health <= 0.0f) {
+                        if (is_trainer) {
+                            bot.health = 100.0f;
+                            bot.anim_state = EEnemyAnimState::HitStagger;
+                        } else {
+                            bot.alive = false;
+                            bot.anim_state = EEnemyAnimState::KnockedOut;
+                            if (!bot.weapon_name.empty() && bot.weapon_name != "None") {
+                                DroppedWeapon dw{};
+                                dw.weapon_name = bot.weapon_name;
+                                dw.ammo = 15;
+                                dw.position = bot.position + Vec3(0, 0, 45.0f);
+                                dw.velocity = dir_to_bot * 110.0f + Vec3(0, 0, 90.0f);
+                                dw.yaw_deg = bot.yaw_deg + 30.0f;
+                                dw.grounded = false;
+                                scene.dropped_weapons.push_back(dw);
+                                bot.weapon_name = "None";
+                            }
+                            m_telemetry.active_subtitle = (m_telemetry.move_state == EMovement::MOVE_MeleeAir)
+                                ? "Flying Jump Kick Knockout!"
+                                : "Melee Combo Knockout!";
+                        }
+                    } else {
+                        bot.anim_state = EEnemyAnimState::HitStagger;
+                        if (m_telemetry.active_subtitle.empty()) {
+                            m_telemetry.active_subtitle = "Enemy Staggered - Weapon Red (Press Right-Click / E to Disarm)";
+                        }
+                    }
                 }
             }
         }
@@ -1353,60 +1902,142 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 }
 
 // -----------------------------------------------------------------------------
-// AI Bots Pursuit, Attack & Disarm Window Simulation
+// AI Bots Pursuit, Ranged Fire, Melee Windup & Disarm Window Simulation
 // -----------------------------------------------------------------------------
 void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
     for (auto& bot : scene.enemies) {
-        if (!bot.alive) continue;
+        bot.anim_timer += dt;
+        if (bot.muzzle_flash_timer > 0.0f) {
+            bot.muzzle_flash_timer = std::max(0.0f, bot.muzzle_flash_timer - dt);
+        }
 
+        if (!bot.alive) {
+            bot.anim_state = EEnemyAnimState::KnockedOut;
+            bot.disarm_window = false;
+            continue;
+        }
+
+        if (bot.home_position.length_sq() < 1e-3f) {
+            bot.home_position = bot.position;
+        }
+
+        bool is_trainer = (bot.archetype.find("TutorialTrainer") != std::string::npos ||
+                           bot.archetype.find("Celeste") != std::string::npos ||
+                           bot.weapon_name.find("TutorialTrainer") != std::string::npos);
+
+        // Handle stunned / staggered / disarmed recovery
         if (bot.stunned) {
             bot.attack_timer += dt;
-            if (bot.attack_timer >= 2.0f) {
+            float stun_dur = is_trainer ? 2.2f : 1.6f;
+            if (bot.attack_timer >= stun_dur) {
                 bot.stunned = false;
                 bot.attack_timer = 0.0f;
+                bot.anim_timer = 0.0f;
+                bot.anim_state = is_trainer ? EEnemyAnimState::MeleeWindup : EEnemyAnimState::AimFire;
+                if (is_trainer && (bot.weapon_name.empty() || bot.weapon_name == "None")) {
+                    bot.weapon_name = "Colt1911";
+                }
             }
             continue;
         }
 
         float dist = bot.position.distance(m_telemetry.position);
-        Vec3 dir_to_player = (m_telemetry.position - bot.position).normalized();
-        bot.yaw_deg = std::atan2(dir_to_player.y, dir_to_player.x) * RAD2DEG;
+        Vec3 dir_to_player = (m_telemetry.position - bot.position).normalized_xy();
+        if (dir_to_player.length_sq() > 1e-4f) {
+            bot.yaw_deg = std::atan2(dir_to_player.y, dir_to_player.x) * RAD2DEG;
+        }
 
         bot.attack_timer += dt;
 
         // Tutorial sparring trainer (Celeste) stays at her training post with disarm window ready
-        if (bot.weapon_name.find("TutorialTrainer") != std::string::npos) {
+        if (is_trainer) {
             bot.disarm_window = true;
+            if (bot.weapon_name.empty() || bot.weapon_name == "None") {
+                bot.weapon_name = "Colt1911";
+            }
+            bot.anim_state = (dist < 260.0f) ? EEnemyAnimState::MeleeWindup : EEnemyAnimState::Idle;
             continue;
         }
 
-        if (dist > 1500.0f) {
-            // Hold guard post until player enters engagement radius
+        if (dist > 1800.0f) {
+            // Patrol / Guard Idle outside engagement radius
             bot.disarm_window = false;
-        } else if (dist > 180.0f) {
-            // Ranged engagement
+            bot.anim_state = EEnemyAnimState::Idle;
+        } else if (dist > 220.0f) {
+            // Ranged engagement or closing distance
             bot.disarm_window = false;
-            if (bot.attack_timer >= 1.5f) {
+
+            if (dist > 750.0f && bot.position.distance_xy(bot.home_position) < 450.0f) {
+                // Advance toward Faith (`RunFwd`)
+                bot.anim_state = EEnemyAnimState::Chase;
+                Vec3 step_move = dir_to_player * (220.0f * dt);
+                TraceHit wall_chk = trace_ray(bot.position + Vec3(0, 0, 50.0f),
+                                              bot.position + Vec3(0, 0, 50.0f) + dir_to_player * 55.0f, scene);
+                if (!wall_chk.hit) {
+                    bot.position += step_move;
+                }
+            } else {
+                bot.anim_state = EEnemyAnimState::AimFire;
+            }
+
+            // Fire weapon bursts at Faith
+            float fire_cadence = (bot.weapon_name.find("Remington") != std::string::npos ||
+                                  bot.weapon_name.find("Neostead") != std::string::npos) ? 1.45f : 0.95f;
+            if (bot.attack_timer >= fire_cadence) {
                 bot.attack_timer = 0.0f;
-                // Deal damage if Faith isn't evading
-                if (m_telemetry.move_state != EMovement::MOVE_Slide &&
-                    m_telemetry.move_state != EMovement::MOVE_SkillRoll &&
-                    m_telemetry.move_state != EMovement::MOVE_WallRunningLeft &&
-                    m_telemetry.move_state != EMovement::MOVE_WallRunningRight) {
-                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 12.0f);
+                bot.muzzle_flash_timer = 0.08f;
+
+                Vec3 bot_muzzle = bot.position + Vec3(0, 0, 62.0f) + dir_to_player * 35.0f;
+                Vec3 target_pt = m_telemetry.position + Vec3(0, 0, m_telemetry.eye_height * 0.75f);
+
+                // Check line of sight so enemies don't shoot through solid walls
+                TraceHit los = trace_ray(bot_muzzle, target_pt, scene);
+                Vec3 tracer_end = los.hit ? los.point : target_pt;
+
+                BulletTracer tr{};
+                tr.start_pos = bot_muzzle;
+                tr.end_pos = tracer_end;
+                tr.timer = 0.085f;
+                tr.max_time = 0.085f;
+                tr.hit_enemy = false;
+                tr.from_player = false;
+                scene.active_tracers.push_back(tr);
+
+                // Deal damage if line-of-sight is clear and Faith isn't actively evading
+                bool evading = (m_telemetry.move_state == EMovement::MOVE_Slide ||
+                                m_telemetry.move_state == EMovement::MOVE_MeleeSlide ||
+                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
+                                m_telemetry.move_state == EMovement::MOVE_Snatch ||
+                                m_telemetry.speed_2d > 540.0f);
+                if (!los.hit && !evading) {
+                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 10.0f);
+                    m_telemetry.damage_flash_timer = 0.25f;
                     m_damage_cooldown = m_config.health_regen_delay;
                 }
             }
         } else {
-            // Melee range: open Red Flashing Disarm Window!
-            if (bot.attack_timer >= 1.0f && bot.attack_timer <= 1.6f) {
+            // Close-quarters melee range (< 220 units): wind up rifle/pistol butt strike and open Red Disarm Window!
+            if (bot.attack_timer < 0.45f) {
+                bot.disarm_window = false;
+                bot.anim_state = EEnemyAnimState::AimFire;
+            } else if (bot.attack_timer <= 1.45f) {
+                if (!bot.disarm_window) {
+                    bot.anim_timer = 0.0f;
+                }
                 bot.disarm_window = true;
-            } else if (bot.attack_timer > 1.6f) {
+                bot.anim_state = EEnemyAnimState::MeleeWindup;
+            } else {
                 bot.disarm_window = false;
                 bot.attack_timer = 0.0f;
-                // Melee strike hit player
-                m_telemetry.health = std::max(0.0f, m_telemetry.health - 25.0f);
-                m_damage_cooldown = m_config.health_regen_delay;
+                bot.anim_timer = 0.0f;
+                bot.anim_state = EEnemyAnimState::MeleeStrike;
+                if (m_telemetry.move_state != EMovement::MOVE_Snatch) {
+                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 22.0f);
+                    m_telemetry.damage_flash_timer = 0.35f;
+                    m_damage_cooldown = m_config.health_regen_delay;
+                }
             }
         }
     }

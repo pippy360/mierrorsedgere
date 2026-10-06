@@ -2753,11 +2753,40 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         EnemyBot celeste;
         celeste.archetype = "TutorialTrainer_Celeste";
         celeste.position = Vec3(751.8f, -1320.0f, 4992.0f);
+        celeste.home_position = celeste.position;
         celeste.yaw_deg = -90.0f;
         celeste.health = 100.0f;
         celeste.weapon_name = "Colt1911";
         celeste.disarm_window = true;
+        celeste.anim_state = EEnemyAnimState::MeleeWindup;
         out_scene.enemies.push_back(celeste);
+
+        // Spawn KrugerSec armed sparring guards on the Stage 19 combat terrace (carrying 2H Assault Rifle, Shotgun, SMG)
+        struct TerraceGuardSpec {
+            const char* archetype;
+            const char* weapon;
+            Vec3 pos;
+            float yaw;
+        };
+        static const TerraceGuardSpec kTerraceGuards[] = {
+            {"Assault_SWAT",    "G36C",         Vec3(1020.0f, -1040.0f, 4992.0f), -110.0f},
+            {"Support_Shotgun", "Remington870", Vec3(480.0f,  -1040.0f, 4992.0f), -70.0f},
+            {"PatrolCop_SMG",   "MP5K",         Vec3(751.8f,   -820.0f, 4992.0f), -90.0f}
+        };
+        for (const auto& tg : kTerraceGuards) {
+            EnemyBot guard{};
+            guard.archetype = tg.archetype;
+            guard.weapon_name = tg.weapon;
+            guard.position = tg.pos;
+            guard.home_position = tg.pos;
+            guard.yaw_deg = tg.yaw;
+            guard.health = 100.0f;
+            guard.max_health = 100.0f;
+            guard.alive = true;
+            guard.disarm_window = false;
+            guard.anim_state = EEnemyAnimState::AimFire;
+            out_scene.enemies.push_back(guard);
+        }
     } else {
         // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry.
         // Prefer the chapter's DefaultCheckpoint when it has valid coordinates.
@@ -2818,15 +2847,31 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
                 out_scene.checkpoints.push_back(cp.location);
             }
         }
+        static const char* kCampaignWeapons[] = {
+            "Colt1911", "MP5K", "G36C", "Remington870", "FNSCARL",
+            "SteyrTMP", "BerettaM93R", "Neostead", "FNMinimi", "M95"
+        };
+        size_t enemy_ord = 0;
         for (const auto& a : out_scene.actors) {
             if (a.is_checkpoint && out_scene.checkpoints.empty()) {
                 out_scene.checkpoints.push_back(a.location);
             }
             if (a.is_enemy) {
-                EnemyBot bot;
+                EnemyBot bot{};
                 bot.archetype = a.class_name;
                 bot.position = a.location;
+                bot.home_position = a.location;
                 bot.yaw_deg = a.rotation.to_degrees().y;
+                if (a.class_name.find("Sniper") != std::string::npos) {
+                    bot.weapon_name = "M95";
+                } else if (a.class_name.find("Support") != std::string::npos) {
+                    bot.weapon_name = "FNMinimi";
+                } else if (a.class_name.find("Assault") != std::string::npos) {
+                    bot.weapon_name = (enemy_ord % 2 == 0) ? "G36C" : "Remington870";
+                } else {
+                    bot.weapon_name = kCampaignWeapons[enemy_ord % 10];
+                }
+                enemy_ord++;
                 out_scene.enemies.push_back(bot);
             }
         }

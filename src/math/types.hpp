@@ -507,30 +507,107 @@ struct LevelActor {
 };
 
 // -----------------------------------------------------------------------------
-// Weapon State & Enemy Bot
+// Weapon State, Tracers, Dropped Weapons & Enemy Bot
 // -----------------------------------------------------------------------------
-struct WeaponState {
-    std::string name;
-    bool equipped = false;
-    bool is_heavy = false;
-    int ammo = 0;
-    int max_ammo = 0;
-    float damage = 35.0f;
-    float range = 4500.0f;
-    float cooldown = 0.0f;
+enum class EWeaponFireMode : uint8_t {
+    SemiAuto = 0,
+    Burst3 = 1,
+    FullAuto = 2,
+    PumpAction = 3,
+    BoltAction = 4
 };
 
-struct EnemyBot {
-    std::string archetype; // PatrolCop, PursuitCop, RiotCop, SWAT, Heavy, Celeste
+struct WeaponState {
+    std::string name;
+    std::string display_name = "Unarmed";
+    bool equipped = false;
+    bool is_heavy = false;
+    bool is_two_handed = false;
+    EWeaponFireMode fire_mode = EWeaponFireMode::SemiAuto;
+    int ammo = 0;
+    int max_ammo = 0;
+    int pellet_count = 1;
+    int burst_remaining = 0;
+    float burst_timer = 0.0f;
+    float damage = 35.0f;
+    float damage_far = 20.0f;
+    float falloff_damage = 20.0f;
+    float falloff_distance = 1000.0f;
+    float falloff_start = 1000.0f;
+    float falloff_end = 3000.0f;
+    float range = 4500.0f;
+    float fire_interval = 0.2f;
+    float spread = 0.02f;
+    float spread_rad = 0.02f;
+    float recoil_pitch = 1.5f;
+    float recoil_pitch_deg = 1.5f;
+    float recoil_yaw = 0.4f;
+    float kickback_amount = 15.0f;
+    float mobility_scale = 0.95f;
+    float cooldown = 0.0f;
+    float fire_anim_timer = 0.0f;
+    float fire_anim_duration = 0.65f;
+    float equip_timer = 0.0f;
+    float drop_timer = 0.0f;
+    float muzzle_flash_timer = 0.0f;
+    bool trigger_released = true;
+    bool fired_this_tick = false;
+};
+
+struct BulletTracer {
+    Vec3 start_pos{0.0f, 0.0f, 0.0f};
+    Vec3 end_pos{0.0f, 0.0f, 0.0f};
+    float timer = 0.08f;
+    float max_time = 0.08f;
+    bool hit_enemy = false;
+    bool from_player = true;
+};
+
+struct DroppedWeapon {
+    std::string weapon_name;
     Vec3 position{0.0f, 0.0f, 0.0f};
     Vec3 velocity{0.0f, 0.0f, 0.0f};
     float yaw_deg = 0.0f;
+    float pitch_deg = 0.0f;
+    float roll_deg = 85.0f;
+    int ammo = 0;
+    bool is_heavy = false;
+    bool grounded = false;
+    float lifetime = 60.0f;
+};
+
+enum class EEnemyAnimState : uint8_t {
+    Idle = 0,
+    Patrol = 1,
+    Chase = 2,
+    AimFire = 3,
+    MeleeWindup = 4,     // Disarm window active (Runner Vision red)
+    MeleeStrike = 5,
+    HitStagger = 6,
+    BeingDisarmed = 7,
+    KnockedOut = 8
+};
+
+struct EnemyBot {
+    std::string archetype; // PatrolCop, PursuitCop, RiotCop, SWAT, Assault, Support, Celeste
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 home_position{0.0f, 0.0f, 0.0f};
+    Vec3 velocity{0.0f, 0.0f, 0.0f};
+    float yaw_deg = 0.0f;
     float health = 100.0f;
+    float max_health = 100.0f;
     bool alive = true;
     bool stunned = false;
     bool disarm_window = false;
     float attack_timer = 0.0f;
     std::string weapon_name = "Colt1911";
+    EEnemyAnimState anim_state = EEnemyAnimState::Idle;
+    std::string active_anim_seq;
+    float anim_timer = 0.0f;
+    float anim_duration = 1.0f;
+    float muzzle_flash_timer = 0.0f;
+    int burst_shots_left = 0;
+    float burst_cooldown = 0.0f;
 };
 
 // -----------------------------------------------------------------------------
@@ -660,6 +737,9 @@ struct InputFrame {
     bool reaction_time = false;
     bool look_at = false;
     bool use = false;              // E / Interact button (e.g. Elevator button)
+    bool drop_weapon = false;      // G / Backspace: Throw away equipped weapon
+    int cycle_weapon_dir = 0;      // +1 / -1: Cycle through retail firearm arsenal
+    bool spawn_combat_squad = false; // H: Spawn combat sparring squad in front of player
 };
 
 // -----------------------------------------------------------------------------
@@ -691,6 +771,14 @@ struct PlayerTelemetry {
     float elevator_progress = 0.0f;
     int streamed_sublevel_count = 0;
     WeaponState weapon;
+    float combat_anim_time = 0.0f;
+    float combat_anim_duration = 0.6f;
+    int melee_variant = 0;
+    bool snatch_from_back = false;
+    bool melee_hit_confirmed = false;
+    bool disarm_prompt_visible = false;
+    float hit_marker_timer = 0.0f;
+    float damage_flash_timer = 0.0f;
     std::string active_subtitle;
 };
 
@@ -749,6 +837,8 @@ struct LevelScene {
     std::vector<MeshBuffer> meshes;
     std::vector<AABB> colliders;
     std::vector<EnemyBot> enemies;
+    std::vector<BulletTracer> active_tracers;
+    std::vector<DroppedWeapon> dropped_weapons;
     std::vector<Vec3> checkpoints;
     std::vector<LevelCheckpointInfo> checkpoint_infos;
     std::vector<LevelStreamingActionInfo> streaming_actions;

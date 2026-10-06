@@ -43,6 +43,7 @@ public:
     [[nodiscard]] int get_active_checkpoint() const { return m_telemetry.active_checkpoint; }
     [[nodiscard]] int get_bags_collected() const { return m_telemetry.bags_collected; }
     [[nodiscard]] const WeaponState& get_weapon() const { return m_telemetry.weapon; }
+    void equip_weapon(const std::string& weapon_name);
 
     void set_position(const Vec3& pos) { m_telemetry.position = pos; }
     void set_velocity(const Vec3& vel) { m_telemetry.velocity = vel; }
@@ -130,6 +131,9 @@ private:
     float m_fall_peak_z = 0.0f;
     float m_crouch_landing_buffer = 0.0f;
     float m_melee_cooldown = 0.0f;
+    int m_melee_combo_index = 0;
+    float m_melee_combo_reset_timer = 0.0f;
+    int m_weapon_cycle_index = 0;
     bool m_jump_consumed = false;
     bool m_prev_turn_180 = false;
 
