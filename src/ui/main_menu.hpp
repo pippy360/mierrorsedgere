@@ -54,6 +54,24 @@ struct MainMenuConfig {
     std::string bags_found_label = "BAGS FOUND:";
 };
 
+struct UIFontGlyph {
+    int32_t u = 0;
+    int32_t v = 0;
+    int32_t w = 0;
+    int32_t h = 0;
+    uint8_t page = 0;
+    int32_t v_offset = 0;
+};
+
+struct UIMultiFont {
+    std::string name;
+    float base_line_height = 28.0f;
+    std::array<UIFontGlyph, 256> glyphs{};
+    std::vector<SceneTexture> pages;
+
+    [[nodiscard]] bool valid() const { return !pages.empty(); }
+};
+
 /**
  * MainMenuSystem: Reverse-engineered Mirror's Edge Frontend UI & 3D Menu City Subsystem.
  *
@@ -64,6 +82,8 @@ struct MainMenuConfig {
  *  - Localization/INT/TdGame.int ([... UIDataProvider_TdMaps] localized chapter & checkpoint names)
  *  - CookedPC/Maps/Menu/TdMainMenu.me1 (S_City_01..05 3D City of Glass panorama, 12 CameraActors,
  *    MI_SP00_01..MI_SP09_01 district highlight MaterialInstanceConstants, and StartTitleImage)
+ *  - CookedPC/UI/UI_Fonts_Final.upk (MultiFont Helvetica_Headline_Thick_Italic, Helvetica_Headline_Light_Italic,
+ *    Helvetica_Medium_Italic, Helvetica_Small_Bold_Italic glyph atlases & metrics)
  *  - CookedPC/UI/TdUIResources.upk (StartTitleImage, Icon_Bag, Icon_Time, LoadCheckpoint_BG)
  *  - CookedPC/UI/TdUIResources_FrontEnd.upk (T_Faith_03 character & diagonal stripe artwork)
  *  - CookedPC/UI/TdUIResources_CheckpointImages.upk (Level1a_CP1..Level9_CP7 halftone chapter previews)
@@ -97,6 +117,11 @@ public:
     [[nodiscard]] const SceneTexture& faith_art_texture() const { return faith_art_tex_; }
     [[nodiscard]] const SceneTexture& chapter_preview_texture(int idx) const;
 
+    [[nodiscard]] const UIMultiFont& headline_thick_font() const { return font_headline_thick_; }
+    [[nodiscard]] const UIMultiFont& headline_light_font() const { return font_headline_light_; }
+    [[nodiscard]] const UIMultiFont& medium_italic_font() const { return font_medium_italic_; }
+    [[nodiscard]] const UIMultiFont& small_italic_font() const { return font_small_italic_; }
+
 private:
     bool loaded_ = false;
     MainMenuConfig config_;
@@ -114,6 +139,11 @@ private:
     SceneTexture panel_bg_tex_;
     SceneTexture faith_art_tex_;
     std::array<SceneTexture, 10> chapter_preview_tex_;
+
+    UIMultiFont font_headline_thick_;
+    UIMultiFont font_headline_light_;
+    UIMultiFont font_medium_italic_;
+    UIMultiFont font_small_italic_;
 };
 
 } // namespace me

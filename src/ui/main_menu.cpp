@@ -1,10 +1,12 @@
 #include "main_menu.hpp"
 #include "../assets/ini_config.hpp"
 #include "../assets/upk_loader.hpp"
+#include "../assets/ue3_props.hpp"
 #include "../assets/package_manager.hpp"
 #include "../assets/texture_loader.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 
@@ -60,6 +62,65 @@ bool load_ui_texture_by_name(PackageManager& pm, const UPKPackage& pkg, const st
                 return true;
             }
         }
+    }
+    return false;
+}
+
+bool load_ui_multifont(PackageManager& pm, const UPKPackage& pkg, const std::string& font_name,
+                       UIMultiFont& out_font) {
+    std::string target_low = to_lower_copy(font_name);
+    const auto& exports = pkg.get_exports();
+    const uint8_t* raw = pkg.get_data().data();
+    size_t raw_size = pkg.get_data().size();
+
+    for (size_t i = 0; i < exports.size(); ++i) {
+        std::string cls = pkg.get_export_class(exports[i]);
+        if (cls != "MultiFont" && cls != "Font") continue;
+        if (to_lower_copy(exports[i].object_name) != target_low) continue;
+
+        UPropertyList props;
+        parse_export_properties(pkg, static_cast<int32_t>(i + 1), props);
+
+        const UProperty* p_chars = find_prop(props, "Characters");
+        const UProperty* p_texs = find_prop(props, "Textures");
+        if (!p_chars || !p_texs || p_chars->array_count < 256) return false;
+
+        out_font = UIMultiFont{};
+        out_font.name = exports[i].object_name;
+
+        // Pick highest-resolution page tier available in MultiFont (tier 2 = 1080p)
+        int num_tiers = std::max(1, p_chars->array_count / 256);
+        int tier = num_tiers - 1;
+        size_t base_off = p_chars->value_offset + 4 + static_cast<size_t>(tier * 256) * 21;
+        if (base_off + 256 * 21 > raw_size) return false;
+
+        float max_glyph_h = 16.0f;
+        for (int c = 0; c < 256; ++c) {
+            size_t off = base_off + static_cast<size_t>(c) * 21;
+            UIFontGlyph g{};
+            std::memcpy(&g.u, raw + off + 0, 4);
+            std::memcpy(&g.v, raw + off + 4, 4);
+            std::memcpy(&g.w, raw + off + 8, 4);
+            std::memcpy(&g.h, raw + off + 12, 4);
+            std::memcpy(&g.page, raw + off + 16, 1);
+            std::memcpy(&g.v_offset, raw + off + 17, 4);
+            out_font.glyphs[static_cast<size_t>(c)] = g;
+            if (c >= 'A' && c <= 'Z') {
+                max_glyph_h = std::max(max_glyph_h, static_cast<float>(g.h + g.v_offset));
+            }
+        }
+        out_font.base_line_height = max_glyph_h;
+
+        out_font.pages.resize(p_texs->ints.size());
+        for (size_t ti = 0; ti < p_texs->ints.size(); ++ti) {
+            int32_t ref = p_texs->ints[ti];
+            if (ref > 0 && load_texture2d(pm, pkg, ref, 1024, out_font.pages[ti], nullptr)) {
+                out_font.pages[ti].srgb = false;
+                out_font.pages[ti].address_x = TexAddress::Clamp;
+                out_font.pages[ti].address_y = TexAddress::Clamp;
+            }
+        }
+        return out_font.valid();
     }
     return false;
 }
@@ -231,6 +292,8 @@ bool MainMenuSystem::init(const std::string& game_root) {
 
         // Load 3D City of Glass menu level (S_City_01..05, S_CityBase_01, S_CityBaseMountains_01, S_CityBaseWater_01)
         if (load_level_scene(game_root, "Maps/Menu/TdMainMenu.me1", city_scene_)) {
+            city_scene_.sun_direction = Vec3(-0.22f, 0.76f, 0.61f).normalized();
+            city_scene_.sun_color = Vec3(2.35f, 2.24f, 2.08f);
             if (city_scene_.materials) {
                 mutable_city_materials_ = std::make_shared<SceneMaterialLibrary>(*city_scene_.materials);
                 city_scene_.materials = mutable_city_materials_;
@@ -264,20 +327,10 @@ bool MainMenuSystem::init(const std::string& game_root) {
                     read_cam(kSpecs[i].cam_export_0based, chapters_[i].camera_location, chapters_[i].camera_rotation);
                 }
 
-                // Remove flat unlit M_Sky_01 skydome section so TdDirHaze blue sky shines behind the 3D city,
-                // and aim each chapter camera directly at the 3D centroid of its MI_SP0*_01 skyscraper cluster
-                // so the Runner Vision Red district is framed dead-center in the open viewport window.
+                // Aim each chapter camera across the skyline toward its MI_SP0*_01 skyscraper cluster
+                // with DICE's panoramic horizon pitch so the glowing district and M_Skydome_Menu shine unobstructed.
                 if (mutable_city_materials_ && !city_scene_.meshes.empty()) {
-                    auto& mesh = city_scene_.meshes[0];
-                    for (auto& s : mesh.sections) {
-                        if (s.material >= 0 && static_cast<size_t>(s.material) < mutable_city_materials_->materials.size()) {
-                            std::string mname = to_lower_copy(mutable_city_materials_->materials[static_cast<size_t>(s.material)].name);
-                            if (mname.find("m_sky") != std::string::npos) {
-                                s.vertex_count = 0;
-                            }
-                        }
-                    }
-
+                    const auto& mesh = city_scene_.meshes[0];
                     for (size_t i = 0; i < 10; ++i) {
                         std::string tag = to_lower_copy(chapters_[i].material_instance_tag);
                         Vec3 sum{0.0f, 0.0f, 0.0f};
@@ -299,11 +352,9 @@ bool MainMenuSystem::init(const std::string& game_root) {
                         }
                         if (count > 0) {
                             Vec3 center = sum / static_cast<float>(count);
-                            // Aim slightly above the district roof centroid so the horizon sits in the upper-middle
-                            // of the open viewport and the red skyscraper cluster sits dead-center between the UI panels
-                            Vec3 look_target(center.x, center.y, max_z + 18.0f);
+                            Vec3 look_target(center.x, center.y, max_z + 28.0f);
                             Vec3 dir = (look_target - chapters_[i].camera_location).normalized();
-                            float pitch_rad = std::asin(std::clamp(dir.z, -1.0f, 1.0f));
+                            float pitch_rad = std::clamp(std::asin(std::clamp(dir.z, -1.0f, 1.0f)), -0.11f, 0.04f);
                             float yaw_rad   = std::atan2(dir.y, dir.x);
                             chapters_[i].camera_rotation = Rotator::from_radians(pitch_rad, yaw_rad, 0.0f);
                         }
@@ -315,7 +366,20 @@ bool MainMenuSystem::init(const std::string& game_root) {
             }
         }
 
-        // 5. Load UI skin & icon textures from UI/TdUIResources.upk
+        // 5. Load retail Mirror's Edge MultiFont atlases from UI/UI_Fonts_Final.upk
+        fs::path font_path = cooked_root / "UI" / "UI_Fonts_Final.upk";
+        if (fs::exists(font_path)) {
+            auto font_pkg = std::make_shared<UPKPackage>(font_path.string());
+            if (font_pkg->is_valid()) {
+                pm.add_loaded("UI_Fonts_Final", font_pkg);
+                load_ui_multifont(pm, *font_pkg, "Helvetica_Headline_Thick_Italic", font_headline_thick_);
+                load_ui_multifont(pm, *font_pkg, "Helvetica_Headline_Light_Italic", font_headline_light_);
+                load_ui_multifont(pm, *font_pkg, "Helvetica_Medium_Italic", font_medium_italic_);
+                load_ui_multifont(pm, *font_pkg, "Helvetica_Small_Bold_Italic", font_small_italic_);
+            }
+        }
+
+        // 6. Load UI skin & icon textures from UI/TdUIResources.upk
         fs::path res_path = cooked_root / "UI" / "TdUIResources.upk";
         if (fs::exists(res_path)) {
             auto res_pkg = std::make_shared<UPKPackage>(res_path.string());
@@ -330,7 +394,7 @@ bool MainMenuSystem::init(const std::string& game_root) {
             }
         }
 
-        // 6. Load Faith & diagonal red stripe artwork from UI/TdUIResources_FrontEnd.upk
+        // 7. Load Faith & diagonal red stripe artwork from UI/TdUIResources_FrontEnd.upk
         fs::path fres_path = cooked_root / "UI" / "TdUIResources_FrontEnd.upk";
         if (fs::exists(fres_path)) {
             auto fres_pkg = std::make_shared<UPKPackage>(fres_path.string());
@@ -340,7 +404,7 @@ bool MainMenuSystem::init(const std::string& game_root) {
             }
         }
 
-        // 7. Load Chapter Preview Halftone Photographs (Level1a_CP1..Level9_CP1, 512x256 PF_DXT5/PF_DXT1)
+        // 8. Load Chapter Preview Halftone Photographs (Level1a_CP1..Level9_CP1, 512x256 PF_DXT5/PF_DXT1)
         fs::path cp_path = cooked_root / "UI" / "TdUIResources_CheckpointImages.upk";
         std::shared_ptr<UPKPackage> cp_pkg;
         if (fs::exists(cp_path)) {
@@ -371,6 +435,7 @@ bool MainMenuSystem::init(const std::string& game_root) {
     std::cout << "[MainMenu] Initialized Mirror's Edge Frontend UI ("
               << tabs_.size() << " tabs, " << chapters_.size() << " chapters, "
               << "Logo=" << (logo_tex_.valid() ? "OK" : "NO")
+              << ", Fonts=" << (font_headline_thick_.valid() && font_medium_italic_.valid() ? "OK" : "NO")
               << ", Previews=" << loaded_previews << "/10"
               << ", CityMeshes=" << city_scene_.meshes.size() << ")" << std::endl;
     return true;
