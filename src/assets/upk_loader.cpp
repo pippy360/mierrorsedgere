@@ -2825,6 +2825,17 @@ void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<st
         auto& el = scene.elevators[e];
         for (size_t p = 0; p < el.parts.size(); ++p) {
             ElevatorPart& part = el.parts[p];
+            // Pose for the elevator's initial state (IdleStart: cab at the start floor, start-floor
+            // doors open), exactly as ParkourController::update_elevators() poses it.
+            const Vec3 cab_offset = el.current_pos - el.start_pos;
+            switch (part.role) {
+                case ElevatorPartRole::Cab:
+                case ElevatorPartRole::CabAttached: part.offset = cab_offset; break;
+                case ElevatorPartRole::CabDoor: part.offset = cab_offset + part.door_open_offset * el.door_open_Start; break;
+                case ElevatorPartRole::StartDoor: part.offset = part.door_open_offset * el.door_open_Start; break;
+                case ElevatorPartRole::EndDoor: part.offset = part.door_open_offset * el.door_open_End; break;
+            }
+            part.prev_offset = part.offset;
             LevelActor& a = scene.actors[part.actor_index];
             const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
             auto cw = std::make_shared<CollisionWorld>();
