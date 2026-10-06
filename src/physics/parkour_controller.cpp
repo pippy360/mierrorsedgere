@@ -1017,6 +1017,13 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
                 m_jump_consumed = true;
             }
 
+            // Maintain clean AABB standoff along +wall_normal so rotated wall seams do not snag sweep_box
+            const float aabb_support = kPawnRadius * (std::abs(hit.normal.x) + std::abs(hit.normal.y)) + 4.0f;
+            const float cur_wall_dist = (m_telemetry.position - hit.point).dot(hit.normal);
+            if (cur_wall_dist < aabb_support) {
+                move_swept(hit.normal * (aabb_support - cur_wall_dist), kPawnHeight, 0.0f, scene);
+            }
+
             // Initial vertical boost (WallRunningHorisontalInitialZHeight = 170)
             m_telemetry.velocity.z = std::max(m_telemetry.velocity.z, m_config.wallrun_initial_z);
 
@@ -1077,7 +1084,7 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
 
     // Check if wall has ended
     Vec3 probe_start = m_telemetry.position + Vec3(0, 0, 70);
-    TraceHit wall_check = trace_ray(probe_start, probe_start - m_telemetry.wall_normal * 80.0f, scene);
+    TraceHit wall_check = trace_ray(probe_start, probe_start - m_telemetry.wall_normal * 95.0f, scene);
 
     if (!wall_check.hit || m_wallrun_timer >= m_config.wallrun_duration || spd < 150.0f) {
         m_wallrun_cooldown = 0.15f;
@@ -1086,16 +1093,57 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
         return;
     }
 
-    // Swept movement along the wall (TdPawn: Radius=30, Height=90): grazing the running wall slides
-    // along it; running into an obstacle or onto a floor ends the wallrun.
-    const TraceHit hit = move_and_slide(m_telemetry.velocity * dt, kPawnHeight, 0.0f, scene);
-    if (hit.hit) {
-        const float vn = m_telemetry.velocity.dot(hit.normal);
-        if (vn < 0.0f) m_telemetry.velocity -= hit.normal * vn;
-        if (hit.normal.dot(m_wall_tangent) < -0.5f || hit.normal.z >= kWalkableFloorZ) {
-            m_wallrun_cooldown = 0.20f;
-            m_telemetry.move_state = EMovement::MOVE_Falling;
-            m_telemetry.camera_roll_deg = 0.0f;
+    // Keep capsule AABB slightly clear of angled wall faces so modular static mesh seams never snag
+    const float aabb_support = kPawnRadius * (std::abs(m_telemetry.wall_normal.x) + std::abs(m_telemetry.wall_normal.y)) + 4.0f;
+    const float cur_wall_dist = (m_telemetry.position - wall_check.point).dot(m_telemetry.wall_normal);
+    if (cur_wall_dist < aabb_support) {
+        move_swept(m_telemetry.wall_normal * (aabb_support - cur_wall_dist), kPawnHeight, 0.0f, scene);
+    }
+
+    // Swept movement along the wall (TdMove_WallRun):
+    // If a modular wall seam, window frame, or thin pilaster (<= 28u along +wall_normal) blocks the
+    // tangent sweep, step outward along +wall_normal just like APawn::stepUp does for floor kerbs.
+    const Vec3 full_delta = m_telemetry.velocity * dt;
+    const TraceHit first = move_swept(full_delta, kPawnHeight, 0.0f, scene);
+    if (first.hit) {
+        bool stepped_over_seam = false;
+        const Vec3 remaining = full_delta * (1.0f - first.fraction);
+        if (first.normal.z < kWalkableFloorZ && remaining.length_sq() > 1e-6f) {
+            constexpr float kMaxWallSeamStep = 28.0f;
+            const Vec3 pos_at_contact = m_telemetry.position;
+            move_swept(m_telemetry.wall_normal * kMaxWallSeamStep, kPawnHeight, 0.0f, scene);
+            const float step_out = (m_telemetry.position - pos_at_contact).dot(m_telemetry.wall_normal);
+            if (step_out > 0.5f) {
+                const Vec3 pos_stepped = m_telemetry.position;
+                const TraceHit retry = move_swept(remaining, kPawnHeight, 0.0f, scene);
+                const float advanced = (m_telemetry.position - pos_stepped).dot(m_wall_tangent);
+                const float expected = remaining.dot(m_wall_tangent);
+                if (!retry.hit || (expected > 1e-3f && advanced > 0.5f * expected)) {
+                    // Settle back toward the new wall panel plane while keeping clean standoff
+                    move_swept(-m_telemetry.wall_normal * std::max(0.0f, step_out - 2.0f), kPawnHeight, 0.0f, scene);
+                    stepped_over_seam = true;
+                } else {
+                    m_telemetry.position = pos_at_contact;
+                }
+            } else {
+                m_telemetry.position = pos_at_contact;
+            }
+        }
+
+        if (!stepped_over_seam) {
+            // Slide remaining movement along the blocking surface and check if wallrun must end
+            Vec3 slide_rem = full_delta * (1.0f - first.fraction);
+            slide_rem -= first.normal * slide_rem.dot(first.normal);
+            if (slide_rem.length_sq() > 1e-6f) {
+                move_swept(slide_rem + first.normal * 0.01f, kPawnHeight, 0.0f, scene);
+            }
+            const float vn = m_telemetry.velocity.dot(first.normal);
+            if (vn < 0.0f) m_telemetry.velocity -= first.normal * vn;
+            if (first.normal.dot(m_wall_tangent) < -0.5f || first.normal.z >= kWalkableFloorZ) {
+                m_wallrun_cooldown = 0.20f;
+                m_telemetry.move_state = EMovement::MOVE_Falling;
+                m_telemetry.camera_roll_deg = 0.0f;
+            }
         }
     }
 }
