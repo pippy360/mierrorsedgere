@@ -142,6 +142,10 @@ public:
     // Level BSP (the PersistentLevel UModel) collision polygons, fan-triangulated in world
     // space (3 vertices per triangle). Non-CSG nodes and PF_NotSolid surfaces are skipped.
     void extract_bsp_collision(std::vector<Vec3>& out_triangles) const;
+    // Level BSP render geometry (from PersistentLevel UModel Nodes + Surfs + FModelVertexBuffer),
+    // binned by canonical material path and oriented to counter-clockwise front-facing winding.
+    void extract_bsp_render_geometry(std::vector<std::pair<std::string, std::vector<Vertex>>>& out_bins,
+                                     AABB& inout_bounds) const;
     void extract_elevators(const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                            std::vector<ElevatorInstance>& out_elevators,
                            std::vector<InterpDoorInfo>* out_doors = nullptr) const;
@@ -186,7 +190,9 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           std::vector<MeshBuffer>& out_meshes,
                           CollisionWorld& out_collision,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-                          std::vector<std::string>* out_material_paths = nullptr);
+                          std::vector<std::string>* out_material_paths = nullptr,
+                          const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins = nullptr,
+                          const AABB* bsp_bounds = nullptr);
 
 // Appends one actor's UE3 collision triangles (world space) to `out` with the per-triangle
 // channels implied by the actor flags and the mesh's UseSimple*Collision settings.
