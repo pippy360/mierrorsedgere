@@ -480,10 +480,34 @@ struct MeshBuffer {
 
 struct SoundClip {
     std::string name;
+    std::string full_path;
     std::vector<uint8_t> pcm_data;
     int sample_rate = 44100;
     int channels = 2;
     float duration = 0.0f;
+};
+
+struct SoundCueDef {
+    std::string name;
+    std::string full_path;
+    std::string sound_group = "InGameSFX";
+    float volume_multiplier = 0.75f;
+    float pitch_multiplier = 1.0f;
+    float min_radius = 200.0f;
+    float max_radius = 3000.0f;
+    bool looping = false;
+    std::vector<std::string> wave_names;
+    std::vector<float> wave_weights;
+};
+
+struct AmbientEmitterInfo {
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    std::string cue_name;
+    std::string wave_name;
+    float min_radius = 200.0f;
+    float max_radius = 3000.0f;
+    float volume = 1.0f;
+    float pitch = 1.0f;
 };
 
 // -----------------------------------------------------------------------------

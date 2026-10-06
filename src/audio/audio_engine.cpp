@@ -69,6 +69,7 @@ long mem_tell(void* datasource) {
 }
 
 int mem_close(void* datasource) {
+    (void)datasource;
     return 0;
 }
 #endif
@@ -87,6 +88,21 @@ std::vector<uint8_t> float_stereo_to_pcm16(const std::vector<float>& left, const
     return bytes;
 }
 
+static const char* surface_prefix(ESurfaceMaterial surf) {
+    switch (surf) {
+        case ESurfaceMaterial::Concrete:     return "Concrete";
+        case ESurfaceMaterial::Metal:        return "Metal";
+        case ESurfaceMaterial::MetalGantry:  return "MetalGantry";
+        case ESurfaceMaterial::MetalAirduct: return "Metal_Airduct";
+        case ESurfaceMaterial::MetalLadder:  return "Metal_Ladder";
+        case ESurfaceMaterial::Wood:         return "Wood";
+        case ESurfaceMaterial::Glass:        return "Glass";
+        case ESurfaceMaterial::Water:        return "Water";
+        case ESurfaceMaterial::Cardboard:    return "Cardboard";
+        default:                             return "Concrete";
+    }
+}
+
 } // namespace
 
 AudioEngine::AudioEngine() = default;
@@ -99,7 +115,7 @@ bool AudioEngine::init(bool headless) {
     headless_ = headless;
     initialized_ = true;
 
-    // Synthesize high-quality procedural fallback clips and 4 dynamic Solar Fields stems
+    // Synthesize procedural fallback clips and 4 dynamic Solar Fields stems
     synthesize_fallback_clips();
 
     if (!headless_) {
@@ -113,6 +129,8 @@ void AudioEngine::shutdown() {
     if (!initialized_) return;
     cleanup_openal();
     sound_clips_.clear();
+    sound_cues_.clear();
+    ambient_emitters_.clear();
     al_buffers_.clear();
     initialized_ = false;
 }
@@ -136,6 +154,9 @@ bool AudioEngine::init_openal() {
     alc_context_ = ctx;
     alcMakeContextCurrent(ctx);
 
+    // Match UE3 ALAudioDevice distance attenuation model
+    alDistanceModel(AL_INVERSE_DISTANCE_CLAMPED);
+
     // Create 32 spatial sources
     for (size_t i = 0; i < kSourcePoolSize; ++i) {
         ALuint src = 0;
@@ -149,16 +170,32 @@ bool AudioEngine::init_openal() {
         alGenSources(1, &src);
         music_stem_sources_[i] = src;
         alSourcei(src, AL_LOOPING, AL_TRUE);
+        alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
+        alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
         alSourcef(src, AL_GAIN, (i == 0) ? 1.0f : 0.0f);
+    }
+    rebind_music_stem_buffers();
 
-        // Preload stem buffers
-        std::string stem_name = "Stem_" + std::to_string(i);
-        if (sound_clips_.find(stem_name) != sound_clips_.end()) {
-            uint32_t buf = get_or_create_buffer(sound_clips_[stem_name]);
-            music_stem_buffers_[i] = buf;
-            alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
-            alSourcePlay(src);
-        }
+    // Create dedicated continuous TdSoundNodeVelocity (RunWind) loop source
+    {
+        ALuint wsrc = 0;
+        alGenSources(1, &wsrc);
+        run_wind_source_ = wsrc;
+        alSourcei(wsrc, AL_LOOPING, AL_TRUE);
+        alSourcei(wsrc, AL_SOURCE_RELATIVE, AL_TRUE);
+        alSource3f(wsrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
+        alSourcef(wsrc, AL_GAIN, 0.0f);
+    }
+
+    // Create 4 dedicated 3D ambient emitter sources (*_Aud.me1 AmbientSound pool)
+    for (size_t i = 0; i < kAmbientPoolSize; ++i) {
+        ALuint asrc = 0;
+        alGenSources(1, &asrc);
+        ambient_sources_[i] = asrc;
+        active_ambient_indices_[i] = -1;
+        alSourcei(asrc, AL_LOOPING, AL_TRUE);
+        alSourcei(asrc, AL_SOURCE_RELATIVE, AL_FALSE);
+        alSourcef(asrc, AL_GAIN, 0.0f);
     }
 
     return true;
@@ -177,6 +214,20 @@ void AudioEngine::cleanup_openal() {
                 alSourceStop(music_stem_sources_[i]);
                 alDeleteSources(1, &music_stem_sources_[i]);
                 music_stem_sources_[i] = 0;
+            }
+        }
+
+        if (run_wind_source_) {
+            alSourceStop(run_wind_source_);
+            alDeleteSources(1, &run_wind_source_);
+            run_wind_source_ = 0;
+        }
+
+        for (size_t i = 0; i < kAmbientPoolSize; ++i) {
+            if (ambient_sources_[i]) {
+                alSourceStop(ambient_sources_[i]);
+                alDeleteSources(1, &ambient_sources_[i]);
+                ambient_sources_[i] = 0;
             }
         }
 
@@ -235,7 +286,8 @@ uint32_t AudioEngine::get_or_create_buffer(const SoundClip& clip) {
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return 0;
 
-    auto it = al_buffers_.find(clip.name);
+    std::string key = !clip.full_path.empty() ? clip.full_path : clip.name;
+    auto it = al_buffers_.find(key);
     if (it != al_buffers_.end()) {
         return it->second;
     }
@@ -250,10 +302,66 @@ uint32_t AudioEngine::get_or_create_buffer(const SoundClip& clip) {
     ALenum format = (clip.channels == 2) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
     alBufferData(buf, format, clip.pcm_data.data(), static_cast<ALsizei>(clip.pcm_data.size()), clip.sample_rate);
 
-    al_buffers_[clip.name] = buf;
+    al_buffers_[key] = buf;
     return buf;
 #else
     return 0;
+#endif
+}
+
+void AudioEngine::rebind_music_stem_buffers() {
+    // Prefer real Solar Fields UPK tracks when loaded; fallback to Stem_0..Stem_3
+    const SoundClip* amb = pick_first_available_clip({
+        "RAW.ambience_01", "ambience_01", "RAW.ME_THEME_Ambience", "RAW.A_M_Menu", "A_M_Menu", "Stem_0"
+    });
+    const SoundClip* tension = pick_first_available_clip({
+        "RAW.ambience_011", "ambience_011", "RAW.Puzzle_01", "Puzzle_01", "Stem_1"
+    });
+    const SoundClip* chase = pick_first_available_clip({
+        "RAW.chase_01", "chase_01", "RAW.A_TT_Music", "A_TT_Music", "Stem_2"
+    });
+    const SoundClip* combat = pick_first_available_clip({
+        "RAW.combat_01", "combat_01", "Stem_3"
+    });
+
+    const SoundClip* chosen[4] = {amb, tension, chase, combat};
+
+#ifndef ME_NO_OPENAL
+    if (headless_ || !alc_context_) return;
+
+    for (int i = 0; i < 4; ++i) {
+        if (!chosen[i] || !music_stem_sources_[i]) continue;
+        std::string new_name = !chosen[i]->full_path.empty() ? chosen[i]->full_path : chosen[i]->name;
+        if (new_name == music_stem_clip_names_[i] && music_stem_buffers_[i] != 0) {
+            continue;
+        }
+        uint32_t buf = get_or_create_buffer(*chosen[i]);
+        if (!buf) continue;
+        music_stem_clip_names_[i] = new_name;
+        music_stem_buffers_[i] = buf;
+        alSourceStop(music_stem_sources_[i]);
+        alSourcei(music_stem_sources_[i], AL_BUFFER, static_cast<ALint>(buf));
+        alSourcePlay(music_stem_sources_[i]);
+    }
+
+    // Bind RunWind (TdSoundNodeVelocity) if CharacterRunWind is loaded
+    if (run_wind_source_) {
+        const SoundClip* wind_clip = pick_first_available_clip({"RAW.CharacterRunWind", "CharacterRunWind", "FX_Wallrun"});
+        if (wind_clip) {
+            uint32_t wbuf = get_or_create_buffer(*wind_clip);
+            if (wbuf) {
+                ALint cur_buf = 0;
+                alGetSourcei(run_wind_source_, AL_BUFFER, &cur_buf);
+                if (static_cast<uint32_t>(cur_buf) != wbuf) {
+                    alSourceStop(run_wind_source_);
+                    alSourcei(run_wind_source_, AL_BUFFER, static_cast<ALint>(wbuf));
+                    alSourcePlay(run_wind_source_);
+                }
+            }
+        }
+    }
+#else
+    (void)chosen;
 #endif
 }
 
@@ -295,16 +403,63 @@ bool AudioEngine::decode_ogg_to_pcm(const uint8_t* ogg_data, size_t ogg_size,
 #endif
 }
 
+void AudioEngine::set_sound_group_mode(ESoundGroupEffectMode mode) {
+    sound_mode_ = mode;
+}
+
 void AudioEngine::update(float dt,
                          const Vec3& listener_pos,
                          const Vec3& listener_forward,
                          const Vec3& listener_up,
                          float player_speed,
                          bool reaction_active) {
+    // Automatically toggle ReactionTime SoundGroupEffects mode 3 (DefaultEngine.ini line 187)
+    if (reaction_active && sound_mode_ == ESoundGroupEffectMode::Normal) {
+        sound_mode_ = ESoundGroupEffectMode::ReactionTime;
+    } else if (!reaction_active && sound_mode_ == ESoundGroupEffectMode::ReactionTime) {
+        sound_mode_ = ESoundGroupEffectMode::Normal;
+    }
+
+    // Evaluate target SoundGroup bus adjusters matching DefaultEngine.ini lines 177-209
+    float target_sfx_gain = 1.0f;
+    float target_music_gain = 1.0f;
+    float target_breath_gain = 1.0f;
+    float target_slomo_pitch = 1.0f;
+
+    switch (sound_mode_) {
+        case ESoundGroupEffectMode::ReactionTime:
+            // Mode 3: InGameSFX=0.4, InGameMusic=0.7, FaithBreath=1.5 + TdSoundNodeSlowMotion pitch drop
+            target_sfx_gain = 0.45f;
+            target_music_gain = 0.70f;
+            target_breath_gain = 1.50f;
+            target_slomo_pitch = 0.65f;
+            break;
+        case ESoundGroupEffectMode::Pause:
+            // Mode 4: SFX=0.0, HudMusic/InGameMusic=0.3
+            target_sfx_gain = 0.0f;
+            target_music_gain = 0.30f;
+            target_breath_gain = 0.0f;
+            break;
+        case ESoundGroupEffectMode::IngameVO:
+            // Mode 2: InGameSFX=0.7, InGameMusic=0.6, FaithBreath=0.1
+            target_sfx_gain = 0.70f;
+            target_music_gain = 0.60f;
+            target_breath_gain = 0.10f;
+            break;
+        default:
+            break;
+    }
+
+    float lerp_factor = std::clamp(dt * 4.0f, 0.0f, 1.0f);
+    sfx_bus_gain_ += (target_sfx_gain - sfx_bus_gain_) * lerp_factor;
+    music_bus_gain_ += (target_music_gain - music_bus_gain_) * lerp_factor;
+    breath_bus_gain_ += (target_breath_gain - breath_bus_gain_) * lerp_factor;
+    slomo_pitch_scale_ += (target_slomo_pitch - slomo_pitch_scale_) * lerp_factor;
+
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
 
-    // 1. Update listener orientation
+    // 1. Update 3D OpenAL listener position & orientation (1 UU = 0.01m)
     ALfloat pos[3] = {listener_pos.x * 0.01f, listener_pos.y * 0.01f, listener_pos.z * 0.01f};
     alListenerfv(AL_POSITION, pos);
 
@@ -313,63 +468,140 @@ void AudioEngine::update(float dt,
     ALfloat ori[6] = {f.x, f.y, f.z, u.x, u.y, u.z};
     alListenerfv(AL_ORIENTATION, ori);
 
-    // 2. Evaluate target stem volumes based on gameplay state
+    // 2. Evaluate target Solar Fields stem volumes based on gameplay speed & state
     if (reaction_active) {
-        target_stem_vols_[0] = 0.2f; // Ambient attenuated
-        target_stem_vols_[1] = 0.2f; // Tension attenuated
-        target_stem_vols_[2] = 0.1f; // Chase attenuated
-        target_stem_vols_[3] = 1.0f; // Reaction stem max
-    } else if (player_speed > 300.0f) {
-        target_stem_vols_[0] = 0.8f; // Ambient active
-        target_stem_vols_[1] = 0.5f; // Tension pulse
-        target_stem_vols_[2] = 1.0f; // Full Chase breakbeat!
-        target_stem_vols_[3] = 0.0f;
+        target_stem_vols_[0] = 0.25f; // Ambient attenuated
+        target_stem_vols_[1] = 0.25f; // Tension attenuated
+        target_stem_vols_[2] = 0.10f; // Chase attenuated
+        target_stem_vols_[3] = 1.00f; // Reaction/Combat stem active
+    } else if (player_speed > 550.0f) {
+        target_stem_vols_[0] = 0.80f; // Ambient pad
+        target_stem_vols_[1] = 0.65f; // Tension pulse
+        target_stem_vols_[2] = 1.00f; // Full Solar Fields Chase layer!
+        target_stem_vols_[3] = 0.00f;
+    } else if (player_speed > 260.0f) {
+        target_stem_vols_[0] = 1.00f; // Ambient active
+        target_stem_vols_[1] = 0.60f; // Puzzle/Tension layer
+        target_stem_vols_[2] = 0.25f; // Subtle Chase build
+        target_stem_vols_[3] = 0.00f;
     } else {
-        target_stem_vols_[0] = 1.0f; // Ambient full
-        target_stem_vols_[1] = 0.1f; // Subtle tension
-        target_stem_vols_[2] = 0.0f;
-        target_stem_vols_[3] = 0.0f;
+        target_stem_vols_[0] = 1.00f; // Ambient full
+        target_stem_vols_[1] = 0.15f; // Subtle pulse
+        target_stem_vols_[2] = 0.00f;
+        target_stem_vols_[3] = 0.00f;
     }
 
-    // Smooth lerp on stem gains
-    float lerp_factor = std::clamp(dt * 3.0f, 0.0f, 1.0f);
+    float stem_lerp = std::clamp(dt * 3.0f, 0.0f, 1.0f);
     for (int i = 0; i < 4; ++i) {
-        current_stem_vols_[i] += (target_stem_vols_[i] - current_stem_vols_[i]) * lerp_factor;
+        current_stem_vols_[i] += (target_stem_vols_[i] - current_stem_vols_[i]) * stem_lerp;
         if (music_stem_sources_[i]) {
-            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i]);
+            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * 0.45f);
+        }
+    }
+
+    // 3. Update TdSoundNodeVelocity (1P RunWind: INTERPOLATION_Square between 450..850 UU/s)
+    if (run_wind_source_) {
+        float norm_spd = std::clamp((player_speed - 450.0f) / 400.0f, 0.0f, 1.0f);
+        float sq_env = norm_spd * norm_spd; // INTERPOLATION_Square
+        current_wind_vol_ += (sq_env * 0.55f - current_wind_vol_) * lerp_factor;
+        float wind_pitch = (1.0f + 0.20f * sq_env) * slomo_pitch_scale_;
+        alSourcef(run_wind_source_, AL_GAIN, current_wind_vol_ * sfx_bus_gain_);
+        alSourcef(run_wind_source_, AL_PITCH, wind_pitch);
+    }
+
+    // 4. Stamina-coupled Faith breathing cadence (A_Character_Female_01.upk)
+    if (player_speed > 320.0f || reaction_active) {
+        breath_timer_ += dt;
+        float breath_interval = reaction_active ? 0.85f : std::clamp(650.0f / std::max(player_speed, 320.0f), 0.55f, 1.4f);
+        if (breath_timer_ >= breath_interval) {
+            breath_timer_ = 0.0f;
+            const char* cue_name = nullptr;
+            if (player_speed > 620.0f || reaction_active) {
+                cue_name = breath_inhale_next_ ? "Breath_Hard.Breath_Hard_Short_In" : "Breath_Hard.Breath_Hard_Short_Out";
+            } else {
+                cue_name = breath_inhale_next_ ? "Breath_Medium.Breath_Medium_Long_In" : "Breath_Medium.Breath_Medium_Long_Out";
+            }
+            breath_inhale_next_ = !breath_inhale_next_;
+            float bvol = 0.28f * breath_bus_gain_;
+            float bpitch = slomo_pitch_scale_;
+            if (const SoundClip* bclip = resolve_cue_or_clip(cue_name, bvol, bpitch)) {
+                play_sound(!bclip->full_path.empty() ? bclip->full_path : bclip->name, bvol, bpitch);
+            }
+        }
+    } else {
+        breath_timer_ = 0.0f;
+    }
+
+    // 5. Spatialize nearest 4 3D AmbientSound emitters from *_Aud.me1 sublevels
+    if (!ambient_emitters_.empty()) {
+        struct Cand { int32_t idx; float dist_sq; };
+        std::vector<Cand> cands;
+        cands.reserve(ambient_emitters_.size());
+        for (size_t i = 0; i < ambient_emitters_.size(); ++i) {
+            Vec3 d = ambient_emitters_[i].location - listener_pos;
+            float d2 = d.dot(d);
+            float max_r = std::max(ambient_emitters_[i].max_radius, 500.0f);
+            if (d2 <= max_r * max_r * 1.5f) {
+                cands.push_back({static_cast<int32_t>(i), d2});
+            }
+        }
+        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist_sq < b.dist_sq; });
+
+        for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
+            ALuint asrc = ambient_sources_[slot];
+            if (!asrc) continue;
+            if (slot < cands.size()) {
+                int32_t eidx = cands[slot].idx;
+                const auto& em = ambient_emitters_[eidx];
+                if (active_ambient_indices_[slot] != eidx) {
+                    active_ambient_indices_[slot] = eidx;
+                    float dummy_v = em.volume, dummy_p = em.pitch;
+                    const SoundClip* clip = resolve_cue_or_clip(
+                        !em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
+                    if (clip) {
+                        uint32_t buf = get_or_create_buffer(*clip);
+                        if (buf) {
+                            alSourceStop(asrc);
+                            alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
+                            alSourcef(asrc, AL_REFERENCE_DISTANCE, std::max(em.min_radius * 0.01f, 1.0f));
+                            alSourcef(asrc, AL_MAX_DISTANCE, std::max(em.max_radius * 0.01f, 10.0f));
+                            alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
+                            alSourcePlay(asrc);
+                        }
+                    }
+                }
+                alSourcef(asrc, AL_GAIN, em.volume * sfx_bus_gain_ * 0.55f);
+                alSourcef(asrc, AL_PITCH, em.pitch * slomo_pitch_scale_);
+            } else if (active_ambient_indices_[slot] != -1) {
+                active_ambient_indices_[slot] = -1;
+                alSourceStop(asrc);
+            }
         }
     }
 #else
-    (void)dt; (void)listener_pos; (void)listener_forward; (void)listener_up;
-    (void)player_speed; (void)reaction_active;
+    (void)listener_pos; (void)listener_forward; (void)listener_up; (void)player_speed;
 #endif
 }
 
-bool AudioEngine::load_sound_bank(const std::string& game_root, const std::string& bank_name) {
+bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path) {
     namespace fs = std::filesystem;
-    fs::path base(game_root);
-    fs::path bank_path = base / "TdGame" / "CookedPC" / "Audio" / bank_name;
-    if (!fs::exists(bank_path)) {
-        bank_path = base / "Audio" / bank_name;
-    }
-    if (!fs::exists(bank_path)) {
+    if (!fs::exists(pkg_path)) {
         return false;
     }
 
-    UPKPackage pkg(bank_path.string());
+    UPKPackage pkg(pkg_path);
     if (!pkg.is_valid()) {
         return false;
     }
 
     auto clips = pkg.extract_audio();
     for (auto& clip : clips) {
-        // If raw Ogg Vorbis stream is present, decode to PCM
         if (clip.pcm_data.size() >= 4 &&
             clip.pcm_data[0] == 'O' && clip.pcm_data[1] == 'g' &&
             clip.pcm_data[2] == 'g' && clip.pcm_data[3] == 'S') {
             std::vector<int16_t> pcm;
-            int rate = 44100;
-            int channels = 2;
+            int rate = clip.sample_rate;
+            int channels = clip.channels;
             if (decode_ogg_to_pcm(clip.pcm_data.data(), clip.pcm_data.size(), pcm, rate, channels)) {
                 clip.pcm_data.resize(pcm.size() * sizeof(int16_t));
                 std::memcpy(clip.pcm_data.data(), pcm.data(), clip.pcm_data.size());
@@ -379,19 +611,57 @@ bool AudioEngine::load_sound_bank(const std::string& game_root, const std::strin
             }
         }
         sound_clips_[clip.name] = clip;
+        if (!clip.full_path.empty()) {
+            sound_clips_[clip.full_path] = clip;
+        }
     }
 
-    return !clips.empty();
+    std::vector<SoundCueDef> cues;
+    std::vector<AmbientEmitterInfo> ambients;
+    pkg.extract_sound_cues_and_ambients(cues, ambients);
+    for (auto& cue : cues) {
+        sound_cues_[cue.name] = cue;
+        if (!cue.full_path.empty()) {
+            sound_cues_[cue.full_path] = cue;
+        }
+    }
+    for (auto& em : ambients) {
+        ambient_emitters_.push_back(std::move(em));
+    }
+
+    return !clips.empty() || !cues.empty();
+}
+
+bool AudioEngine::load_sound_bank(const std::string& game_root, const std::string& bank_name) {
+    namespace fs = std::filesystem;
+    fs::path base(game_root);
+    fs::path bank_path = base / "TdGame" / "CookedPC" / "Audio" / bank_name;
+    if (!fs::exists(bank_path)) {
+        bank_path = base / "Audio" / bank_name;
+    }
+    bool ok = load_package_audio_and_cues(bank_path.string());
+    if (ok) {
+        rebind_music_stem_buffers();
+    }
+    return ok;
 }
 
 bool AudioEngine::load_stock_audio(const std::string& game_root) {
     bool any_loaded = false;
     static const char* kStockBanks[] = {
-        "A_Bodyfalls.upk",
+        "A_M_Menu.upk",
+        "A_M_SP01A.upk",
+        "A_M_SP01B.upk",
         "A_Material_Footstep.upk",
+        "A_Material_Handstep.upk",
         "A_Character_Female_01.upk",
+        "A_Character_Effects.upk",
+        "A_Character_Oral.upk",
+        "A_Character_Disarm.upk",
+        "A_Character_Melee.upk",
+        "A_WP_Pistol_BerettaM93R.upk",
         "A_HUD.upk",
-        "A_Music.upk"
+        "A_Ambience.upk"
     };
 
     for (const char* bank : kStockBanks) {
@@ -399,74 +669,251 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
             any_loaded = true;
         }
     }
+    rebind_music_stem_buffers();
     return any_loaded;
 }
 
-void AudioEngine::play_sound(const std::string& name, float volume, float pitch) {
+bool AudioEngine::load_level_audio(const std::string& game_root, const std::string& map_file) {
+    namespace fs = std::filesystem;
+    ambient_emitters_.clear();
+    for (size_t i = 0; i < kAmbientPoolSize; ++i) {
+        active_ambient_indices_[i] = -1;
+    }
+
+    // Load chapter-matched Solar Fields interactive music bank if applicable
+    if (map_file.find("SP02") != std::string::npos) load_sound_bank(game_root, "A_M_SP02.upk");
+    else if (map_file.find("SP03") != std::string::npos) load_sound_bank(game_root, "A_M_SP03.upk");
+    else if (map_file.find("SP04") != std::string::npos) load_sound_bank(game_root, "A_M_SP04.upk");
+    else if (map_file.find("SP05") != std::string::npos) load_sound_bank(game_root, "A_M_SP05.upk");
+    else if (map_file.find("SP06") != std::string::npos) load_sound_bank(game_root, "A_M_SP06.upk");
+    else if (map_file.find("SP07") != std::string::npos) load_sound_bank(game_root, "A_M_SP07.upk");
+    else if (map_file.find("SP08") != std::string::npos) load_sound_bank(game_root, "A_M_SP08.upk");
+    else if (map_file.find("SP09") != std::string::npos) load_sound_bank(game_root, "A_M_SP09.upk");
+    else if (map_file.find("TT_") != std::string::npos)  load_sound_bank(game_root, "A_M_TimeTrial.upk");
+    else load_sound_bank(game_root, "A_M_SP01A.upk");
+
+    // Scan map directory for streaming *_Aud.me1 spatial audio sublevels
+    fs::path full_map = fs::path(game_root) / "TdGame" / "CookedPC" / map_file;
+    if (!fs::exists(full_map)) {
+        full_map = fs::path(map_file);
+    }
+    bool loaded_any_aud = false;
+    if (fs::exists(full_map.parent_path())) {
+        for (const auto& entry : fs::directory_iterator(full_map.parent_path())) {
+            if (!entry.is_regular_file()) continue;
+            std::string fn = entry.path().filename().string();
+            if (fn.find("_Aud.me1") != std::string::npos || fn.find("_Audio0.me1") != std::string::npos) {
+                if (load_package_audio_and_cues(entry.path().string())) {
+                    loaded_any_aud = true;
+                }
+            }
+        }
+    }
+
+    rebind_music_stem_buffers();
+    return loaded_any_aud;
+}
+
+const SoundClip* AudioEngine::pick_first_available_clip(std::initializer_list<const char*> candidates) const {
+    for (const char* name : candidates) {
+        auto it = sound_clips_.find(name);
+        if (it != sound_clips_.end() && !it->second.pcm_data.empty()) {
+            return &it->second;
+        }
+    }
+    return nullptr;
+}
+
+const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const {
+    // 1. Check UE3 SoundCue graph first (supports SoundNodeRandom variation + SoundNodeModulator jitter)
+    auto cue_it = sound_cues_.find(name);
+    if (cue_it != sound_cues_.end() && !cue_it->second.wave_names.empty()) {
+        const auto& cue = cue_it->second;
+        io_vol *= cue.volume_multiplier;
+        // Apply subtle SoundNodeModulator random pitch variation (±4%)
+        io_pitch *= cue.pitch_multiplier * (0.96f + 0.08f * rand_normalized());
+
+        size_t idx = static_cast<size_t>(std::rand()) % cue.wave_names.size();
+        const std::string& wname = cue.wave_names[idx];
+        auto wit = sound_clips_.find(wname);
+        if (wit != sound_clips_.end() && !wit->second.pcm_data.empty()) {
+            return &wit->second;
+        }
+        // Scan all wave_names if random choice was an unloaded import
+        for (const auto& alt : cue.wave_names) {
+            auto ait = sound_clips_.find(alt);
+            if (ait != sound_clips_.end() && !ait->second.pcm_data.empty()) {
+                return &ait->second;
+            }
+        }
+    }
+
+    // 2. Direct SoundClip lookup
     auto it = sound_clips_.find(name);
-    if (it == sound_clips_.end()) return;
+    if (it != sound_clips_.end() && !it->second.pcm_data.empty()) {
+        return &it->second;
+    }
+
+    return nullptr;
+}
+
+void AudioEngine::play_sound(const std::string& name, float volume, float pitch) {
+    float final_vol = volume * sfx_bus_gain_;
+    float final_pitch = pitch * slomo_pitch_scale_;
+    const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
+    if (!clip) return;
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
     uint32_t src = acquire_source();
     if (!src) return;
 
-    uint32_t buf = get_or_create_buffer(it->second);
+    uint32_t buf = get_or_create_buffer(*clip);
     if (!buf) return;
 
     alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
-    alSourcef(src, AL_GAIN, volume);
-    alSourcef(src, AL_PITCH, pitch);
+    alSourcef(src, AL_GAIN, std::clamp(final_vol, 0.0f, 1.5f));
+    alSourcef(src, AL_PITCH, std::clamp(final_pitch, 0.25f, 2.0f));
     alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
     alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
     alSourcePlay(src);
 #else
-    (void)volume; (void)pitch;
+    (void)final_vol; (void)final_pitch;
 #endif
 }
 
 void AudioEngine::play_sound_3d(const std::string& name, const Vec3& world_pos, float volume, float pitch) {
-    auto it = sound_clips_.find(name);
-    if (it == sound_clips_.end()) return;
+    float final_vol = volume * sfx_bus_gain_;
+    float final_pitch = pitch * slomo_pitch_scale_;
+    const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
+    if (!clip) return;
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
     uint32_t src = acquire_source();
     if (!src) return;
 
-    uint32_t buf = get_or_create_buffer(it->second);
+    uint32_t buf = get_or_create_buffer(*clip);
     if (!buf) return;
 
     alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
-    alSourcef(src, AL_GAIN, volume);
-    alSourcef(src, AL_PITCH, pitch);
+    alSourcef(src, AL_GAIN, std::clamp(final_vol, 0.0f, 1.5f));
+    alSourcef(src, AL_PITCH, std::clamp(final_pitch, 0.25f, 2.0f));
     alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
+    alSourcef(src, AL_REFERENCE_DISTANCE, 2.5f);
+    alSourcef(src, AL_MAX_DISTANCE, 35.0f);
     alSource3f(src, AL_POSITION, world_pos.x * 0.01f, world_pos.y * 0.01f, world_pos.z * 0.01f);
     alSourcePlay(src);
 #else
-    (void)world_pos; (void)volume; (void)pitch;
+    (void)world_pos; (void)final_vol; (void)final_pitch;
 #endif
 }
 
+void AudioEngine::play_footstep(ESurfaceMaterial surface, float speed, bool crouch, float volume) {
+    std::string prefix = surface_prefix(surface);
+    std::string action = "_03_Female_FootStepRun";
+    if (crouch) action = "_01_Female_FootStepSneak";
+    else if (speed > 620.0f) action = "_04_Female_FootStepSprint";
+    else if (speed < 250.0f) action = "_02_Female_FootStepWalk";
+
+    std::string full_cue = prefix + "." + action;
+    float v = volume, p = 1.0f;
+    if (resolve_cue_or_clip(full_cue, v, p)) {
+        play_sound(full_cue, volume, 1.0f);
+    } else if (resolve_cue_or_clip(action, v, p)) {
+        play_sound(action, volume, 1.0f);
+    } else {
+        play_sound("FX_Footstep", volume, 0.95f + 0.1f * rand_normalized());
+    }
+}
+
+void AudioEngine::play_handstep(ESurfaceMaterial surface, bool hard_impact, float volume) {
+    std::string prefix = surface_prefix(surface);
+    std::string action = hard_impact ? "_23_Female_HandStepHard" : "_21_Female_HandStepSoft";
+    std::string full_cue = prefix + "." + action;
+    float v = volume, p = 1.0f;
+    if (resolve_cue_or_clip(full_cue, v, p)) {
+        play_sound(full_cue, volume, 1.0f);
+    } else if (resolve_cue_or_clip(action, v, p)) {
+        play_sound(action, volume, 1.0f);
+    } else {
+        play_sound("FX_Vault", volume, 1.0f);
+    }
+}
+
 void AudioEngine::play_effect(EAudioEffect effect, float volume, float pitch) {
-    static const char* kEffectNames[] = {
+    // Prefer real Mirror's Edge UE3 SoundCue / SoundNodeWave assets when present
+    switch (effect) {
+        case EAudioEffect::Footstep:
+            play_footstep(ESurfaceMaterial::Concrete, 550.0f, false, volume);
+            return;
+        case EAudioEffect::Jump: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Strain_Medium_Cue", v, p)) { play_sound("Strain_Medium_Cue", volume, pitch); return; }
+            if (resolve_cue_or_clip("Vault", v, p)) { play_sound("Vault", volume, pitch); return; }
+            break;
+        }
+        case EAudioEffect::Wallrun: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Concrete._06_Female_FootStepWallRun", v, p)) {
+                play_sound("Concrete._06_Female_FootStepWallRun", volume, pitch);
+                return;
+            }
+            break;
+        }
+        case EAudioEffect::Vault: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Vault", v, p)) { play_sound("Vault", volume, pitch); return; }
+            play_handstep(ESurfaceMaterial::Concrete, true, volume);
+            return;
+        }
+        case EAudioEffect::Slide: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Body.BodySlide", v, p)) { play_sound("Body.BodySlide", volume, pitch); return; }
+            break;
+        }
+        case EAudioEffect::SkillRoll: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Body.Roll", v, p)) { play_sound("Body.Roll", volume, pitch); return; }
+            break;
+        }
+        case EAudioEffect::CheckpointChime: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("BagFound", v, p)) { play_sound("BagFound", volume, pitch); return; }
+            break;
+        }
+        case EAudioEffect::Disarm: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Arm_Break_01", v, p)) { play_sound("Arm_Break_01", volume, pitch); return; }
+            break;
+        }
+        case EAudioEffect::Gunshot: {
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Fire1P", v, p)) { play_sound("Fire1P", volume, pitch); return; }
+            break;
+        }
+        default:
+            break;
+    }
+
+    static const char* kFallbackEffectNames[] = {
         "FX_Footstep", "FX_Jump", "FX_Wallrun", "FX_Vault", "FX_Slide",
         "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot"
     };
     size_t idx = static_cast<size_t>(effect);
     if (idx < static_cast<size_t>(EAudioEffect::Count)) {
-        play_sound(kEffectNames[idx], volume, pitch);
+        play_sound(kFallbackEffectNames[idx], volume, pitch);
     }
 }
 
 void AudioEngine::play_effect_3d(EAudioEffect effect, const Vec3& world_pos, float volume, float pitch) {
-    static const char* kEffectNames[] = {
+    static const char* kFallbackEffectNames[] = {
         "FX_Footstep", "FX_Jump", "FX_Wallrun", "FX_Vault", "FX_Slide",
         "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot"
     };
     size_t idx = static_cast<size_t>(effect);
     if (idx < static_cast<size_t>(EAudioEffect::Count)) {
-        play_sound_3d(kEffectNames[idx], world_pos, volume, pitch);
+        play_sound_3d(kFallbackEffectNames[idx], world_pos, volume, pitch);
     }
 }
 
@@ -492,7 +939,7 @@ const SoundClip* AudioEngine::get_clip(const std::string& name) const {
 }
 
 // -----------------------------------------------------------------------------
-// Procedural Sound & Dynamic Solar Fields Music Synthesis
+// Procedural Sound & Dynamic Solar Fields Music Synthesis (Offline Fallback)
 // -----------------------------------------------------------------------------
 void AudioEngine::synthesize_fallback_clips() {
     constexpr int kSampleRate = 44100;
@@ -509,6 +956,7 @@ void AudioEngine::synthesize_fallback_clips() {
         }
         SoundClip clip;
         clip.name = name;
+        clip.full_path = name;
         clip.sample_rate = kSampleRate;
         clip.channels = 2;
         clip.duration = duration;
@@ -592,7 +1040,7 @@ void AudioEngine::synthesize_fallback_clips() {
     });
 
     // -------------------------------------------------------------------------
-    // 4 Dynamic Solar Fields Music Stems (Seamless 5.0-second loops)
+    // 4 Dynamic Solar Fields Music Stems (Seamless 5.0-second fallback loops)
     // -------------------------------------------------------------------------
 
     // Stem 0: Ambient (Ethereal synthesizer chords Am -> F -> C -> G)

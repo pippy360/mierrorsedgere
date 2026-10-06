@@ -23,6 +23,35 @@ enum class EAudioEffect : uint8_t {
     Count
 };
 
+// Matches [Engine.AudioDevice] +SoundGroupEffects presets 0..10 in DefaultEngine.ini
+enum class ESoundGroupEffectMode : uint8_t {
+    Normal = 0,
+    IngameCutScenes = 1,
+    IngameVO = 2,
+    ReactionTime = 3,
+    Pause = 4,
+    AllTurnedOff = 5,
+    FallingToDeath = 6,
+    CustomCutsceneTrack = 7,
+    DeathByFall = 8,
+    DeathGeneric = 9,
+    EndCredit = 10
+};
+
+// Matches the 9 physical surface material packages in A_Material_Footstep.upk
+enum class ESurfaceMaterial : uint8_t {
+    Concrete = 0,
+    Metal,
+    MetalGantry,
+    MetalAirduct,
+    MetalLadder,
+    Wood,
+    Glass,
+    Water,
+    Cardboard,
+    Count
+};
+
 class AudioEngine {
 public:
     AudioEngine();
@@ -37,7 +66,9 @@ public:
     [[nodiscard]] bool is_initialized() const { return initialized_; }
     [[nodiscard]] bool is_headless() const { return headless_; }
 
-    // Update 3D listener orientation and dynamic Solar Fields stems
+    // Update 3D listener orientation, global SoundGroupEffects ducking,
+    // TdSoundNodeVelocity (RunWind), Faith breathing cadence, 3D level ambients,
+    // and dynamic Solar Fields music stems
     void update(float dt,
                 const Vec3& listener_pos,
                 const Vec3& listener_forward,
@@ -45,15 +76,26 @@ public:
                 float player_speed,
                 bool reaction_active);
 
-    // Load real Ogg Vorbis audio banks from game CookedPC/Audio directory
+    // Load real Ogg Vorbis audio banks & SoundCue graphs from game CookedPC/Audio directory
     bool load_sound_bank(const std::string& game_root, const std::string& bank_name);
     bool load_stock_audio(const std::string& game_root);
 
-    // Playback APIs
+    // Load streaming level audio sublevel (*_Aud.me1) and chapter Solar Fields music stems
+    bool load_level_audio(const std::string& game_root, const std::string& map_file);
+
+    // Playback APIs (supports both direct wave names and UE3 SoundCue names/paths)
     void play_sound(const std::string& name, float volume = 1.0f, float pitch = 1.0f);
     void play_sound_3d(const std::string& name, const Vec3& world_pos, float volume = 1.0f, float pitch = 1.0f);
     void play_effect(EAudioEffect effect, float volume = 1.0f, float pitch = 1.0f);
     void play_effect_3d(EAudioEffect effect, const Vec3& world_pos, float volume = 1.0f, float pitch = 1.0f);
+
+    // Surface-aware TdPhysicalMaterialFootSteps / HandSteps playback
+    void play_footstep(ESurfaceMaterial surface, float speed, bool crouch, float volume = 0.75f);
+    void play_handstep(ESurfaceMaterial surface, bool hard_impact, float volume = 0.75f);
+
+    // Global SoundGroupEffects mix state (DefaultEngine.ini modes 0..10)
+    void set_sound_group_mode(ESoundGroupEffectMode mode);
+    [[nodiscard]] ESoundGroupEffectMode get_sound_group_mode() const { return sound_mode_; }
 
     // Dynamic 4-track Solar Fields stem volume control (0.0 to 1.0)
     void set_music_stems(float ambient_vol, float tension_vol, float chase_vol, float reaction_vol);
@@ -61,9 +103,11 @@ public:
     // Stop all playing sound sources
     void stop_all();
 
-    // Access loaded clip
+    // Access loaded clips, cues, and spatial ambient emitters
     [[nodiscard]] const SoundClip* get_clip(const std::string& name) const;
     [[nodiscard]] size_t get_clip_count() const { return sound_clips_.size(); }
+    [[nodiscard]] size_t get_cue_count() const { return sound_cues_.size(); }
+    [[nodiscard]] size_t get_ambient_emitter_count() const { return ambient_emitters_.size(); }
 
     // Synthesize procedural fallback clips for 100% offline/fallback reliability
     void synthesize_fallback_clips();
@@ -73,6 +117,11 @@ private:
     void cleanup_openal();
     uint32_t acquire_source();
     uint32_t get_or_create_buffer(const SoundClip& clip);
+    void rebind_music_stem_buffers();
+
+    bool load_package_audio_and_cues(const std::string& pkg_path);
+    const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const;
+    const SoundClip* pick_first_available_clip(std::initializer_list<const char*> candidates) const;
 
     bool decode_ogg_to_pcm(const uint8_t* ogg_data, size_t ogg_size,
                            std::vector<int16_t>& out_pcm, int& out_rate, int& out_channels);
@@ -90,14 +139,38 @@ private:
     size_t next_source_ = 0;
 
     // 4 Dynamic Solar Fields music stem sources:
-    // 0: Ambient, 1: Tension, 2: Chase, 3: Reaction
+    // 0: Ambient (ambience_01 / Menu), 1: Tension/Puzzle (ambience_011 / Puzzle_01),
+    // 2: Chase (chase_01), 3: Combat/Reaction (combat_01 / Stem_3)
     uint32_t music_stem_sources_[4] = {0};
     uint32_t music_stem_buffers_[4] = {0};
+    std::string music_stem_clip_names_[4] = {"Stem_0", "Stem_1", "Stem_2", "Stem_3"};
     float current_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float target_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
-    // Sound clips and OpenAL buffer cache
+    // Dedicated continuous TdSoundNodeVelocity source for 1P RunWind
+    uint32_t run_wind_source_ = 0;
+    float current_wind_vol_ = 0.0f;
+
+    // 4 Dedicated looping 3D sources for level *_Aud.me1 AmbientSound emitters
+    static constexpr size_t kAmbientPoolSize = 4;
+    uint32_t ambient_sources_[kAmbientPoolSize] = {0};
+    int32_t active_ambient_indices_[kAmbientPoolSize] = {-1, -1, -1, -1};
+
+    // Stamina-coupled Faith breathing cadence state (A_Character_Female_01.upk)
+    float breath_timer_ = 0.0f;
+    bool breath_inhale_next_ = true;
+
+    // Global SoundGroupEffects ducking state (DefaultEngine.ini)
+    ESoundGroupEffectMode sound_mode_ = ESoundGroupEffectMode::Normal;
+    float sfx_bus_gain_ = 1.0f;
+    float music_bus_gain_ = 1.0f;
+    float breath_bus_gain_ = 1.0f;
+    float slomo_pitch_scale_ = 1.0f;
+
+    // Sound clips, UE3 SoundCue graphs, level 3D ambients, and OpenAL buffer cache
     std::unordered_map<std::string, SoundClip> sound_clips_;
+    std::unordered_map<std::string, SoundCueDef> sound_cues_;
+    std::vector<AmbientEmitterInfo> ambient_emitters_;
     std::unordered_map<std::string, uint32_t> al_buffers_;
 };
 

@@ -1361,10 +1361,40 @@ void UPKPackage::extract_elevators(
 }
 
 
+std::string UPKPackage::get_full_export_path(int32_t exp_zero_idx) const {
+    if (exp_zero_idx < 0 || static_cast<size_t>(exp_zero_idx) >= exports_.size()) {
+        return "";
+    }
+    std::vector<std::string> parts;
+    int32_t cur = exp_zero_idx;
+    int guard = 0;
+    while (cur >= 0 && static_cast<size_t>(cur) < exports_.size() && guard++ < 16) {
+        const auto& e = exports_[cur];
+        std::string nm = e.object_name;
+        if (e.object_number > 0) {
+            nm += "_" + std::to_string(e.object_number - 1);
+        }
+        parts.push_back(nm);
+        if (e.outer_index > 0) {
+            cur = e.outer_index - 1;
+        } else {
+            break;
+        }
+    }
+    std::reverse(parts.begin(), parts.end());
+    std::string out;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out += ".";
+        out += parts[i];
+    }
+    return out;
+}
+
 std::vector<SoundClip> UPKPackage::extract_audio() const {
     std::vector<SoundClip> sounds;
 
-    for (const auto& exp : exports_) {
+    for (size_t exp_idx = 0; exp_idx < exports_.size(); ++exp_idx) {
+        const auto& exp = exports_[exp_idx];
         std::string cls_name = get_export_class(exp);
         if (cls_name.find("SoundNodeWave") == std::string::npos) {
             continue;
@@ -1378,6 +1408,24 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
         const uint8_t* p = data_.data() + exp.serial_offset;
         size_t sz = exp.serial_size;
 
+        // Parse UE3 SoundNodeWave properties (SampleRate, NumChannels, Duration)
+        int prop_rate = 44100;
+        int prop_channels = 2;
+        float prop_duration = 0.0f;
+        size_t prop_start = find_property_start(exp);
+        if (prop_start < data_.size() && prop_start < static_cast<size_t>(exp.serial_offset) + sz) {
+            auto props = parse_properties(prop_start, static_cast<size_t>(exp.serial_offset) + sz - prop_start);
+            if (auto it = props.find("SampleRate"); it != props.end() && it->second.int_val > 0) {
+                prop_rate = it->second.int_val;
+            }
+            if (auto it = props.find("NumChannels"); it != props.end() && it->second.int_val > 0) {
+                prop_channels = it->second.int_val;
+            }
+            if (auto it = props.find("Duration"); it != props.end() && it->second.float_val > 0.0f) {
+                prop_duration = it->second.float_val;
+            }
+        }
+
         // Search for OggS magic: 0x4F, 0x67, 0x67, 0x53
         for (size_t i = 0; i + 4 <= sz; ++i) {
             if (p[i] == 'O' && p[i+1] == 'g' && p[i+2] == 'g' && p[i+3] == 'S') {
@@ -1387,24 +1435,172 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
                     int32_t disk_sz = 0;
                     std::memcpy(&elem_cnt, p + i - 12, 4);
                     std::memcpy(&disk_sz, p + i - 8, 4);
-                    if (disk_sz > 0 && disk_sz <= sz - i) {
-                        ogg_sz = disk_sz;
+                    if (disk_sz > 0 && static_cast<size_t>(disk_sz) <= sz - i) {
+                        ogg_sz = static_cast<size_t>(disk_sz);
                     }
                 }
 
                 SoundClip clip;
                 clip.name = exp.object_name;
+                if (exp.object_number > 0) {
+                    clip.name += "_" + std::to_string(exp.object_number - 1);
+                }
+                clip.full_path = get_full_export_path(static_cast<int32_t>(exp_idx));
                 clip.pcm_data.assign(p + i, p + i + ogg_sz);
-                clip.sample_rate = 44100;
-                clip.channels = 2;
-                clip.duration = static_cast<float>(ogg_sz) / (44100.0f * 4.0f);
-                sounds.push_back(clip);
+                clip.sample_rate = prop_rate;
+                clip.channels = prop_channels;
+                clip.duration = (prop_duration > 0.0f)
+                    ? prop_duration
+                    : static_cast<float>(ogg_sz) / (static_cast<float>(prop_rate) * 4.0f);
+                sounds.push_back(std::move(clip));
                 break;
             }
         }
     }
 
     return sounds;
+}
+
+void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_cues,
+                                                 std::vector<AmbientEmitterInfo>& out_ambients) const {
+    auto parse_exp_props = [&](int32_t one_based_idx) -> std::unordered_map<std::string, PropertyValue> {
+        if (one_based_idx <= 0 || static_cast<size_t>(one_based_idx) > exports_.size()) return {};
+        const auto& e = exports_[one_based_idx - 1];
+        if (e.serial_size <= 0 || e.serial_offset < 0) return {};
+        size_t p_start = find_property_start(e);
+        size_t p_end = static_cast<size_t>(e.serial_offset) + static_cast<size_t>(e.serial_size);
+        if (p_start >= data_.size() || p_start >= p_end) return {};
+        return parse_properties(p_start, std::min(p_end - p_start, data_.size() - p_start));
+    };
+
+    // Recursive helper to traverse SoundNode graphs inside this package
+    auto walk_sound_node = [&](auto& self, int32_t obj_idx, SoundCueDef& cue, int depth) -> void {
+        if (depth > 12 || obj_idx == 0) return;
+
+        if (obj_idx < 0) {
+            // Import reference (e.g. external SoundNodeWave)
+            auto [imp_name, imp_cls] = resolve_object_index(obj_idx);
+            if (!imp_name.empty()) {
+                cue.wave_names.push_back(imp_name);
+                cue.wave_weights.push_back(1.0f);
+            }
+            return;
+        }
+
+        if (static_cast<size_t>(obj_idx) > exports_.size()) return;
+        const auto& nexp = exports_[obj_idx - 1];
+        std::string ncls = get_export_class(nexp);
+
+        if (ncls.find("SoundNodeWave") != std::string::npos) {
+            std::string wname = nexp.object_name;
+            if (nexp.object_number > 0) {
+                wname += "_" + std::to_string(nexp.object_number - 1);
+            }
+            cue.wave_names.push_back(wname);
+            cue.wave_weights.push_back(1.0f);
+            return;
+        }
+
+        if (ncls.find("SoundNodeLooping") != std::string::npos) {
+            cue.looping = true;
+        }
+
+        auto nprops = parse_exp_props(obj_idx);
+        if (ncls.find("Attenuation") != std::string::npos) {
+            // Extract MinRadius / MaxRadius from DistributionFloatUniform subobjects if present
+            if (auto it = nprops.find("MinRadius"); it != nprops.end() && it->second.obj_ref_index > 0) {
+                auto dprops = parse_exp_props(it->second.obj_ref_index);
+                if (auto dit = dprops.find("Min"); dit != dprops.end()) cue.min_radius = dit->second.float_val;
+            }
+            if (auto it = nprops.find("MaxRadius"); it != nprops.end() && it->second.obj_ref_index > 0) {
+                auto dprops = parse_exp_props(it->second.obj_ref_index);
+                if (auto dit = dprops.find("Max"); dit != dprops.end()) cue.max_radius = dit->second.float_val;
+            }
+        }
+
+        // Follow ChildNodes array
+        if (auto it = nprops.find("ChildNodes"); it != nprops.end() && it->second.raw_bytes.size() >= 4) {
+            int32_t cnt = 0;
+            std::memcpy(&cnt, it->second.raw_bytes.data(), 4);
+            if (cnt > 0 && it->second.raw_bytes.size() >= 4 + static_cast<size_t>(cnt) * 4) {
+                for (int32_t k = 0; k < cnt; ++k) {
+                    int32_t child_idx = 0;
+                    std::memcpy(&child_idx, it->second.raw_bytes.data() + 4 + static_cast<size_t>(k) * 4, 4);
+                    self(self, child_idx, cue, depth + 1);
+                }
+            }
+        }
+    };
+
+    // 1. Extract all SoundCues
+    std::unordered_map<int32_t, size_t> cue_exp_to_idx;
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        const auto& exp = exports_[i];
+        std::string cls = get_export_class(exp);
+        if (cls != "SoundCue") continue;
+
+        SoundCueDef cue;
+        cue.name = exp.object_name;
+        cue.full_path = get_full_export_path(static_cast<int32_t>(i));
+
+        auto props = parse_exp_props(static_cast<int32_t>(i) + 1);
+        if (auto it = props.find("SoundGroup"); it != props.end() && !it->second.str_val.empty()) {
+            cue.sound_group = it->second.str_val;
+        }
+        if (auto it = props.find("VolumeMultiplier"); it != props.end()) {
+            cue.volume_multiplier = it->second.float_val;
+        }
+        if (auto it = props.find("PitchMultiplier"); it != props.end()) {
+            cue.pitch_multiplier = it->second.float_val;
+        }
+        if (auto it = props.find("FirstNode"); it != props.end() && it->second.obj_ref_index != 0) {
+            walk_sound_node(walk_sound_node, it->second.obj_ref_index, cue, 0);
+        }
+
+        cue_exp_to_idx[static_cast<int32_t>(i) + 1] = out_cues.size();
+        out_cues.push_back(std::move(cue));
+    }
+
+    // 2. Extract 3D AmbientSound / AmbientSoundSimple emitters
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        const auto& exp = exports_[i];
+        std::string cls = get_export_class(exp);
+        if (cls.find("AmbientSound") == std::string::npos) continue;
+
+        auto props = parse_exp_props(static_cast<int32_t>(i) + 1);
+        AmbientEmitterInfo em;
+        if (auto it = props.find("Location"); it != props.end()) {
+            em.location = it->second.vec_val;
+        }
+
+        if (auto it = props.find("AudioComponent"); it != props.end() && it->second.obj_ref_index > 0) {
+            auto ac_props = parse_exp_props(it->second.obj_ref_index);
+            if (auto cit = ac_props.find("VolumeMultiplier"); cit != ac_props.end()) {
+                em.volume = cit->second.float_val;
+            }
+            if (auto cit = ac_props.find("PitchMultiplier"); cit != ac_props.end()) {
+                em.pitch = cit->second.float_val;
+            }
+            if (auto cit = ac_props.find("SoundCue"); cit != ac_props.end() && cit->second.obj_ref_index != 0) {
+                int32_t cue_obj = cit->second.obj_ref_index;
+                if (auto map_it = cue_exp_to_idx.find(cue_obj); map_it != cue_exp_to_idx.end()) {
+                    const auto& cdef = out_cues[map_it->second];
+                    em.cue_name = cdef.name;
+                    em.min_radius = cdef.min_radius;
+                    em.max_radius = cdef.max_radius;
+                    if (!cdef.wave_names.empty()) {
+                        em.wave_name = cdef.wave_names.front();
+                    }
+                } else {
+                    em.cue_name = cit->second.obj_ref_name;
+                }
+            }
+        }
+
+        if (!em.cue_name.empty() || !em.wave_name.empty()) {
+            out_ambients.push_back(std::move(em));
+        }
+    }
 }
 
 bool UPKPackage::extract_static_mesh_bounds(int32_t exp_idx, Vec3& out_origin, Vec3& out_extent, float& out_radius) const {

@@ -98,6 +98,7 @@ public:
 
     [[nodiscard]] std::pair<std::string, std::string> resolve_object_index(int32_t index) const;
     [[nodiscard]] std::string get_export_class(const FObjectExport& exp) const;
+    [[nodiscard]] std::string get_full_export_path(int32_t exp_zero_idx) const;
 
     // Property stream parser & header offset detector
     size_t find_property_start(const FObjectExport& exp) const;
@@ -106,6 +107,8 @@ public:
     // High-level extraction
     std::vector<LevelActor> extract_actors() const;
     std::vector<SoundClip> extract_audio() const;
+    void extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_cues,
+                                         std::vector<AmbientEmitterInfo>& out_ambients) const;
     bool extract_static_mesh_bounds(int32_t export_index, Vec3& out_origin, Vec3& out_extent, float& out_radius) const;
     void extract_static_meshes(std::unordered_map<std::string, StaticMeshAsset>& out_meshes) const;
     void extract_level_streaming_and_checkpoints(std::vector<LevelCheckpointInfo>& out_checkpoints,
