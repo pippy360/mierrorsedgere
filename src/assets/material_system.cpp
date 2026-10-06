@@ -1812,8 +1812,8 @@ inline MatLightMap mat_virtual_lightmap(MatParams P, constant FrameUniforms& F) 
 
 // GetMaterialHemisphereLightTransferFull (model: 0 Phong, 1 NonDirectional, 2 Custom)
 // UE3 does not clamp TwoSidedLightingMask, but values outside [0, 1] only make sense against
-// real Beast light-map magnitudes (SP07's vista water uses 12, which would extrapolate the
-// synthetic sky term ~30x), so the virtual light-map clamps it.
+// real Beast light-map magnitudes. SP07's vista water uses 12: lerp(L, 12 * D, 12) = 144 * D - 11 * L,
+// roughly 140x the clamped sky term. The virtual light-map therefore clamps it.
 inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm, int model) {
     tslm = saturate(tslm);
     float3 upper_c = float3(F.sky_color) * kSkyUpper;

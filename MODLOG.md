@@ -300,3 +300,43 @@ All 7 PNG screenshots visually confirmed via `view_file` at `screenshots/` and p
   - TexCoord ≥ 2 (mapped to UV1)
   - translucency sorting
   - `TextureRenderTarget2D` reflections
+  - `TextureMovie` (Bink) LCD screens
+- TwoSidedLightingMask is clamped to [0, 1] until real light-maps exist (§7.7).
+
+### 7.6 All-chapter sweep (SP02–SP09)
+Every campaign map was loaded headless with the material system on. The material and shader counts come from the `[Materials]` and `[MetalRenderer]` log lines.
+
+| Chapter | Meshes placed | Materials resolved | Textures loaded | Shaders compiled |
+|---|---|---|---|---|
+| SP02 Stormdrain | 12752 | 502/502 | 799/799 | 353/353 |
+| SP03 Cranes | 9980 | 533/533 | 791/792 | 340/340 |
+| SP04 Subway | 7459 | 459/459 | 721/721 | 335/335 |
+| SP05 Mall | 7654 | 581/581 | 854/854 | 372/372 |
+| SP06 Factory | 8817 | 565/565 | 815/819 | 397/397 |
+| SP07 Boat | 8494 | 382/382 | 608/608 | 300/300 |
+| SP08 Convoy | 6616 | 498/498 | 765/766 | 323/323 |
+| SP09 Scraper | 10738 | 448/448 | 727/728 | 348/348 |
+
+- Every chapter has 0 missing meshes and 0 fallback materials.
+- Every texture failure is a runtime-only class with no cooked pixels:
+  - `TextureMovie`: the `M_LCDScreens.*` `TM_*` screens (SP03, SP06, SP08, SP09).
+  - `TextureRenderTarget2D`: `M_SP01.T_EdgeReflection_01_R` and `M_Reflections.SP06.T_TrainingFacilityMonitorReflection_01_R`.
+
+### 7.7 Lighting fixes
+4. **The sun colour was a shader constant.** Only the sun direction came from the level.
+   - Fix: `LevelScene::sun_color` now carries the DirectionalLight's linear `LightColor × Brightness`, or the Beast `BakerColor × BakerBrightness` override when set. `kSunIntensity` drops from 2.0 to 1.0, so the no-light default (2.0, 1.96, 1.9) reproduces the old look.
+   - Lighting packages are now matched by `_lgt` in the lowercased stem. That also opens SP07's singular `Boat_Chase_Lgt`, which the old `_lgts` match skipped. The geometry exclusion filter is unchanged.
+   - The per-chapter table is in `docs/MATERIAL_SYSTEM.md` §7. SP07's sun is near-black by design: `Brightness` 0, `BakerBrightness` 0.025.
+5. **SP07's sea rendered pure white.** `B_Vista.SP07.M_VistaWater_SP07` sets TwoSidedLightingMask to the constant 12.
+   - The shipped `BasePassPixelShader.usf` / `MaterialTemplate.usf` never clamp the mask. The light-map transfer is linear in M and the hemisphere term is quadratic: `lerp(L, 12·D, 12) = 144·D − 11·L`, which is 133–144× the clamped value.
+   - Fix: `saturate(M)` in the MSL prelude (`mat_lighting`, `mat_hemisphere`). The water now shows its cubemap reflections and waves.
+   - Survey of every generated shader in all ten maps (MSL dump plus runtime MIC parameter values):
+     - Texture-driven masks (trees, plastic baskets, the SP06 flag) and the constant 0.25 (bush leaves) are within [0, 1], so the clamp does not touch them.
+     - Values above 1 come only from SP07's water (12), the `M_Awning_01` `*trans` MICs and SP03's PX emissive awning (3), and `MI_Antenna_13_Red` (2).
+     - Those few instances render with full two-sided wrap instead of UE3's extrapolated transfer. This is a deliberate deviation until Beast light-maps are decoded.
+
+### 7.8 Merge with the animation system
+- Rebased onto `main` at `80c78f7` (USkeletalMesh / TdAnimSet animation system). Conflicts resolved:
+  - `parse_properties`: both branches fixed the v536 ByteProperty tag. Kept main's version, which adds FName number suffixes and `raw_bytes`.
+  - `metal_renderer.mm`: kept both includes. The enemy pass re-binds the legacy world pipeline and depth state after the material passes, then runs main's per-bot `evaluate_enemy_swat`.
+- `--verify-all`: stages 1–8 PASS after the rebase. The oracle screenshots show skeletal SWAT enemies and Faith's first-person arms inside the material-rendered levels.

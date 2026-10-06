@@ -9,11 +9,21 @@ static switches, blend mode and two-sidedness.
 |---|---|---|---|---|---|
 | SP00 `Tutorial_p` | 2403 | 0 | 273 / 273 | 469 / 469 (143 MB) | 205 / 205 |
 | SP01 `Edge_p` | 4276 | 0 | 407 / 407 | 646 / 647 (215 MB) | 267 / 267 |
+| SP02 `Stormdrain_p` | 12752 | 0 | 502 / 502 | 799 / 799 (242 MB) | 353 / 353 |
+| SP03 `Cranes_p` | 9980 | 0 | 533 / 533 | 791 / 792 (236 MB) | 340 / 340 |
+| SP04 `Subway_p` | 7459 | 0 | 459 / 459 | 721 / 721 (211 MB) | 335 / 335 |
+| SP05 `Mall_p` | 7654 | 0 | 581 / 581 | 854 / 854 (267 MB) | 372 / 372 |
+| SP06 `Factory_p` | 8817 | 0 | 565 / 565 | 815 / 819 (229 MB) | 397 / 397 |
+| SP07 `Boat_p` | 8494 | 0 | 382 / 382 | 608 / 608 (170 MB) | 300 / 300 |
+| SP08 `Convoy_p` | 6616 | 0 | 498 / 498 | 765 / 766 (234 MB) | 323 / 323 |
+| SP09 `Scraper_p` | 10738 | 0 | 448 / 448 | 727 / 728 (212 MB) | 348 / 348 |
 
-The one texture that doesn't load is `M_SP01.T_EdgeReflection_01_R`. It's a
-`TextureRenderTarget2D` (a runtime reflection target, with no cooked pixels), so the material
-falls back to its default texture. Building the material library takes about 0.1 s per
-level, and the GPU upload plus MSL compile takes about 0.75 s.
+The textures that don't load use runtime-only classes with no cooked pixels:
+- `TextureMovie`: Bink video on LCD screens, for example `M_LCDScreens.ZB.TM_ZB_Widescreen_01`.
+- `TextureRenderTarget2D`: planar reflections, for example `M_SP01.T_EdgeReflection_01_R`.
+
+Their materials fall back to the default texture. Building the material library takes
+0.05–0.2 s per level, and the GPU upload plus MSL compile takes 0.75–2.5 s.
 
 ---
 
@@ -257,8 +267,9 @@ term. Distance haze is added in the output helpers.
 
 **The level sun** is read from the data (see `scan_level_suns` in
 [`upk_loader.cpp`](../src/assets/upk_loader.cpp)):
-- Sources: the master package, the loaded sub-levels, and the `*_Lgts` lighting packages.
-  The `_Lgts` packages are opened for lights only.
+- Sources: the master package, the loaded sub-levels, and the lighting packages. Any package
+  whose stem contains `_lgt` counts: `*_Lgts`, `*_lgts`, `*_LGTs`, `*_Lgts_Pt1`, and SP07's
+  odd `Boat_Chase_Lgt`. The lighting packages are opened for lights only.
 - Every non-component class containing `DirectionalLight` is a candidate. Scoring:
   1. built into the light-map (`bHasLightEverBeenBuiltIntoLightMap`) first;
   2. then affects the Static lighting channel;
@@ -273,9 +284,46 @@ term. Distance haze is added in the output helpers.
 |---|---|---|---|
 | SP00 | `Tutorial_lgts.DirectionalLight_0` | (0.335, −0.500, 0.799) | (2.50, 2.29, 1.90) |
 | SP01 | `Edge_Ext_Lgts.DirectionalLight_1` | (−0.575, 0.507, 0.643) | (2.50, 2.29, 1.90) |
+| SP02 | `Stormdrain_Ext_Lgts.DirectionalLight_1` | (0.613, 0.526, 0.589) | (1.15, 1.01, 0.83) |
+| SP03 | `Cranes_Ext_Lgts.DirectionalLight_1` | (0.258, 0.561, 0.786) | (2.50, 2.29, 1.90) |
+| SP04 | `Subway_Ext_Lgts.DirectionalLight_1` | (−0.769, −0.486, 0.414) | (2.20, 1.75, 1.26) |
+| SP05 | `Mall_Ext_Lgts.DirectionalLight_0` | (0.526, −0.508, 0.682) | (2.50, 2.39, 1.99) |
+| SP06 | `Factory_Ext_Lgts.DirectionalLight_1` | (−0.677, −0.305, 0.669) | (2.20, 1.75, 1.26) |
+| SP07 | `Boat_Ext_Lgts.DirectionalLight_0` | (−0.174, 0.874, 0.454) | (0.012, 0.019, 0.013) |
+| SP08 | `Convoy_p.DirectionalLight_1` | (0.469, 0.377, 0.799) | (2.50, 2.29, 1.90) |
+| SP09 | `Scraper_Lobby_Lgts.DirectionalLight_0` | (0.301, 0.615, 0.729) | (0.67, 0.77, 0.85) |
+
+SP07's sun really is close to black: runtime `Brightness` 0.0, `BakerBrightness` 0.025. That
+level was baked from sky and local lights, so here only the hemisphere term lights it.
 
 The sky shader uses the same direction for its sun disc. Without a light, the old defaults
 apply: direction (−0.4, 0.6, 0.7) and colour (2.0, 1.96, 1.9).
+
+**TwoSidedLightingMask clamp.** UE3 compiles the input as `TwoSidedLightingMask *
+TwoSidedLightingColor` and never clamps it.
+- `BasePassPixelShader.usf` is linear in the mask M: `DiffuseTransfer = pow(...) * (1 - M) + M`
+  and `SpecularTransfer = pow(...) * (1 - M)`.
+- The hemisphere function in `MaterialTemplate.usf` is quadratic in M:
+  `lerp(Lighting, M * Diffuse, M)`.
+
+Values above 1 only make sense against real Beast light-map magnitudes, so the virtual
+light-map uses `saturate(M)`. Every generated shader in the ten campaign maps was surveyed
+(`ME_MATERIAL_DUMP` plus the runtime parameter values). These are the only non-zero masks:
+
+| Mask source | Materials | M | Clamped |
+|---|---|---|---|
+| Constant | `G_Vegetation.M_BushA_Leaves_White_01` | 0.25 | no |
+| Texture | `M_TreeA_BD_White_01` (1 − tex.g), `M_BasketContainerPlastic_01` (0.3·(1 − tex.r)), SP06 `M_PirandelloFlag_01` (0.5·(1 − n.y)) | 0..1 | no |
+| Parameter | `M_Antenna_13` (SP01, SP09) / `MI_Antenna_13_Red` (SP01) | 1 / 2 | red MIC |
+| Parameter | `M_Awning_01` colour MICs (SP01–SP06) / `*trans` MICs (SP01–SP05); SP03 `PX_MI_Awning_01_Transparent_Orange` / `..._Orange_Emissive` | 0 / 3 | `*trans`, PX emissive |
+| Constant | SP07 `B_Vista.SP07.M_VistaWater_SP07` | 12 | yes |
+
+- Unclamped, M = 12 turns SP07's vista-water hemisphere term into `144·Diffuse − 11·Lighting`.
+  That is 133–144× its clamped value, whatever the sky colours, and the sea renders pure white.
+- The awning `*trans` instances and the red antenna drop from M = 3 and M = 2 to full
+  two-sided wrap (M = 1). They still look backlit next to their opaque siblings, but are dimmer
+  than UE3's extrapolated transfer would make them. Revisit this once Beast light-maps are
+  decoded (§11).
 
 The scene colour buffer is display-referred: material outputs are encoded with `pow(1/2.2)`,
 and `SceneTexture` reads decode with `pow(2.2)`.
@@ -344,7 +392,8 @@ They sample TexCoord index 2, which is mapped to UV1.
 1. **Beast light-maps.** Decode `LightMapTexture2D` and the `FLightMap2D`/`FLightMap1D` data in
    `StaticMeshComponent.LODData`. That needs light-map UVs and per-component scale vectors,
    and would replace the virtual light-map with the real baked GI and shadows. Tutorial_p alone
-   has 76 light-map textures (35 MB).
+   has 76 light-map textures (35 MB). With real light-map magnitudes, the TwoSidedLightingMask
+   clamp (§7) can be dropped.
 2. **Decals.** Implement `DecalComponent` static receivers, the pre-baked decal geometry
    (550 components in Tutorial_p).
 3. **BSP.** Render the `ModelComponent`s (Tutorial_p has 151 Models).
@@ -353,3 +402,5 @@ They sample TexCoord index 2, which is mapped to UV1.
 6. **Translucency sorting.** Translucent sections are drawn unsorted.
 7. **`TextureRenderTarget2D`.** Planar reflections are not rendered, so these targets fall back
    to their default texture.
+8. **`TextureMovie`.** Bink playback is not implemented, so the `M_LCDScreens.*` screens
+   (SP03, SP06, SP08, SP09) fall back to their default texture.
