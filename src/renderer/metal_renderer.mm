@@ -1,6 +1,7 @@
 #include "metal_renderer.hpp"
 #include "../anim/anim_system.hpp"
 #include "../assets/scene_materials.hpp"
+#include "../cutscene/cutscene_player.hpp"
 #include "../ui/main_menu.hpp"
 
 #import <Foundation/Foundation.h>
@@ -884,6 +885,11 @@ struct MetalRenderer::Impl {
     std::vector<Vertex> faith_viewmodel_mesh;
     std::vector<Vertex> enemy_guard_mesh;
     AnimSystem anim_system;
+
+    // Cutscene Bink Video & Matinee Renderer State
+    const CutscenePlayer* cutscene_player = nullptr;
+    id<MTLTexture> bink_video_tex = nil;
+    uint64_t bink_uploaded_serial = 0;
 
     // Cached GPU Vertex Buffers for Scene Meshes
     std::string cached_map_name;
@@ -2854,7 +2860,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
-        if (!impl_->menu_open) {
+        const bool cutscene_active = (impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing());
+        if (!impl_->menu_open && !cutscene_active) {
             impl_->build_faith_viewmodel(telemetry);
             if (!impl_->faith_viewmodel_mesh.empty()) {
                 [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 0.05}];
@@ -2895,7 +2902,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
         // ---------------------------------------------------------------------
-        // Pass 3: 2D HUD & Frontend UI Overlay (TdMainMenu / TdLoadLevel / HUD)
+        // Pass 3: 2D HUD, Cutscene Video/Letterbox Overlay & Frontend UI
         // ---------------------------------------------------------------------
         simd_float2 screen_size = simd_make_float2(float(impl_->width), float(impl_->height));
         if (impl_->menu_open) {
@@ -2926,6 +2933,131 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 bind_vertex_bytes_or_buffer(postEnc, fg_verts.data(), fg_verts.size() * sizeof(HUDVertex), 0);
                 [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
                 [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:fg_verts.size()];
+            }
+        } else if (cutscene_active) {
+            const CutscenePlayer* cp = impl_->cutscene_player;
+            float w = float(impl_->width);
+            float h = float(impl_->height);
+
+            // 1. If playing a Bink (.bik) video movie, upload decoded RGBA frame and draw full-screen 16:9 quad
+            if (cp->get_mode() == ECutsceneMode::BinkVideo) {
+                int vw = cp->get_video_width();
+                int vh = cp->get_video_height();
+                const auto& rgba = cp->get_rgba_frame();
+                if (vw > 0 && vh > 0 && rgba.size() == static_cast<size_t>(vw * vh * 4)) {
+                    if (!impl_->bink_video_tex ||
+                        (int)impl_->bink_video_tex.width != vw ||
+                        (int)impl_->bink_video_tex.height != vh) {
+                        MTLTextureDescriptor* td = [MTLTextureDescriptor
+                            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                         width:vw
+                                                        height:vh
+                                                     mipmapped:NO];
+                        td.usage = MTLTextureUsageShaderRead;
+                        td.storageMode = MTLStorageModeShared;
+                        impl_->bink_video_tex = [impl_->device newTextureWithDescriptor:td];
+                        impl_->bink_uploaded_serial = 0;
+                    }
+                    if (impl_->bink_video_tex && impl_->bink_uploaded_serial != cp->get_frame_serial()) {
+                        [impl_->bink_video_tex replaceRegion:MTLRegionMake2D(0, 0, vw, vh)
+                                                 mipmapLevel:0
+                                                   withBytes:rgba.data()
+                                                 bytesPerRow:vw * 4];
+                        impl_->bink_uploaded_serial = cp->get_frame_serial();
+                    }
+
+                    if (impl_->bink_video_tex && impl_->ui_tex_pipeline) {
+                        // Draw solid black backdrop + letterboxed 16:9 Bink video frame
+                        std::vector<HUDVertex> black_bg;
+                        impl_->draw_ui_quad(black_bg, 0.0f, 0.0f, w, h, simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+                        [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                        bind_vertex_bytes_or_buffer(postEnc, black_bg.data(), black_bg.size() * sizeof(HUDVertex), 0);
+                        [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                        [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:black_bg.size()];
+
+                        float vid_aspect = float(vw) / float(vh);
+                        float scr_aspect = w / h;
+                        float draw_w = w, draw_h = h, draw_x = 0.0f, draw_y = 0.0f;
+                        if (scr_aspect > vid_aspect) {
+                            draw_w = h * vid_aspect;
+                            draw_x = (w - draw_w) * 0.5f;
+                        } else {
+                            draw_h = w / vid_aspect;
+                            draw_y = (h - draw_h) * 0.5f;
+                        }
+
+                        std::vector<UITexVertex> qv;
+                        simd_float4 white = simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+                        UITexVertex v0{{draw_x, draw_y}, {0.0f, 0.0f}, white};
+                        UITexVertex v1{{draw_x + draw_w, draw_y}, {1.0f, 0.0f}, white};
+                        UITexVertex v2{{draw_x + draw_w, draw_y + draw_h}, {1.0f, 1.0f}, white};
+                        UITexVertex v3{{draw_x, draw_y + draw_h}, {0.0f, 1.0f}, white};
+                        qv = {v0, v1, v2, v0, v2, v3};
+
+                        [postEnc setRenderPipelineState:impl_->ui_tex_pipeline];
+                        [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                        [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+                        [postEnc setFragmentTexture:impl_->bink_video_tex atIndex:0];
+                        bind_vertex_bytes_or_buffer(postEnc, qv.data(), qv.size() * sizeof(UITexVertex), 0);
+                        [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:qv.size()];
+                    }
+                }
+            }
+
+            // 2. Cinema Letterbox Bars, Cutscene Progress & Synchronized Subtitles
+            std::vector<HUDVertex> cs_hud;
+            float lb = cp->get_letterbox_amount();
+            float bar_h = ((cp->get_mode() == ECutsceneMode::InEngineMatinee) ? 64.0f : 44.0f) * lb;
+            if (bar_h > 1.0f) {
+                impl_->draw_ui_quad(cs_hud, 0.0f, 0.0f, w, bar_h, simd_make_float4(0.0f, 0.0f, 0.0f, 0.88f));
+                impl_->draw_ui_quad(cs_hud, 0.0f, h - bar_h, w, bar_h, simd_make_float4(0.0f, 0.0f, 0.0f, 0.88f));
+            }
+
+            // Top-right Skip / Next Cutscene controls + progress bar
+            std::string ctrl_str = "[SPACE / ENTER] SKIP CUTSCENE   |   [C] NEXT CUTSCENE";
+            impl_->draw_ui_text(cs_hud, ctrl_str, w - 535.0f, 14.0f, 1.55f,
+                                simd_make_float4(0.88f, 0.90f, 0.94f, 0.88f));
+            float prog = (cp->get_duration() > 0.0f)
+                             ? std::clamp(cp->get_current_time() / cp->get_duration(), 0.0f, 1.0f)
+                             : 0.0f;
+            impl_->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f, 6.0f, simd_make_float4(0.18f, 0.20f, 0.24f, 0.75f));
+            impl_->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f * prog, 6.0f, simd_make_float4(0.902f, 0.078f, 0.078f, 0.95f));
+            impl_->draw_ui_text(cs_hud, "CUTSCENE: " + cp->get_movie_name(), 28.0f, 26.0f, 1.5f,
+                                simd_make_float4(0.85f, 0.88f, 0.92f, 0.85f));
+
+            // Synchronized localized dialogue subtitle
+            const std::string& sub = cp->get_active_subtitle();
+            if (!sub.empty()) {
+                // Split long subtitle lines across 2 lines if > 82 chars
+                std::string line1 = sub;
+                std::string line2;
+                if (sub.size() > 82) {
+                    size_t split = sub.rfind(' ', 82);
+                    if (split != std::string::npos) {
+                        line1 = sub.substr(0, split);
+                        line2 = sub.substr(split + 1);
+                    }
+                }
+                float max_chars = static_cast<float>(std::max(line1.size(), line2.size()));
+                float box_w = std::min(w - 80.0f, max_chars * 10.6f + 40.0f);
+                float box_h = line2.empty() ? 30.0f : 52.0f;
+                float box_x = (w - box_w) * 0.5f;
+                float box_y = h - std::max(bar_h + box_h + 10.0f, 56.0f);
+                impl_->draw_ui_quad(cs_hud, box_x, box_y, box_w, box_h, simd_make_float4(0.03f, 0.05f, 0.08f, 0.82f));
+                impl_->draw_ui_quad(cs_hud, box_x, box_y, 3.0f, box_h, simd_make_float4(0.902f, 0.078f, 0.078f, 0.95f));
+                impl_->draw_ui_text(cs_hud, line1, box_x + 18.0f, box_y + 8.0f, 1.75f,
+                                    simd_make_float4(0.99f, 0.99f, 1.0f, 1.0f));
+                if (!line2.empty()) {
+                    impl_->draw_ui_text(cs_hud, line2, box_x + 18.0f, box_y + 29.0f, 1.75f,
+                                        simd_make_float4(0.99f, 0.99f, 1.0f, 1.0f));
+                }
+            }
+
+            if (!cs_hud.empty()) {
+                [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                bind_vertex_bytes_or_buffer(postEnc, cs_hud.data(), cs_hud.size() * sizeof(HUDVertex), 0);
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:cs_hud.size()];
             }
         } else {
             std::vector<HUDVertex> hud_verts;
@@ -3042,6 +3174,7 @@ void MetalRenderer::set_menu_open(bool open) { impl_->menu_open = open; }
 bool MetalRenderer::is_menu_open() const { return impl_->menu_open; }
 void MetalRenderer::set_selected_chapter(int idx) { impl_->selected_chapter = std::clamp(idx, 0, 9); }
 int MetalRenderer::selected_chapter() const { return impl_->selected_chapter; }
+void MetalRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
 
 void* MetalRenderer::raw_device() const { return (__bridge void*)impl_->device; }
 void* MetalRenderer::raw_command_queue() const { return (__bridge void*)impl_->command_queue; }
