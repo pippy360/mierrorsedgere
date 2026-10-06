@@ -116,7 +116,8 @@ private:
     bool init_openal();
     void cleanup_openal();
     uint32_t acquire_source();
-    uint32_t get_or_create_buffer(const SoundClip& clip);
+    uint32_t get_or_create_buffer(const SoundClip& clip, bool force_mono_for_3d = false);
+    void invalidate_cached_buffer(const std::string& key);
     void rebind_music_stem_buffers();
 
     bool load_package_audio_and_cues(const std::string& pkg_path);
@@ -128,6 +129,7 @@ private:
 
     bool initialized_ = false;
     bool headless_ = false;
+    bool is_menu_music_ = false;
 
     // OpenAL context handles (opaque pointers)
     void* alc_device_ = nullptr;
