@@ -641,7 +641,8 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
 // Interactive SDL2 + Metal Window Gameplay Loop
 // -----------------------------------------------------------------------------
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
-                              const std::string& custom_level, int max_frames) {
+                              const std::string& custom_level, int max_frames,
+                              bool start_in_main_menu) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
     std::cout << "  MIRROR'S EDGE NATIVE MACOS - INTERACTIVE LAUNCH" << std::endl;
@@ -726,7 +727,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     cutscene_player.init(game_root, /*headless=*/(max_frames > 0));
     renderer.set_cutscene_player(&cutscene_player);
 
-    auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path) {
+    auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path, bool play_intro = true) {
         std::string map_file = custom_path;
         if (map_file.empty()) {
             static const char* kChapterMaps[10] = {
@@ -760,7 +761,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         audio.load_level_audio(game_root, map_file);
 
         // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in)
-        if (max_frames == 0) {
+        if (max_frames == 0 && play_intro) {
             std::string intro_movie = CutscenePlayer::get_chapter_intro_movie(map_file);
             if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
                 // Bink movie started; will transition into 3D rooftop intro on finish
@@ -771,7 +772,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return true;
     };
 
-    if (!load_chapter_or_level(current_chapter_idx, custom_level)) {
+    if (!load_chapter_or_level(current_chapter_idx, custom_level, /*play_intro=*/!start_in_main_menu)) {
         std::cerr << "[Game ERROR] No playable level (check --game-root / --level)." << std::endl;
         if (game_controller) SDL_GameControllerClose(game_controller);
         SDL_Metal_DestroyView(metal_view);
@@ -780,7 +781,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return 1;
     }
 
-    SDL_SetRelativeMouseMode(SDL_TRUE);
+    renderer.set_menu_open(start_in_main_menu);
+    SDL_SetRelativeMouseMode(start_in_main_menu ? SDL_FALSE : SDL_TRUE);
     ensure_dir("screenshots");
 
     // Interactive Loop
@@ -805,7 +807,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     std::cout << "  Right Mouse / E: Disarm Enemy / Use Elevator" << std::endl;
     std::cout << "  X: Toggle Reaction Time (Slow-Motion)" << std::endl;
     std::cout << "  V / Left Alt: Runner Vision Look-At" << std::endl;
-    std::cout << "  Tab / M: Toggle Chapter Select Menu" << std::endl;
+    std::cout << "  Tab / M: Toggle Main Menu / Chapter Select" << std::endl;
     std::cout << "  1..9, 0: Directly load Chapter 0 through 9 (with Chapter Cutscene)" << std::endl;
     std::cout << "  [ / ] (or B / N): Previous / Next Tutorial Checkpoint" << std::endl;
     std::cout << "  R: Reset to Active Checkpoint" << std::endl;
@@ -832,13 +834,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     renderer.resize(drawable_w, drawable_h);
                 }
             } else if (ev.type == SDL_MOUSEMOTION) {
-                if (SDL_GetRelativeMouseMode() == SDL_TRUE && !cutscene_player.is_playing()) {
+                if (SDL_GetRelativeMouseMode() == SDL_TRUE && !cutscene_player.is_playing() && !renderer.is_menu_open()) {
                     float sens = 0.15f;
                     input.look_yaw_delta += float(ev.motion.xrel) * sens;
                     input.look_pitch_delta -= float(ev.motion.yrel) * sens;
                 }
             } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
-                if (!renderer.is_menu_open() && SDL_GetRelativeMouseMode() != SDL_TRUE) {
+                if (renderer.is_menu_open() && ev.button.button == SDL_BUTTON_LEFT && frame_counter >= 10) {
+                    renderer.set_menu_open(false);
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                } else if (!renderer.is_menu_open() && SDL_GetRelativeMouseMode() != SDL_TRUE) {
                     SDL_SetRelativeMouseMode(SDL_TRUE);
                 } else if (frame_counter >= 15 && !renderer.is_menu_open() && !cutscene_player.is_playing()) {
                     if (ev.button.button == SDL_BUTTON_LEFT) {
@@ -849,21 +855,37 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     }
                 }
             } else if (ev.type == SDL_MOUSEWHEEL) {
-                if (!renderer.is_menu_open() && !cutscene_player.is_playing() && ev.wheel.y != 0) {
+                if (renderer.is_menu_open() && ev.wheel.y != 0) {
+                    current_chapter_idx = (current_chapter_idx + (ev.wheel.y > 0 ? 9 : 1)) % 10;
+                    renderer.set_selected_chapter(current_chapter_idx);
+                } else if (!renderer.is_menu_open() && !cutscene_player.is_playing() && ev.wheel.y != 0) {
                     input.cycle_weapon_dir = (ev.wheel.y > 0) ? 1 : -1;
                 }
             } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
                 SDL_Keycode key = ev.key.keysym.sym;
                 if (key == SDLK_ESCAPE) {
                     if (renderer.is_menu_open()) {
-                        renderer.set_menu_open(false);
-                        SDL_SetRelativeMouseMode(SDL_TRUE);
+                        running = false;
                     } else if (cutscene_player.is_playing()) {
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
                         cutscene_player.stop();
                     } else {
-                        running = false;
+                        renderer.set_menu_open(true);
+                        SDL_SetRelativeMouseMode(SDL_FALSE);
                     }
+                } else if (renderer.is_menu_open() &&
+                           (key == SDLK_UP || key == SDLK_w || key == SDLK_LEFT || key == SDLK_a)) {
+                    current_chapter_idx = (current_chapter_idx + 9) % 10;
+                    renderer.set_selected_chapter(current_chapter_idx);
+                } else if (renderer.is_menu_open() &&
+                           (key == SDLK_DOWN || key == SDLK_s || key == SDLK_RIGHT || key == SDLK_d)) {
+                    current_chapter_idx = (current_chapter_idx + 1) % 10;
+                    renderer.set_selected_chapter(current_chapter_idx);
+                } else if (renderer.is_menu_open() && (key == SDLK_RETURN || key == SDLK_SPACE)) {
+                    suppress_space_until_release = true;
+                    renderer.set_menu_open(false);
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
                 } else if ((key == SDLK_SPACE || key == SDLK_RETURN) && cutscene_player.is_playing()) {
                     suppress_space_until_release = true;
                     if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo) {
@@ -932,7 +954,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     int sel = (key == SDLK_0) ? 0 : (key - SDLK_0);
                     current_chapter_idx = sel;
                     renderer.set_selected_chapter(sel);
-                    load_chapter_or_level(sel, "");
+                    renderer.set_menu_open(false);
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                    load_chapter_or_level(sel, "", /*play_intro=*/true);
                 }
             }
         }
@@ -997,15 +1021,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) input.turn_180 = true;
         }
 
-        // Advance simulation or active cutscene step
+        // Advance simulation or active cutscene step (paused while Main Menu is open)
         Vec3 pre_vel = controller.get_velocity();
-        if (cutscene_player.is_playing()) {
-            cutscene_player.update(dt, active_scene, controller.get_telemetry());
-            if (!cutscene_player.is_playing()) {
-                controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+        if (!renderer.is_menu_open()) {
+            if (cutscene_player.is_playing()) {
+                cutscene_player.update(dt, active_scene, controller.get_telemetry());
+                if (!cutscene_player.is_playing()) {
+                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                }
+            } else {
+                controller.step(input, dt, active_scene);
             }
-        } else {
-            controller.step(input, dt, active_scene);
         }
         const auto& tel = controller.get_telemetry();
 
@@ -1082,7 +1108,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Footstep cadence (TdPhysicalMaterialFootSteps: Sneak / Walk / Run / Sprint)
-        if (tel.grounded && tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
+        if (!renderer.is_menu_open() && tel.grounded && tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
             footstep_timer += dt;
             float stride_time = std::clamp(150.0f / tel.speed_2d, 0.22f, 0.45f);
             if (footstep_timer >= stride_time) {
@@ -1128,6 +1154,7 @@ int main(int argc, char* argv[]) {
     int initial_chapter = 0;
     std::string custom_level = "";
     int max_frames = 0;
+    bool start_in_main_menu = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1143,10 +1170,14 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 script_json = argv[++i];
             }
+        } else if (arg == "--main-menu") {
+            start_in_main_menu = true;
         } else if (arg == "--chapter") {
             if (i + 1 < argc) initial_chapter = std::atoi(argv[++i]);
+            start_in_main_menu = false;
         } else if (arg == "--level") {
             if (i + 1 < argc) custom_level = argv[++i];
+            start_in_main_menu = false;
         } else if (arg == "--max-frames") {
             if (i + 1 < argc) max_frames = std::atoi(argv[++i]);
         } else if (arg == "--game-root") {
@@ -1156,6 +1187,7 @@ int main(int argc, char* argv[]) {
                       << "Usage:\n"
                       << "  mirrorsedge_macos [options]\n\n"
                       << "Options:\n"
+                      << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
                       << "  --test-replay <trace>    Replay physics trace headless\n"
@@ -1172,5 +1204,5 @@ int main(int argc, char* argv[]) {
         return run_oracle_verification(game_root, script_json);
     }
 
-    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames);
+    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu);
 }
