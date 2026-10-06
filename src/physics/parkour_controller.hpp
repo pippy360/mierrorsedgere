@@ -62,11 +62,11 @@ private:
     void update_checkpoints_and_volumes(LevelScene& scene);
     void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
 
-    // Collision Detection and Swept Physics
+    // Collision Detection and Swept Physics (TdPawn default cylinder: Radius=30, Height=90)
     struct Capsule {
         Vec3 base;
-        float radius = 34.0f;
-        float height = 96.0f;
+        float radius = 30.0f;
+        float height = 90.0f;
         float bottom_offset = 0.0f;
 
         [[nodiscard]] AABB to_aabb() const {
@@ -118,6 +118,8 @@ private:
     float m_momentum_timer = 0.0f;
     float m_state_timer = 0.0f;
     float m_wallrun_timer = 0.0f;
+    float m_wallrun_cooldown = 0.0f;
+    float m_wallrun_begin_speed = 0.0f;
     float m_slide_timer = 0.0f;
     float m_coil_timer = 0.0f;
     float m_turn_180_timer = 0.0f;
@@ -128,9 +130,12 @@ private:
     float m_fall_peak_z = 0.0f;
     float m_crouch_landing_buffer = 0.0f;
     float m_melee_cooldown = 0.0f;
+    bool m_jump_consumed = false;
+    bool m_prev_turn_180 = false;
 
     // Wallrun / Climb / Zipline vectors
     Vec3 m_wall_tangent{0.0f, 0.0f, 0.0f};
+    Vec3 m_last_wallrun_normal{0.0f, 0.0f, 0.0f};
     Vec3 m_zipline_start{0.0f, 0.0f, 0.0f};
     Vec3 m_zipline_end{0.0f, 0.0f, 0.0f};
     Vec3 m_swing_anchor{0.0f, 0.0f, 0.0f};
