@@ -724,45 +724,6 @@ struct UITexVertex {
 };
 
 // -----------------------------------------------------------------------------
-// Procedural Geometry Helpers
-// -----------------------------------------------------------------------------
-static void append_box(std::vector<Vertex>& verts, const Vec3& center, const Vec3& ext,
-                       const Vec3& color_rgb, bool is_runner_red = false) {
-    uint32_t c = is_runner_red ? 0xFF0E14E6 : 0xFFFFFFFF;
-    if (!is_runner_red) {
-        uint8_t r = (uint8_t)std::clamp(color_rgb.x * 255.0f, 0.0f, 255.0f);
-        uint8_t g = (uint8_t)std::clamp(color_rgb.y * 255.0f, 0.0f, 255.0f);
-        uint8_t b = (uint8_t)std::clamp(color_rgb.z * 255.0f, 0.0f, 255.0f);
-        c = (0xFF << 24) | (b << 16) | (g << 8) | r;
-    }
-
-    Vec3 p0 = center + Vec3(-ext.x, -ext.y, -ext.z);
-    Vec3 p1 = center + Vec3( ext.x, -ext.y, -ext.z);
-    Vec3 p2 = center + Vec3( ext.x,  ext.y, -ext.z);
-    Vec3 p3 = center + Vec3(-ext.x,  ext.y, -ext.z);
-    Vec3 p4 = center + Vec3(-ext.x, -ext.y,  ext.z);
-    Vec3 p5 = center + Vec3( ext.x, -ext.y,  ext.z);
-    Vec3 p6 = center + Vec3( ext.x,  ext.y,  ext.z);
-    Vec3 p7 = center + Vec3(-ext.x,  ext.y,  ext.z);
-
-    auto add_quad = [&](const Vec3& a, const Vec3& b, const Vec3& d, const Vec3& e, const Vec3& n) {
-        Vertex v0{a, n, Vec3(1,0,0), 0, 0, 0, 0, c};
-        Vertex v1{b, n, Vec3(1,0,0), 1, 0, 0, 0, c};
-        Vertex v2{d, n, Vec3(1,0,0), 1, 1, 0, 0, c};
-        Vertex v3{e, n, Vec3(1,0,0), 0, 1, 0, 0, c};
-        verts.push_back(v0); verts.push_back(v1); verts.push_back(v2);
-        verts.push_back(v0); verts.push_back(v2); verts.push_back(v3);
-    };
-
-    add_quad(p4, p5, p6, p7, Vec3(0, 0, 1));  // Top (+Z)
-    add_quad(p3, p2, p1, p0, Vec3(0, 0, -1)); // Bottom (-Z)
-    add_quad(p0, p1, p5, p4, Vec3(0, -1, 0)); // Front (-Y)
-    add_quad(p2, p3, p7, p6, Vec3(0, 1, 0));  // Back (+Y)
-    add_quad(p1, p2, p6, p5, Vec3(1, 0, 0));  // Right (+X)
-    add_quad(p3, p0, p4, p7, Vec3(-1, 0, 0)); // Left (-X)
-}
-
-// -----------------------------------------------------------------------------
 // Material System GPU Helpers (scene_materials.hpp -> Metal)
 // -----------------------------------------------------------------------------
 static bool tex_format_is_bc(TexFormat f) {
@@ -876,10 +837,6 @@ struct MetalRenderer::Impl {
         id<MTLTexture> tex = nil;
         std::vector<UITexVertex> verts;
     };
-
-    // Procedural Fallback Cityscape Meshes
-    std::vector<Vertex> rooftop_mesh;
-    std::vector<Vertex> runner_vision_mesh;
 
     // First-Person Faith Viewmodel Mesh & 3D Enemy Guard Mesh
     std::vector<Vertex> faith_viewmodel_mesh;
@@ -1552,154 +1509,18 @@ struct MetalRenderer::Impl {
         scene_depth_copy = [device newTextureWithDescriptor:copyDepthDesc];
     }
 
-    void generate_procedural_scene() {
-        rooftop_mesh.clear();
-        runner_vision_mesh.clear();
-
-        append_box(rooftop_mesh, Vec3(0, 0, -20), Vec3(2500, 2500, 20), Vec3(0.95f, 0.95f, 0.96f));
-        append_box(rooftop_mesh, Vec3(0, 2500, 60), Vec3(2500, 40, 60), Vec3(0.90f, 0.92f, 0.94f));
-        append_box(rooftop_mesh, Vec3(0, -2500, 60), Vec3(2500, 40, 60), Vec3(0.90f, 0.92f, 0.94f));
-        append_box(rooftop_mesh, Vec3(2500, 0, 60), Vec3(40, 2500, 60), Vec3(0.90f, 0.92f, 0.94f));
-        append_box(rooftop_mesh, Vec3(-2500, 0, 60), Vec3(40, 2500, 60), Vec3(0.90f, 0.92f, 0.94f));
-        append_box(rooftop_mesh, Vec3(600, 800, 75), Vec3(180, 280, 75), Vec3(0.88f, 0.90f, 0.92f));
-        append_box(rooftop_mesh, Vec3(-800, -500, 90), Vec3(250, 160, 90), Vec3(0.86f, 0.88f, 0.90f));
-        append_box(rooftop_mesh, Vec3(3500, 1200, 600), Vec3(600, 800, 1200), Vec3(0.92f, 0.94f, 0.96f));
-        append_box(rooftop_mesh, Vec3(-3200, 2400, 800), Vec3(500, 500, 1500), Vec3(0.89f, 0.92f, 0.95f));
-        append_box(rooftop_mesh, Vec3(1200, -3800, 400), Vec3(800, 700, 900), Vec3(0.94f, 0.95f, 0.97f));
-
-        append_box(runner_vision_mesh, Vec3(400, 300, 35), Vec3(60, 140, 35), Vec3(0.95f, 0.05f, 0.05f), true);
-        append_box(runner_vision_mesh, Vec3(1200, 500, 300), Vec3(15, 15, 300), Vec3(0.95f, 0.05f, 0.05f), true);
-        append_box(runner_vision_mesh, Vec3(1200, 650, 600), Vec3(15, 150, 15), Vec3(0.95f, 0.05f, 0.05f), true);
-        append_box(runner_vision_mesh, Vec3(800, 2480, 120), Vec3(400, 10, 50), Vec3(0.95f, 0.05f, 0.05f), true);
-        append_box(runner_vision_mesh, Vec3(-200, 600, 45), Vec3(50, 160, 45), Vec3(0.95f, 0.05f, 0.05f), true);
-
-        // Articulated 3D KrugerSec / CPF SWAT Guard Mesh (local origin at feet)
-        enemy_guard_mesh.clear();
-        // Tactical boots & shin guards
-        append_box(enemy_guard_mesh, Vec3(0, -10, 22), Vec3(7, 6, 22), Vec3(0.14f, 0.16f, 0.20f));
-        append_box(enemy_guard_mesh, Vec3(0,  10, 22), Vec3(7, 6, 22), Vec3(0.14f, 0.16f, 0.20f));
-        // Thighs (navy tactical trousers)
-        append_box(enemy_guard_mesh, Vec3(0, -10, 60), Vec3(8, 7, 18), Vec3(0.18f, 0.22f, 0.30f));
-        append_box(enemy_guard_mesh, Vec3(0,  10, 60), Vec3(8, 7, 18), Vec3(0.18f, 0.22f, 0.30f));
-        // Utility belt & holster
-        append_box(enemy_guard_mesh, Vec3(0, 0, 80), Vec3(10, 19, 5), Vec3(0.10f, 0.10f, 0.12f));
-        // Armored Kevlar Torso Vest (CPF White/Dark Grey panels facing +X)
-        append_box(enemy_guard_mesh, Vec3(0, 0, 112), Vec3(11, 20, 26), Vec3(0.22f, 0.26f, 0.34f));
-        append_box(enemy_guard_mesh, Vec3(3, 0, 115), Vec3(10, 16, 18), Vec3(0.88f, 0.90f, 0.94f));
-        // Shoulder pads & Arms aiming forward (+X in local space)
-        append_box(enemy_guard_mesh, Vec3(0, -24, 128), Vec3(8, 6, 8), Vec3(0.88f, 0.90f, 0.94f));
-        append_box(enemy_guard_mesh, Vec3(0,  24, 128), Vec3(8, 6, 8), Vec3(0.88f, 0.90f, 0.94f));
-        append_box(enemy_guard_mesh, Vec3(16, -18, 122), Vec3(16, 5, 5), Vec3(0.18f, 0.22f, 0.30f));
-        append_box(enemy_guard_mesh, Vec3(16,  14, 122), Vec3(16, 5, 5), Vec3(0.18f, 0.22f, 0.30f));
-        // Tactical Helmet & Reflective Black Visor (+X)
-        append_box(enemy_guard_mesh, Vec3(0, 0, 152), Vec3(10, 10, 12), Vec3(0.16f, 0.18f, 0.22f));
-        append_box(enemy_guard_mesh, Vec3(6, 0, 153), Vec3(6, 9, 5), Vec3(0.05f, 0.08f, 0.12f));
-        // Extended G36C Carbine Rifle (+X at hand level z=118, highlighted in scarlet red for Disarm window)
-        append_box(enemy_guard_mesh, Vec3(28, 0, 118), Vec3(12, 2.5f, 3.5f), Vec3(0.95f, 0.08f, 0.08f), true);
-        append_box(enemy_guard_mesh, Vec3(42, 0, 119), Vec3(8,  1.2f, 1.5f), Vec3(0.95f, 0.08f, 0.08f), true);
-        append_box(enemy_guard_mesh, Vec3(26, 0, 111), Vec3(2.5f, 1.8f, 5.0f), Vec3(0.95f, 0.08f, 0.08f), true);
-
-        // Load real UE3 USkeletalMesh & TdAnimSet assets from Mirror's Edge
+    // Real UE3 USkeletalMesh & TdAnimSet assets (CH_Faith_1P, KrugerSec/CPF SWAT, weapons) used for
+    // the first-person viewmodel, enemies and dropped weapons.
+    void load_character_assets() {
         anim_system.init_from_game_root("/Users/tomnom/mirrorsedge");
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
+        // CH_Faith_1P skinned by the AnimSystem; nothing is drawn without the real assets.
         if (anim_system.is_loaded()) {
             anim_system.evaluate_faith_1p(telemetry, faith_viewmodel_mesh);
-            if (!faith_viewmodel_mesh.empty()) return;
-        }
-        faith_viewmodel_mesh.clear();
-
-        float sim_time = telemetry.sim_time;
-        float speed = telemetry.speed_2d;
-        EMovement state = telemetry.move_state;
-
-        // Natural runner arm pumping cadence (framed cleanly in lower-left / lower-right peripheral view)
-        float stride_freq = std::clamp(speed * 0.022f, 2.5f, 14.0f);
-        float swing = (speed > 40.0f) ? std::sin(sim_time * stride_freq) * 5.5f : std::sin(sim_time * 2.0f) * 0.6f;
-        float bob_z = (speed > 40.0f) ? std::cos(sim_time * stride_freq) * 2.2f : 0.0f;
-
-        float r_arm_x = 19.0f;
-        float r_arm_y = 32.0f + swing;
-        float r_arm_z = -20.0f + bob_z;
-
-        float l_arm_x = -19.0f;
-        float l_arm_y = 32.0f - swing;
-        float l_arm_z = -20.0f - bob_z;
-
-        if (state == EMovement::MOVE_WallRunningRight) {
-            r_arm_x = 24.0f; r_arm_y = 36.0f; r_arm_z = -12.0f;
-        } else if (state == EMovement::MOVE_WallRunningLeft) {
-            l_arm_x = -24.0f; l_arm_y = 36.0f; l_arm_z = -12.0f;
-        } else if (state == EMovement::MOVE_SpeedVaulting || state == EMovement::MOVE_VaultOver || state == EMovement::MOVE_SpringBoarding) {
-            r_arm_y = 36.0f; r_arm_z = -14.0f;
-            l_arm_y = 34.0f; l_arm_z = -15.0f;
-        } else if (state == EMovement::MOVE_ZipLine) {
-            // Arms raised gripping overhead zipline handle
-            r_arm_x = 8.0f;  r_arm_y = 28.0f; r_arm_z = 14.0f;
-            l_arm_x = -8.0f; l_arm_y = 28.0f; l_arm_z = 14.0f;
-        }
-
-        // 1. Right Forearm, Wrist Strap & Iconic Scarlet Red Runner Glove (#E61414)
-        append_box(faith_viewmodel_mesh, Vec3(r_arm_x + 2.0f, r_arm_y - 10.0f, r_arm_z - 5.0f),
-                   Vec3(2.4f, 8.5f, 2.2f), Vec3(0.91f, 0.74f, 0.63f));
-        append_box(faith_viewmodel_mesh, Vec3(r_arm_x, r_arm_y - 1.5f, r_arm_z - 2.8f),
-                   Vec3(2.6f, 1.4f, 2.4f), Vec3(0.95f, 0.95f, 0.97f));
-        append_box(faith_viewmodel_mesh, Vec3(r_arm_x - 0.5f, r_arm_y + 3.5f, r_arm_z - 1.8f),
-                   Vec3(2.7f, 4.0f, 1.8f), Vec3(0.902f, 0.078f, 0.078f));
-        // Articulated fingers on right glove
-        for (int f = 0; f < 4; ++f) {
-            float fx = r_arm_x - 2.2f + float(f) * 1.15f;
-            append_box(faith_viewmodel_mesh, Vec3(fx, r_arm_y + 8.5f, r_arm_z - 1.6f),
-                       Vec3(0.48f, 2.0f, 0.55f), Vec3(0.88f, 0.08f, 0.08f));
-            append_box(faith_viewmodel_mesh, Vec3(fx, r_arm_y + 11.0f, r_arm_z - 1.9f),
-                       Vec3(0.44f, 1.0f, 0.48f), Vec3(0.91f, 0.74f, 0.63f));
-        }
-
-        // 2. Left Forearm, Geometric Tattoo & Black Fingerless Glove
-        append_box(faith_viewmodel_mesh, Vec3(l_arm_x - 2.0f, l_arm_y - 10.0f, l_arm_z - 5.0f),
-                   Vec3(2.4f, 8.5f, 2.2f), Vec3(0.91f, 0.74f, 0.63f));
-        append_box(faith_viewmodel_mesh, Vec3(l_arm_x - 1.5f, l_arm_y - 7.5f, l_arm_z - 3.6f),
-                   Vec3(2.5f, 2.2f, 2.3f), Vec3(0.12f, 0.13f, 0.16f));
-        append_box(faith_viewmodel_mesh, Vec3(l_arm_x + 0.5f, l_arm_y + 3.5f, l_arm_z - 1.8f),
-                   Vec3(2.6f, 4.0f, 1.8f), Vec3(0.16f, 0.17f, 0.20f));
-        for (int f = 0; f < 4; ++f) {
-            float fx = l_arm_x - 1.2f + float(f) * 1.15f;
-            append_box(faith_viewmodel_mesh, Vec3(fx, l_arm_y + 8.5f, l_arm_z - 1.6f),
-                       Vec3(0.46f, 1.8f, 0.52f), Vec3(0.91f, 0.74f, 0.63f));
-        }
-
-        // 3. Lower Legs & Split-Toe Tabi Shoes during Slide / JumpKick
-        if (state == EMovement::MOVE_Slide || state == EMovement::MOVE_MeleeSlide || state == EMovement::MOVE_Coil) {
-            // Extended slide kick leg in lower-center view (framed below horizon so sky & buildings remain clear)
-            float leg_y = 44.0f;
-            float leg_z = -24.0f;
-            append_box(faith_viewmodel_mesh, Vec3(6.0f, leg_y - 8.0f, leg_z),
-                       Vec3(3.2f, 12.0f, 3.0f), Vec3(0.94f, 0.95f, 0.97f));
-            append_box(faith_viewmodel_mesh, Vec3(9.3f, leg_y - 8.0f, leg_z),
-                       Vec3(0.4f, 12.0f, 1.2f), Vec3(0.902f, 0.078f, 0.078f));
-            append_box(faith_viewmodel_mesh, Vec3(6.0f, leg_y + 6.0f, leg_z + 1.5f),
-                       Vec3(2.8f, 4.5f, 3.5f), Vec3(0.15f, 0.16f, 0.19f));
-            append_box(faith_viewmodel_mesh, Vec3(6.0f, leg_y + 9.5f, leg_z + 2.5f),
-                       Vec3(2.6f, 1.8f, 2.8f), Vec3(0.902f, 0.078f, 0.078f));
-        }
-
-        // 4. Equipped Handgun Model (Colt 1911 / P28 when disarmed)
-        if (telemetry.weapon.equipped) {
-            float gx = 10.0f;
-            float gy = 34.0f;
-            float gz = -13.0f;
-            // Matte gunmetal slide & barrel
-            append_box(faith_viewmodel_mesh, Vec3(gx, gy + 5.0f, gz + 2.2f),
-                       Vec3(1.3f, 7.5f, 1.6f), Vec3(0.22f, 0.25f, 0.29f));
-            append_box(faith_viewmodel_mesh, Vec3(gx, gy + 12.8f, gz + 2.2f),
-                       Vec3(0.5f, 1.2f, 0.5f), Vec3(0.10f, 0.11f, 0.13f));
-            // Ergonomic black grip & trigger guard
-            append_box(faith_viewmodel_mesh, Vec3(gx, gy - 0.5f, gz - 2.2f),
-                       Vec3(1.15f, 2.2f, 3.8f), Vec3(0.12f, 0.13f, 0.15f));
-            // Red Runner Glove gripping weapon handle
-            append_box(faith_viewmodel_mesh, Vec3(gx + 0.5f, gy + 0.5f, gz - 1.8f),
-                       Vec3(1.8f, 3.0f, 2.6f), Vec3(0.902f, 0.078f, 0.078f));
+        } else {
+            faith_viewmodel_mesh.clear();
         }
     }
 
@@ -2289,7 +2110,7 @@ bool MetalRenderer::init_headless(int width, int height) {
     if (!impl_->compile_shaders()) return false;
     impl_->create_material_defaults();
     impl_->allocate_render_targets();
-    impl_->generate_procedural_scene();
+    impl_->load_character_assets();
 
     impl_->initialized = true;
     std::cout << "[MetalRenderer] Initialized in Headless Mode (" << width << "x" << height
@@ -2320,7 +2141,7 @@ bool MetalRenderer::init_with_metal_layer(void* ca_metal_layer, int width, int h
     if (!impl_->compile_shaders()) return false;
     impl_->create_material_defaults();
     impl_->allocate_render_targets();
-    impl_->generate_procedural_scene();
+    impl_->load_character_assets();
 
     impl_->initialized = true;
     std::cout << "[MetalRenderer] Initialized with CAMetalLayer (" << width << "x" << height
@@ -2506,6 +2327,23 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                    static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
         };
 
+        // Moving elevator parts (InterpActors driven by the elevator matinees) are baked at their
+        // initial pose; they are drawn translated by the part's current matinee offset. Sets
+        // uniforms.model for scene mesh i and returns true when it is not the identity.
+        auto apply_scene_mesh_model = [&](size_t i) -> bool {
+            const MeshBuffer& mb = active_scene.meshes[i];
+            if (mb.elevator >= 0 && static_cast<size_t>(mb.elevator) < active_scene.elevators.size()) {
+                const auto& parts = active_scene.elevators[static_cast<size_t>(mb.elevator)].parts;
+                if (mb.elevator_part >= 0 && static_cast<size_t>(mb.elevator_part) < parts.size()) {
+                    Mat4 part_model = Mat4::translation(parts[static_cast<size_t>(mb.elevator_part)].offset);
+                    std::memcpy(&uniforms.model, part_model.m, sizeof(float) * 16);
+                    return true;
+                }
+            }
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            return false;
+        };
+
         // ---------------------------------------------------------------------
         // Pass 0: Real-Time Directional Sun Shadow Map (4096x4096 Depth)
         // ---------------------------------------------------------------------
@@ -2524,45 +2362,39 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [shEnc setCullMode:MTLCullModeNone];
             [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
-            if (!active_scene.meshes.empty()) {
-                for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
-                    const auto& mesh = active_scene.meshes[i];
-                    if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
-                    [shEnc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
-                    if (mesh.sections.empty()) {
-                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
-                        continue;
-                    }
-                    for (const auto& s : mesh.sections) {
-                        if (!section_in_range(mesh, s)) continue;
-                        const MaterialShader* sh = nullptr;
-                        impl_->section_pipeline(s, &sh, nullptr);
-                        if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
-                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
-                    }
+            bool sh_prev_moved = false;
+            for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                const auto& mesh = active_scene.meshes[i];
+                if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                bool moved = apply_scene_mesh_model(i);
+                if (moved || sh_prev_moved) [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                sh_prev_moved = moved;
+                [shEnc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
+                if (mesh.sections.empty()) {
+                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                    continue;
                 }
-            } else {
-                bind_vertex_bytes_or_buffer(shEnc, impl_->rooftop_mesh.data(), impl_->rooftop_mesh.size() * sizeof(Vertex), 0);
-                [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->rooftop_mesh.size()];
-                bind_vertex_bytes_or_buffer(shEnc, impl_->runner_vision_mesh.data(), impl_->runner_vision_mesh.size() * sizeof(Vertex), 0);
-                [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->runner_vision_mesh.size()];
+                for (const auto& s : mesh.sections) {
+                    if (!section_in_range(mesh, s)) continue;
+                    const MaterialShader* sh = nullptr;
+                    impl_->section_pipeline(s, &sh, nullptr);
+                    if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
+                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                }
             }
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
 
-            if (!active_scene.enemies.empty()) {
+            if (impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
                 for (const auto& bot : active_scene.enemies) {
                     if (!bot.alive) continue;
-                    if (impl_->anim_system.is_loaded()) {
-                        impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
-                    }
+                    impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
                     if (impl_->enemy_guard_mesh.empty()) continue;
                     bind_vertex_bytes_or_buffer(shEnc, impl_->enemy_guard_mesh.data(),
                                                 impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
                     Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                     std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                     [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                    size_t v_count = impl_->enemy_guard_mesh.size();
-                    if (!impl_->anim_system.is_loaded() && bot.stunned && v_count > 108) v_count -= 108;
-                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
+                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
                 }
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
             }
@@ -2599,9 +2431,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
 
-        // Binds mesh i's vertex buffer + frame uniforms on the current encoder.
+        // Binds mesh i's vertex buffer + frame uniforms (incl. its model matrix) on the current encoder.
         auto bind_scene_mesh = [&](size_t i) {
             uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
+            apply_scene_mesh_model(i);
             [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
             [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -2673,18 +2506,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 }
             }
             [enc setCullMode:MTLCullModeNone];
-        } else {
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
             uniforms.is_runner_vision = 0.0f;
-            bind_vertex_bytes_or_buffer(enc, impl_->rooftop_mesh.data(), impl_->rooftop_mesh.size() * sizeof(Vertex), 0);
-            [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-            [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->rooftop_mesh.size()];
-
-            uniforms.is_runner_vision = 1.0f;
-            bind_vertex_bytes_or_buffer(enc, impl_->runner_vision_mesh.data(), impl_->runner_vision_mesh.size() * sizeof(Vertex), 0);
-            [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-            [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->runner_vision_mesh.size()];
         }
 
         // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies & 3D Weapons/Tracers (only during gameplay)
@@ -2692,24 +2515,19 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
         [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
-        if (!impl_->menu_open && !active_scene.enemies.empty()) {
+        if (!impl_->menu_open && impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
             for (const auto& bot : active_scene.enemies) {
-                if (!bot.alive && !impl_->anim_system.is_loaded()) continue;
-                if (impl_->anim_system.is_loaded()) {
-                    impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
-                }
+                impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
                 if (impl_->enemy_guard_mesh.empty()) continue;
                 bind_vertex_bytes_or_buffer(enc, impl_->enemy_guard_mesh.data(),
                                             impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
-                uniforms.is_runner_vision = (bot.disarm_window && !bot.stunned && !impl_->anim_system.is_loaded()) ? 0.35f : 0.0f;
+                uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                size_t v_count = impl_->enemy_guard_mesh.size();
-                if (!impl_->anim_system.is_loaded() && bot.stunned && v_count > 108) v_count -= 108;
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
@@ -2739,75 +2557,6 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:combat_rv_verts.size()];
-                uniforms.is_runner_vision = 0.0f;
-            }
-        }
-
-        // B2b. Render Interactive 3D Elevator Cabs, Sliding Doors & Runner Vision Buttons
-        if (!impl_->menu_open && !active_scene.elevators.empty()) {
-            std::vector<Vertex> elev_mesh;
-            std::vector<Vertex> elev_rv_mesh;
-            for (const auto& elev : active_scene.elevators) {
-                Vec3 fc = elev.current_pos + elev.cab_local_offset;
-                Vec3 he = elev.cab_half_extents;
-                float h_cab = he.z * 2.0f;
-
-                // Brushed stainless steel floor & ceiling with illuminated light diffuser
-                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z - 8.0f),
-                           Vec3(he.x, he.y, 8.0f), Vec3(0.80f, 0.83f, 0.87f));
-                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z + h_cab + 8.0f),
-                           Vec3(he.x, he.y, 8.0f), Vec3(0.90f, 0.92f, 0.95f));
-                append_box(elev_mesh, Vec3(fc.x, fc.y, fc.z + h_cab - 1.5f),
-                           Vec3(he.x * 0.65f, he.y * 0.65f, 1.5f), Vec3(0.99f, 0.99f, 1.0f));
-
-                // Side walls (-Y and +Y) and stainless steel interior handrails
-                append_box(elev_mesh, Vec3(fc.x, fc.y - he.y - 6.0f, fc.z + h_cab * 0.5f),
-                           Vec3(he.x, 6.0f, h_cab * 0.5f), Vec3(0.90f, 0.92f, 0.95f));
-                append_box(elev_mesh, Vec3(fc.x, fc.y + he.y + 6.0f, fc.z + h_cab * 0.5f),
-                           Vec3(he.x, 6.0f, h_cab * 0.5f), Vec3(0.90f, 0.92f, 0.95f));
-                append_box(elev_mesh, Vec3(fc.x, fc.y - he.y + 6.0f, fc.z + 95.0f),
-                           Vec3(he.x * 0.82f, 3.0f, 2.5f), Vec3(0.68f, 0.72f, 0.77f));
-                append_box(elev_mesh, Vec3(fc.x, fc.y + he.y - 6.0f, fc.z + 95.0f),
-                           Vec3(he.x * 0.82f, 3.0f, 2.5f), Vec3(0.68f, 0.72f, 0.77f));
-
-                // Sliding Lower Entry Doors (-X, S_ElevatorDoor_01: 76-unit slide per leaf)
-                float slide_start = 76.0f * elev.door_open_Start;
-                append_box(elev_mesh, Vec3(fc.x - he.x - 4.0f, fc.y - 38.5f - slide_start, fc.z + 120.0f),
-                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
-                append_box(elev_mesh, Vec3(fc.x - he.x - 4.0f, fc.y + 38.5f + slide_start, fc.z + 120.0f),
-                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
-
-                // Sliding Upper Exit Doors (+X, S_ElevatorDoor_01: 76-unit slide per leaf)
-                float slide_end = 76.0f * elev.door_open_End;
-                append_box(elev_mesh, Vec3(fc.x + he.x + 4.0f, fc.y - 38.5f - slide_end, fc.z + 120.0f),
-                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
-                append_box(elev_mesh, Vec3(fc.x + he.x + 4.0f, fc.y + 38.5f + slide_end, fc.z + 120.0f),
-                           Vec3(4.0f, 38.5f, 120.0f), Vec3(0.84f, 0.87f, 0.91f));
-
-                // Interior Control Panel & Glowing Runner Vision Elevator Button (S_ElevatorButton_Single)
-                append_box(elev_mesh, Vec3(fc.x + he.x * 0.55f, fc.y + he.y - 3.0f, fc.z + 125.0f),
-                           Vec3(14.0f, 2.0f, 24.0f), Vec3(0.22f, 0.25f, 0.30f));
-                append_box(elev_rv_mesh, Vec3(fc.x + he.x * 0.55f, fc.y + he.y - 5.5f, fc.z + 125.0f),
-                           Vec3(6.5f, 3.0f, 6.5f), Vec3(0.95f, 0.08f, 0.08f), true);
-                // Runner Vision Doorway Arch Indicator
-                append_box(elev_rv_mesh, Vec3(fc.x - he.x - 5.0f, fc.y, fc.z + h_cab - 8.0f),
-                           Vec3(5.0f, 78.0f, 6.0f), Vec3(0.95f, 0.08f, 0.08f), true);
-            }
-            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
-            uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
-            if (!elev_mesh.empty()) {
-                uniforms.is_runner_vision = 0.0f;
-                bind_vertex_bytes_or_buffer(enc, elev_mesh.data(), elev_mesh.size() * sizeof(Vertex), 0);
-                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:elev_mesh.size()];
-            }
-            if (!elev_rv_mesh.empty()) {
-                uniforms.is_runner_vision = 1.0f;
-                bind_vertex_bytes_or_buffer(enc, elev_rv_mesh.data(), elev_rv_mesh.size() * sizeof(Vertex), 0);
-                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:elev_rv_mesh.size()];
                 uniforms.is_runner_vision = 0.0f;
             }
         }
@@ -2857,6 +2606,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 }
             }
             [enc setCullMode:MTLCullModeNone];
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])

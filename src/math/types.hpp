@@ -11,6 +11,7 @@
 namespace me {
 
 struct SceneMaterialLibrary;  // assets/scene_materials.hpp
+class CollisionWorld;         // physics/collision_world.hpp
 
 constexpr float PI = 3.14159265358979323846f;
 constexpr float DEG2RAD = PI / 180.0f;
@@ -476,6 +477,10 @@ struct MeshBuffer {
     AABB bounds;
     bool is_runner_vision = false;
     std::vector<MeshSection> sections; // empty = whole buffer uses legacy procedural shading
+    // Moving (InterpActor) geometry: vertices are stored at the actor's initial pose and drawn
+    // with a translation model matrix of LevelScene::elevators[elevator].parts[elevator_part].offset.
+    int32_t elevator = -1;
+    int32_t elevator_part = -1;
 };
 
 struct SoundClip {
@@ -516,6 +521,8 @@ struct AmbientEmitterInfo {
 struct LevelActor {
     std::string class_name;
     std::string object_name;
+    std::string unique_name;   // export name including the FName number suffix (e.g. "InterpActor_3")
+    std::string base_name;     // unique_name of the Actor.Base this actor is attached to ("" = none)
     std::string mesh_name;
     std::string tag;
     Vec3 location{0.0f, 0.0f, 0.0f};
@@ -523,7 +530,14 @@ struct LevelActor {
     Vec3 draw_scale_3d{1.0f, 1.0f, 1.0f};
     float draw_scale = 1.0f;
     AABB world_bounds;
-    bool is_collidable = true;
+    // UE3 collision: bCollideActors && bBlockActors && CollisionComponent.CollideActors &&
+    // BlockActors && BlockNonZeroExtent (pawn movement) / BlockZeroExtent (traces).
+    bool is_collidable = true;   // blocks non-zero-extent (player / AI movement) checks
+    bool blocks_traces = true;   // blocks zero-extent line checks
+    bool is_hidden = false;      // bHidden / HiddenGame: collides but is never drawn
+    bool collide_complex = false; // Actor.bCollideComplex: ignore simple collision, collide per poly
+    bool is_blocking_volume = false;
+    int32_t elevator = -1;       // >= 0: moving part of LevelScene::elevators[elevator]
     bool is_runner_vision = false;
     bool is_checkpoint = false;
     bool is_trigger = false;
@@ -540,6 +554,10 @@ struct LevelActor {
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
     std::vector<std::string> material_overrides;
+    // BlockingVolume BrushComponent.BrushAggGeom hulls, world space, 3 vertices per triangle.
+    std::vector<Vec3> brush_triangles;
+    // TdTutorialStart.BelongToChallenge (EMovementChallenge names, e.g. "EMC_SlideOne").
+    std::vector<std::string> tutorial_challenges;
 };
 
 // -----------------------------------------------------------------------------
@@ -728,6 +746,28 @@ struct ElevatorKeyframe {
     Vec3 pos{0.0f, 0.0f, 0.0f};
 };
 
+// A moving InterpActor driven by the elevator matinees: the cab itself, actors hard-attached to
+// it (Base == cab, e.g. the cab doors) and the landing doors at either floor.
+enum class ElevatorPartRole : uint8_t {
+    Cab = 0,          // moves along the cab PosTrack
+    CabAttached = 1,  // Base == cab: rides with the cab
+    CabDoor = 2,      // Base == cab sliding door: rides with the cab and opens at either floor
+    StartDoor = 3,    // landing door at the start floor
+    EndDoor = 4       // landing door at the destination floor
+};
+
+struct ElevatorPart {
+    std::string actor_name;    // LevelActor::unique_name
+    int32_t actor_index = -1;  // LevelScene::actors index
+    ElevatorPartRole role = ElevatorPartRole::Cab;
+    int32_t mesh_index = -1;   // LevelScene::meshes index (vertices at the initial pose, -1 = none)
+    Vec3 door_open_offset{0.0f, 0.0f, 0.0f};  // world offset of a fully open door (matinee end key)
+    Vec3 offset{0.0f, 0.0f, 0.0f};            // current world displacement from the initial pose
+    Vec3 prev_offset{0.0f, 0.0f, 0.0f};
+    // Collision triangles at the initial pose (queries are shifted by -offset)
+    std::shared_ptr<const CollisionWorld> collision;
+};
+
 struct ElevatorInstance {
     std::string name;                  // e.g. "Escape_Intro-Off_Slc:mainlift"
     std::string source_package;        // e.g. "Escape_Intro-Off_Spt"
@@ -753,6 +793,8 @@ struct ElevatorInstance {
     std::vector<std::string> stream_out_packages;
     std::vector<ElevatorKeyframe> keyframes; // Full InterpTrackMove PosTrack curve
     Vec3 button_pos{0.0f, 0.0f, 0.0f};       // Interior/exterior S_ElevatorButton_Single world position
+    std::string cab_actor_name;              // LevelActor::unique_name of the cab InterpActor
+    std::vector<ElevatorPart> parts;         // real moving meshes + collision (cab, doors)
 };
 
 // -----------------------------------------------------------------------------
@@ -871,7 +913,10 @@ struct LevelScene {
     std::string sky_light_source;                   // Package.ObjectName of resolved SkyLightComponent
     std::vector<LevelActor> actors;
     std::vector<MeshBuffer> meshes;
-    std::vector<AABB> colliders;
+    // Static world collision built from the real UE3 data (StaticMesh BodySetup / kDOP triangles,
+    // BlockingVolume brushes). Moving elevator parts carry their own CollisionWorld.
+    std::shared_ptr<const CollisionWorld> collision;
+    float kill_z = -1.0e30f;  // falling below this kills the player (WorldInfo.KillZ or geometry floor)
     std::vector<EnemyBot> enemies;
     std::vector<BulletTracer> active_tracers;
     std::vector<DroppedWeapon> dropped_weapons;

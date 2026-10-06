@@ -340,3 +340,60 @@ Every campaign map was loaded headless with the material system on. The material
   - `parse_properties`: both branches fixed the v536 ByteProperty tag. Kept main's version, which adds FName number suffixes and `raw_bytes`.
   - `metal_renderer.mm`: kept both includes. The enemy pass re-binds the legacy world pipeline and depth state after the material passes, then runs main's per-bot `evaluate_enemy_swat`.
 - `--verify-all`: stages 1–8 PASS after the rebase. The oracle screenshots show skeletal SWAT enemies and Faith's first-person arms inside the material-rendered levels.
+
+---
+
+## 8. Real collision instead of procedural box stand-ins (agent/remove-append-box, 2026-10-06)
+
+**Goal:** remove every `append_box` / fallback-box hack; gameplay, rendering and the oracle use only
+reverse-engineered game data.
+
+### 8.1 Removed
+- `main.mm`: `build_parkour_test_course` (the fake parkour gauntlet), `append_box_mesh`,
+  `append_test_course_visuals`, `align_city_meshes_around_course`.
+- `metal_renderer.mm`: `append_box`, the procedural rooftop / runner-vision cityscape drawn for empty
+  scenes, the box SWAT guard, the box Faith arms / legs / gun, and the box elevator cab, doors and buttons.
+- `upk_loader.cpp`: the per-actor fallback boxes and the AABB `LevelScene::colliders`.
+
+### 8.2 Replacements
+- `src/physics/collision_world.*`: triangle collision with `sweep_box`, `line_check` and `overlap_box` per
+  channel (`COLL_BlockNonZeroExtent` = movement, `COLL_BlockZeroExtent` = traces / bullets).
+  - Built from StaticMesh `RB_BodySetup` aggregate geometry (box / sphere / sphyl / convex) and the kDOP
+    triangle tree, chosen per `UseSimpleBoxCollision` / `UseSimpleLineCollision` / `bCollideComplex`.
+  - Also built from `BlockingVolume` brushes and BSP. Tutorial_p: 204865 triangles (73 BlockingVolumes);
+    Edge_p: 180380; Escape_p: 523989 (409 BlockingVolumes).
+- `parkour_controller.cpp`: the capsule is swept against `LevelScene::collision` (UE3 PHYS_Walking rules:
+  MaxStepHeight 35, MAXFLOORDIST 2.4, WalkableFloorZ 0.7). Elevators move their real `InterpActor` parts
+  and carry Faith through `Pawn.Base`.
+- Elevators: `assign_elevator_parts()` / `build_elevator_part_geometry()` give each cab, cab door and
+  landing door leaf its own mesh and collision. The renderer draws and shadows them with their matinee offset.
+- Characters: only the real skinned `CH_Faith_1P`, enemies and weapons from `AnimSystem` are drawn.
+- Interactive app: a failed level load keeps the current level; a failed initial load exits with status 1.
+
+### 8.3 Oracle results (`./build/mirrorsedge_macos --verify-all`, run from the worktree)
+Stages 1–7 run on Tutorial_p at the tutorial's own training spots; stage 8 runs on Escape_p.
+
+| Stage | Result |
+|---|---|
+| 1 Sprint | 538 u/s, FOV 104.8°, roof Z 5760 |
+| 2 Speed vault / springboard | lands beyond the stage-7 airduct at (-3061.8, 4228); springboard apex 4298.5 (+458) |
+| 3 Wallrun | `MOVE_WallRunningLeft`, roll 15°, lands across the gap at (-1389, 4224) |
+| 4 Wallclimb | `MOVE_WallClimbing`, peak Z 4286.7 (+63) |
+| 5 Zipline / slide | 1428 u along `TdZiplineVolume_0`; 454 u slide |
+| 6 Coil / skill roll | `MOVE_Coil`, `MOVE_SkillRoll` after a 431 u drop |
+| 7 Disarm | Celeste disarmed (`Colt1911`), reaction time active, 11/11 weapons fire |
+| 8 Elevator | `mainlift` cab Z 10608 → 12288, `IdleEnd`, 16 sublevels streamed, walk-out at (5746, 12288) |
+
+- `ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!`, exit status 0. A failing stage now prints
+  `N OF 9 VERIFIED STAGES FAILED` (parkour stages 1–8 plus the cutscene stage 11 from `main`) and
+  exits with status 1.
+- Rebased onto `main` at `40a352c` (audio system + Bink cutscenes): stages 1–11 PASS.
+- `screenshots/oracle_8_elevator_level_streaming.png` shows the real `S_Elevator_01` interior with the
+  `S_ElevatorDoor_01` leaves half open at the top floor.
+
+### 8.4 Remaining gaps
+- Level skeletal meshes (flags, pigeons, the courier bag `SK_Bag`, `SK_Celeste`) are not drawn. The bag used
+  to be a fallback box; pickup still works from the actor position.
+- The wall climb rises only ~63 u (main's tuning), so the stage-10 ledge cannot be reached by climbing.
+- Holding jump re-triggers the wall climb (`try_initiate_wallclimb` ignores `m_jump_consumed`).
+- The three terrace guards in Tutorial_p come from the combat merge and are not part of the retail map.

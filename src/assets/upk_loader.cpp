@@ -2,6 +2,7 @@
 #include "material_system.hpp"
 #include "package_manager.hpp"
 #include "ue3_props.hpp"
+#include "../physics/collision_world.hpp"
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
@@ -11,7 +12,10 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <set>
+#include <unordered_map>
 #include <zlib.h>
 
 namespace me {
@@ -85,53 +89,180 @@ std::string read_fstring(const uint8_t*& ptr, const uint8_t* end) {
     return "";
 }
 
-// Generate box vertices for visual and physical geometry (6 triangle vertices per face)
-void add_box_mesh(std::vector<Vertex>& verts, std::vector<uint32_t>& indices,
-                  const Vec3& min_p, const Vec3& max_p, uint32_t color = 0xFFCCCCCC) {
-    // 8 box corners
-    Vec3 p[8] = {
-        {min_p.x, min_p.y, min_p.z}, // 0
-        {max_p.x, min_p.y, min_p.z}, // 1
-        {max_p.x, max_p.y, min_p.z}, // 2
-        {min_p.x, max_p.y, min_p.z}, // 3
-        {min_p.x, min_p.y, max_p.z}, // 4
-        {max_p.x, min_p.y, max_p.z}, // 5
-        {max_p.x, max_p.y, max_p.z}, // 6
-        {min_p.x, max_p.y, max_p.z}  // 7
-    };
+// UE3 AActor::LocalToWorld(): Translation(-PrePivot) * Scale(DrawScale3D * DrawScale) *
+// FRotationMatrix(Rotation) * Translation(Location).
+struct ActorTransform {
+    Vec3 axis_x{1.0f, 0.0f, 0.0f};
+    Vec3 axis_y{0.0f, 1.0f, 0.0f};
+    Vec3 axis_z{0.0f, 0.0f, 1.0f};
+    Vec3 scale{1.0f, 1.0f, 1.0f};
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Vec3 pre_pivot{0.0f, 0.0f, 0.0f};
 
-    struct Face {
-        int idx[4];
-        Vec3 normal;
-    };
+    ActorTransform(const Vec3& loc, const Rotator& rot, const Vec3& scale3, const Vec3& prepivot = Vec3(0.0f, 0.0f, 0.0f))
+        : scale(scale3), location(loc), pre_pivot(prepivot) {
+        const Vec3 rad = rot.to_radians();
+        const float sp = std::sin(rad.x), cp = std::cos(rad.x);
+        const float sy = std::sin(rad.y), cy = std::cos(rad.y);
+        const float sr = std::sin(rad.z), cr = std::cos(rad.z);
+        axis_x = Vec3(cp * cy, cp * sy, sp);
+        axis_y = Vec3(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp);
+        axis_z = Vec3(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp);
+    }
+    static ActorTransform of(const LevelActor& a) {
+        return ActorTransform(a.location, a.rotation,
+                              Vec3(a.draw_scale * a.draw_scale_3d.x, a.draw_scale * a.draw_scale_3d.y,
+                                   a.draw_scale * a.draw_scale_3d.z));
+    }
+    [[nodiscard]] Vec3 apply(const Vec3& local) const {
+        const Vec3 l = local - pre_pivot;
+        return location + axis_x * (l.x * scale.x) + axis_y * (l.y * scale.y) + axis_z * (l.z * scale.z);
+    }
+};
 
-    Face faces[6] = {
-        {{4, 5, 6, 7}, {0, 0, 1}},  // Top (+Z)
-        {{3, 2, 1, 0}, {0, 0, -1}}, // Bottom (-Z)
-        {{0, 1, 5, 4}, {0, -1, 0}}, // Front (-Y)
-        {{2, 3, 7, 6}, {0, 1, 0}},  // Back (+Y)
-        {{0, 4, 7, 3}, {-1, 0, 0}}, // Left (-X)
-        {{1, 2, 6, 5}, {1, 0, 0}}   // Right (+X)
-    };
+// FMatrix (row-vector convention): p' = p.x * XPlane + p.y * YPlane + p.z * ZPlane + WPlane.
+struct ElemMatrix {
+    Vec3 rows[4] = {Vec3(1, 0, 0), Vec3(0, 1, 0), Vec3(0, 0, 1), Vec3(0, 0, 0)};
+    [[nodiscard]] Vec3 apply(const Vec3& p) const { return rows[0] * p.x + rows[1] * p.y + rows[2] * p.z + rows[3]; }
+};
 
-    static const int tri_order[6] = {0, 1, 2, 0, 2, 3};
-    for (int f = 0; f < 6; ++f) {
-        for (int t = 0; t < 6; ++t) {
-            int i = tri_order[t];
-            Vertex v;
-            v.position = p[faces[f].idx[i]];
-            v.normal = faces[f].normal;
-            v.tangent = Vec3(1, 0, 0);
-            v.u = (i == 1 || i == 2) ? 1.0f : 0.0f;
-            v.v = (i == 2 || i == 3) ? 1.0f : 0.0f;
-            v.color = color;
-            indices.push_back(static_cast<uint32_t>(verts.size()));
-            verts.push_back(v);
+ElemMatrix read_elem_matrix(const UPKPackage& pkg, const UPropertyList& fields) {
+    ElemMatrix m;
+    const UProperty* tm = find_prop(fields, "TM");
+    const auto& d = pkg.get_data();
+    if (!tm || tm->size != 64 || tm->value_offset + 64 > d.size()) return m;
+    float f[16];
+    std::memcpy(f, d.data() + tm->value_offset, 64);
+    for (int r = 0; r < 4; ++r) m.rows[r] = Vec3(f[r * 4 + 0], f[r * 4 + 1], f[r * 4 + 2]);
+    return m;
+}
+
+void push_tri(std::vector<Vec3>& out, const Vec3& a, const Vec3& b, const Vec3& c) {
+    out.push_back(a);
+    out.push_back(b);
+    out.push_back(c);
+}
+
+// Brute-force convex hull faces for small point sets (KConvexElem without cooked FaceTriData).
+void convex_hull_triangles(const std::vector<Vec3>& pts, std::vector<Vec3>& out) {
+    const size_t n = pts.size();
+    if (n < 4 || n > 64) return;
+    Vec3 centroid(0.0f, 0.0f, 0.0f);
+    for (const Vec3& p : pts) centroid = centroid + p;
+    centroid = centroid * (1.0f / static_cast<float>(n));
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            for (size_t k = j + 1; k < n; ++k) {
+                Vec3 nrm = (pts[j] - pts[i]).cross(pts[k] - pts[i]);
+                const float len = nrm.length();
+                if (len < 1e-4f) continue;
+                nrm = nrm / len;
+                bool pos = false, neg = false;
+                for (size_t m = 0; m < n && !(pos && neg); ++m) {
+                    const float s = nrm.dot(pts[m] - pts[i]);
+                    if (s > 0.05f) pos = true;
+                    if (s < -0.05f) neg = true;
+                }
+                if (pos && neg) continue;
+                push_tri(out, pts[i], pts[j], pts[k]);
+            }
+        }
+    }
+}
+
+// Low-poly ellipsoid / capsule tessellation for KSphereElem / KSphylElem.
+void append_capsule(std::vector<Vec3>& out, const ElemMatrix& tm, float radius, float half_length) {
+    constexpr int kSeg = 12;
+    constexpr int kRings = 6;  // per hemisphere
+    auto ring_point = [&](int ring, int seg) {
+        // ring 0 = bottom pole ... 2*kRings = top pole; the cylinder sits between the hemispheres.
+        const bool top = ring > kRings;
+        const int r = top ? ring - 1 : ring;
+        const float phi = -0.5f * PI + PI * static_cast<float>(r) / static_cast<float>(2 * kRings - 1 + 1);
+        const float theta = 2.0f * PI * static_cast<float>(seg) / static_cast<float>(kSeg);
+        const float z = radius * std::sin(phi) + (ring > kRings ? half_length : -half_length);
+        const float rr = radius * std::cos(phi);
+        return tm.apply(Vec3(rr * std::cos(theta), rr * std::sin(theta), z));
+    };
+    const int rings = 2 * kRings + 1;
+    for (int ring = 0; ring < rings; ++ring) {
+        for (int seg = 0; seg < kSeg; ++seg) {
+            const Vec3 a = ring_point(ring, seg);
+            const Vec3 b = ring_point(ring, seg + 1);
+            const Vec3 c = ring_point(ring + 1, seg + 1);
+            const Vec3 d = ring_point(ring + 1, seg);
+            push_tri(out, a, b, c);
+            push_tri(out, a, c, d);
         }
     }
 }
 
 } // namespace
+
+void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out) {
+    const auto& d = pkg.get_data();
+    for (const UProperty& f : agg_geom.fields) {
+        if (f.name == "ConvexElems") {
+            for (const UPropertyList& el : f.elements) {
+                std::vector<Vec3> verts;
+                if (const UProperty* vd = find_prop(el, "VertexData")) {
+                    if (vd->value_offset + 4 <= d.size()) {
+                        int32_t count = 0;
+                        std::memcpy(&count, d.data() + vd->value_offset, 4);
+                        if (count > 0 && count < 100000 &&
+                            vd->value_offset + 4 + static_cast<size_t>(count) * 12 <= d.size() &&
+                            static_cast<size_t>(vd->size) == 4 + static_cast<size_t>(count) * 12) {
+                            verts.resize(static_cast<size_t>(count));
+                            for (int32_t k = 0; k < count; ++k) {
+                                std::memcpy(&verts[k], d.data() + vd->value_offset + 4 + static_cast<size_t>(k) * 12, 12);
+                            }
+                        }
+                    }
+                }
+                if (verts.size() < 3) continue;
+                const UProperty* ft = find_prop(el, "FaceTriData");
+                if (ft && ft->ints.size() >= 3) {
+                    for (size_t t = 0; t + 2 < ft->ints.size(); t += 3) {
+                        const int32_t i0 = ft->ints[t], i1 = ft->ints[t + 1], i2 = ft->ints[t + 2];
+                        if (i0 < 0 || i1 < 0 || i2 < 0 || static_cast<size_t>(std::max({i0, i1, i2})) >= verts.size()) continue;
+                        push_tri(out, verts[i0], verts[i1], verts[i2]);
+                    }
+                } else {
+                    convex_hull_triangles(verts, out);
+                }
+            }
+        } else if (f.name == "BoxElems") {
+            for (const UPropertyList& el : f.elements) {
+                const ElemMatrix tm = read_elem_matrix(pkg, el);
+                // KBoxElem X/Y/Z are full lengths, not radii.
+                const Vec3 h(0.5f * prop_float(el, "X"), 0.5f * prop_float(el, "Y"), 0.5f * prop_float(el, "Z"));
+                if (h.x <= 0.0f || h.y <= 0.0f || h.z <= 0.0f) continue;
+                Vec3 c[8];
+                for (int k = 0; k < 8; ++k) {
+                    c[k] = tm.apply(Vec3((k & 1) ? h.x : -h.x, (k & 2) ? h.y : -h.y, (k & 4) ? h.z : -h.z));
+                }
+                static const int kFaces[6][4] = {{0, 1, 3, 2}, {4, 6, 7, 5}, {0, 4, 5, 1},
+                                                 {2, 3, 7, 6}, {0, 2, 6, 4}, {1, 5, 7, 3}};
+                for (const auto& q : kFaces) {
+                    push_tri(out, c[q[0]], c[q[1]], c[q[2]]);
+                    push_tri(out, c[q[0]], c[q[2]], c[q[3]]);
+                }
+            }
+        } else if (f.name == "SphereElems") {
+            for (const UPropertyList& el : f.elements) {
+                const float r = prop_float(el, "Radius");
+                if (r > 0.0f) append_capsule(out, read_elem_matrix(pkg, el), r, 0.0f);
+            }
+        } else if (f.name == "SphylElems") {
+            for (const UPropertyList& el : f.elements) {
+                const float r = prop_float(el, "Radius");
+                // KSphylElem: capsule along local Z, Length = distance between the sphere centres.
+                if (r > 0.0f) append_capsule(out, read_elem_matrix(pkg, el), r, 0.5f * std::max(0.0f, prop_float(el, "Length")));
+            }
+        }
+    }
+}
+
 
 // -----------------------------------------------------------------------------
 // Pure C++20 LZO1X Decompressor
@@ -754,6 +885,152 @@ size_t UPKPackage::find_property_start(const FObjectExport& exp) const {
     return so + (has_stack ? 32 : 4);
 }
 
+// -----------------------------------------------------------------------------
+// Script class defaults (Engine.u / GameFramework.u / TdGame.u / Td*Content.u)
+// -----------------------------------------------------------------------------
+// Level exports only serialize the properties that differ from their archetype: the class
+// default object (Default__InterpActor) for actors, and for components the template inside it
+// (Default__InterpActor.StaticMeshComponent0 -> Default__DynamicSMActor.StaticMeshComponent0 ->
+// Default__StaticMeshComponent -> ...). Collision flags therefore have to be resolved through the
+// script packages; e.g. Default__StaticMeshActorBase sets bCollideActors/bBlockActors while
+// Actor/InterpActor leave them false, so a placed InterpActor only collides when the level
+// designer enabled it on the instance.
+namespace {
+
+class ScriptDefaults {
+public:
+    // Property lists along an archetype chain, most-derived first.
+    using Chain = std::vector<const UPropertyList*>;
+
+    static ScriptDefaults& instance() {
+        static ScriptDefaults s;
+        return s;
+    }
+
+    // Indexes every class default object ("Default__Class") and component template
+    // ("Default__Class.Template") of the script packages in `cooked_dir`. The ~3.7k objects are
+    // parsed eagerly (a few ms) so the packages themselves (TdGame.u alone is ~57 MB) are released.
+    void init(const std::string& cooked_dir) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (dir_ == cooked_dir) return;
+        dir_ = cooked_dir;
+        objects_.clear();
+        cache_.clear();
+        namespace fs = std::filesystem;
+        size_t package_count = 0;
+        for (const char* file : {"Engine.u", "GameFramework.u", "TdGame.u", "TdSharedContent.u", "TdSpContent.u",
+                                 "TdTuContent.u", "TdSpBossContent.u", "TdTTContent.u", "TdMpContent.u"}) {
+            const fs::path p = fs::path(cooked_dir) / file;
+            if (!fs::exists(p)) continue;
+            const UPKPackage pkg(p.string());
+            if (!pkg.is_valid()) continue;
+            ++package_count;
+            const auto& ex = pkg.get_exports();
+            for (size_t i = 0; i < ex.size(); ++i) {
+                const int32_t idx = static_cast<int32_t>(i) + 1;
+                std::string key = export_key(pkg, idx);
+                if (key.empty() || objects_.count(key) != 0) continue;
+                Entry entry;
+                parse_export_properties(pkg, idx, entry.props);
+                const int32_t arch = ex[i].archetype;
+                entry.archetype = arch > 0 ? export_key(pkg, arch) : (arch < 0 ? import_key(pkg, arch) : std::string());
+                if (ex[i].outer_index != 0) entry.template_class = pkg.get_export_class(ex[i]);
+                objects_.emplace(std::move(key), std::move(entry));
+            }
+        }
+        if (package_count > 0) {
+            std::cout << "[Level] Script class defaults: " << objects_.size() << " default objects / templates from "
+                      << package_count << " script packages" << std::endl;
+        }
+    }
+
+    // Chain of "Default__Class" or "Default__Class.Template". Empty when unknown.
+    const Chain& chain(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return chain_locked(key, 0);
+    }
+
+    // Chain of an object a level package references through its import table.
+    const Chain& import_chain(const UPKPackage& pkg, int32_t import_index) { return chain(import_key(pkg, import_index)); }
+
+private:
+    struct Entry {
+        UPropertyList props;
+        std::string archetype;       // key of the archetype object; empty = none (class default)
+        std::string template_class;  // component class when this is a template inside a Default__ object
+    };
+
+    static bool is_default_name(const std::string& n) { return n.rfind("Default__", 0) == 0; }
+
+    static std::string import_name(const FObjectImport& im) {
+        return im.object_number > 0 ? im.object_name + "_" + std::to_string(im.object_number - 1) : im.object_name;
+    }
+
+    // "Default__Class" for a top-level class default object, "Default__Class.Template" for a
+    // component template inside one; empty for anything else.
+    static std::string export_key(const UPKPackage& pkg, int32_t idx) {
+        const auto& ex = pkg.get_exports();
+        if (idx <= 0 || static_cast<size_t>(idx) > ex.size()) return {};
+        const std::string name = export_object_name(pkg, idx);
+        const int32_t outer = ex[static_cast<size_t>(idx - 1)].outer_index;
+        if (outer == 0) return is_default_name(name) ? name : std::string();
+        if (outer < 0 || static_cast<size_t>(outer) > ex.size() || ex[static_cast<size_t>(outer - 1)].outer_index != 0) return {};
+        const std::string outer_name = export_object_name(pkg, outer);
+        return is_default_name(outer_name) ? outer_name + "." + name : std::string();
+    }
+
+    static std::string import_key(const UPKPackage& pkg, int32_t import_index) {
+        const auto& imps = pkg.get_imports();
+        const int32_t i = -import_index - 1;
+        if (import_index >= 0 || i >= static_cast<int32_t>(imps.size())) return {};
+        const FObjectImport& im = imps[static_cast<size_t>(i)];
+        const std::string name = import_name(im);
+        const int32_t outer = im.outer_index;
+        if (outer < 0 && -outer - 1 < static_cast<int32_t>(imps.size())) {
+            const std::string outer_name = import_name(imps[static_cast<size_t>(-outer - 1)]);
+            if (is_default_name(outer_name)) return outer_name + "." + name;
+        }
+        return name;
+    }
+
+    const Chain& chain_locked(const std::string& key, int depth) {
+        static const Chain kEmpty;
+        if (key.empty() || depth > 4) return kEmpty;
+        if (auto it = cache_.find(key); it != cache_.end()) return it->second;
+        Chain out;
+        std::string template_class;  // class of the last visited component template
+        std::string cur = key;
+        for (int guard = 0; !cur.empty() && guard < 16; ++guard) {
+            auto it = objects_.find(cur);
+            if (it == objects_.end()) break;
+            out.push_back(&it->second.props);
+            template_class = it->second.template_class;
+            cur = it->second.archetype;
+        }
+        // A component template without an archetype derives from its class default object.
+        if (!template_class.empty()) {
+            const Chain& base = chain_locked("Default__" + template_class, depth + 1);
+            out.insert(out.end(), base.begin(), base.end());
+        }
+        return cache_.emplace(key, std::move(out)).first->second;
+    }
+
+    std::mutex mutex_;
+    std::string dir_;
+    std::unordered_map<std::string, Entry> objects_;
+    std::unordered_map<std::string, Chain> cache_;
+};
+
+// First value of a bool property along a property-list chain.
+std::optional<bool> chain_bool(const ScriptDefaults::Chain& chain, const char* name) {
+    for (const UPropertyList* l : chain) {
+        if (const UProperty* p = find_prop(*l, name)) return p->b;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
 std::vector<LevelActor> UPKPackage::extract_actors() const {
     std::vector<LevelActor> actors;
 
@@ -814,6 +1091,11 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         LevelActor a;
         a.class_name = cls_name;
         a.object_name = exp.object_name;
+        const int32_t exp_index = static_cast<int32_t>(&exp - exports_.data()) + 1;
+        a.unique_name = export_object_name(*this, exp_index);
+        if (const auto* p = get_prop("Base"); p && p->obj_ref_index > 0) {
+            a.base_name = export_object_name(*this, p->obj_ref_index);
+        }
         a.source_package = package_name_of(*this);
 
         if (const auto* p = get_prop("Location")) a.location = p->vec_val;
@@ -850,14 +1132,6 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             }
         }
 
-        bool b_comp_collide = true;
-        if (const auto* p = get_prop("bCollideActors")) {
-            if (!p->bool_val) b_comp_collide = false;
-        }
-        if (const auto* p = get_prop("bBlockActors")) {
-            if (!p->bool_val) b_comp_collide = false;
-        }
-
         if (comp_idx > 0 && static_cast<size_t>(comp_idx) <= exports_.size()) {
             const auto& comp_exp = exports_[comp_idx - 1];
             size_t cp_start = find_property_start(comp_exp);
@@ -870,12 +1144,6 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                 }
                 if (comp_props.find("HiddenGame") != comp_props.end() && comp_props["HiddenGame"].bool_val) {
                     b_hidden = true;
-                }
-                if (comp_props.find("CollideActors") != comp_props.end() && !comp_props["CollideActors"].bool_val) {
-                    b_comp_collide = false;
-                }
-                if (comp_props.find("BlockActors") != comp_props.end() && !comp_props["BlockActors"].bool_val) {
-                    b_comp_collide = false;
                 }
                 if (comp_props.find("Scale") != comp_props.end() && comp_props["Scale"].float_val > 0.0f) {
                     a.draw_scale *= comp_props["Scale"].float_val;
@@ -901,12 +1169,6 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     }
                     if (acomp_props.find("HiddenGame") != acomp_props.end() && acomp_props["HiddenGame"].bool_val) {
                         b_hidden = true;
-                    }
-                    if (acomp_props.find("CollideActors") != acomp_props.end() && !acomp_props["CollideActors"].bool_val) {
-                        b_comp_collide = false;
-                    }
-                    if (acomp_props.find("BlockActors") != acomp_props.end() && !acomp_props["BlockActors"].bool_val) {
-                        b_comp_collide = false;
                     }
                 }
                 c_arch = acomp_exp.archetype;
@@ -940,9 +1202,10 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         std::string low_mesh = a.mesh_name;
         std::transform(low_mesh.begin(), low_mesh.end(), low_mesh.begin(), ::tolower);
 
+        // Hidden actors (bHidden / HiddenGame) and dedicated collision meshes are never drawn,
+        // but UE3 still collides against them.
         if (b_hidden || low_mesh.find("blockingbox") != std::string::npos || low_mesh.find("_colmesh") != std::string::npos) {
-            a.mesh_name.clear();
-            low_mesh.clear();
+            a.is_hidden = true;
         }
 
         bool is_elev_button = (low_mesh.find("elevatorbutton") != std::string::npos);
@@ -964,7 +1227,110 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         a.is_bag = (low_class.find("bag") != std::string::npos || low_obj.find("bag") != std::string::npos || low_mesh.find("s_bag") != std::string::npos);
         a.is_elevator_part = is_elev_mesh || is_elev_button;
         a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline || a.is_ladder || a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
-        a.is_collidable = (!a.mesh_name.empty() && b_comp_collide && !a.is_elevator_part && !a.is_trigger && !a.is_checkpoint && !a.is_zipline);
+
+        // --- UE3 collision flags -------------------------------------------------------------
+        // Blocks pawn movement: Actor.bCollideActors && Actor.bBlockActors &&
+        //   CollisionComponent.CollideActors && BlockActors && BlockNonZeroExtent.
+        // Blocks zero-extent traces: ... && BlockZeroExtent.
+        // Each flag resolves instance -> in-package archetypes -> script archetype chain (the imported
+        // archetype, else the class default object). Unset everywhere means false, as in UE3. Only when
+        // the script packages are unavailable do the class-based fallbacks below apply.
+        a.is_blocking_volume = low_class.ends_with("blockingvolume");
+        ScriptDefaults& script_defaults = ScriptDefaults::instance();
+        auto script_chain = [&](int32_t idx, std::string cls) -> const ScriptDefaults::Chain& {
+            for (int guard = 0; idx > 0 && static_cast<size_t>(idx) <= exports_.size() && guard < 8; ++guard) {
+                cls = get_export_class(exports_[idx - 1]);
+                idx = exports_[idx - 1].archetype;
+            }
+            if (idx < 0) {
+                const auto& c = script_defaults.import_chain(*this, idx);
+                if (!c.empty()) return c;
+            }
+            return script_defaults.chain("Default__" + cls);
+        };
+        const ScriptDefaults::Chain& actor_defaults = script_chain(exp.archetype, cls_name);
+        const bool is_volume = low_class.find("volume") != std::string::npos;
+        const bool non_blocking_class = a.is_trigger || a.is_checkpoint || (is_volume && !a.is_blocking_volume);
+        auto actor_bool = [&](const char* name, bool fallback) {
+            if (const auto* p = get_prop(name)) return p->bool_val;
+            if (!actor_defaults.empty()) return chain_bool(actor_defaults, name).value_or(false);
+            return fallback;
+        };
+        const bool actor_collide = actor_bool("bCollideActors", !non_blocking_class);
+        const bool actor_block = actor_bool("bBlockActors", !non_blocking_class);
+        a.collide_complex = actor_bool("bCollideComplex", false);
+
+        // Collision component property chain (instance, in-package archetypes, script templates).
+        std::vector<UPropertyList> comp_chain;
+        const ScriptDefaults::Chain* comp_defaults = nullptr;
+        auto load_comp_chain = [&](int32_t idx) {
+            if (idx <= 0 || static_cast<size_t>(idx) > exports_.size()) return;
+            const std::string comp_cls = get_export_class(exports_[idx - 1]);
+            const int32_t first = idx;
+            for (int guard = 0; idx > 0 && static_cast<size_t>(idx) <= exports_.size() && guard < 8; ++guard) {
+                comp_chain.emplace_back();
+                parse_export_properties(*this, idx, comp_chain.back());
+                idx = exports_[idx - 1].archetype;
+            }
+            comp_defaults = &script_chain(first, comp_cls);
+        };
+        auto comp_bool = [&](const char* name, bool fallback) {
+            for (const auto& l : comp_chain) {
+                if (const UProperty* p = find_prop(l, name)) return p->b;
+            }
+            if (comp_defaults && !comp_defaults->empty()) return chain_bool(*comp_defaults, name).value_or(false);
+            return fallback;
+        };
+
+        bool block_zero_default = true;
+        if (a.is_blocking_volume) {
+            // Fallback mirrors BlockingVolume.BrushComponent0: BlockZeroExtent=false, BlockNonZeroExtent=true.
+            block_zero_default = false;
+            int32_t brush_idx = 0;
+            if (const auto* p = get_prop("BrushComponent")) brush_idx = p->obj_ref_index;
+            if (brush_idx <= 0) {
+                if (const auto* p = get_prop("CollisionComponent")) brush_idx = p->obj_ref_index;
+            }
+            if (brush_idx <= 0) {
+                for (const auto& [comp_name, c_idx] : exp.component_map) {
+                    if (comp_name.find("Brush") != std::string::npos) {
+                        brush_idx = c_idx;
+                        break;
+                    }
+                }
+            }
+            load_comp_chain(brush_idx);
+            for (const auto& l : comp_chain) {
+                if (const UProperty* agg = find_prop(l, "BrushAggGeom")) {
+                    std::vector<Vec3> local;
+                    append_agg_geom_triangles(*this, *agg, local);
+                    Vec3 pre_pivot(0.0f, 0.0f, 0.0f);
+                    if (const auto* p = get_prop("PrePivot")) pre_pivot = p->vec_val;
+                    const ActorTransform xf(a.location, a.rotation,
+                                            Vec3(a.draw_scale * a.draw_scale_3d.x, a.draw_scale * a.draw_scale_3d.y,
+                                                 a.draw_scale * a.draw_scale_3d.z),
+                                            pre_pivot);
+                    a.brush_triangles.reserve(local.size());
+                    for (const Vec3& v : local) a.brush_triangles.push_back(xf.apply(v));
+                    break;
+                }
+            }
+        } else if (comp_idx > 0) {
+            load_comp_chain(comp_idx);
+        }
+        const bool comp_collide = comp_bool("CollideActors", true);
+        const bool comp_block = comp_bool("BlockActors", true);
+        const bool comp_block_nonzero = comp_bool("BlockNonZeroExtent", true);
+        const bool comp_block_zero = comp_bool("BlockZeroExtent", block_zero_default);
+        a.is_collidable = actor_collide && actor_block && comp_collide && comp_block && comp_block_nonzero;
+        a.blocks_traces = actor_collide && actor_block && comp_collide && comp_block_zero;
+
+        // TdTutorialStart.BelongToChallenge: array of EMovementChallenge names.
+        if (low_class == "tdtutorialstart") {
+            UPropertyList tl;
+            parse_export_properties(*this, exp_index, tl);
+            if (const UProperty* ch = find_prop(tl, "BelongToChallenge")) a.tutorial_challenges = ch->names;
+        }
 
         // Movement volumes (TdZiplineVolume, TdBalanceWalkVolume, TdLadderVolume, TdLedgeWalkVolume, TdSwingVolume)
         // store their world-space spline endpoints in Start and End properties.
@@ -1109,7 +1475,8 @@ void UPKPackage::extract_level_streaming_and_checkpoints(
 
 void UPKPackage::extract_elevators(
     const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-    std::vector<ElevatorInstance>& out_elevators) const {
+    std::vector<ElevatorInstance>& out_elevators,
+    std::vector<InterpDoorInfo>* out_doors) const {
 
     std::string pkg_name = package_name_of(*this);
 
@@ -1240,9 +1607,10 @@ void UPKPackage::extract_elevators(
         parse_export_properties(*this, group_idx_1, gprops);
         std::string group_name = prop_name(gprops, "GroupName", "Elevator");
         std::string low_group = to_lower(group_name);
+        const bool is_door_group = low_group.find("door") != std::string::npos;
 
-        // Skip non-elevator Matinee tracks (cameras, doors, helicopters, trains, boats, etc.)
-        if (low_group.find("cam") != std::string::npos || low_group.find("door") != std::string::npos ||
+        // Skip non-elevator Matinee tracks (cameras, helicopters, trains, boats, etc.)
+        if (low_group.find("cam") != std::string::npos ||
             low_group.find("heli") != std::string::npos || low_group.find("chopper") != std::string::npos ||
             low_group.find("train") != std::string::npos || low_group.find("wagen") != std::string::npos ||
             low_group.find("boat") != std::string::npos || low_group.find("truck") != std::string::npos ||
@@ -1250,6 +1618,7 @@ void UPKPackage::extract_elevators(
             low_group.find("cop") != std::string::npos || low_group.find("gate") != std::string::npos) {
             continue;
         }
+        if (is_door_group && !out_doors) continue;
 
         UPropertyList tprops;
         parse_export_properties(*this, track_idx_1, tprops);
@@ -1268,11 +1637,39 @@ void UPKPackage::extract_elevators(
             raw_keys.push_back(kf);
         }
 
-        float total_dz = raw_keys.back().pos.z - raw_keys.front().pos.z;
-        if (std::abs(total_dz) < 400.0f) continue; // Floor-to-floor elevators travel at least 400 UE3 units vertically
-
         std::string mf = prop_name(tprops, "MoveFrame", "IMF_RelativeToInitial");
         bool is_world_frame = (mf == "IMF_World");
+
+        if (is_door_group) {
+            // Sliding door leaves are placed closed; the end of the door matinee is the open
+            // state. IMF_RelativeToInitial keys are expressed in the actor's initial rotation
+            // frame (InterpTrackInstMove::InitialTM).
+            auto git = group_to_actors.find(low_group);
+            if (git == group_to_actors.end()) continue;
+            for (int32_t a_idx : git->second) {
+                auto ait = interp_actors.find(a_idx);
+                if (ait == interp_actors.end()) continue;
+                const CabCandidate& door = ait->second;
+                Vec3 open = raw_keys.back().pos - raw_keys.front().pos;
+                if (is_world_frame) {
+                    open = raw_keys.back().pos - door.location;
+                } else {
+                    const ActorTransform rot_only(Vec3(0.0f, 0.0f, 0.0f), door.rotation, Vec3(1.0f, 1.0f, 1.0f));
+                    open = rot_only.apply(open);
+                }
+                InterpDoorInfo info;
+                info.package = pkg_name;
+                info.actor_name = door.obj_name;
+                info.group = group_name;
+                info.open_offset = open;
+                info.open_time = std::max(0.05f, raw_keys.back().time);
+                out_doors->push_back(std::move(info));
+            }
+            continue;
+        }
+
+        float total_dz = raw_keys.back().pos.z - raw_keys.front().pos.z;
+        if (std::abs(total_dz) < 400.0f) continue; // Floor-to-floor elevators travel at least 400 UE3 units vertically
 
         // Resolve linked InterpActor cab
         const CabCandidate* chosen_cab = nullptr;
@@ -1297,10 +1694,16 @@ void UPKPackage::extract_elevators(
         if (chosen_cab && !chosen_cab->is_cab_mesh && !is_named_elevator_group) {
             continue;
         }
+        // IMF_RelativeToInitial keys are offsets from the cab's initial location: without a
+        // resolved cab InterpActor there is nothing to move (and no valid world position).
+        if (!chosen_cab && !is_world_frame) {
+            continue;
+        }
 
         ElevatorInstance elev;
         elev.source_package = pkg_name;
         elev.name = pkg_name + ":" + group_name;
+        elev.cab_actor_name = chosen_cab ? chosen_cab->obj_name : std::string();
         elev.move_frame_world = is_world_frame;
         elev.cab_mesh_name = (chosen_cab && !chosen_cab->mesh_name.empty()) ? chosen_cab->mesh_name : "S_Elevator_01";
         elev.rotation = chosen_cab ? chosen_cab->rotation : Rotator(0.0f, 0.0f, 0.0f);
@@ -1652,7 +2055,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         if (prop_start >= data_.size() || prop_start >= exp_end || exp_end > data_.size()) continue;
 
         size_t bytes_read = 0;
-        parse_properties(prop_start, exp_end - prop_start, &bytes_read);
+        const auto mesh_props = parse_properties(prop_start, exp_end - prop_start, &bytes_read);
 
         size_t rem_start = prop_start + bytes_read;
         if (rem_start + 48 > exp_end) continue;
@@ -1669,7 +2072,26 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         std::memcpy(&asset.bounds_extent.z, rem + 20, 4);
         std::memcpy(&asset.bounds_radius,   rem + 24, 4);
 
-        // Skip kDOP Nodes (rem + 32) and kDOP Triangles
+        // UStaticMesh collision: UseSimple{Box,Line}Collision (default TRUE) select the
+        // RB_BodySetup (native tail + 28) aggregate geometry over the per-poly kDOP tree.
+        if (auto it = mesh_props.find("UseSimpleBoxCollision"); it != mesh_props.end()) {
+            asset.use_simple_box_collision = it->second.bool_val;
+        }
+        if (auto it = mesh_props.find("UseSimpleLineCollision"); it != mesh_props.end()) {
+            asset.use_simple_line_collision = it->second.bool_val;
+        }
+        int32_t body_setup_ref = 0;
+        std::memcpy(&body_setup_ref, rem + 28, 4);
+        if (body_setup_ref > 0 && static_cast<size_t>(body_setup_ref) <= exports_.size()) {
+            UPropertyList body_props;
+            parse_export_properties(*this, body_setup_ref, body_props);
+            asset.has_body_setup = true;
+            if (const UProperty* agg = find_prop(body_props, "AggGeom")) {
+                append_agg_geom_triangles(*this, *agg, asset.simple_collision);
+            }
+        }
+
+        // kDOP Nodes (rem + 32) and kDOP Triangles (FkDOPCollisionTriangle<WORD>: v1, v2, v3, MaterialIndex)
         int32_t kdop_ns = 0, kdop_nc = 0;
         std::memcpy(&kdop_ns, rem + 32, 4);
         std::memcpy(&kdop_nc, rem + 36, 4);
@@ -1681,6 +2103,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         std::memcpy(&kdop_ts, rem + off, 4);
         std::memcpy(&kdop_tc, rem + off + 4, 4);
         if (kdop_ts < 0 || kdop_tc < 0) continue;
+        const size_t kdop_tri_off = off + 8;
         off += 8 + static_cast<size_t>(kdop_ts) * static_cast<size_t>(kdop_tc);
         if (off + 24 > rem_len) continue;
 
@@ -1708,6 +2131,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         // FirstIndex, NumTriangles, MinVertexIndex, MaxVertexIndex, MaterialIndex, Fragments[]
         struct RawElement {
             int32_t material_ref = 0;
+            int32_t enable_collision = 1;
             int32_t first_index = 0;
             int32_t num_triangles = 0;
         };
@@ -1717,6 +2141,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
             if (cur + 40 > rem_len) { elem_ok = false; break; }
             RawElement re;
             std::memcpy(&re.material_ref, rem + cur, 4);
+            std::memcpy(&re.enable_collision, rem + cur + 4, 4);
             std::memcpy(&re.first_index, rem + cur + 16, 4);
             std::memcpy(&re.num_triangles, rem + cur + 20, 4);
             int32_t frag_cnt = 0;
@@ -1738,6 +2163,24 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         size_t pos_data_off = cur + 16;
         cur += 16 + static_cast<size_t>(pos_bsz) * static_cast<size_t>(pos_bcnt);
         if (cur + 24 > rem_len) continue;
+
+        // Per-poly collision: kDOP triangles index the LOD0 PositionVertexBuffer. Like
+        // FStaticMeshCollisionDataProvider::ShouldCheckMaterial, triangles of elements whose
+        // EnableCollision is off (light shafts, decals, glass panes...) never collide.
+        if (kdop_ts == 8 && kdop_tc > 0 && kdop_tri_off + static_cast<size_t>(kdop_tc) * 8 <= rem_len) {
+            asset.complex_collision.reserve(static_cast<size_t>(kdop_tc) * 3);
+            for (int32_t t = 0; t < kdop_tc; ++t) {
+                uint16_t tri[4];
+                std::memcpy(tri, rem + kdop_tri_off + static_cast<size_t>(t) * 8, 8);
+                if (tri[0] >= pos_num || tri[1] >= pos_num || tri[2] >= pos_num) continue;
+                if (tri[3] < raw_elems.size() && raw_elems[tri[3]].enable_collision == 0) continue;
+                for (int k = 0; k < 3; ++k) {
+                    Vec3 p;
+                    std::memcpy(&p, rem + pos_data_off + static_cast<size_t>(tri[k]) * 12, 12);
+                    asset.complex_collision.push_back(p);
+                }
+            }
+        }
 
         // StaticMeshVertexBuffer (TangentX, TangentZ/Normal, VertexColor, UVs)
         int32_t num_uv = 0, smvb_stride = 0, smvb_num = 0, full_prec = 0, smvb_bsz = 0, smvb_bcnt = 0;
@@ -1884,392 +2327,543 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
             asset.elements.push_back(std::move(el));
         }
 
-        if (!asset.triangles.empty()) {
+        if (!asset.triangles.empty() || !asset.simple_collision.empty() || !asset.complex_collision.empty()) {
             out_meshes[key] = std::move(asset);
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Contiguous Rooftop & Parkour Level Geometry Construction
+// Level BSP collision (UModel, v536)
+//
+//   UObject tagged properties
+//   FBoxSphereBounds Bounds                       (28 bytes)
+//   Vectors  BulkSerialize<FVector>               (int32 elem size, int32 count, data)
+//   Points   BulkSerialize<FVector>
+//   Nodes    BulkSerialize<FBspNode>              (64 bytes: Plane, iVertPool@16, iSurf@20, ...,
+//                                                  NumVertices@54, NodeFlags@55)
+//   Surfs    TTransArray<FBspSurf>                (int32 Owner, int32 count, 56 bytes each:
+//                                                  Material, PolyFlags@4, ...)
+//   Verts    BulkSerialize<FVert>                 (24 bytes: pVertex@0, iSide, 2x FVector2D)
 // -----------------------------------------------------------------------------
-void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
-                                     std::vector<MeshBuffer>& out_meshes,
-                                     std::vector<AABB>& out_colliders,
-                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib,
-                                     std::vector<std::string>* out_material_paths) {
-    out_meshes.clear();
-    out_colliders.clear();
+void UPKPackage::extract_bsp_collision(std::vector<Vec3>& out_triangles) const {
+    constexpr uint8_t NF_NotCsg = 0x01;
+    constexpr uint32_t PF_NotSolid = 0x00000008;
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        const auto& exp = exports_[i];
+        if (get_export_class(exp) != "Model") continue;
+        if (resolve_object_index(exp.outer_index).first != "PersistentLevel") continue;
+        UPropertyList props;
+        size_t off = parse_export_properties(*this, static_cast<int32_t>(i) + 1, props);
+        const size_t end = std::min(data_.size(), static_cast<size_t>(exp.serial_offset) + static_cast<size_t>(exp.serial_size));
+        if (off == 0 || off + 28 > end) continue;
+        off += 28;  // Bounds
 
-    if (actors.empty()) {
-        MeshBuffer floor_mesh;
-        floor_mesh.name = "Fallback_Rooftop";
-        Vec3 floor_min(-2000.0f, -2000.0f, -50.0f);
-        Vec3 floor_max(2000.0f, 2000.0f, 0.0f);
-        add_box_mesh(floor_mesh.vertices, floor_mesh.indices, floor_min, floor_max, 0xFFEEEEEE);
-        floor_mesh.bounds = AABB(floor_min, floor_max);
-        out_meshes.push_back(floor_mesh);
-        out_colliders.push_back(floor_mesh.bounds);
-        return;
+        auto rd = [&](size_t o) {
+            int32_t v = 0;
+            std::memcpy(&v, data_.data() + o, 4);
+            return v;
+        };
+        struct Bulk {
+            size_t data = 0;
+            int32_t elem = 0;
+            int32_t count = 0;
+        };
+        auto bulk = [&](Bulk& b) -> bool {
+            if (off + 8 > end) return false;
+            b.elem = rd(off);
+            b.count = rd(off + 4);
+            if (b.elem <= 0 || b.elem > 256 || b.count < 0 ||
+                off + 8 + static_cast<size_t>(b.elem) * static_cast<size_t>(b.count) > end) {
+                return false;
+            }
+            b.data = off + 8;
+            off = b.data + static_cast<size_t>(b.elem) * static_cast<size_t>(b.count);
+            return true;
+        };
+        Bulk vectors, points, nodes, verts;
+        if (!bulk(vectors) || !bulk(points) || !bulk(nodes)) continue;
+        if (points.elem != 12 || nodes.elem != 64 || nodes.count == 0) continue;
+        if (off + 8 > end) continue;
+        const int32_t surf_count = rd(off + 4);  // TTransArray: Owner, then the TArray
+        constexpr size_t kSurfSize = 56;
+        const size_t surfs = off + 8;
+        if (surf_count < 0 || surfs + kSurfSize * static_cast<size_t>(surf_count) > end) continue;
+        off = surfs + kSurfSize * static_cast<size_t>(surf_count);
+        if (!bulk(verts) || verts.elem < 4) continue;
+
+        size_t emitted = 0;
+        for (int32_t n = 0; n < nodes.count; ++n) {
+            const uint8_t* nd = data_.data() + nodes.data + static_cast<size_t>(n) * 64;
+            int32_t vert_pool = 0, surf = 0;
+            std::memcpy(&vert_pool, nd + 16, 4);
+            std::memcpy(&surf, nd + 20, 4);
+            const uint8_t num_verts = nd[54];
+            const uint8_t node_flags = nd[55];
+            if (num_verts < 3 || (node_flags & NF_NotCsg)) continue;
+            if (vert_pool < 0 || vert_pool + num_verts > verts.count) continue;
+            if (surf >= 0 && surf < surf_count) {
+                uint32_t poly_flags = 0;
+                std::memcpy(&poly_flags, data_.data() + surfs + kSurfSize * static_cast<size_t>(surf) + 4, 4);
+                if (poly_flags & PF_NotSolid) continue;
+            }
+            Vec3 poly[256];
+            int count = 0;
+            for (int k = 0; k < num_verts; ++k) {
+                const int32_t pv = rd(verts.data + static_cast<size_t>(verts.elem) * static_cast<size_t>(vert_pool + k));
+                if (pv < 0 || pv >= points.count) continue;
+                std::memcpy(&poly[count++], data_.data() + points.data + static_cast<size_t>(pv) * 12, 12);
+            }
+            for (int k = 1; k + 1 < count; ++k) {
+                out_triangles.push_back(poly[0]);
+                out_triangles.push_back(poly[k]);
+                out_triangles.push_back(poly[k + 1]);
+                ++emitted;
+            }
+        }
+        if (emitted > 0) {
+            std::cout << "[Level] BSP " << package_name_of(*this) << ": " << nodes.count << " nodes -> " << emitted
+                      << " collision triangles" << std::endl;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Level geometry: real UStaticMesh render batches + UE3 collision
+// -----------------------------------------------------------------------------
+namespace {
+
+// Legacy procedural palette (ME_NO_MATERIALS=1 / no material library): vertex colour per
+// architectural class (ABGR packed).
+uint32_t legacy_palette_color(const LevelActor& a, const std::string& low_mesh) {
+    if (a.is_runner_vision) return 0xFF1414E6;  // Runner Vision Red (#E61414)
+    if (low_mesh.find("glass") != std::string::npos || low_mesh.find("window") != std::string::npos ||
+        low_mesh.find("skylight") != std::string::npos) {
+        return 0xFFE8C890;  // Reflective cyan-blue architectural glass
+    }
+    if (low_mesh.find("catwalk") != std::string::npos || low_mesh.find("fence") != std::string::npos ||
+        low_mesh.find("railing") != std::string::npos || low_mesh.find("stair") != std::string::npos ||
+        low_mesh.find("scaffold") != std::string::npos) {
+        return 0xFFA8A098;  // Dark steel catwalk/railing
+    }
+    if (low_mesh.find("airduct") != std::string::npos || low_mesh.find("vent") != std::string::npos ||
+        low_mesh.find("ac") != std::string::npos || low_mesh.find("pipe") != std::string::npos) {
+        return 0xFFDCD8D4;  // Galvanized metallic silver HVAC/ducting
+    }
+    if (low_mesh.find("crane") != std::string::npos || a.is_checkpoint) return 0xFF2898F0;  // Industrial orange
+    if (low_mesh.find("bd_") != std::string::npos || low_mesh.find("building") != std::string::npos ||
+        low_mesh.find("s_c_") != std::string::npos || low_mesh.find("s_r_") != std::string::npos ||
+        low_mesh.find("sky") != std::string::npos) {
+        // Subtle architectural variation across city blocks using a hash of the location
+        static const uint32_t kBuildingPalette[4] = {0xFFF6F4F2, 0xFFF2ECE4, 0xFFEAE6E2, 0xFFE8DED2};
+        const uint32_t h_idx = static_cast<uint32_t>(std::abs(int(a.location.x * 0.01f) + int(a.location.y * 0.01f))) % 4;
+        return kBuildingPalette[h_idx];
+    }
+    return 0xFFF2F0EE;  // Clean Mirror's Edge white architectural concrete
+}
+
+const StaticMeshAsset* find_mesh(const std::unordered_map<std::string, StaticMeshAsset>& lib, const std::string& name) {
+    if (name.empty()) return nullptr;
+    auto it = lib.find(to_lower(name));
+    return it != lib.end() ? &it->second : nullptr;
+}
+
+// World AABB of a mesh actor from the transformed corners of the mesh bounds box.
+AABB transformed_mesh_bounds(const LevelActor& a, const StaticMeshAsset& sm) {
+    const ActorTransform xf = ActorTransform::of(a);
+    AABB box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+    for (int k = 0; k < 8; ++k) {
+        const Vec3 c(sm.bounds_origin.x + ((k & 1) ? sm.bounds_extent.x : -sm.bounds_extent.x),
+                     sm.bounds_origin.y + ((k & 2) ? sm.bounds_extent.y : -sm.bounds_extent.y),
+                     sm.bounds_origin.z + ((k & 4) ? sm.bounds_extent.z : -sm.bounds_extent.z));
+        box.expand(xf.apply(c));
+    }
+    return box;
+}
+
+// Emits StaticMeshActor LOD0 triangles in world space, binned per scene material.
+class MeshEmitter {
+public:
+    explicit MeshEmitter(std::vector<std::string>* material_paths) : material_paths_(material_paths) {
+        if (material_paths_) {
+            for (size_t i = 0; i < material_paths_->size(); ++i) {
+                ids_.emplace(to_lower((*material_paths_)[i]), static_cast<int32_t>(i));
+            }
+        }
+    }
+    [[nodiscard]] bool use_materials() const { return material_paths_ != nullptr; }
+
+    // Material mode: appends to `bins` (material id -> vertices). Legacy mode: appends palette
+    // coloured vertices to `flat`. Returns the world AABB of the emitted vertices.
+    AABB emit(const LevelActor& a, const StaticMeshAsset& sm, std::map<int32_t, std::vector<Vertex>>& bins,
+              std::vector<Vertex>& flat) {
+        const ActorTransform xf = ActorTransform::of(a);
+        // Normals transform with the inverse transpose (R * S^-1); tangents with R * S.
+        // A mirroring scale (negative determinant) flips the binormal handedness.
+        auto safe_inv = [](float s) { return (std::abs(s) > 1e-12f) ? 1.0f / s : 0.0f; };
+        const Vec3 inv_scale(safe_inv(xf.scale.x), safe_inv(xf.scale.y), safe_inv(xf.scale.z));
+        const float det_sign = (xf.scale.x * xf.scale.y * xf.scale.z < 0.0f) ? -1.0f : 1.0f;
+        const uint32_t color = legacy_palette_color(a, to_lower(a.mesh_name));
+        AABB box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+
+        auto emit_vertex = [&](std::vector<Vertex>& dst, const Vertex& lv, bool keep_vertex_color) {
+            const Vec3 wp = xf.apply(lv.position);
+            const Vec3 wn = xf.axis_x * (lv.normal.x * inv_scale.x) + xf.axis_y * (lv.normal.y * inv_scale.y) +
+                            xf.axis_z * (lv.normal.z * inv_scale.z);
+            const Vec3 wt = xf.axis_x * (lv.tangent.x * xf.scale.x) + xf.axis_y * (lv.tangent.y * xf.scale.y) +
+                            xf.axis_z * (lv.tangent.z * xf.scale.z);
+            Vertex wv = lv;
+            wv.position = wp;
+            wv.normal = (wn.length_sq() > 1e-20f) ? wn.normalized() : Vec3(0.0f, 0.0f, 1.0f);
+            wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+            wv.tangent_sign = lv.tangent_sign * det_sign;
+            if (!keep_vertex_color) wv.color = color;
+            dst.push_back(wv);
+            box.expand(wp);
+        };
+        // Whole triangles; mirrored instances reverse the vertex order so world-space winding
+        // stays consistent (UE3 flips the cull mode instead).
+        auto emit_range = [&](std::vector<Vertex>& dst, uint32_t first, uint32_t count, bool keep_vertex_color) {
+            const uint32_t end = std::min<uint32_t>(first + count, static_cast<uint32_t>(sm.triangles.size()));
+            for (uint32_t i = first; i + 2 < end; i += 3) {
+                emit_vertex(dst, sm.triangles[i], keep_vertex_color);
+                if (det_sign < 0.0f) {
+                    emit_vertex(dst, sm.triangles[i + 2], keep_vertex_color);
+                    emit_vertex(dst, sm.triangles[i + 1], keep_vertex_color);
+                } else {
+                    emit_vertex(dst, sm.triangles[i + 1], keep_vertex_color);
+                    emit_vertex(dst, sm.triangles[i + 2], keep_vertex_color);
+                }
+            }
+        };
+
+        if (use_materials()) {
+            // UStaticMeshComponent::GetMaterial(ElementIndex): component override, else the
+            // element's material, else the engine default material ("" here).
+            for (size_t e = 0; e < sm.elements.size(); ++e) {
+                const auto& el = sm.elements[e];
+                if (el.vertex_count == 0) continue;
+                const bool overridden = e < a.material_overrides.size() && !a.material_overrides[e].empty();
+                const int32_t mat = material_id(overridden ? a.material_overrides[e] : el.material);
+                emit_range(bins[mat], el.first_vertex, el.vertex_count, true);
+            }
+        } else {
+            emit_range(flat, 0, static_cast<uint32_t>(sm.triangles.size()), false);
+        }
+        return box;
     }
 
-    // Batched world buffers for ultra-fast single-draw-call rendering
+    static void flush(MeshBuffer& mb, std::map<int32_t, std::vector<Vertex>>& bins) {
+        size_t total = mb.vertices.size();
+        for (const auto& [mat, verts] : bins) total += verts.size();
+        mb.vertices.reserve(total);
+        for (auto& [mat, verts] : bins) {
+            if (verts.empty()) continue;
+            MeshSection s;
+            s.first_vertex = static_cast<uint32_t>(mb.vertices.size());
+            s.vertex_count = static_cast<uint32_t>(verts.size());
+            s.material = mat;
+            mb.vertices.insert(mb.vertices.end(), verts.begin(), verts.end());
+            mb.sections.push_back(s);
+            std::vector<Vertex>().swap(verts);
+        }
+        bins.clear();
+    }
+
+private:
+    int32_t material_id(const std::string& path) {
+        std::string key = to_lower(path);
+        auto it = ids_.find(key);
+        if (it != ids_.end()) return it->second;
+        const int32_t id = static_cast<int32_t>(material_paths_->size());
+        material_paths_->push_back(path);
+        ids_.emplace(std::move(key), id);
+        return id;
+    }
+
+    std::vector<std::string>* material_paths_;
+    std::unordered_map<std::string, int32_t> ids_;
+};
+
+bool valid_box(const AABB& b) { return b.min_pt.x <= b.max_pt.x && b.min_pt.y <= b.max_pt.y && b.min_pt.z <= b.max_pt.z; }
+
+} // namespace
+
+void append_actor_collision(const LevelActor& a, int32_t actor_index, const StaticMeshAsset* sm, CollisionWorld& out) {
+    uint8_t actor_channels = 0;
+    if (a.is_collidable) actor_channels |= COLL_BlockNonZeroExtent;
+    if (a.blocks_traces) actor_channels |= COLL_BlockZeroExtent;
+    if (actor_channels == 0) return;
+
+    // BlockingVolume brush hulls are already in world space.
+    for (size_t i = 0; i + 2 < a.brush_triangles.size(); i += 3) {
+        out.add_triangle(a.brush_triangles[i], a.brush_triangles[i + 1], a.brush_triangles[i + 2], actor_index,
+                         actor_channels);
+    }
+    if (!sm) return;
+
+    // UStaticMeshComponent::LineCheck (UDN CollisionTechnicalGuide, UStaticMesh::UseSimple*Collision):
+    //  - extent checks (pawn movement): with UseSimpleBoxCollision only the collision hull
+    //    (RB_BodySetup.AggGeom) is tested, so a mesh without a hull never blocks movement; without
+    //    it, per-poly kDOP.
+    //  - zero-extent traces: the hull when UseSimpleLineCollision is set and the mesh has one,
+    //    per-poly kDOP otherwise.
+    //  The owner's bCollideComplex forces per-poly collision for both.
+    const bool use_hull_extent = sm->use_simple_box_collision && !a.collide_complex;
+    const bool use_hull_zero = sm->use_simple_line_collision && sm->has_body_setup && !a.collide_complex;
+    uint8_t simple_ch = 0;
+    uint8_t complex_ch = 0;
+    (use_hull_extent ? simple_ch : complex_ch) |= COLL_BlockNonZeroExtent;
+    (use_hull_zero ? simple_ch : complex_ch) |= COLL_BlockZeroExtent;
+    simple_ch &= actor_channels;
+    complex_ch &= actor_channels;
+
+    const ActorTransform xf = ActorTransform::of(a);
+    auto emit = [&](const std::vector<Vec3>& tris, uint8_t channels) {
+        if (channels == 0) return;
+        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+            out.add_triangle(xf.apply(tris[i]), xf.apply(tris[i + 1]), xf.apply(tris[i + 2]), actor_index, channels);
+        }
+    };
+    emit(sm->simple_collision, simple_ch);
+    emit(sm->complex_collision, complex_ch);
+}
+
+void build_level_geometry(std::vector<LevelActor>& actors,
+                          std::vector<MeshBuffer>& out_meshes,
+                          CollisionWorld& out_collision,
+                          const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+                          std::vector<std::string>* out_material_paths) {
+    out_meshes.clear();
+
+    // Batched world buffers for single-draw-call-per-material rendering
     MeshBuffer world_batch;
     world_batch.name = "UE3_Level_World_Geometry";
-    world_batch.is_runner_vision = false;
-
     MeshBuffer rv_batch;
     rv_batch.name = "UE3_Level_RunnerVision_Geometry";
     rv_batch.is_runner_vision = true;
 
-    // Material sections: vertices are binned per scene material (-1 = procedural palette shading)
-    // and concatenated at the end so every material is one contiguous draw.
-    const bool use_materials = (out_material_paths != nullptr);
-    std::unordered_map<std::string, int32_t> material_ids;
-    if (use_materials) {
-        for (size_t i = 0; i < out_material_paths->size(); ++i) {
-            material_ids.emplace(to_lower((*out_material_paths)[i]), static_cast<int32_t>(i));
-        }
-    }
-    auto material_id = [&](const std::string& path) -> int32_t {
-        std::string key = to_lower(path);
-        auto it = material_ids.find(key);
-        if (it != material_ids.end()) return it->second;
-        const int32_t id = static_cast<int32_t>(out_material_paths->size());
-        out_material_paths->push_back(path);
-        material_ids.emplace(std::move(key), id);
-        return id;
-    };
+    MeshEmitter emitter(out_material_paths);
     std::map<int32_t, std::vector<Vertex>> world_bins;
     std::map<int32_t, std::vector<Vertex>> rv_bins;
-    std::vector<uint32_t> scratch_indices;
 
-    Vec3 overall_min(1e9f, 1e9f, 1e9f);
-    Vec3 overall_max(-1e9f, -1e9f, -1e9f);
-    bool has_real_meshes = (mesh_lib && !mesh_lib->empty());
+    AABB overall(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
     size_t placed_meshes = 0;
+    size_t hidden_meshes = 0;
     size_t missing_meshes = 0;
-    size_t fallback_boxes = 0;
+    size_t blocking_volumes = 0;
     std::map<std::string, int> missing_names;
 
-    for (auto& a : actors) {
+    for (size_t i = 0; i < actors.size(); ++i) {
+        LevelActor& a = actors[i];
         if (std::abs(a.location.x) > 150000.0f || std::abs(a.location.y) > 150000.0f) continue;
-        if (a.location.x == 0.0f && a.location.y == 0.0f && a.location.z == 0.0f && a.mesh_name.empty()) continue;
+        if (a.elevator >= 0) continue;  // moving InterpActor: see build_elevator_part_geometry()
 
-        // Determine architectural material palette color (ABGR packed uint32)
-        std::string low_mesh = a.mesh_name;
-        std::transform(low_mesh.begin(), low_mesh.end(), low_mesh.begin(), ::tolower);
-
-        uint32_t color = 0xFFF2F0EE; // Clean Mirror's Edge white architectural concrete
-        if (a.is_runner_vision) {
-            color = 0xFF1414E6; // Runner Vision Red (#E61414)
-        } else if (low_mesh.find("glass") != std::string::npos || low_mesh.find("window") != std::string::npos ||
-                   low_mesh.find("skylight") != std::string::npos) {
-            color = 0xFFE8C890; // Reflective cyan-blue architectural glass
-        } else if (low_mesh.find("catwalk") != std::string::npos || low_mesh.find("fence") != std::string::npos ||
-                   low_mesh.find("railing") != std::string::npos || low_mesh.find("stair") != std::string::npos ||
-                   low_mesh.find("scaffold") != std::string::npos) {
-            color = 0xFFA8A098; // Dark steel catwalk/railing
-        } else if (low_mesh.find("airduct") != std::string::npos || low_mesh.find("vent") != std::string::npos ||
-                   low_mesh.find("ac") != std::string::npos || low_mesh.find("pipe") != std::string::npos) {
-            color = 0xFFDCD8D4; // Galvanized metallic silver HVAC/ducting
-        } else if (low_mesh.find("crane") != std::string::npos || a.is_checkpoint) {
-            color = 0xFF2898F0; // Industrial orange/gold accent
-        } else if (low_mesh.find("bd_") != std::string::npos || low_mesh.find("building") != std::string::npos ||
-                   low_mesh.find("s_c_") != std::string::npos || low_mesh.find("s_r_") != std::string::npos ||
-                   low_mesh.find("sky") != std::string::npos) {
-            // Subtle architectural variation across city blocks using hash of location
-            uint32_t h_idx = static_cast<uint32_t>(std::abs(int(a.location.x * 0.01f) + int(a.location.y * 0.01f))) % 4;
-            static const uint32_t kBuildingPalette[4] = {
-                0xFFF6F4F2, // Stark white tower
-                0xFFF2ECE4, // Cool Ice-Blue glass/concrete tower
-                0xFFEAE6E2, // Light warm limestone/concrete tower
-                0xFFE8DED2  // Deep sky-tinted glass facade tower
-            };
-            color = kBuildingPalette[h_idx];
+        const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+        if (!a.mesh_name.empty() && !sm) {
+            ++missing_meshes;
+            missing_names[to_lower(a.mesh_name)]++;
         }
+        if (!a.brush_triangles.empty()) ++blocking_volumes;
+        append_actor_collision(a, static_cast<int32_t>(i), sm, out_collision);
+        if (!sm) continue;
 
-        // Check if we have the real extracted UStaticMesh geometry
-        const StaticMeshAsset* sm = nullptr;
-        if (mesh_lib && !low_mesh.empty()) {
-            auto it = mesh_lib->find(low_mesh);
-            if (it != mesh_lib->end() && !it->second.triangles.empty()) {
-                sm = &it->second;
-            } else {
-                missing_meshes++;
-                missing_names[low_mesh]++;
-            }
+        if (a.is_hidden || sm->triangles.empty()) {
+            a.world_bounds = transformed_mesh_bounds(a, *sm);
+            ++hidden_meshes;
+            continue;
         }
-
-        if (sm) {
-            placed_meshes++;
-            // UE3 FScaleRotationTranslationMatrix exact transformation:
-            // Local Scale -> Rotation(Pitch, Yaw, Roll) -> Translation(Location)
-            Vec3 scale(a.draw_scale * a.draw_scale_3d.x,
-                       a.draw_scale * a.draw_scale_3d.y,
-                       a.draw_scale * a.draw_scale_3d.z);
-
-            Vec3 rad = a.rotation.to_radians();
-            float sp = std::sin(rad.x), cp = std::cos(rad.x);
-            float sy = std::sin(rad.y), cy = std::cos(rad.y);
-            float sr = std::sin(rad.z), cr = std::cos(rad.z);
-
-            // UE3 FRotationMatrix axes
-            Vec3 axis_x(cp * cy, cp * sy, sp);
-            Vec3 axis_y(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp);
-            Vec3 axis_z(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp);
-
-            // Normals transform with the inverse transpose (R * S^-1); tangents with R * S.
-            // A mirroring scale (negative determinant) flips the binormal handedness.
-            auto safe_inv = [](float s) { return (std::abs(s) > 1e-12f) ? 1.0f / s : 0.0f; };
-            const Vec3 inv_scale(safe_inv(scale.x), safe_inv(scale.y), safe_inv(scale.z));
-            const float det_sign = (scale.x * scale.y * scale.z < 0.0f) ? -1.0f : 1.0f;
-
-            AABB actor_aabb(Vec3(1e9f, 1e9f, 1e9f), Vec3(-1e9f, -1e9f, -1e9f));
-
-            auto emit_vertex = [&](std::vector<Vertex>& dst, const Vertex& lv, bool keep_vertex_color) {
-                Vec3 sp_pos(lv.position.x * scale.x, lv.position.y * scale.y, lv.position.z * scale.z);
-                Vec3 wp = a.location + axis_x * sp_pos.x + axis_y * sp_pos.y + axis_z * sp_pos.z;
-
-                Vec3 wn = axis_x * (lv.normal.x * inv_scale.x) + axis_y * (lv.normal.y * inv_scale.y) +
-                          axis_z * (lv.normal.z * inv_scale.z);
-                Vec3 wt = axis_x * (lv.tangent.x * scale.x) + axis_y * (lv.tangent.y * scale.y) +
-                          axis_z * (lv.tangent.z * scale.z);
-
-                Vertex wv = lv;
-                wv.position = wp;
-                wv.normal = (wn.length_sq() > 1e-20f) ? wn.normalized() : Vec3(0.0f, 0.0f, 1.0f);
-                wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
-                wv.tangent_sign = lv.tangent_sign * det_sign;
-                if (!keep_vertex_color) wv.color = color;
-                dst.push_back(wv);
-
-                actor_aabb.expand(wp);
-            };
-            // Emits whole triangles; mirrored instances (negative determinant) reverse the vertex
-            // order so world-space winding stays consistent (UE3 flips the cull mode instead).
-            auto emit_range = [&](std::vector<Vertex>& dst, uint32_t first, uint32_t count, bool keep_vertex_color) {
-                const uint32_t end = std::min<uint32_t>(first + count, static_cast<uint32_t>(sm->triangles.size()));
-                for (uint32_t i = first; i + 2 < end; i += 3) {
-                    emit_vertex(dst, sm->triangles[i], keep_vertex_color);
-                    if (det_sign < 0.0f) {
-                        emit_vertex(dst, sm->triangles[i + 2], keep_vertex_color);
-                        emit_vertex(dst, sm->triangles[i + 1], keep_vertex_color);
-                    } else {
-                        emit_vertex(dst, sm->triangles[i + 1], keep_vertex_color);
-                        emit_vertex(dst, sm->triangles[i + 2], keep_vertex_color);
-                    }
-                }
-            };
-
-            if (use_materials) {
-                // UStaticMeshComponent::GetMaterial(ElementIndex): component override, else the
-                // element's material, else the engine default material ("" here).
-                auto& bins = a.is_runner_vision ? rv_bins : world_bins;
-                for (size_t e = 0; e < sm->elements.size(); ++e) {
-                    const auto& el = sm->elements[e];
-                    if (el.vertex_count == 0) continue;
-                    const bool overridden = e < a.material_overrides.size() && !a.material_overrides[e].empty();
-                    const int32_t mat = material_id(overridden ? a.material_overrides[e] : el.material);
-                    emit_range(bins[mat], el.first_vertex, el.vertex_count, true);
-                }
-            } else {
-                std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
-                emit_range(dst_verts, 0, static_cast<uint32_t>(sm->triangles.size()), false);
-            }
-
-            if (actor_aabb.min_pt.x <= actor_aabb.max_pt.x) {
-                a.world_bounds = actor_aabb;
-                overall_min.x = std::min(overall_min.x, actor_aabb.min_pt.x);
-                overall_min.y = std::min(overall_min.y, actor_aabb.min_pt.y);
-                overall_min.z = std::min(overall_min.z, actor_aabb.min_pt.z);
-                overall_max.x = std::max(overall_max.x, actor_aabb.max_pt.x);
-                overall_max.y = std::max(overall_max.y, actor_aabb.max_pt.y);
-                overall_max.z = std::max(overall_max.z, actor_aabb.max_pt.z);
-
-                // Filter out non-gameplay sky/vista/backdrop/clutter/door-blocker meshes from collision
-                if (a.is_collidable) {
-                    if (low_mesh.find("vista") != std::string::npos ||
-                        low_mesh.find("sky") != std::string::npos ||
-                        low_mesh.find("cloud") != std::string::npos ||
-                        low_mesh.find("airliner") != std::string::npos ||
-                        low_mesh.find("road_") != std::string::npos ||
-                        low_mesh.find("street") != std::string::npos ||
-                        low_mesh.find("signad") != std::string::npos ||
-                        low_mesh.find("litter") != std::string::npos ||
-                        low_mesh.find("garbage") != std::string::npos ||
-                        low_mesh.find("paintbucket") != std::string::npos ||
-                        low_mesh.find("cablesystem") != std::string::npos ||
-                        low_mesh.find("cablebox") != std::string::npos ||
-                        low_mesh.find("cable_") != std::string::npos ||
-                        low_mesh.find("crane_wire") != std::string::npos ||
-                        low_mesh.find("plasticcover") != std::string::npos ||
-                        low_mesh.find("doorhalf") != std::string::npos ||
-                        low_mesh.find("barge") != std::string::npos ||
-                        low_mesh.find("doorframe") != std::string::npos ||
-                        low_mesh.find("runnersign") != std::string::npos ||
-                        low_mesh.find("windowcover") != std::string::npos) {
-                        a.is_collidable = false;
-                    }
-                }
-
-                if (a.is_collidable) {
-                    Vec3 ext = actor_aabb.max_pt - actor_aabb.min_pt;
-                    if (ext.x > 140.0f || ext.y > 140.0f || ext.z > 140.0f) {
-                        // Decompose large architectural meshes (rooftop shells, staircases, ramps, ducts, fences)
-                        // into tight per-triangle AABBs so hollow interiors, doorways, and crouch-slide ducts remain open.
-                        auto xform_pt = [&](const Vec3& lv_pos) -> Vec3 {
-                            Vec3 sp_pos(lv_pos.x * scale.x, lv_pos.y * scale.y, lv_pos.z * scale.z);
-                            return a.location + axis_x * sp_pos.x + axis_y * sp_pos.y + axis_z * sp_pos.z;
-                        };
-
-                        auto emit_tri_colliders = [&](auto& self, const Vec3& p0, const Vec3& p1, const Vec3& p2,
-                                                      const Vec3& n, int depth) -> void {
-                            float min_x = std::min({p0.x, p1.x, p2.x});
-                            float max_x = std::max({p0.x, p1.x, p2.x});
-                            float min_y = std::min({p0.y, p1.y, p2.y});
-                            float max_y = std::max({p0.y, p1.y, p2.y});
-                            float min_z = std::min({p0.z, p1.z, p2.z});
-                            float max_z = std::max({p0.z, p1.z, p2.z});
-
-                            if (std::abs(n.z) >= 0.55f) {
-                                // Walkable floor, ramp, or overhead soffit surface (extrude downward so top is exactly max_z)
-                                if ((max_z - min_z) > 16.0f && depth < 3) {
-                                    Vec3 m01 = (p0 + p1) * 0.5f;
-                                    Vec3 m12 = (p1 + p2) * 0.5f;
-                                    Vec3 m20 = (p2 + p0) * 0.5f;
-                                    self(self, p0, m01, m20, n, depth + 1);
-                                    self(self, m01, p1, m12, n, depth + 1);
-                                    self(self, m20, m12, p2, n, depth + 1);
-                                    self(self, m01, m12, m20, n, depth + 1);
-                                    return;
-                                }
-                                out_colliders.emplace_back(Vec3(min_x, min_y, max_z - 12.0f),
-                                                           Vec3(max_x, max_y, max_z));
-                            } else {
-                                // Vertical wall / parapet / fence
-                                if ((max_z - min_z) < 18.0f) return;
-                                if ((max_x - min_x) > 45.0f && (max_y - min_y) > 45.0f && depth < 3) {
-                                    Vec3 m01 = (p0 + p1) * 0.5f;
-                                    Vec3 m12 = (p1 + p2) * 0.5f;
-                                    Vec3 m20 = (p2 + p0) * 0.5f;
-                                    self(self, p0, m01, m20, n, depth + 1);
-                                    self(self, m01, p1, m12, n, depth + 1);
-                                    self(self, m20, m12, p2, n, depth + 1);
-                                    self(self, m01, m12, m20, n, depth + 1);
-                                    return;
-                                }
-                                out_colliders.emplace_back(Vec3(min_x - 3.0f, min_y - 3.0f, min_z),
-                                                           Vec3(max_x + 3.0f, max_y + 3.0f, max_z));
-                            }
-                        };
-
-                        for (size_t i = 0; i + 2 < sm->triangles.size(); i += 3) {
-                            Vec3 p0 = xform_pt(sm->triangles[i].position);
-                            Vec3 p1 = xform_pt(sm->triangles[det_sign < 0.0f ? i + 2 : i + 1].position);
-                            Vec3 p2 = xform_pt(sm->triangles[det_sign < 0.0f ? i + 1 : i + 2].position);
-                            Vec3 e1 = p1 - p0;
-                            Vec3 e2 = p2 - p0;
-                            Vec3 fn = e2.cross(e1);
-                            float len_sq = fn.length_sq();
-                            if (len_sq < 1e-6f) continue;
-                            fn = fn * (1.0f / std::sqrt(len_sq));
-                            emit_tri_colliders(emit_tri_colliders, p0, p1, p2, fn, 0);
-                        }
-                    } else if (ext.z >= 18.0f) {
-                        out_colliders.push_back(actor_aabb);
-                    }
-                    // Clear is_collidable on the actor so sweep_capsule/trace_ray use out_colliders
-                    // rather than testing the coarse whole-actor AABB in scene.actors.
-                    a.is_collidable = false;
-                }
-            }
-        } else if ((a.is_balance_beam || a.is_ledge) && a.end_point.length_sq() > 1.0f) {
-            // Emit walkable step colliders along TdBalanceWalkVolume and TdLedgeWalkVolume spans
-            Vec3 span = a.end_point - a.location;
-            float len = span.length();
-            int steps = std::max(1, static_cast<int>(len / 40.0f));
-            float z_top_offset = a.is_balance_beam ? -25.0f : -3.0f;
-            for (int s = 0; s <= steps; ++s) {
-                float t = static_cast<float>(s) / static_cast<float>(steps);
-                Vec3 p = a.location + span * t;
-                float top_z = p.z + z_top_offset;
-                out_colliders.emplace_back(Vec3(p.x - 36.0f, p.y - 36.0f, top_z - 16.0f),
-                                           Vec3(p.x + 36.0f, p.y + 36.0f, top_z));
-            }
-            a.is_collidable = false;
-        } else if (!has_real_meshes || a.is_springboard || a.is_zipline || a.is_bag) {
-            // Fallback box only when no mesh library is provided or for interactive parkour items
-            float w = 60.0f * std::abs(a.draw_scale) * std::max(0.2f, std::abs(a.draw_scale_3d.x));
-            float d = 60.0f * std::abs(a.draw_scale) * std::max(0.2f, std::abs(a.draw_scale_3d.y));
-            float h = 45.0f * std::abs(a.draw_scale) * std::max(0.2f, std::abs(a.draw_scale_3d.z));
-
-            Vec3 b_min = a.location - Vec3(w, d, h);
-            Vec3 b_max = a.location + Vec3(w, d, h);
-            AABB box_bounds(b_min, b_max);
-            a.world_bounds = box_bounds;
-            fallback_boxes++;
-
-            if (use_materials) {
-                auto& bins = a.is_runner_vision ? rv_bins : world_bins;
-                add_box_mesh(bins[-1], scratch_indices, b_min, b_max, color);
-            } else {
-                std::vector<Vertex>& dst_verts = a.is_runner_vision ? rv_batch.vertices : world_batch.vertices;
-                std::vector<uint32_t>& dst_idx = a.is_runner_vision ? rv_batch.indices : world_batch.indices;
-                add_box_mesh(dst_verts, dst_idx, b_min, b_max, color);
-            }
-
-            if (a.is_collidable) {
-                out_colliders.push_back(box_bounds);
-                a.is_collidable = false;
-            }
+        ++placed_meshes;
+        const AABB box = emitter.emit(a, *sm, a.is_runner_vision ? rv_bins : world_bins,
+                                      a.is_runner_vision ? rv_batch.vertices : world_batch.vertices);
+        if (valid_box(box)) {
+            a.world_bounds = box;
+            overall.expand(box.min_pt);
+            overall.expand(box.max_pt);
         }
     }
 
-    if (use_materials) {
-        auto flush_bins = [](MeshBuffer& mb, std::map<int32_t, std::vector<Vertex>>& bins) {
-            size_t total = 0;
-            for (const auto& [mat, verts] : bins) total += verts.size();
-            mb.vertices.reserve(total);
-            for (auto& [mat, verts] : bins) {
-                if (verts.empty()) continue;
-                MeshSection s;
-                s.first_vertex = static_cast<uint32_t>(mb.vertices.size());
-                s.vertex_count = static_cast<uint32_t>(verts.size());
-                s.material = mat;
-                mb.vertices.insert(mb.vertices.end(), verts.begin(), verts.end());
-                mb.sections.push_back(s);
-                std::vector<Vertex>().swap(verts);
-            }
-        };
-        flush_bins(world_batch, world_bins);
-        flush_bins(rv_batch, rv_bins);
+    if (emitter.use_materials()) {
+        MeshEmitter::flush(world_batch, world_bins);
+        MeshEmitter::flush(rv_batch, rv_bins);
     }
 
-    if (has_real_meshes) {
-        size_t sections = world_batch.sections.size() + rv_batch.sections.size();
-        std::cout << "[Level] " << placed_meshes << " static meshes placed, " << missing_meshes
-                  << " missing (" << missing_names.size() << " unique), " << fallback_boxes << " fallback boxes, "
-                  << sections << " material sections, " << out_colliders.size() << " colliders" << std::endl;
-        if (std::getenv("ME_MATERIAL_VERBOSE") && !missing_names.empty()) {
-            std::vector<std::pair<int, std::string>> top;
-            for (const auto& [n, c] : missing_names) top.emplace_back(c, n);
-            std::sort(top.rbegin(), top.rend());
-            for (size_t i = 0; i < top.size() && i < 12; ++i) {
-                std::cout << "[Level]   missing mesh '" << top[i].second << "' x" << top[i].first << std::endl;
-            }
+    const size_t sections = world_batch.sections.size() + rv_batch.sections.size();
+    std::cout << "[Level] " << placed_meshes << " static meshes placed, " << hidden_meshes << " hidden (collision only), "
+              << missing_meshes << " missing (" << missing_names.size() << " unique), " << sections
+              << " material sections; collision: " << out_collision.triangle_count() << " triangles ("
+              << blocking_volumes << " BlockingVolumes)" << std::endl;
+    if (std::getenv("ME_MATERIAL_VERBOSE") && !missing_names.empty()) {
+        std::vector<std::pair<int, std::string>> top;
+        for (const auto& [n, c] : missing_names) top.emplace_back(c, n);
+        std::sort(top.rbegin(), top.rend());
+        for (size_t i = 0; i < top.size() && i < 12; ++i) {
+            std::cout << "[Level]   missing mesh '" << top[i].second << "' x" << top[i].first << std::endl;
         }
     }
 
     if (!world_batch.vertices.empty()) {
-        world_batch.bounds = AABB(overall_min, overall_max);
+        world_batch.bounds = overall;
         out_meshes.push_back(std::move(world_batch));
     }
     if (!rv_batch.vertices.empty()) {
-        rv_batch.bounds = AABB(overall_min, overall_max);
+        rv_batch.bounds = overall;
         out_meshes.push_back(std::move(rv_batch));
     }
 }
+
+namespace {
+
+// Assigns the real moving InterpActors of every elevator: the cab, actors hard-attached to it
+// (Actor.Base == cab, e.g. the cab doors) and the landing door leaves of the door matinees.
+// Duplicate elevators / InterpActors (the same lift cooked into both *_Slc and *_Spt) are merged.
+void assign_elevator_parts(LevelScene& scene, const std::vector<InterpDoorInfo>& doors,
+                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib) {
+    // 1. Dedupe elevators extracted from several streaming packages.
+    std::vector<ElevatorInstance> unique;
+    for (auto& e : scene.elevators) {
+        bool dup = false;
+        for (const auto& u : unique) {
+            if ((u.start_pos - e.start_pos).length() < 16.0f && (u.end_pos - e.end_pos).length() < 16.0f) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) unique.push_back(std::move(e));
+    }
+    scene.elevators.swap(unique);
+
+    auto& actors = scene.actors;
+    std::unordered_map<std::string, int32_t> by_name;
+    for (size_t i = 0; i < actors.size(); ++i) {
+        by_name[actors[i].source_package + ":" + actors[i].unique_name] = static_cast<int32_t>(i);
+    }
+    std::unordered_map<std::string, const InterpDoorInfo*> door_by_name;
+    for (const auto& d : doors) door_by_name.emplace(d.package + ":" + d.actor_name, &d);
+
+    auto same_placement = [](const LevelActor& x, const LevelActor& y) {
+        return to_lower(x.mesh_name) == to_lower(y.mesh_name) && (x.location - y.location).length() < 1.0f &&
+               std::abs(x.rotation.pitch - y.rotation.pitch) < 1.0f && std::abs(x.rotation.yaw - y.rotation.yaw) < 1.0f &&
+               std::abs(x.rotation.roll - y.rotation.roll) < 1.0f;
+    };
+    auto claim = [&](int32_t e, int32_t ai, ElevatorPartRole role, const Vec3& open) {
+        if (actors[ai].elevator >= 0) return;
+        actors[ai].elevator = e;
+        ElevatorPart part;
+        part.actor_name = actors[ai].unique_name;
+        part.actor_index = ai;
+        part.role = role;
+        part.door_open_offset = open;
+        scene.elevators[e].parts.push_back(std::move(part));
+        // The same InterpActor cooked into another streaming package moves with this one.
+        for (size_t j = 0; j < actors.size(); ++j) {
+            if (static_cast<int32_t>(j) == ai || actors[j].elevator >= 0) continue;
+            if (actors[j].class_name == actors[ai].class_name && same_placement(actors[j], actors[ai])) {
+                actors[j].elevator = e;
+            }
+        }
+    };
+
+    for (size_t ei = 0; ei < scene.elevators.size(); ++ei) {
+        const int32_t e = static_cast<int32_t>(ei);
+        const ElevatorInstance& el = scene.elevators[ei];
+        auto cab_it = by_name.find(el.source_package + ":" + el.cab_actor_name);
+        if (el.cab_actor_name.empty() || cab_it == by_name.end()) continue;
+        claim(e, cab_it->second, ElevatorPartRole::Cab, Vec3(0.0f, 0.0f, 0.0f));
+
+        for (size_t i = 0; i < actors.size(); ++i) {
+            const LevelActor& a = actors[i];
+            if (a.base_name != el.cab_actor_name || a.source_package != el.source_package) continue;
+            auto d = door_by_name.find(a.source_package + ":" + a.unique_name);
+            if (d != door_by_name.end()) {
+                claim(e, static_cast<int32_t>(i), ElevatorPartRole::CabDoor, d->second->open_offset);
+            } else {
+                claim(e, static_cast<int32_t>(i), ElevatorPartRole::CabAttached, Vec3(0.0f, 0.0f, 0.0f));
+            }
+        }
+
+        // Landing doors: door-matinee leaves at the shaft's start / destination floor.
+        const LevelActor& cab = actors[cab_it->second];
+        float floor_offset = 0.0f;
+        float cab_height = 262.0f;
+        if (const StaticMeshAsset* sm = find_mesh(mesh_lib, cab.mesh_name)) {
+            floor_offset = sm->bounds_origin.z - sm->bounds_extent.z;
+            cab_height = 2.0f * sm->bounds_extent.z;
+        }
+        // The landing leaves sit in the shaft wall directly in front of the cab doorway, i.e.
+        // inside the cab's footprint (+ a few units of door frame). Neighbouring shafts' doors
+        // (Escape_Off has a second, unused shaft 320 units over) must stay put.
+        const Vec3 center = el.start_pos + el.cab_local_offset;
+        constexpr float kFootprintMargin = 64.0f;
+        for (const auto& d : doors) {
+            auto it = by_name.find(d.package + ":" + d.actor_name);
+            if (it == by_name.end()) continue;
+            const LevelActor& a = actors[it->second];
+            if (a.elevator >= 0 || !a.base_name.empty()) continue;
+            const float dx = a.location.x - center.x;
+            const float dy = a.location.y - center.y;
+            if (std::abs(dx) > el.cab_half_extents.x + kFootprintMargin ||
+                std::abs(dy) > el.cab_half_extents.y + kFootprintMargin) {
+                continue;
+            }
+            const float dz_start = a.location.z - (el.start_pos.z + floor_offset);
+            const float dz_end = a.location.z - (el.end_pos.z + floor_offset);
+            if (dz_start > -120.0f && dz_start < cab_height) {
+                claim(e, it->second, ElevatorPartRole::StartDoor, d.open_offset);
+            } else if (dz_end > -120.0f && dz_end < cab_height) {
+                claim(e, it->second, ElevatorPartRole::EndDoor, d.open_offset);
+            }
+        }
+    }
+}
+
+// Builds the per-part render buffer (appended to scene.meshes) and collision of every elevator part.
+void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+                                  std::vector<std::string>* material_paths) {
+    MeshEmitter emitter(material_paths);
+    for (size_t e = 0; e < scene.elevators.size(); ++e) {
+        auto& el = scene.elevators[e];
+        for (size_t p = 0; p < el.parts.size(); ++p) {
+            ElevatorPart& part = el.parts[p];
+            // Pose for the elevator's initial state (IdleStart: cab at the start floor, start-floor
+            // doors open), exactly as ParkourController::update_elevators() poses it.
+            const Vec3 cab_offset = el.current_pos - el.start_pos;
+            switch (part.role) {
+                case ElevatorPartRole::Cab:
+                case ElevatorPartRole::CabAttached: part.offset = cab_offset; break;
+                case ElevatorPartRole::CabDoor: part.offset = cab_offset + part.door_open_offset * el.door_open_Start; break;
+                case ElevatorPartRole::StartDoor: part.offset = part.door_open_offset * el.door_open_Start; break;
+                case ElevatorPartRole::EndDoor: part.offset = part.door_open_offset * el.door_open_End; break;
+            }
+            part.prev_offset = part.offset;
+            LevelActor& a = scene.actors[part.actor_index];
+            const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+            auto cw = std::make_shared<CollisionWorld>();
+            append_actor_collision(a, part.actor_index, sm, *cw);
+            cw->build();
+            if (!cw->empty()) part.collision = std::move(cw);
+            if (!sm) continue;
+            a.world_bounds = transformed_mesh_bounds(a, *sm);
+            if (a.is_hidden || sm->triangles.empty()) continue;
+
+            MeshBuffer mb;
+            mb.name = "UE3_Elevator_" + a.source_package + "_" + a.unique_name;
+            mb.is_runner_vision = a.is_runner_vision;
+            mb.elevator = static_cast<int32_t>(e);
+            mb.elevator_part = static_cast<int32_t>(p);
+            std::map<int32_t, std::vector<Vertex>> bins;
+            const AABB box = emitter.emit(a, *sm, bins, mb.vertices);
+            if (emitter.use_materials()) MeshEmitter::flush(mb, bins);
+            if (mb.vertices.empty()) continue;
+            mb.bounds = box;
+            a.world_bounds = box;
+            part.mesh_index = static_cast<int32_t>(scene.meshes.size());
+            scene.meshes.push_back(std::move(mb));
+        }
+    }
+}
+
+} // namespace
 
 // -----------------------------------------------------------------------------
 // Level sun: the dominant DirectionalLight of the level
@@ -2604,7 +3198,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.map_name = main_path.stem().string();
     out_scene.actors.clear();
     out_scene.meshes.clear();
-    out_scene.colliders.clear();
+    out_scene.collision.reset();
+    out_scene.kill_z = -1.0e30f;
     out_scene.checkpoints.clear();
     out_scene.subtitles.clear();
     out_scene.checkpoint_infos.clear();
@@ -2633,6 +3228,9 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         pm = std::make_unique<PackageManager>(cooked_root.string());
         pm->add_loaded(main_path.stem().string(), master_pkg);
     }
+    // Class default objects / component templates for resolving unserialized (default) actor and
+    // component properties such as the collision flags.
+    ScriptDefaults::instance().init(cooked_root.string());
 
     std::unordered_map<std::string, StaticMeshAsset> mesh_library;
     std::vector<std::shared_ptr<UPKPackage>> loaded_packages;
@@ -2725,14 +3323,10 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         if (!sub_pkg->is_valid()) continue;
 
         std::string sub_stem = fs::path(sub_path).stem().string();
-        const bool is_background_pkg = (to_lower(sub_stem).find("_bac") != std::string::npos);
 
         loaded_packages.push_back(sub_pkg);
         sub_pkg->extract_static_meshes(mesh_library);
         auto sub_actors = sub_pkg->extract_actors();
-        if (is_background_pkg) {
-            for (auto& sa : sub_actors) sa.is_collidable = false;
-        }
         out_scene.actors.insert(out_scene.actors.end(), sub_actors.begin(), sub_actors.end());
         sub_pkg->extract_level_streaming_and_checkpoints(
             out_scene.checkpoint_infos, out_scene.streaming_actions, out_scene.all_streaming_packages);
@@ -2743,11 +3337,15 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
 
     // Extract all interactive elevators (InterpActor + SeqAct_Interp + InterpTrackMove)
+    // now that mesh_library has all UStaticMesh bounds (S_Elevator_01, S_SP09_ElevatorWithTop_01, etc.),
     // and real-time planar reflection actors/volumes (SceneCaptureReflectActor + TdReflectionVolume)
+    std::vector<InterpDoorInfo> door_infos;
     for (const auto& pkg : loaded_packages) {
-        pkg->extract_elevators(mesh_library, out_scene.elevators);
+        pkg->extract_elevators(mesh_library, out_scene.elevators, &door_infos);
         pkg->extract_reflections(out_scene.reflection_captures, out_scene.reflection_volumes);
     }
+    // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
+    assign_elevator_parts(out_scene, door_infos, mesh_library);
 
     // Link each extracted elevator to the checkpoints at its start and destination floors so
     // riding the elevator streams in the destination zone's sub-packages (SeqAct_MultiLevelStreaming)
@@ -2894,10 +3492,32 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
                   << out_scene.sky_lower_color.y << ", " << out_scene.sky_lower_color.z << ")" << std::endl;
     }
 
-    // Construct real 3D UStaticMesh rooftop geometry and colliders (populating each actor's transformed world_bounds)
+    // Real UStaticMesh render batches + UE3 collision (populating each actor's transformed world_bounds),
+    // then the moving elevator parts with their own buffers and collision.
     std::vector<std::string> material_paths;
-    generate_rooftop_level_geometry(out_scene.actors, out_scene.meshes, out_scene.colliders, &mesh_library,
-                                    pm ? &material_paths : nullptr);
+    auto collision = std::make_shared<CollisionWorld>();
+    {
+        // Level BSP (rooms, interiors blocked out with brushes) collides as world geometry.
+        std::vector<Vec3> bsp;
+        for (const auto& pkg : loaded_packages) pkg->extract_bsp_collision(bsp);
+        collision->reserve(bsp.size() / 3 + 1024);
+        for (size_t i = 0; i + 2 < bsp.size(); i += 3) {
+            collision->add_triangle(bsp[i], bsp[i + 1], bsp[i + 2], -1, COLL_BlockAll);
+        }
+    }
+    build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr);
+    collision->build();
+    build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
+
+    // WorldInfo.KillZ when the level sets it (otherwise lethal falls are handled by fall height).
+    for (size_t i = 0; i < master_pkg->get_exports().size(); ++i) {
+        if (master_pkg->get_export_class(master_pkg->get_exports()[i]) != "WorldInfo") continue;
+        UPropertyList wprops;
+        parse_export_properties(*master_pkg, static_cast<int32_t>(i) + 1, wprops);
+        if (const UProperty* kz = find_prop(wprops, "KillZ")) out_scene.kill_z = kz->f;
+        break;
+    }
+    out_scene.collision = std::move(collision);
 
     // Resolve, translate and load every material referenced by the level geometry
     // (ME_MATERIAL_VERBOSE=1 prints per-material diagnostics, ME_MAX_TEXTURE_SIZE caps mip size).
@@ -3074,11 +3694,6 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
     }
 
-    // Ensure a walkable rooftop collider sits directly beneath player_spawn_pos so the player never falls through uncollided art
-    Vec3 sp = out_scene.player_spawn_pos;
-    out_scene.colliders.emplace_back(Vec3(sp.x - 220.0f, sp.y - 220.0f, sp.z - 20.0f),
-                                     Vec3(sp.x + 220.0f, sp.y + 220.0f, sp.z));
-
     std::cout << "[Level] Streaming summary for " << out_scene.map_name << ": "
               << out_scene.all_streaming_packages.size() << " LevelStreamingKismet sublevels, "
               << out_scene.checkpoint_infos.size() << " TdCheckpoints, "
@@ -3101,9 +3716,6 @@ bool stream_level_to_checkpoint(const std::string& /*game_root*/, LevelScene& sc
     if (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f) {
         scene.player_spawn_pos = cp.location + Vec3(0.0f, 0.0f, 35.0f);
         scene.player_spawn_yaw = cp.rotation.to_degrees().y;
-        Vec3 sp = scene.player_spawn_pos;
-        scene.colliders.emplace_back(Vec3(sp.x - 400.0f, sp.y - 400.0f, sp.z - 120.0f),
-                                     Vec3(sp.x + 400.0f, sp.y + 400.0f, sp.z - 40.0f));
     }
     std::cout << "[Streaming] TdCheckpoint '" << cp.checkpoint_name << "' (weight " << cp.checkpoint_weight
               << ") active -> " << scene.loaded_sublevel_packages.size() << " sublevels streamed in" << std::endl;

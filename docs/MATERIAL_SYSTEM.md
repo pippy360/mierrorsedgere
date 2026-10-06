@@ -372,15 +372,19 @@ ME_MATERIAL_DUMP=/tmp/me_mats.metal ./build/mirrorsedge_macos --verify-all
 Expected log lines:
 
 ```
-[Level] Sun from Tutorial_lgts.DirectionalLight_0: direction (0.335133, -0.4999, 0.798615), linear colour (2.5, 2.28938, 1.89825)
-[Level] 2403 static meshes placed, 0 missing (0 unique), 1 fallback boxes, 287 material sections
-[Materials] 273 materials (273 resolved, 0 fallback, 3 with warnings), 205 shaders, 469 textures (469 loaded, 0 failed, 143 MB) ...
-[Level] Sun from Edge_Ext_Lgts.DirectionalLight_1: direction (-0.574586, 0.506797, 0.642657), linear colour (2.5, 2.28938, 1.89825)
-[Level] 4276 static meshes placed, 0 missing (0 unique), 1 fallback boxes, 420 material sections
-[Materials] 407 materials (407 resolved, 0 fallback, 2 with warnings), 267 shaders, 647 textures (646 loaded, 1 failed, 215 MB) ...
-[MetalRenderer] Material shaders: 205/205 compiled
-[MetalRenderer] Material shaders: 267/267 compiled
+[Level] Sun from Tutorial_lgts.DirectionalLight_0: direction (0.335133, -0.4999, 0.798615), linear colour (2.5, 2.28938, 1.89825), ModShadowColor (0.493616, 0.659224, 0.875138)
+[Level] 2404 static meshes placed, 1 hidden (collision only), 18 missing (5 unique), 287 material sections; collision: 204865 triangles (73 BlockingVolumes)
+[Materials] 274 materials (274 resolved, 0 fallback, 3 with warnings), 206 shaders, 469 textures (469 loaded, 0 failed, 143 MB) ...
+[Level] Sun from Edge_Ext_Lgts.DirectionalLight_1: direction (-0.574586, 0.506797, 0.642657), linear colour (2.5, 2.28938, 1.89825), ModShadowColor (0.529523, 0.74453, 0.932277)
+[Level] 4363 static meshes placed, 21 hidden (collision only), 63 missing (12 unique), 427 material sections; collision: 180380 triangles (109 BlockingVolumes)
+[Materials] 414 materials (414 resolved, 0 fallback, 2 with warnings), 273 shaders, 665 textures (665 loaded, 0 failed, 219 MB) ...
+[MetalRenderer] Material shaders: 206/206 compiled
+[MetalRenderer] Material shaders: 273/273 compiled
 ```
+
+The "missing" actors use level skeletal meshes (`SK_Flag_02`, `SK_Pigeon`, `SK_Celeste`,
+`CH_TKY_Cop_SWAT`, the `PX_SK_*` cloth, ...) or the editor-only `MatineeCam_SM`, which is not cooked.
+They are not drawn yet, and no procedural stand-in geometry is generated for them.
 
 The only remaining material warnings are the crane materials (`VH_Stationary.S_Crane_01.*`).
 They sample TexCoord index 2, which is mapped to UV1.

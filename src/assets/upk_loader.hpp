@@ -77,6 +77,31 @@ struct StaticMeshAsset {
     float bounds_radius = 173.2f;
     std::vector<Vertex> triangles; // 3 vertices per triangle in local space, grouped by element
     std::vector<StaticMeshElement> elements;
+
+    // Collision (local space, 3 vertices per triangle). UStaticMeshComponent::LineCheck uses the
+    // RB_BodySetup simple geometry when the mesh has a BodySetup and UseSimpleBoxCollision
+    // (extent checks) / UseSimpleLineCollision (zero-extent checks) is set, otherwise the
+    // per-poly kDOP tree (FkDOPCollisionTriangle over the LOD0 PositionVertexBuffer).
+    bool has_body_setup = false;
+    bool use_simple_box_collision = true;
+    bool use_simple_line_collision = true;
+    std::vector<Vec3> simple_collision;   // KConvexElem / KBoxElem / KSphereElem / KSphylElem
+    std::vector<Vec3> complex_collision;  // kDOP triangles
+};
+
+// Appends the triangles of a UE3 KAggregateGeom struct (RB_BodySetup.AggGeom or
+// BrushComponent.BrushAggGeom) in its local space, 3 vertices per triangle.
+struct UProperty;
+class UPKPackage;
+void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out);
+
+// A sliding door InterpActor driven by a door Matinee group (e.g. "lowerdoors").
+struct InterpDoorInfo {
+    std::string package;     // source package stem
+    std::string actor_name;  // unique export name of the InterpActor
+    std::string group;       // InterpGroup.GroupName
+    Vec3 open_offset{0.0f, 0.0f, 0.0f};  // world displacement at the end of the matinee (open)
+    float open_time = 0.7f;              // PosTrack length
 };
 
 class UPKPackage {
@@ -114,8 +139,12 @@ public:
     void extract_level_streaming_and_checkpoints(std::vector<LevelCheckpointInfo>& out_checkpoints,
                                                  std::vector<LevelStreamingActionInfo>& out_streaming_actions,
                                                  std::vector<std::string>& out_streaming_packages) const;
+    // Level BSP (the PersistentLevel UModel) collision polygons, fan-triangulated in world
+    // space (3 vertices per triangle). Non-CSG nodes and PF_NotSolid surfaces are skipped.
+    void extract_bsp_collision(std::vector<Vec3>& out_triangles) const;
     void extract_elevators(const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-                           std::vector<ElevatorInstance>& out_elevators) const;
+                           std::vector<ElevatorInstance>& out_elevators,
+                           std::vector<InterpDoorInfo>* out_doors = nullptr) const;
     void extract_reflections(std::vector<SceneCaptureReflectInfo>& out_captures,
                              std::vector<ReflectionVolumeInfo>& out_volumes) const;
 
@@ -147,15 +176,22 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 // (or an Elevator's mid-shaft SeqAct_MultiLevelStreaming transition).
 bool stream_level_to_checkpoint(const std::string& game_root, LevelScene& scene, int checkpoint_idx);
 
-// Helper to construct a contiguous, playable 3D rooftop mesh around extracted actors.
-// When `out_material_paths` is non-null, real static meshes are emitted as per-material
-// MeshSections whose `material` indexes into *out_material_paths (full object paths,
-// "" = engine default material); fallback boxes use material -1 (procedural shading).
-void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
-                                     std::vector<MeshBuffer>& out_meshes,
-                                     std::vector<AABB>& out_colliders,
-                                     const std::unordered_map<std::string, StaticMeshAsset>* mesh_lib = nullptr,
-                                     std::vector<std::string>* out_material_paths = nullptr);
+// Builds the level's render batches and appends the static collision triangles of every actor
+// (call CollisionWorld::build() afterwards) from the real extracted UStaticMesh geometry. Real
+// static meshes are emitted as per-material MeshSections whose `material` indexes into
+// *out_material_paths (full object paths, "" = engine default material) when it is non-null.
+// Actors that are moving elevator parts (LevelActor::elevator >= 0) are skipped: they get their
+// own buffers and collision. Hidden actors collide but are not drawn.
+void build_level_geometry(std::vector<LevelActor>& actors,
+                          std::vector<MeshBuffer>& out_meshes,
+                          CollisionWorld& out_collision,
+                          const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+                          std::vector<std::string>* out_material_paths = nullptr);
+
+// Appends one actor's UE3 collision triangles (world space) to `out` with the per-triangle
+// channels implied by the actor flags and the mesh's UseSimple*Collision settings.
+void append_actor_collision(const LevelActor& actor, int32_t actor_index, const StaticMeshAsset* mesh,
+                            CollisionWorld& out);
 
 } // namespace me
 

@@ -10,6 +10,7 @@
 #include "assets/ini_config.hpp"
 #include "audio/audio_engine.hpp"
 #include "cutscene/cutscene_player.hpp"
+#include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
 #include "renderer/metal_renderer.hpp"
 
@@ -27,226 +28,6 @@
 namespace fs = std::filesystem;
 
 namespace me {
-
-// Helper to append a 3D box into a MeshBuffer
-static void append_box_mesh(std::vector<Vertex>& verts, const Vec3& min_p, const Vec3& max_p,
-                            const Vec3& normal_bias = Vec3(0, 0, 0)) {
-    Vec3 p[8] = {
-        {min_p.x, min_p.y, min_p.z}, // 0
-        {max_p.x, min_p.y, min_p.z}, // 1
-        {max_p.x, max_p.y, min_p.z}, // 2
-        {min_p.x, max_p.y, min_p.z}, // 3
-        {min_p.x, min_p.y, max_p.z}, // 4
-        {max_p.x, min_p.y, max_p.z}, // 5
-        {max_p.x, max_p.y, max_p.z}, // 6
-        {min_p.x, max_p.y, max_p.z}  // 7
-    };
-
-    struct Face {
-        int idx[4];
-        Vec3 norm;
-    };
-
-    Face faces[6] = {
-        {{4, 5, 6, 7}, {0, 0, 1}},  // Top (+Z)
-        {{3, 2, 1, 0}, {0, 0, -1}}, // Bottom (-Z)
-        {{0, 1, 5, 4}, {0, -1, 0}}, // Front (-Y)
-        {{2, 3, 7, 6}, {0, 1, 0}},  // Back (+Y)
-        {{0, 4, 7, 3}, {-1, 0, 0}}, // Left (-X)
-        {{1, 2, 6, 5}, {1, 0, 0}}   // Right (+X)
-    };
-
-    for (int f = 0; f < 6; ++f) {
-        Vec3 n = (faces[f].norm + normal_bias).normalized();
-        Vec3 v0 = p[faces[f].idx[0]];
-        Vec3 v1 = p[faces[f].idx[1]];
-        Vec3 v2 = p[faces[f].idx[2]];
-        Vec3 v3 = p[faces[f].idx[3]];
-
-        Vertex vert0{v0, n, {1, 0, 0}, 0.0f, 0.0f, 0.0f, 0.0f, 0xFFFFFFFF};
-        Vertex vert1{v1, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, 0xFFFFFFFF};
-        Vertex vert2{v2, n, {1, 0, 0}, 1.0f, 1.0f, 0.0f, 0.0f, 0xFFFFFFFF};
-        Vertex vert3{v3, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, 0xFFFFFFFF};
-
-        // Two triangles per face
-        verts.push_back(vert0); verts.push_back(vert1); verts.push_back(vert2);
-        verts.push_back(vert0); verts.push_back(vert2); verts.push_back(vert3);
-    }
-}
-
-// Generate high-visibility 3D architectural geometry for parkour test course
-static void append_test_course_visuals(LevelScene& scene) {
-    MeshBuffer course_mesh;
-    course_mesh.name = "Parkour_Course_Geometry";
-
-    MeshBuffer runner_vision_mesh;
-    runner_vision_mesh.name = "Parkour_Course_RunnerVision";
-    runner_vision_mesh.is_runner_vision = true;
-
-    // 1. Runway start building tower & rooftop platform
-    append_box_mesh(course_mesh.vertices, Vec3(-520.0f, -320.0f, -1800.0f), Vec3(3800.0f, 320.0f, 0.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(-500.0f, -300.0f, 0.0f), Vec3(3800.0f, 300.0f, 50.0f));
-
-    // Parapet walls & coping borders along runway
-    append_box_mesh(course_mesh.vertices, Vec3(-500.0f, -325.0f, 50.0f), Vec3(3800.0f, -295.0f, 92.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(-500.0f, 295.0f, 50.0f), Vec3(3800.0f, 325.0f, 92.0f));
-
-    // Rooftop HVAC units, vents, and architectural pylons flanking the sprint runway (outside central lane)
-    for (int i = 0; i < 6; ++i) {
-        float bx = 350.0f + float(i) * 520.0f;
-        // Left side HVAC & ducting
-        append_box_mesh(course_mesh.vertices, Vec3(bx, -285.0f, 50.0f), Vec3(bx + 180.0f, -185.0f, 165.0f));
-        append_box_mesh(course_mesh.vertices, Vec3(bx + 20.0f, -275.0f, 165.0f), Vec3(bx + 160.0f, -195.0f, 195.0f));
-        // Right side stairwell / chiller enclosure
-        append_box_mesh(course_mesh.vertices, Vec3(bx + 140.0f, 185.0f, 50.0f), Vec3(bx + 340.0f, 285.0f, 180.0f));
-        append_box_mesh(course_mesh.vertices, Vec3(bx + 165.0f, 200.0f, 180.0f), Vec3(bx + 315.0f, 270.0f, 215.0f));
-    }
-
-    // 2. Vault Hurdle (Red Runner Vision pipe barrier + side stanchions)
-    append_box_mesh(course_mesh.vertices, Vec3(3195.0f, -165.0f, 50.0f), Vec3(3255.0f, -140.0f, 125.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(3195.0f, 140.0f, 50.0f), Vec3(3255.0f, 165.0f, 125.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(3200.0f, -150.0f, 50.0f), Vec3(3250.0f, 150.0f, 120.0f));
-
-    // 3. Springboard Box (Red Runner Vision AC enclosure + base)
-    append_box_mesh(course_mesh.vertices, Vec3(3540.0f, -90.0f, 50.0f), Vec3(3660.0f, 90.0f, 72.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(3550.0f, -80.0f, 72.0f), Vec3(3650.0f, 80.0f, 140.0f));
-
-    // 4. Canyon floor & flanking skyscraper facades
-    append_box_mesh(course_mesh.vertices, Vec3(3800.0f, -320.0f, -1800.0f), Vec3(5650.0f, 320.0f, 0.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(3800.0f, -300.0f, 0.0f), Vec3(5600.0f, 300.0f, 50.0f));
-    // Tall architectural building walls backing the wallrun panels
-    append_box_mesh(course_mesh.vertices, Vec3(3920.0f, -520.0f, 50.0f), Vec3(5150.0f, -258.0f, 780.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(3920.0f, 258.0f, 50.0f), Vec3(5150.0f, 520.0f, 780.0f));
-
-    // Wallrun left & right panels (Red Runner Vision)
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(4000.0f, -258.0f, 55.0f), Vec3(5000.0f, -200.0f, 420.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(4000.0f, 200.0f, 55.0f), Vec3(5000.0f, 258.0f, 420.0f));
-
-    // 5. Wallclimb tower & upper rooftop deck (Red Runner Vision)
-    append_box_mesh(course_mesh.vertices, Vec3(5355.0f, -240.0f, 50.0f), Vec3(5650.0f, 240.0f, 480.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(5350.0f, -150.0f, 50.0f), Vec3(5450.0f, 150.0f, 500.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(5345.0f, -250.0f, 480.0f), Vec3(5660.0f, 250.0f, 505.0f));
-
-    // 6. Zipline gantry masts & diagonal cable
-    append_box_mesh(course_mesh.vertices, Vec3(5485.0f, -90.0f, 500.0f), Vec3(5515.0f, -65.0f, 640.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(5485.0f, 65.0f, 500.0f), Vec3(5515.0f, 90.0f, 640.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(5480.0f, -95.0f, 620.0f), Vec3(5520.0f, 95.0f, 645.0f));
-    //Segmented diagonal zipline cable
-    Vec3 zip_s(5500.0f, 0.0f, 620.0f);
-    Vec3 zip_e(7000.0f, 0.0f, 240.0f);
-    for (int s = 0; s < 24; ++s) {
-        float t0 = float(s) / 24.0f;
-        float t1 = float(s + 1) / 24.0f;
-        Vec3 p0 = zip_s + (zip_e - zip_s) * t0;
-        Vec3 p1 = zip_s + (zip_e - zip_s) * t1;
-        append_box_mesh(runner_vision_mesh.vertices,
-                        Vec3(p0.x, -4.5f, std::min(p0.z, p1.z) - 4.0f),
-                        Vec3(p1.x, 4.5f, std::max(p0.z, p1.z) + 4.0f));
-    }
-    // Far zipline anchor gantry
-    append_box_mesh(course_mesh.vertices, Vec3(6985.0f, -160.0f, 100.0f), Vec3(7015.0f, -130.0f, 260.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(6985.0f, 130.0f, 100.0f), Vec3(7015.0f, 160.0f, 260.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(6980.0f, -165.0f, 240.0f), Vec3(7020.0f, 165.0f, 265.0f));
-
-    // 7. Far rooftop building & slide duct
-    append_box_mesh(course_mesh.vertices, Vec3(6800.0f, -320.0f, -1800.0f), Vec3(8020.0f, 320.0f, 0.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(6800.0f, -300.0f, 0.0f), Vec3(8000.0f, 300.0f, 100.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(6800.0f, -325.0f, 100.0f), Vec3(8000.0f, -295.0f, 140.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(6800.0f, 295.0f, 100.0f), Vec3(8000.0f, 325.0f, 140.0f));
-
-    // Low ventilation duct for crouch slide + side support legs + Runner Vision clearance bar
-    append_box_mesh(course_mesh.vertices, Vec3(7275.0f, -260.0f, 100.0f), Vec3(7345.0f, -210.0f, 310.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(7275.0f, 210.0f, 100.0f), Vec3(7345.0f, 260.0f, 310.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(7260.0f, -250.0f, 168.0f), Vec3(7360.0f, 250.0f, 305.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(7255.0f, -210.0f, 156.0f), Vec3(7365.0f, 210.0f, 170.0f));
-
-    // 8. Balance pipe (Red Runner Vision) bridging canyon gap
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(8000.0f, -18.0f, 88.0f), Vec3(8800.0f, 18.0f, 112.0f));
-
-    // 9. Destination arena rooftop & hollow Penthouse Elevator shaft framing (X=9840..10080, Z=100 -> 680)
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -420.0f, -1800.0f), Vec3(10100.0f, 420.0f, 0.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -400.0f, 0.0f), Vec3(9840.0f, 400.0f, 100.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, -425.0f, 100.0f), Vec3(9840.0f, -395.0f, 145.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(8800.0f, 395.0f, 100.0f), Vec3(9840.0f, 425.0f, 145.0f));
-    // Left and right architectural shaft towers flanking the hollow elevator cab (Y=-132.5..+132.5 open)
-    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -390.0f, 100.0f), Vec3(10085.0f, -138.0f, 980.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(9835.0f,  138.0f, 100.0f), Vec3(10085.0f,  390.0f, 980.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -138.0f, 370.0f), Vec3(9855.0f,   138.0f, 980.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(9835.0f, -390.0f, 960.0f), Vec3(10085.0f,  390.0f, 995.0f));
-
-    // 10. Streamed Upper Penthouse Helipad Deck at Z = 680 (X = 10080..11200)
-    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -460.0f, -1800.0f), Vec3(11200.0f, 460.0f, 640.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -450.0f, 640.0f), Vec3(11200.0f, 450.0f, 680.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(10080.0f, -465.0f, 680.0f), Vec3(11200.0f, -440.0f, 725.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(10080.0f,  440.0f, 680.0f), Vec3(11200.0f,  465.0f, 725.0f));
-    append_box_mesh(course_mesh.vertices, Vec3(11175.0f, -450.0f, 680.0f), Vec3(11205.0f,  450.0f, 725.0f));
-    // Runner Vision Helipad Target Beacon at (10550, 0, 680)
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(10460.0f, -90.0f, 680.0f), Vec3(10640.0f, -70.0f, 684.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(10460.0f,  70.0f, 680.0f), Vec3(10640.0f,  90.0f, 684.0f));
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(10535.0f, -70.0f, 680.0f), Vec3(10565.0f,  70.0f, 684.0f));
-
-    // Courier bag
-    append_box_mesh(runner_vision_mesh.vertices, Vec3(5380.0f, 30.0f, 505.0f), Vec3(5420.0f, 70.0f, 545.0f));
-
-    scene.meshes.push_back(course_mesh);
-    scene.meshes.push_back(runner_vision_mesh);
-}
-
-// Translate extracted level meshes so they surround the (0..11200, 0, 50..680) parkour course
-// while culling triangles inside the immediate parkour runway corridor so the camera view is never obstructed.
-static void align_city_meshes_around_course(LevelScene& scene, const Vec3& original_spawn) {
-    Vec3 offset = Vec3(3200.0f, 0.0f, -120.0f) - original_spawn;
-    auto in_corridor = [](const Vec3& p) {
-        return (p.x > -450.0f && p.x < 11250.0f &&
-                p.y > -460.0f && p.y < 460.0f &&
-                p.z > -40.0f  && p.z < 1020.0f);
-    };
-    for (auto& mb : scene.meshes) {
-        std::vector<Vertex> filtered;
-        filtered.reserve(mb.vertices.size());
-
-        // Offsets + culls the triangles of [first, first + count) and appends the survivors.
-        auto filter_range = [&](size_t first, size_t count) {
-            const size_t end = std::min(mb.vertices.size(), first + count);
-            for (size_t i = first; i + 2 < end; i += 3) {
-                Vertex v0 = mb.vertices[i];
-                Vertex v1 = mb.vertices[i + 1];
-                Vertex v2 = mb.vertices[i + 2];
-                v0.position += offset;
-                v1.position += offset;
-                v2.position += offset;
-
-                Vec3 mid = (v0.position + v1.position + v2.position) * (1.0f / 3.0f);
-                if (in_corridor(v0.position) || in_corridor(v1.position) || in_corridor(v2.position) || in_corridor(mid)) {
-                    continue;
-                }
-                filtered.push_back(v0);
-                filtered.push_back(v1);
-                filtered.push_back(v2);
-            }
-        };
-
-        if (mb.sections.empty()) {
-            filter_range(0, mb.vertices.size());
-        } else {
-            // Material sections: filter each section independently and rebuild its vertex range.
-            std::vector<MeshSection> sections;
-            sections.reserve(mb.sections.size());
-            for (const MeshSection& s : mb.sections) {
-                const size_t before = filtered.size();
-                filter_range(s.first_vertex, s.vertex_count);
-                const size_t kept = filtered.size() - before;
-                if (kept == 0) continue;
-                MeshSection ns = s;
-                ns.first_vertex = static_cast<uint32_t>(before);
-                ns.vertex_count = static_cast<uint32_t>(kept);
-                sections.push_back(ns);
-            }
-            mb.sections.swap(sections);
-        }
-        mb.vertices.swap(filtered);
-    }
-}
 
 // Ensure screenshots directory exists
 static void ensure_dir(const std::string& path) {
@@ -337,7 +118,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << "[Oracle] SP00/Tutorial_p.me1: " << (sp00_ok ? "PASS" : "FAIL")
               << " (" << sp00_scene.actors.size() << " actors, "
               << sp00_scene.meshes.size() << " meshes, "
-              << sp00_scene.colliders.size() << " colliders)" << std::endl;
+              << (sp00_scene.collision ? sp00_scene.collision->triangle_count() : 0) << " collision triangles)" << std::endl;
     std::cout << "[Oracle]   SP00 Ambient Lighting (" << sp00_scene.sky_light_source
               << "): FSkyLightSceneProxy UpperLinear=(" << sp00_scene.raw_sky_upper_linear.x << ","
               << sp00_scene.raw_sky_upper_linear.y << "," << sp00_scene.raw_sky_upper_linear.z
@@ -383,13 +164,14 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << std::endl;
 
     // 3. Multi-Stage Deterministic Parkour Simulation & Screenshot Capture
+    //    Every stage drives the real ParkourController against the real UE3 level collision of
+    //    SP00/Tutorial_p.me1 at the tutorial's own training spots (and SP01/Escape_p.me1 for the
+    //    elevator): no procedural geometry is involved.
     std::cout << "\n--- [Multi-Stage Parkour Simulation & Screenshot Capture] ---" << std::endl;
 
+    constexpr float kDt = 1.0f / 60.0f;
     ParkourController controller(move_cfg);
     LevelScene sim_scene = sp00_scene;
-    align_city_meshes_around_course(sim_scene, sp00_scene.player_spawn_pos);
-    controller.build_parkour_test_course(sim_scene);
-    append_test_course_visuals(sim_scene);
 
     std::vector<std::string> telemetry_log;
     auto log_telemetry = [&](const std::string& stage_tag) {
@@ -416,189 +198,219 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         copy_artifact(local_path, brain_path);
     };
 
-    // Stage 1: Sprint acceleration & FOV scaling
-    std::cout << "[Oracle Stage 1] Running Sprint Acceleration & FOV Scaling..." << std::endl;
-    controller.reset(Vec3(1950.0f, 0.0f, 100.0f), 0.0f);
-    InputFrame in1{};
-    in1.forward = 1.0f;
-    in1.sprint = true;
+    // Steps `in` until done() holds (checked after every step) or max_frames elapse.
+    auto step_until = [&](const InputFrame& in, int max_frames, LevelScene& scene, auto&& done) {
+        for (int i = 0; i < max_frames; ++i) {
+            controller.step(in, kDt, scene);
+            if (done()) return true;
+        }
+        return false;
+    };
 
+    InputFrame in_idle{};
+    InputFrame in_run{};
+    in_run.forward = 1.0f;
+    in_run.sprint = true;
+    InputFrame in_run_jump = in_run;
+    in_run_jump.jump = true;
+
+    // Stage 1: Sprint acceleration & FOV scaling across the tutorial's starting roof
+    std::cout << "[Oracle Stage 1] Running Sprint Acceleration & FOV Scaling..." << std::endl;
+    controller.reset(sp00_scene.player_spawn_pos, sp00_scene.player_spawn_yaw);
     for (int i = 0; i < 90; ++i) {
-        controller.step(in1, 1.0f / 60.0f, sim_scene);
+        controller.step(in_run, kDt, sim_scene);
         log_telemetry("Stage1_Sprint");
     }
     renderer.render_frame(sim_scene, controller.get_telemetry());
     save_and_publish_png("oracle_1_sprint_rooftop.png");
 
-    bool s1_pass = (controller.get_telemetry().speed_2d >= 400.0f) && (controller.get_telemetry().fov_deg > 100.0f);
+    const float s1_speed = controller.get_telemetry().speed_2d;
+    const float s1_fov = controller.get_telemetry().fov_deg;
+    const float s1_z = controller.get_position().z;
+    bool s1_pass = (s1_speed >= 400.0f) && (s1_fov > 100.0f) && controller.is_grounded() &&
+                   std::abs(s1_z - sp00_scene.player_spawn_pos.z) < 1.0f;
     std::cout << "  -> Stage 1 Result: " << (s1_pass ? "PASS" : "FAIL")
-              << " (Speed=" << controller.get_telemetry().speed_2d
-              << " u/s, FOV=" << controller.get_telemetry().fov_deg << "°)" << std::endl;
+              << " (Speed=" << s1_speed << " u/s, FOV=" << s1_fov << "°, Roof Z=" << s1_z << ")" << std::endl;
 
-    // Stage 2: Speed Vault & Springboard
+    // Stage 2: Speed Vault over the stage-7 airduct (S_AirductSystem_02a, 145 units high, east face
+    // x ~ -2621) & Springboard off the stage-17 stacked boxes (S_ConstructionPackages_01b)
     std::cout << "[Oracle Stage 2] Testing Speed Vault & Springboard..." << std::endl;
-    // A. Speed Vault Test
-    controller.reset(Vec3(3120.0f, 0.0f, 50.0f), 0.0f);
-    controller.set_velocity(Vec3(420.0f, 0.0f, 0.0f));
-    InputFrame in2_vault{};
-    in2_vault.forward = 1.0f;
-    in2_vault.sprint = true;
-    in2_vault.jump = true;
-    controller.step(in2_vault, 1.0f / 60.0f, sim_scene);
+    // A. Speed Vault: sprint west and jump within reach of the duct face
+    controller.reset(Vec3(-1655.2f, -6505.2f, 4224.0f), 180.0f);
+    step_until(in_run, 240, sim_scene, [&] { return controller.get_position().x <= -2513.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
     bool s2_vault = (controller.get_move_state() == EMovement::MOVE_SpeedVaulting);
     log_telemetry("Stage2_Vault");
+    step_until(in_run, 180, sim_scene, [&] { return controller.is_grounded(); });
+    // Back on the roof (floor 4224) beyond the duct rather than on top of it (4369)
+    const Vec3 vault_land = controller.get_position();
+    bool s2_vault_over = s2_vault && controller.is_grounded() && vault_land.x < -2700.0f && vault_land.z < 4300.0f;
 
-    // B. Springboard Test
-    controller.reset(Vec3(3500.0f, 0.0f, 50.0f), 0.0f);
-    controller.set_velocity(Vec3(450.0f, 0.0f, 0.0f));
-    InputFrame in2_spring{};
-    in2_spring.forward = 1.0f;
-    in2_spring.sprint = true;
-    in2_spring.jump = true;
-    controller.step(in2_spring, 1.0f / 60.0f, sim_scene);
+    // B. Springboard: sprint east at the stacked boxes and jump off them
+    controller.reset(Vec3(156.4f, -3933.6f, 3840.0f), 0.0f);
+    step_until(in_run, 240, sim_scene, [&] { return controller.get_position().x >= 674.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
     bool s2_spring = (controller.get_move_state() == EMovement::MOVE_SpringBoarding);
     log_telemetry("Stage2_Springboard");
 
-    // Advance springboard jump toward apex looking across the rooftop canyon
-    in2_spring.jump = false;
+    // Advance the springboard jump toward its apex looking across the rooftops
     for (int i = 0; i < 8; ++i) {
-        controller.step(in2_spring, 1.0f / 60.0f, sim_scene);
+        controller.step(in_run, kDt, sim_scene);
     }
     controller.set_rotation(0.0f, -12.0f, 0.0f);
     renderer.render_frame(sim_scene, controller.get_telemetry());
     save_and_publish_png("oracle_2_springboard_vault.png");
-    bool s2_pass = s2_vault || s2_spring;
+    float spring_apex_z = controller.get_position().z;
+    step_until(in_run, 120, sim_scene, [&] {
+        spring_apex_z = std::max(spring_apex_z, controller.get_position().z);
+        return controller.get_velocity().z < 0.0f;
+    });
+    // A plain jump (BaseJumpZ 630) peaks ~202 units up; the springboard (JumpZ 950) clears 300+
+    bool s2_spring_high = s2_spring && (spring_apex_z - 3840.0f) > 300.0f;
+    bool s2_pass = s2_vault_over && s2_spring_high;
     std::cout << "  -> Stage 2 Result: " << (s2_pass ? "PASS" : "FAIL")
               << " (Vault=" << (s2_vault ? "OK" : "NO")
+              << ", Vault Landing=(" << vault_land.x << ", " << vault_land.z << ")"
               << ", SpringBoard=" << (s2_spring ? "OK" : "NO")
-              << ", Apex Z=" << controller.get_position().z << ")" << std::endl;
+              << ", Apex Z=" << spring_apex_z << ")" << std::endl;
 
-    // Stage 3: Wallrun & Wallrun Jump with 15° camera tilt
+    // Stage 3: Wallrun along the stage-6 billboard (S_RunnerSign_02) across the rooftop gap
     std::cout << "[Oracle Stage 3] Testing Wallrun & 15° Camera Tilt..." << std::endl;
-    // Position next to right wall (y: 200..260), angled slightly right
-    controller.set_position(Vec3(4150.0f, 160.0f, 180.0f));
-    controller.set_rotation(15.0f, 0.0f, 0.0f);
-    controller.set_velocity(Vec3(400.0f, 80.0f, 0.0f));
-    InputFrame in3{};
-    in3.forward = 1.0f;
-    in3.jump = true;
-
-    controller.step(in3, 1.0f / 60.0f, sim_scene);
+    controller.reset(Vec3(-100.0f, -6110.0f, 4224.0f), 180.0f);
+    controller.set_velocity(Vec3(-550.0f, 0.0f, 0.0f));
+    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= -280.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
     log_telemetry("Stage3_Wallrun_Start");
-
-    in3.jump = false;
+    const EMovement s3_state = controller.get_move_state();
+    bool s3_wallrun = (s3_state == EMovement::MOVE_WallRunningLeft || s3_state == EMovement::MOVE_WallRunningRight);
+    float s3_max_roll = std::abs(controller.get_roll());
     for (int i = 0; i < 15; ++i) {
-        controller.step(in3, 1.0f / 60.0f, sim_scene);
+        controller.step(in_run, kDt, sim_scene);
         log_telemetry("Stage3_Wallrun_Sustain");
+        s3_max_roll = std::max(s3_max_roll, std::abs(controller.get_roll()));
     }
-
-    bool s3_pass = (controller.get_move_state() == EMovement::MOVE_WallRunningRight) ||
-                   (std::abs(controller.get_roll()) >= 10.0f);
-
     renderer.render_frame(sim_scene, controller.get_telemetry());
     save_and_publish_png("oracle_3_wallrun_tilt.png");
-    std::cout << "  -> Stage 3 Result: " << (s3_pass ? "PASS" : "FAIL")
-              << " (State=" << move_state_name(controller.get_move_state())
-              << ", Camera Roll=" << controller.get_roll() << "°)" << std::endl;
 
-    // Stage 4: Wallclimb & Ledge Grab
-    std::cout << "[Oracle Stage 4] Testing Wallclimb & Ledge Grab..." << std::endl;
-    controller.set_position(Vec3(5300.0f, 0.0f, 100.0f));
-    controller.set_rotation(0.0f, 0.0f, 0.0f);
-    controller.set_velocity(Vec3(350.0f, 0.0f, 0.0f));
+    // Ride the wallrun out over the gap (x in [-1100, -400] has no floor) onto the stage-7 roof
+    step_until(in_run, 240, sim_scene, [&] { return controller.is_grounded(); });
+    const Vec3 s3_land = controller.get_position();
+    bool s3_cleared_gap = controller.is_grounded() && s3_land.x < -1150.0f && std::abs(s3_land.z - 4224.0f) < 2.0f;
+    bool s3_pass = s3_wallrun && (s3_max_roll >= 10.0f) && s3_cleared_gap;
+    std::cout << "  -> Stage 3 Result: " << (s3_pass ? "PASS" : "FAIL")
+              << " (State=" << move_state_name(s3_state)
+              << ", Camera Roll=" << s3_max_roll << "°"
+              << ", Landing=(" << s3_land.x << ", " << s3_land.z << "))" << std::endl;
+
+    // Stage 4: Wallclimb up the stage-10 facade (S_R_05_03_F_SP00, face x ~ -8384)
+    std::cout << "[Oracle Stage 4] Testing Wallclimb..." << std::endl;
+    controller.reset(Vec3(-8310.0f, -5534.0f, 4224.0f), 180.0f);
+    for (int i = 0; i < 5; ++i) {
+        controller.step(in_idle, kDt, sim_scene);
+    }
     InputFrame in4{};
     in4.forward = 1.0f;
     in4.jump = true;
-
-    controller.step(in4, 1.0f / 60.0f, sim_scene);
+    controller.step(in4, kDt, sim_scene);
     bool s4_climb = (controller.get_move_state() == EMovement::MOVE_WallClimbing);
     log_telemetry("Stage4_Climb");
 
+    float s4_peak_z = controller.get_position().z;
     in4.jump = false;
     for (int i = 0; i < 35; ++i) {
-        controller.step(in4, 1.0f / 60.0f, sim_scene);
+        controller.step(in4, kDt, sim_scene);
+        s4_peak_z = std::max(s4_peak_z, controller.get_position().z);
     }
-    std::cout << "  -> Stage 4 Result: " << (s4_climb ? "PASS" : "FAIL")
+    bool s4_pass = s4_climb && (s4_peak_z - 4224.0f) >= 40.0f;
+    std::cout << "  -> Stage 4 Result: " << (s4_pass ? "PASS" : "FAIL")
               << " (State=" << move_state_name(controller.get_move_state())
-              << ", Final Z=" << controller.get_position().z << ")" << std::endl;
+              << ", Climb Peak Z=" << s4_peak_z << ")" << std::endl;
 
-    // Stage 5: Zipline & Crouch Slide
+    // Stage 5: Zipline (TdZiplineVolume_0 from the stage-15 platform) & Crouch Slide (stage-3 airduct)
     std::cout << "[Oracle Stage 5] Testing Zipline & Crouch Slide..." << std::endl;
-    controller.reset(Vec3(5500.0f, 0.0f, 520.0f), 0.0f);
-    InputFrame in5_zip{};
-    in5_zip.forward = 1.0f;
-
-    controller.step(in5_zip, 1.0f / 60.0f, sim_scene);
-    bool s5_zip = (controller.get_move_state() == EMovement::MOVE_ZipLine);
+    controller.reset(Vec3(-8900.0f, -5280.0f, 6142.0f), 20.0f);
+    for (int i = 0; i < 10; ++i) {
+        controller.step(in_idle, kDt, sim_scene);
+    }
+    InputFrame in5_jump{};
+    in5_jump.jump = true;
+    controller.step(in5_jump, kDt, sim_scene);
+    bool s5_zip = step_until(in_idle, 40, sim_scene, [&] { return controller.get_move_state() == EMovement::MOVE_ZipLine; });
     log_telemetry("Stage5_Zipline");
 
-    // Land on far rooftop and slide approaching the overhead ventilation duct
-    controller.reset(Vec3(7060.0f, 0.0f, 100.0f), 0.0f);
-    controller.set_velocity(Vec3(450.0f, 0.0f, 0.0f));
+    const Vec3 zip_grab = controller.get_position();
+    for (int i = 0; i < 120 && controller.get_move_state() == EMovement::MOVE_ZipLine; ++i) {
+        controller.step(in_idle, kDt, sim_scene);
+        log_telemetry("Stage5_Zipline_Ride");
+        if (i == 60) {
+            renderer.render_frame(sim_scene, controller.get_telemetry());
+            save_and_publish_png("oracle_4_zipline_slide.png");
+        }
+    }
+    const float zip_travel = controller.get_position().distance(zip_grab);
+    bool s5_zip_ride = s5_zip && (controller.get_move_state() == EMovement::MOVE_ZipLine) && zip_travel > 600.0f;
+
+    // Slide toward the airduct across the stage-3 roof
+    controller.reset(Vec3(208.0f, -7744.0f, 5760.0f), 0.0f);
+    for (int i = 0; i < 40; ++i) {
+        controller.step(in_run, kDt, sim_scene);
+    }
     InputFrame in5_slide{};
     in5_slide.forward = 1.0f;
     in5_slide.crouch = true;
-    controller.step(in5_slide, 1.0f / 60.0f, sim_scene);
+    controller.step(in5_slide, kDt, sim_scene);
     bool s5_slide = (controller.get_move_state() == EMovement::MOVE_Slide);
     log_telemetry("Stage5_Slide");
-
-    renderer.render_frame(sim_scene, controller.get_telemetry());
-    save_and_publish_png("oracle_4_zipline_slide.png");
-    bool s5_pass = s5_zip && s5_slide;
+    const float slide_start_x = controller.get_position().x;
+    for (int i = 0; i < 70; ++i) {
+        controller.step(in5_slide, kDt, sim_scene);
+    }
+    const float slide_dist = controller.get_position().x - slide_start_x;
+    bool s5_slide_ok = s5_slide && (controller.get_move_state() == EMovement::MOVE_Slide) &&
+                       controller.is_grounded() && slide_dist > 300.0f;
+    bool s5_pass = s5_zip_ride && s5_slide_ok;
     std::cout << "  -> Stage 5 Result: " << (s5_pass ? "PASS" : "FAIL")
-              << " (ZipLine=" << (s5_zip ? "OK" : "NO")
-              << ", Slide=" << (s5_slide ? "OK" : "NO") << ")" << std::endl;
+              << " (ZipLine=" << (s5_zip ? "OK" : "NO") << ", Ride=" << zip_travel << " u"
+              << ", Slide=" << (s5_slide ? "OK" : "NO") << ", Slide Distance=" << slide_dist << " u)" << std::endl;
 
-    // Stage 6: Mid-Air Coil & Landing Skill Roll
+    // Stage 6: Mid-Air Coil & Skill Roll: run off the top of S_RunnerRamp_01 into the pit beyond
+    // the starting roof (5840 -> 5409)
     std::cout << "[Oracle Stage 6] Testing Mid-Air Coil & Skill Roll..." << std::endl;
-    controller.reset(Vec3(2000.0f, 0.0f, 350.0f), 0.0f);
-    controller.get_telemetry().grounded = false;
-    controller.get_telemetry().move_state = EMovement::MOVE_Falling;
-    controller.set_velocity(Vec3(350.0f, 0.0f, -100.0f));
+    controller.reset(Vec3(-1500.0f, -7903.8f, 5760.0f), 0.0f);
+    controller.set_velocity(Vec3(630.0f, 0.0f, 0.0f));
+    step_until(in_run, 240, sim_scene, [&] { return !controller.is_grounded(); });
+    const float s6_launch_z = controller.get_position().z;
 
     InputFrame in6{};
     in6.crouch = true;
     in6.forward = 1.0f;
-    controller.step(in6, 1.0f / 60.0f, sim_scene);
+    controller.step(in6, kDt, sim_scene);
     bool s6_coil = (controller.get_move_state() == EMovement::MOVE_Coil);
     log_telemetry("Stage6_Coil");
 
-    // Descend to floor with crouch buffer for skill roll
-    for (int i = 0; i < 45; ++i) {
-        controller.step(in6, 1.0f / 60.0f, sim_scene);
-    }
+    // Keep crouch held (crouch landing buffer) through the touchdown for the skill roll
+    step_until(in6, 180, sim_scene, [&] { return controller.is_grounded(); });
     bool s6_roll = (controller.get_move_state() == EMovement::MOVE_SkillRoll);
+    log_telemetry("Stage6_SkillRoll");
+    const float s6_drop = s6_launch_z - controller.get_position().z;
     bool s6_pass = s6_coil && s6_roll;
     std::cout << "  -> Stage 6 Result: " << (s6_pass ? "PASS" : "FAIL")
-              << " (Coil=" << (s6_coil ? "OK" : "NO") << ", Roll=" << (s6_roll ? "OK" : "NO") << ")" << std::endl;
+              << " (Coil=" << (s6_coil ? "OK" : "NO") << ", Roll=" << (s6_roll ? "OK" : "NO")
+              << ", Drop=" << s6_drop << " u)" << std::endl;
 
-    // Stage 7: Combat Disarm & Reaction Time
+    // Stage 7: Combat Disarm (Celeste on the stage-19 combat terrace) & Reaction Time
     std::cout << "[Oracle Stage 7] Testing Combat Disarm & Reaction Time..." << std::endl;
-    if (!sim_scene.enemies.empty()) {
-        sim_scene.enemies[0].position = Vec3(9310.0f, -24.0f, 100.0f);
-        sim_scene.enemies[0].yaw_deg = 172.0f;
-        sim_scene.enemies[0].alive = true;
-        sim_scene.enemies[0].stunned = false;
-        sim_scene.enemies[0].disarm_window = true;
-        sim_scene.enemies[0].weapon_name = "Colt1911";
-
-        // Second KrugerSec SWAT backup guard in arena with active Runner Vision disarm window
-        EnemyBot backup_guard;
-        backup_guard.position = Vec3(9450.0f, 48.0f, 100.0f);
-        backup_guard.yaw_deg = 200.0f;
-        backup_guard.health = 100.0f;
-        backup_guard.alive = true;
-        backup_guard.stunned = false;
-        backup_guard.disarm_window = true;
-        backup_guard.weapon_name = "G36C";
-        sim_scene.enemies.push_back(backup_guard);
+    controller.reset(Vec3(751.8f, -1591.7f, 4992.0f), 90.0f);
+    InputFrame in7_walk{};
+    in7_walk.forward = 1.0f;
+    for (int i = 0; i < 20; ++i) {
+        controller.step(in7_walk, kDt, sim_scene);
     }
-    controller.reset(Vec3(9215.0f, 0.0f, 100.0f), 0.0f);
     InputFrame in7{};
     in7.reaction_time = true;
     in7.disarm = true;
 
-    controller.step(in7, 1.0f / 60.0f, sim_scene);
+    controller.step(in7, kDt, sim_scene);
     log_telemetry("Stage7_Disarm");
 
     bool s7_disarm = (controller.get_move_state() == EMovement::MOVE_Snatch && controller.get_telemetry().weapon.equipped);
@@ -633,56 +445,79 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", WeaponsVerified=" << weapons_verified << "/11"
               << ", Reaction=" << (s7_reaction ? "ACTIVE" : "OFF") << ")" << std::endl;
 
-    // Stage 8: Interactive Elevator Ride & Mid-Shaft Level Streaming Transition (Z = 100 -> 680)
+    // Stage 8: Interactive Elevator Ride & Mid-Shaft Level Streaming on the real SP01/Escape_p.me1
+    // mainlift (Escape_Intro-Off_Spt InterpActor cab + sliding doors, Z 10608 -> 12288)
     std::cout << "[Oracle Stage 8] Testing Interactive Elevator Ride & Mid-Shaft Level Streaming..." << std::endl;
-    sim_scene.enemies.clear(); // clear arena guards so Faith can walk into the Penthouse Elevator unimpeded
-    controller.reset(Vec3(9780.0f, 0.0f, 100.0f), 0.0f);
-
-    // 8A. Walk across the open lower doorway into the Penthouse Elevator cab (X=9960, Y=0, Z=100)
-    InputFrame in8_enter{};
-    in8_enter.forward = 1.0f;
-    for (int i = 0; i < 45; ++i) {
-        controller.step(in8_enter, 1.0f / 60.0f, sim_scene);
-    }
-    // Press E / Use inside the cab and ride the elevator through DoorsClosing -> Moving -> DoorsOpening -> IdleEnd
-    InputFrame in8_ride{};
-    in8_ride.use = true;
-    controller.step(in8_ride, 1.0f / 60.0f, sim_scene);
-    in8_ride.use = false;
-
-    bool captured_mid_ride = false;
-    for (int i = 0; i < 180; ++i) {
-        controller.step(in8_ride, 1.0f / 60.0f, sim_scene);
-        log_telemetry("Stage8_Elevator_Ride");
-        if (!captured_mid_ride && !sim_scene.elevators.empty() &&
-            sim_scene.elevators.front().state == ElevatorState::DoorsOpening &&
-            sim_scene.elevators.front().door_open_End >= 0.42f) {
-            captured_mid_ride = true;
-            PlayerTelemetry t8_shot = controller.get_telemetry();
-            t8_shot.position = Vec3(9935.0f, -24.0f, sim_scene.elevators.front().current_pos.z);
-            t8_shot.yaw_deg = 20.0f;
-            t8_shot.pitch_deg = -3.0f;
-            t8_shot.in_elevator = true;
-            t8_shot.elevator_progress = 1.0f;
-            renderer.render_frame(sim_scene, t8_shot);
-            save_and_publish_png("oracle_8_elevator_level_streaming.png");
+    bool s8_pass = false;
+    {
+        LevelScene esc_scene;
+        const bool esc_ok = load_level_scene(game_root, "Maps/SP01/Escape_p.me1", esc_scene);
+        int lift = -1;
+        for (size_t i = 0; i < esc_scene.elevators.size(); ++i) {
+            const ElevatorInstance& e = esc_scene.elevators[i];
+            if (std::abs(e.end_pos.z - e.start_pos.z - 1680.0f) < 1.0f) {
+                lift = static_cast<int>(i);
+                break;
+            }
         }
-    }
-    float cab_top_z = controller.get_position().z;
-    bool s8_elev_top = (cab_top_z >= 675.0f) && !sim_scene.elevators.empty() &&
-                       sim_scene.elevators.front().streaming_triggered;
 
-    // 8B. Walk out of the open upper elevator doors onto the streamed Upper Penthouse Helipad deck (X > 10120, Z = 680)
-    for (int i = 0; i < 50; ++i) {
-        controller.step(in8_enter, 1.0f / 60.0f, sim_scene);
+        float cab_top_z = 0.0f;
+        bool s8_elev_top = false;
+        bool s8_walkout = false;
+        Vec3 walkout_pos(0.0f, 0.0f, 0.0f);
+        if (esc_ok && lift >= 0) {
+            const Vec3 lift_floor = esc_scene.elevators[lift].start_pos + esc_scene.elevators[lift].cab_local_offset;
+            const Vec3 lift_half = esc_scene.elevators[lift].cab_half_extents;
+            const float lift_top_z = esc_scene.elevators[lift].end_pos.z;
+
+            // 8A. Walk from the corridor through the open lower doors into the cab and press Use
+            controller.reset(Vec3(5800.0f, lift_floor.y, lift_floor.z), 0.0f);
+            InputFrame in8_walk{};
+            in8_walk.forward = 1.0f;
+            for (int i = 0; i < 45; ++i) {
+                controller.step(in8_walk, kDt, esc_scene);
+            }
+            InputFrame in8_use{};
+            in8_use.use = true;
+            controller.step(in8_use, kDt, esc_scene);
+
+            // Ride DoorsClosing -> Moving (sublevels stream in mid-shaft) -> DoorsOpening -> IdleEnd
+            bool captured_mid_ride = false;
+            for (int i = 0; i < 600 && esc_scene.elevators[lift].state != ElevatorState::IdleEnd; ++i) {
+                controller.step(in_idle, kDt, esc_scene);
+                log_telemetry("Stage8_Elevator_Ride");
+                const ElevatorInstance& el = esc_scene.elevators[lift];
+                if (!captured_mid_ride && el.state == ElevatorState::DoorsOpening && el.door_open_End >= 0.42f) {
+                    captured_mid_ride = true;
+                    PlayerTelemetry t8_shot = controller.get_telemetry();
+                    t8_shot.yaw_deg = 180.0f;  // look out through the opening upper doors
+                    t8_shot.pitch_deg = -3.0f;
+                    renderer.render_frame(esc_scene, t8_shot);
+                    save_and_publish_png("oracle_8_elevator_level_streaming.png");
+                }
+            }
+            cab_top_z = controller.get_position().z;
+            s8_elev_top = (std::abs(cab_top_z - lift_top_z) < 2.0f) &&
+                          (esc_scene.elevators[lift].state == ElevatorState::IdleEnd) &&
+                          esc_scene.elevators[lift].streaming_triggered;
+
+            // 8B. Turn around and walk out of the open upper doors onto the upper floor
+            controller.set_rotation(180.0f, 0.0f, 0.0f);
+            for (int i = 0; i < 60; ++i) {
+                controller.step(in8_walk, kDt, esc_scene);
+            }
+            walkout_pos = controller.get_position();
+            s8_walkout = controller.is_grounded() && walkout_pos.x < lift_floor.x - lift_half.x - 30.0f &&
+                         std::abs(walkout_pos.z - lift_top_z) < 2.0f;
+        }
+        s8_pass = s8_elev_top && s8_walkout && real_elev_ok;
+        std::cout << "  -> Stage 8 Result: " << (s8_pass ? "PASS" : "FAIL")
+                  << " (Escape_p=" << (esc_ok ? "OK" : "NO") << ", Lift=" << lift
+                  << ", Elevator Top Z=" << cab_top_z
+                  << ", Walkout Pos=(" << walkout_pos.x << ", " << walkout_pos.z << ")"
+                  << ", Streamed Sublevels=" << esc_scene.loaded_sublevel_packages.size()
+                  << ", Checkpoint='" << controller.get_telemetry().active_checkpoint_name << "')" << std::endl;
     }
-    bool s8_helipad_walkout = (controller.get_position().x >= 10100.0f) && (controller.get_position().z >= 675.0f);
-    bool s8_pass = s8_elev_top && s8_helipad_walkout && real_elev_ok;
-    std::cout << "  -> Stage 8 Result: " << (s8_pass ? "PASS" : "FAIL")
-              << " (Elevator Top Z=" << cab_top_z
-              << ", Walkout Pos=(" << controller.get_position().x << ", " << controller.get_position().z << ")"
-              << ", Streamed Sublevels=" << sim_scene.loaded_sublevel_packages.size()
-              << ", Checkpoint='" << controller.get_telemetry().active_checkpoint_name << "')" << std::endl;
 
     // Stage 9: SP01/Edge_p.me1 Level Rendering, Checkpoint Streaming & Chapter Select Menu
     std::cout << "[Oracle Stage 9] Testing SP01 Level, Checkpoint Streaming & Chapter Select Overlay..." << std::endl;
@@ -786,10 +621,20 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cout << "[Oracle] Telemetry written to /tmp/me_oracle_telemetry.json" << std::endl;
     }
 
+    // Stages with pass/fail assertions: parkour stages 1-8 and the cutscene stage 11
+    // (stages 9 and 10 only render screenshots).
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass};
+    int stages_failed = 0;
+    for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
-    std::cout << "  ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!" << std::endl;
+    if (stages_failed == 0) {
+        std::cout << "  ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!" << std::endl;
+    } else {
+        std::cout << "  ORACLE VERIFICATION COMPLETE: " << stages_failed << " OF " << std::size(stage_results)
+                  << " VERIFIED STAGES FAILED" << std::endl;
+    }
     std::cout << "============================================================" << std::endl;
-    return 0;
+    return stages_failed == 0 ? 0 : 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -900,18 +745,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         std::cout << "[Game] Loading Level: " << map_file << "..." << std::endl;
-        bool loaded = load_level_scene(game_root, map_file, active_scene);
-        audio.load_level_audio(game_root, map_file);
-        if (!loaded) {
-            std::cout << "[Game] Using contiguous procedural training grounds." << std::endl;
-            controller.build_parkour_test_course(active_scene);
-            append_test_course_visuals(active_scene);
+        LevelScene loaded_scene;
+        if (!load_level_scene(game_root, map_file, loaded_scene)) {
+            std::cerr << "[Game ERROR] Failed to load " << map_file << " from " << game_root
+                      << (active_scene.meshes.empty() ? "" : " (staying in the current level)") << std::endl;
+            return false;
         }
+        active_scene = std::move(loaded_scene);
         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
         controller.get_telemetry().active_checkpoint = 0;
         if (!active_scene.subtitles.empty() && !active_scene.subtitles[0].empty()) {
             controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
+        audio.load_level_audio(game_root, map_file);
 
         // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in)
         if (max_frames == 0) {
@@ -922,9 +768,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
             }
         }
+        return true;
     };
 
-    load_chapter_or_level(current_chapter_idx, custom_level);
+    if (!load_chapter_or_level(current_chapter_idx, custom_level)) {
+        std::cerr << "[Game ERROR] No playable level (check --game-root / --level)." << std::endl;
+        if (game_controller) SDL_GameControllerClose(game_controller);
+        SDL_Metal_DestroyView(metal_view);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
 
     SDL_SetRelativeMouseMode(SDL_TRUE);
     ensure_dir("screenshots");
