@@ -850,6 +850,14 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             }
         }
 
+        bool b_comp_collide = true;
+        if (const auto* p = get_prop("bCollideActors")) {
+            if (!p->bool_val) b_comp_collide = false;
+        }
+        if (const auto* p = get_prop("bBlockActors")) {
+            if (!p->bool_val) b_comp_collide = false;
+        }
+
         if (comp_idx > 0 && static_cast<size_t>(comp_idx) <= exports_.size()) {
             const auto& comp_exp = exports_[comp_idx - 1];
             size_t cp_start = find_property_start(comp_exp);
@@ -862,6 +870,12 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                 }
                 if (comp_props.find("HiddenGame") != comp_props.end() && comp_props["HiddenGame"].bool_val) {
                     b_hidden = true;
+                }
+                if (comp_props.find("CollideActors") != comp_props.end() && !comp_props["CollideActors"].bool_val) {
+                    b_comp_collide = false;
+                }
+                if (comp_props.find("BlockActors") != comp_props.end() && !comp_props["BlockActors"].bool_val) {
+                    b_comp_collide = false;
                 }
                 if (comp_props.find("Scale") != comp_props.end() && comp_props["Scale"].float_val > 0.0f) {
                     a.draw_scale *= comp_props["Scale"].float_val;
@@ -887,6 +901,12 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     }
                     if (acomp_props.find("HiddenGame") != acomp_props.end() && acomp_props["HiddenGame"].bool_val) {
                         b_hidden = true;
+                    }
+                    if (acomp_props.find("CollideActors") != acomp_props.end() && !acomp_props["CollideActors"].bool_val) {
+                        b_comp_collide = false;
+                    }
+                    if (acomp_props.find("BlockActors") != acomp_props.end() && !acomp_props["BlockActors"].bool_val) {
+                        b_comp_collide = false;
                     }
                 }
                 c_arch = acomp_exp.archetype;
@@ -931,23 +951,26 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
         a.is_checkpoint = (low_class.find("checkpoint") != std::string::npos || low_obj.find("checkpoint") != std::string::npos);
         a.is_trigger = (low_class.find("trigger") != std::string::npos);
-        a.is_zipline = (low_class.find("zipline") != std::string::npos || low_mesh.find("zipline") != std::string::npos);
-        a.is_ladder = (low_class.find("ladder") != std::string::npos || low_mesh.find("ladder") != std::string::npos);
-        a.is_ledge = (low_class.find("ledge") != std::string::npos);
-        a.is_springboard = (low_class.find("springboard") != std::string::npos || low_obj.find("springboard") != std::string::npos || low_mesh.find("springboard") != std::string::npos);
-        a.is_balance_beam = (low_class.find("balance") != std::string::npos);
-        a.is_swing_bar = (low_class.find("swing") != std::string::npos || low_mesh.find("swingpole") != std::string::npos);
+        a.is_zipline = (low_class.find("ziplinevolume") != std::string::npos);
+        a.is_ladder = (low_class.find("laddervolume") != std::string::npos || low_mesh.find("ladder") != std::string::npos);
+        a.is_ledge = (low_class.find("ledgewalkvolume") != std::string::npos || low_class.find("ledge") != std::string::npos);
+        a.is_springboard = (low_class.find("springboard") != std::string::npos || low_obj.find("springboard") != std::string::npos ||
+                            low_mesh.find("springboard") != std::string::npos ||
+                            (b_loi && (low_mesh.find("constructionpackages") != std::string::npos ||
+                                       low_mesh.find("runnerramp") != std::string::npos)));
+        a.is_balance_beam = (low_class.find("balancewalkvolume") != std::string::npos || low_class.find("balance") != std::string::npos);
+        a.is_swing_bar = (low_class.find("swingvolume") != std::string::npos || low_mesh.find("swingpole") != std::string::npos);
         a.is_enemy = (low_class.find("ai") != std::string::npos || low_class.find("botpawn") != std::string::npos || low_class.find("cop") != std::string::npos);
         a.is_bag = (low_class.find("bag") != std::string::npos || low_obj.find("bag") != std::string::npos || low_mesh.find("s_bag") != std::string::npos);
         a.is_elevator_part = is_elev_mesh || is_elev_button;
         a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline || a.is_ladder || a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
+        a.is_collidable = (!a.mesh_name.empty() && b_comp_collide && !a.is_elevator_part && !a.is_trigger && !a.is_checkpoint && !a.is_zipline);
 
-        // Hollow elevator cabs (S_Elevator_01, S_SP09_ElevatorWithTop_01, etc.), elevator frames,
-        // and sliding doors (S_ElevatorDoor_01) must NOT become solid static AABB bricks in out_colliders,
-        // otherwise the player cannot walk through the doorway or stand inside the cab.
-        // Instead, ElevatorInstance provides dynamic floor/ceiling/wall/door collision.
-        if (a.is_elevator_part || a.is_trigger || a.is_checkpoint) {
-            a.is_collidable = false;
+        // Movement volumes (TdZiplineVolume, TdBalanceWalkVolume, TdLadderVolume, TdLedgeWalkVolume, TdSwingVolume)
+        // store their world-space spline endpoints in Start and End properties.
+        if (a.is_zipline || a.is_balance_beam || a.is_ladder || a.is_ledge || a.is_swing_bar) {
+            if (const auto* ps = get_prop("Start")) a.location = ps->vec_val;
+            if (const auto* pe = get_prop("End")) a.end_point = pe->vec_val;
         }
 
         // Approximate initial world bounds (refined later when StaticMeshAsset is bound)
@@ -1868,10 +1891,123 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                 overall_max.y = std::max(overall_max.y, actor_aabb.max_pt.y);
                 overall_max.z = std::max(overall_max.z, actor_aabb.max_pt.z);
 
+                // Filter out non-gameplay sky/vista/backdrop/clutter/door-blocker meshes from collision
                 if (a.is_collidable) {
-                    out_colliders.push_back(actor_aabb);
+                    if (low_mesh.find("vista") != std::string::npos ||
+                        low_mesh.find("sky") != std::string::npos ||
+                        low_mesh.find("cloud") != std::string::npos ||
+                        low_mesh.find("airliner") != std::string::npos ||
+                        low_mesh.find("bd_") != std::string::npos ||
+                        low_mesh.find("_bd") != std::string::npos ||
+                        low_mesh.find("road_") != std::string::npos ||
+                        low_mesh.find("street") != std::string::npos ||
+                        low_mesh.find("signad") != std::string::npos ||
+                        low_mesh.find("litter") != std::string::npos ||
+                        low_mesh.find("garbage") != std::string::npos ||
+                        low_mesh.find("paintbucket") != std::string::npos ||
+                        low_mesh.find("cablesystem") != std::string::npos ||
+                        low_mesh.find("cablebox") != std::string::npos ||
+                        low_mesh.find("cable_") != std::string::npos ||
+                        low_mesh.find("crane_wire") != std::string::npos ||
+                        low_mesh.find("plasticcover") != std::string::npos ||
+                        low_mesh.find("doorhalf") != std::string::npos ||
+                        low_mesh.find("barge") != std::string::npos ||
+                        low_mesh.find("doorframe") != std::string::npos ||
+                        low_mesh.find("runnersign") != std::string::npos ||
+                        low_mesh.find("windowcover") != std::string::npos) {
+                        a.is_collidable = false;
+                    }
+                }
+
+                if (a.is_collidable) {
+                    Vec3 ext = actor_aabb.max_pt - actor_aabb.min_pt;
+                    if (ext.x > 140.0f || ext.y > 140.0f || ext.z > 140.0f) {
+                        // Decompose large architectural meshes (rooftop shells, staircases, ramps, ducts, fences)
+                        // into tight per-triangle AABBs so hollow interiors, doorways, and crouch-slide ducts remain open.
+                        auto xform_pt = [&](const Vec3& lv_pos) -> Vec3 {
+                            Vec3 sp_pos(lv_pos.x * scale.x, lv_pos.y * scale.y, lv_pos.z * scale.z);
+                            return a.location + axis_x * sp_pos.x + axis_y * sp_pos.y + axis_z * sp_pos.z;
+                        };
+
+                        auto emit_tri_colliders = [&](auto& self, const Vec3& p0, const Vec3& p1, const Vec3& p2,
+                                                      const Vec3& n, int depth) -> void {
+                            float min_x = std::min({p0.x, p1.x, p2.x});
+                            float max_x = std::max({p0.x, p1.x, p2.x});
+                            float min_y = std::min({p0.y, p1.y, p2.y});
+                            float max_y = std::max({p0.y, p1.y, p2.y});
+                            float min_z = std::min({p0.z, p1.z, p2.z});
+                            float max_z = std::max({p0.z, p1.z, p2.z});
+
+                            if (n.z >= 0.55f) {
+                                // Walkable floor or ramp surface
+                                if ((max_z - min_z) > 16.0f && depth < 3) {
+                                    Vec3 m01 = (p0 + p1) * 0.5f;
+                                    Vec3 m12 = (p1 + p2) * 0.5f;
+                                    Vec3 m20 = (p2 + p0) * 0.5f;
+                                    self(self, p0, m01, m20, n, depth + 1);
+                                    self(self, m01, p1, m12, n, depth + 1);
+                                    self(self, m20, m12, p2, n, depth + 1);
+                                    self(self, m01, m12, m20, n, depth + 1);
+                                    return;
+                                }
+                                out_colliders.emplace_back(Vec3(min_x, min_y, max_z - 12.0f),
+                                                           Vec3(max_x, max_y, max_z));
+                            } else if (n.z <= -0.55f) {
+                                // Ceiling / overhead airduct soffit (blocks standing walk, allows crouch-slide underneath)
+                                out_colliders.emplace_back(Vec3(min_x, min_y, min_z),
+                                                           Vec3(max_x, max_y, min_z + 12.0f));
+                            } else {
+                                // Vertical wall / parapet / fence
+                                if ((max_z - min_z) < 18.0f) return;
+                                if ((max_x - min_x) > 45.0f && (max_y - min_y) > 45.0f && depth < 3) {
+                                    Vec3 m01 = (p0 + p1) * 0.5f;
+                                    Vec3 m12 = (p1 + p2) * 0.5f;
+                                    Vec3 m20 = (p2 + p0) * 0.5f;
+                                    self(self, p0, m01, m20, n, depth + 1);
+                                    self(self, m01, p1, m12, n, depth + 1);
+                                    self(self, m20, m12, p2, n, depth + 1);
+                                    self(self, m01, m12, m20, n, depth + 1);
+                                    return;
+                                }
+                                out_colliders.emplace_back(Vec3(min_x - 3.0f, min_y - 3.0f, min_z),
+                                                           Vec3(max_x + 3.0f, max_y + 3.0f, max_z));
+                            }
+                        };
+
+                        for (size_t i = 0; i + 2 < sm->triangles.size(); i += 3) {
+                            Vec3 p0 = xform_pt(sm->triangles[i].position);
+                            Vec3 p1 = xform_pt(sm->triangles[det_sign < 0.0f ? i + 2 : i + 1].position);
+                            Vec3 p2 = xform_pt(sm->triangles[det_sign < 0.0f ? i + 1 : i + 2].position);
+                            Vec3 e1 = p1 - p0;
+                            Vec3 e2 = p2 - p0;
+                            Vec3 fn = e1.cross(e2);
+                            float len_sq = fn.length_sq();
+                            if (len_sq < 1e-6f) continue;
+                            fn = fn * (1.0f / std::sqrt(len_sq));
+                            emit_tri_colliders(emit_tri_colliders, p0, p1, p2, fn, 0);
+                        }
+                    } else if (ext.z >= 18.0f) {
+                        out_colliders.push_back(actor_aabb);
+                    }
+                    // Clear is_collidable on the actor so sweep_capsule/trace_ray use out_colliders
+                    // rather than testing the coarse whole-actor AABB in scene.actors.
+                    a.is_collidable = false;
                 }
             }
+        } else if ((a.is_balance_beam || a.is_ledge) && a.end_point.length_sq() > 1.0f) {
+            // Emit walkable step colliders along TdBalanceWalkVolume and TdLedgeWalkVolume spans
+            Vec3 span = a.end_point - a.location;
+            float len = span.length();
+            int steps = std::max(1, static_cast<int>(len / 40.0f));
+            float z_top_offset = a.is_balance_beam ? -25.0f : -3.0f;
+            for (int s = 0; s <= steps; ++s) {
+                float t = static_cast<float>(s) / static_cast<float>(steps);
+                Vec3 p = a.location + span * t;
+                float top_z = p.z + z_top_offset;
+                out_colliders.emplace_back(Vec3(p.x - 36.0f, p.y - 36.0f, top_z - 16.0f),
+                                           Vec3(p.x + 36.0f, p.y + 36.0f, top_z));
+            }
+            a.is_collidable = false;
         } else if (!has_real_meshes || a.is_springboard || a.is_zipline || a.is_bag) {
             // Fallback box only when no mesh library is provided or for interactive parkour items
             float w = 60.0f * std::abs(a.draw_scale) * std::max(0.2f, std::abs(a.draw_scale_3d.x));
@@ -1895,6 +2031,7 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
 
             if (a.is_collidable) {
                 out_colliders.push_back(box_bounds);
+                a.is_collidable = false;
             }
         }
     }
@@ -1923,7 +2060,7 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
         size_t sections = world_batch.sections.size() + rv_batch.sections.size();
         std::cout << "[Level] " << placed_meshes << " static meshes placed, " << missing_meshes
                   << " missing (" << missing_names.size() << " unique), " << fallback_boxes << " fallback boxes, "
-                  << sections << " material sections" << std::endl;
+                  << sections << " material sections, " << out_colliders.size() << " colliders" << std::endl;
         if (std::getenv("ME_MATERIAL_VERBOSE") && !missing_names.empty()) {
             std::vector<std::pair<int, std::string>> top;
             for (const auto& [n, c] : missing_names) top.emplace_back(c, n);
@@ -2054,6 +2191,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.meshes.clear();
     out_scene.colliders.clear();
     out_scene.checkpoints.clear();
+    out_scene.subtitles.clear();
     out_scene.checkpoint_infos.clear();
     out_scene.streaming_actions.clear();
     out_scene.all_streaming_packages.clear();
@@ -2167,14 +2305,19 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         auto sub_pkg = std::make_shared<UPKPackage>(sub_path);
         if (!sub_pkg->is_valid()) continue;
 
+        std::string sub_stem = fs::path(sub_path).stem().string();
+        const bool is_background_pkg = (to_lower(sub_stem).find("_bac") != std::string::npos);
+
         loaded_packages.push_back(sub_pkg);
         sub_pkg->extract_static_meshes(mesh_library);
         auto sub_actors = sub_pkg->extract_actors();
+        if (is_background_pkg) {
+            for (auto& sa : sub_actors) sa.is_collidable = false;
+        }
         out_scene.actors.insert(out_scene.actors.end(), sub_actors.begin(), sub_actors.end());
         sub_pkg->extract_level_streaming_and_checkpoints(
             out_scene.checkpoint_infos, out_scene.streaming_actions, out_scene.all_streaming_packages);
         scan_level_suns(*sub_pkg, level_sun);
-        std::string sub_stem = fs::path(sub_path).stem().string();
         out_scene.loaded_sublevel_packages.push_back(sub_stem);
         if (pm) pm->add_loaded(sub_stem, sub_pkg);
     }
@@ -2283,82 +2426,130 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
     pm.reset();
 
-    // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry.
-    // Prefer the chapter's DefaultCheckpoint when it has valid coordinates.
-    bool found_start = false;
-    for (const auto& cp : out_scene.checkpoint_infos) {
-        if (cp.default_checkpoint && (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f)) {
-            out_scene.player_spawn_pos = cp.location + Vec3(0.0f, 0.0f, 35.0f);
-            out_scene.player_spawn_yaw = cp.rotation.to_degrees().y;
-            found_start = true;
-            break;
-        }
-    }
-    int best_score = -100000;
-    for (const auto& a : out_scene.actors) {
-        bool is_spawn_candidate = (a.class_name.find("PlayerStart") != std::string::npos ||
-                                   a.class_name.find("TutorialStart") != std::string::npos ||
-                                   a.class_name.find("Checkpoint") != std::string::npos ||
-                                   a.class_name.find("CheckPoint") != std::string::npos);
-        if (!is_spawn_candidate) continue;
-        if (a.location.x == 0.0f && a.location.y == 0.0f && a.location.z == 0.0f) continue;
+    if (low_prefix == "tutorial") {
+        // Exact 19-stage Tutorial progression extracted from Tutorial_p.me1 TdTutorialStart exports
+        // (feet Z = TdTutorialStart.Location.z - 94.0f)
+        out_scene.chapter_title = "TRAINING: TUTORIAL";
+        out_scene.player_spawn_pos = Vec3(-4813.65f, -7903.79f, 5760.0f);
+        out_scene.player_spawn_yaw = 0.0f;
 
-        int nearby = 0;
-        bool has_floor_below = false;
-        for (const auto& other : out_scene.actors) {
-            if (other.mesh_name.empty()) continue;
-            Vec3 c = other.world_bounds.center();
-            float dx = c.x - a.location.x;
-            float dy = c.y - a.location.y;
-            float dz = std::abs(c.z - a.location.z);
-            if ((dx * dx + dy * dy) < (6000.0f * 6000.0f) && dz < 2500.0f) {
-                nearby++;
-            }
-            if (a.location.x >= other.world_bounds.min_pt.x - 150.0f &&
-                a.location.x <= other.world_bounds.max_pt.x + 150.0f &&
-                a.location.y >= other.world_bounds.min_pt.y - 150.0f &&
-                a.location.y <= other.world_bounds.max_pt.y + 150.0f &&
-                other.world_bounds.max_pt.z >= a.location.z - 250.0f &&
-                other.world_bounds.max_pt.z <= a.location.z + 80.0f) {
-                has_floor_below = true;
-            }
+        struct TutorialStage {
+            Vec3 pos;
+            const char* subtitle;
+        };
+        static const TutorialStage kTutorialStages[] = {
+            {Vec3(-4813.6f, -7903.8f, 5760.0f), "Celeste: Follow me across the roof! (WASD + Mouse, V: Look-At Hint, [/]: Skip Stage)"},
+            {Vec3(-3332.3f, -7914.6f, 5760.0f), "Stage 2/19: Press SPACE to Jump over the rooftop curbing"},
+            {Vec3(208.0f, -7744.0f, 5760.0f),   "Stage 3/19: Hold C / Left Ctrl while running to Slide under the airduct"},
+            {Vec3(1473.0f, -7869.0f, 5760.0f),  "Stage 4/19: Sprint and press SPACE at the edge to Jump the rooftop gap"},
+            {Vec3(2015.9f, -6260.9f, 4247.0f),  "Stage 5/19: Turn West (180 deg) and press SPACE to Vault the fence"},
+            {Vec3(758.2f, -6460.0f, 4224.0f),   "Stage 6/19: Angle into the wall and hold SPACE to Horizontal Wallrun"},
+            {Vec3(-1655.2f, -6505.2f, 4224.0f), "Stage 7/19: Sprint and press SPACE to Speed Vault over the obstacle"},
+            {Vec3(-3748.7f, -6363.9f, 4224.0f), "Stage 8/19: Barge through the rooftop doorway and continue West"},
+            {Vec3(-5017.8f, -6434.3f, 4224.0f), "Stage 9/19: Walk across the narrow Balance Beam to the far roof"},
+            {Vec3(-7184.1f, -5744.1f, 4224.0f), "Stage 10/19: Face the wall and hold SPACE to Vertical Wallclimb"},
+            {Vec3(-7902.2f, -5026.3f, 4720.0f), "Stage 11/19: Climb the pipe and leap across the Swingpole"},
+            {Vec3(-7112.2f, -3216.2f, 4704.0f), "Stage 12/19: Wallclimb (SPACE), press Q to Turn 180, then SPACE to Jump"},
+            {Vec3(-6967.4f, -2757.4f, 4992.0f), "Stage 13/19: Jump to Grab the upper ledge, then press SPACE/W to Pull Up"},
+            {Vec3(-8448.0f, -2840.0f, 5792.0f), "Stage 14/19: Carefully edge along the narrow Ledge Walk"},
+            {Vec3(-8503.6f, -3787.3f, 5760.0f), "Stage 15/19: Press C before landing for a Skill Roll, or ride the Zipline!"},
+            {Vec3(-2982.6f, -3933.6f, 4410.0f), "Stage 16/19: Jump (SPACE) then tuck legs in mid-air (C) for a Coil Jump"},
+            {Vec3(156.4f, -3933.6f, 3840.0f),   "Stage 17/19: Sprint at the stacked boxes and press SPACE to Springboard"},
+            {Vec3(2221.7f, -3884.2f, 4992.0f),  "Stage 18/19: Leap up toward the combat training terrace"},
+            {Vec3(751.8f, -1591.7f, 4992.0f),   "Stage 19/19: Combat Training - Press Left Click/F to Melee or Right Click/E to Disarm Celeste!"}
+        };
+        for (const auto& st : kTutorialStages) {
+            out_scene.checkpoints.push_back(st.pos);
+            out_scene.subtitles.emplace_back(st.subtitle);
         }
-        int score = nearby + (has_floor_below ? 400 : 0) +
-                    ((a.class_name.find("TutorialStart") != std::string::npos && nearby > 150) ? 500 : 0);
-        if (!found_start && score > best_score) {
-            best_score = score;
-            out_scene.player_spawn_pos = a.location + Vec3(0.0f, 0.0f, 35.0f);
-            out_scene.player_spawn_yaw = a.rotation.to_degrees().y;
-            found_start = true;
-        }
-    }
-    if (!found_start && !out_scene.actors.empty()) {
-        out_scene.player_spawn_pos = out_scene.actors.front().location + Vec3(0, 0, 96.0f);
-    }
 
-    // Collect checkpoints (ordered by TdCheckpoint weight first) and enemies
-    for (const auto& cp : out_scene.checkpoint_infos) {
-        if (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f) {
-            out_scene.checkpoints.push_back(cp.location);
+        // Spawn Celeste training partner on the combat rooftop for Stage 19 Melee & Disarm training
+        EnemyBot celeste;
+        celeste.archetype = "TutorialTrainer_Celeste";
+        celeste.position = Vec3(751.8f, -1320.0f, 4992.0f);
+        celeste.yaw_deg = -90.0f;
+        celeste.health = 100.0f;
+        celeste.weapon_name = "Colt1911";
+        celeste.disarm_window = true;
+        out_scene.enemies.push_back(celeste);
+    } else {
+        // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry.
+        // Prefer the chapter's DefaultCheckpoint when it has valid coordinates.
+        bool found_start = false;
+        for (const auto& cp : out_scene.checkpoint_infos) {
+            if (cp.default_checkpoint && (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f)) {
+                out_scene.player_spawn_pos = cp.location + Vec3(0.0f, 0.0f, 35.0f);
+                out_scene.player_spawn_yaw = cp.rotation.to_degrees().y;
+                found_start = true;
+                break;
+            }
         }
-    }
-    for (const auto& a : out_scene.actors) {
-        if (a.is_checkpoint && out_scene.checkpoints.empty()) {
-            out_scene.checkpoints.push_back(a.location);
+        int best_score = -100000;
+        for (const auto& a : out_scene.actors) {
+            bool is_spawn_candidate = (a.class_name.find("PlayerStart") != std::string::npos ||
+                                       a.class_name.find("TutorialStart") != std::string::npos ||
+                                       a.class_name.find("Checkpoint") != std::string::npos ||
+                                       a.class_name.find("CheckPoint") != std::string::npos);
+            if (!is_spawn_candidate) continue;
+            if (a.location.x == 0.0f && a.location.y == 0.0f && a.location.z == 0.0f) continue;
+
+            int nearby = 0;
+            bool has_floor_below = false;
+            for (const auto& other : out_scene.actors) {
+                if (other.mesh_name.empty()) continue;
+                Vec3 c = other.world_bounds.center();
+                float dx = c.x - a.location.x;
+                float dy = c.y - a.location.y;
+                float dz = std::abs(c.z - a.location.z);
+                if ((dx * dx + dy * dy) < (6000.0f * 6000.0f) && dz < 2500.0f) {
+                    nearby++;
+                }
+                if (a.location.x >= other.world_bounds.min_pt.x - 150.0f &&
+                    a.location.x <= other.world_bounds.max_pt.x + 150.0f &&
+                    a.location.y >= other.world_bounds.min_pt.y - 150.0f &&
+                    a.location.y <= other.world_bounds.max_pt.y + 150.0f &&
+                    other.world_bounds.max_pt.z >= a.location.z - 250.0f &&
+                    other.world_bounds.max_pt.z <= a.location.z + 80.0f) {
+                    has_floor_below = true;
+                }
+            }
+            int score = nearby + (has_floor_below ? 400 : 0) +
+                        ((a.class_name.find("TutorialStart") != std::string::npos && nearby > 150) ? 500 : 0);
+            if (!found_start && score > best_score) {
+                best_score = score;
+                out_scene.player_spawn_pos = a.location + Vec3(0.0f, 0.0f, 35.0f);
+                out_scene.player_spawn_yaw = a.rotation.to_degrees().y;
+                found_start = true;
+            }
         }
-        if (a.is_enemy) {
-            EnemyBot bot;
-            bot.archetype = a.class_name;
-            bot.position = a.location;
-            bot.yaw_deg = a.rotation.to_degrees().y;
-            out_scene.enemies.push_back(bot);
+        if (!found_start && !out_scene.actors.empty()) {
+            out_scene.player_spawn_pos = out_scene.actors.front().location + Vec3(0, 0, 96.0f);
+        }
+
+        // Collect checkpoints (ordered by TdCheckpoint weight first) and enemies
+        for (const auto& cp : out_scene.checkpoint_infos) {
+            if (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f) {
+                out_scene.checkpoints.push_back(cp.location);
+            }
+        }
+        for (const auto& a : out_scene.actors) {
+            if (a.is_checkpoint && out_scene.checkpoints.empty()) {
+                out_scene.checkpoints.push_back(a.location);
+            }
+            if (a.is_enemy) {
+                EnemyBot bot;
+                bot.archetype = a.class_name;
+                bot.position = a.location;
+                bot.yaw_deg = a.rotation.to_degrees().y;
+                out_scene.enemies.push_back(bot);
+            }
         }
     }
 
     // Ensure a walkable rooftop collider sits directly beneath player_spawn_pos so the player never falls through uncollided art
     Vec3 sp = out_scene.player_spawn_pos;
-    out_scene.colliders.emplace_back(Vec3(sp.x - 600.0f, sp.y - 600.0f, sp.z - 120.0f),
-                                     Vec3(sp.x + 600.0f, sp.y + 600.0f, sp.z - 40.0f));
+    out_scene.colliders.emplace_back(Vec3(sp.x - 220.0f, sp.y - 220.0f, sp.z - 20.0f),
+                                     Vec3(sp.x + 220.0f, sp.y + 220.0f, sp.z));
 
     std::cout << "[Level] Streaming summary for " << out_scene.map_name << ": "
               << out_scene.all_streaming_packages.size() << " LevelStreamingKismet sublevels, "

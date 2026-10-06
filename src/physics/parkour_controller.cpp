@@ -357,8 +357,20 @@ ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& caps
 
     Vec3 half_extent(capsule.radius, capsule.radius, (capsule.height - capsule.bottom_offset) * 0.5f);
     Vec3 start_center = capsule.base + Vec3(0.0f, 0.0f, capsule.bottom_offset + half_extent.z);
+    Vec3 end_center = start_center + delta;
+    Vec3 sweep_min(std::min(start_center.x, end_center.x) - half_extent.x - 2.0f,
+                   std::min(start_center.y, end_center.y) - half_extent.y - 2.0f,
+                   std::min(start_center.z, end_center.z) - half_extent.z - 2.0f);
+    Vec3 sweep_max(std::max(start_center.x, end_center.x) + half_extent.x + 2.0f,
+                   std::max(start_center.y, end_center.y) + half_extent.y + 2.0f,
+                   std::max(start_center.z, end_center.z) + half_extent.z + 2.0f);
 
     auto test_box = [&](const AABB& box, const LevelActor* actor) {
+        if (box.max_pt.x < sweep_min.x || box.min_pt.x > sweep_max.x ||
+            box.max_pt.y < sweep_min.y || box.min_pt.y > sweep_max.y ||
+            box.max_pt.z < sweep_min.z || box.min_pt.z > sweep_max.z) {
+            return;
+        }
         // If movement is horizontal or upward and the box top is at or below capsule base,
         // it represents the floor under feet, not a blocking wall.
         if (delta.z >= -1e-4f && box.max_pt.z <= capsule.base.z + 2.0f) {
@@ -450,8 +462,15 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
     float dist = dir.length();
     if (dist < 1e-6f) return best;
     Vec3 dir_norm = dir / dist;
+    Vec3 ray_min(std::min(start.x, end.x) - 1.0f, std::min(start.y, end.y) - 1.0f, std::min(start.z, end.z) - 1.0f);
+    Vec3 ray_max(std::max(start.x, end.x) + 1.0f, std::max(start.y, end.y) + 1.0f, std::max(start.z, end.z) + 1.0f);
 
     auto test_box = [&](const AABB& box, const LevelActor* act) {
+        if (box.max_pt.x < ray_min.x || box.min_pt.x > ray_max.x ||
+            box.max_pt.y < ray_min.y || box.min_pt.y > ray_max.y ||
+            box.max_pt.z < ray_min.z || box.min_pt.z > ray_max.z) {
+            return;
+        }
         float t_hit = 0.0f;
         if (box.ray_intersect(start, dir_norm, t_hit)) {
             float frac = t_hit / dist;
@@ -819,6 +838,23 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
     Vec3 fwd = view_rot.forward();
     Vec3 probe_start = m_telemetry.position + Vec3(0, 0, 70);
 
+    // Check TdLadderVolume actors (`is_ladder`) for ladder/pipe climbing
+    for (const auto& act : scene.actors) {
+        if (act.is_ladder) {
+            if (m_telemetry.position.distance_xy(act.location) < 110.0f &&
+                m_telemetry.position.z >= act.world_bounds.min_pt.z - 80.0f &&
+                m_telemetry.position.z <= act.world_bounds.max_pt.z + 80.0f) {
+                m_telemetry.move_state = EMovement::MOVE_WallClimbing;
+                m_telemetry.wall_normal = -fwd;
+                m_telemetry.velocity.x = 0.0f;
+                m_telemetry.velocity.y = 0.0f;
+                m_telemetry.velocity.z = m_config.wallclimb_boost_z;
+                m_state_timer = 0.0f;
+                return true;
+            }
+        }
+    }
+
     TraceHit hit = trace_ray(probe_start, probe_start + fwd * 90.0f, scene);
     if (!hit.hit || std::abs(hit.normal.z) > 0.2f) return false;
 
@@ -1047,20 +1083,24 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
 // -----------------------------------------------------------------------------
 bool ParkourController::try_initiate_zipline(const LevelScene& scene) {
     for (const auto& act : scene.actors) {
-        if (act.is_zipline) {
+        if (act.is_zipline && act.end_point.length_sq() > 1.0f) {
             Vec3 start = act.location;
             Vec3 end = act.end_point;
-            Vec3 line_dir = (end - start).normalized();
+            float line_len = (end - start).length();
+            if (line_len < 50.0f) continue;
+            Vec3 line_dir = (end - start) / line_len;
             Vec3 to_player = m_telemetry.position - start;
             float t = to_player.dot(line_dir);
 
-            if (t >= -50.0f && t <= (end - start).length()) {
-                Vec3 closest_pt = start + line_dir * t;
-                if (closest_pt.distance(m_telemetry.position + Vec3(0, 0, 80)) < 120.0f) {
+            if (t >= -60.0f && t <= line_len - 100.0f) {
+                Vec3 closest_pt = start + line_dir * std::max(0.0f, t);
+                if (closest_pt.distance(m_telemetry.position + Vec3(0, 0, 80)) < 135.0f) {
                     m_telemetry.move_state = EMovement::MOVE_ZipLine;
                     m_zipline_start = start;
                     m_zipline_end = end;
-                    m_telemetry.velocity = line_dir * 300.0f;
+                    m_telemetry.position = closest_pt - Vec3(0.0f, 0.0f, 80.0f);
+                    m_telemetry.velocity = line_dir * 350.0f;
+                    m_telemetry.grounded = false;
                     return true;
                 }
             }
@@ -1082,12 +1122,15 @@ void ParkourController::update_zipline(const InputFrame& input, float dt, const 
 
     // Accelerate down zipline
     float spd = m_telemetry.velocity.length();
-    spd = std::min(800.0f, spd + 400.0f * dt);
+    spd = std::min(850.0f, spd + 450.0f * dt);
     m_telemetry.velocity = zip_dir * spd;
     m_telemetry.position += m_telemetry.velocity * dt;
 
-    if (m_telemetry.position.distance(m_zipline_end) < 80.0f) {
+    Vec3 hand_pos = m_telemetry.position + Vec3(0.0f, 0.0f, 80.0f);
+    if (hand_pos.distance(m_zipline_end) < 90.0f || m_telemetry.position.distance(m_zipline_end) < 90.0f) {
         m_telemetry.move_state = EMovement::MOVE_Falling;
+        m_telemetry.velocity = Vec3(zip_dir.x * 320.0f, zip_dir.y * 320.0f, 0.0f);
+        m_fall_peak_z = m_telemetry.position.z;
     }
 }
 
@@ -1252,9 +1295,14 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
 
         bot.attack_timer += dt;
 
+        // Tutorial sparring trainer (Celeste) stays at her training post with disarm window ready
+        if (bot.weapon_name.find("TutorialTrainer") != std::string::npos) {
+            bot.disarm_window = true;
+            continue;
+        }
+
         if (dist > 1500.0f) {
-            // Patrol / Advance
-            bot.position += dir_to_player * 200.0f * dt;
+            // Hold guard post until player enters engagement radius
             bot.disarm_window = false;
         } else if (dist > 180.0f) {
             // Ranged engagement
@@ -1301,7 +1349,9 @@ void ParkourController::update_health_and_regen(float dt) {
 // -----------------------------------------------------------------------------
 void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
     // 1. Fall Death / Kill Volume -> Respawn
-    if (m_telemetry.position.z < -2000.0f || m_telemetry.health <= 0.0f) {
+    if (m_telemetry.position.z < -2000.0f ||
+        m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f ||
+        m_telemetry.health <= 0.0f) {
         reset(m_last_checkpoint_pos, m_last_checkpoint_yaw);
         m_telemetry.active_subtitle = "Respawned at Checkpoint";
         return;
@@ -1309,7 +1359,7 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
 
     // 2. Checkpoints & TdCheckpoint.StreamingLevels
     for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
-        if (m_telemetry.position.distance(scene.checkpoints[i]) < 180.0f) {
+        if (m_telemetry.position.distance(scene.checkpoints[i]) < 240.0f) {
             if (static_cast<int>(i) > m_telemetry.active_checkpoint) {
                 m_telemetry.active_checkpoint = static_cast<int>(i);
                 m_last_checkpoint_pos = scene.checkpoints[i];
@@ -1321,7 +1371,10 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
                         scene.loaded_sublevel_packages = cp.streaming_levels;
                     }
                     m_telemetry.active_subtitle = "Checkpoint: " + cp.checkpoint_name;
-                } else {
+                }
+                if (i < scene.subtitles.size() && !scene.subtitles[i].empty()) {
+                    m_telemetry.active_subtitle = scene.subtitles[i];
+                } else if (i >= scene.checkpoint_infos.size()) {
                     m_telemetry.active_subtitle = "Checkpoint Reached";
                 }
             }
