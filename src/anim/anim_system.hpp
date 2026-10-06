@@ -178,11 +178,19 @@ public:
 
     [[nodiscard]] bool is_loaded() const { return loaded_; }
 
-    // Evaluate Faith's first-person skeletal viewmodel (SK_UpperBody + SK_LowerBody + SK_Colt1911)
+    // Evaluate Faith's first-person skeletal viewmodel (SK_UpperBody + SK_LowerBody + equipped weapon + 1P muzzle flash)
     void evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector<Vertex>& out_triangles) const;
 
-    // Evaluate KrugerSec / CPF SWAT Officer 3D skeletal mesh (CH_TKY_Cop_SWAT)
+    // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
     void evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const;
+
+    // Evaluate 3D dropped weapons on the ground and active ballistic tracers / impact sparks
+    void evaluate_combat_world_fx(const LevelScene& scene, float sim_time,
+                                  std::vector<Vertex>& out_world_tris,
+                                  std::vector<Vertex>& out_rv_tris) const;
+
+    // Lookup a loaded weapon skeletal mesh by weapon name (Colt1911, Glock18, BerettaM93R, SteyrTMP, MP5K, G36C, FNSCARL, Remington870, Neostead, FNMinimi, M95)
+    [[nodiscard]] const SkeletalMeshAsset* get_weapon_mesh(const std::string& weapon_name) const;
 
     // Standalone binary parsers exposed for inspection and unit verification
     static bool parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport& exp, SkeletalMeshAsset& out_mesh);
@@ -196,10 +204,13 @@ public:
     [[nodiscard]] const SkeletalMeshAsset& faith_lower_mesh() const { return faith_lower_; }
     [[nodiscard]] const SkeletalMeshAsset& swat_mesh() const { return swat_mesh_; }
     [[nodiscard]] const SkeletalMeshAsset& colt1911_mesh() const { return colt1911_mesh_; }
+    [[nodiscard]] const std::unordered_map<std::string, SkeletalMeshAsset>& weapon_meshes() const { return weapon_meshes_; }
     [[nodiscard]] const AnimSetAsset& faith_unarmed_anims() const { return faith_unarmed_set_; }
     [[nodiscard]] const AnimSetAsset& faith_common_anims() const { return faith_common_set_; }
+    [[nodiscard]] const AnimSetAsset& faith_2h_common_anims() const { return faith_2h_common_set_; }
     [[nodiscard]] const AnimSetAsset& faith_colt_anims() const { return faith_colt_set_; }
     [[nodiscard]] const AnimSetAsset& swat_anims() const { return swat_set_; }
+    [[nodiscard]] const AnimSetAsset& swat_2h_anims() const { return swat_2h_set_; }
     [[nodiscard]] const std::vector<AnimBlendConfig>& blend_configs() const { return blend_configs_; }
 
 private:
@@ -210,11 +221,15 @@ private:
     SkeletalMeshAsset faith_lower_;
     SkeletalMeshAsset swat_mesh_;
     SkeletalMeshAsset colt1911_mesh_;
+    std::unordered_map<std::string, SkeletalMeshAsset> weapon_meshes_;
 
     AnimSetAsset faith_unarmed_set_;
     AnimSetAsset faith_common_set_;
+    AnimSetAsset faith_2h_common_set_;
     AnimSetAsset faith_colt_set_;
+    std::unordered_map<std::string, AnimSetAsset> faith_weapon_sets_;
     AnimSetAsset swat_set_;
+    AnimSetAsset swat_2h_set_;
 
     std::vector<AnimBlendConfig> blend_configs_;
 };

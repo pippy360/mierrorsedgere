@@ -2126,11 +2126,47 @@ struct MetalRenderer::Impl {
         float h = float(height);
         float sim_time = telemetry.sim_time;
 
-        // 1. Center Runner Reticle Dot
-        bool is_interactive_target = (telemetry.weapon.name != "") ||
+        // 1. Center Runner Reticle Dot + Dynamic Weapon Crosshair & Hit Marker
+        float cx = w * 0.5f;
+        float cy = h * 0.5f;
+        bool is_interactive_target = telemetry.weapon.equipped ||
+                                     telemetry.disarm_prompt_visible ||
                                      (telemetry.speed_2d > 450.0f) ||
                                      (telemetry.move_state == EMovement::MOVE_Snatch);
-        draw_ui_reticle(verts, w * 0.5f, h * 0.5f, is_interactive_target, std::sin(sim_time * 8.0f));
+        draw_ui_reticle(verts, cx, cy, is_interactive_target, std::sin(sim_time * 8.0f));
+
+        if (telemetry.weapon.equipped) {
+            float gap = 10.0f + telemetry.weapon.spread_rad * 180.0f + telemetry.weapon.fire_anim_timer * 28.0f;
+            float tick_len = (telemetry.weapon.pellet_count > 1) ? 10.0f : 7.0f;
+            simd_float4 xhair_col = (telemetry.weapon.ammo > 0)
+                ? simd_make_float4(0.95f, 0.97f, 1.0f, 0.88f)
+                : simd_make_float4(0.95f, 0.18f, 0.18f, 0.92f);
+            draw_ui_quad(verts, cx - gap - tick_len, cy - 1.0f, tick_len, 2.0f, xhair_col);
+            draw_ui_quad(verts, cx + gap,            cy - 1.0f, tick_len, 2.0f, xhair_col);
+            draw_ui_quad(verts, cx - 1.0f, cy - gap - tick_len, 2.0f, tick_len, xhair_col);
+            draw_ui_quad(verts, cx - 1.0f, cy + gap,            2.0f, tick_len, xhair_col);
+        }
+
+        if (telemetry.hit_marker_timer > 0.0f) {
+            float alpha = std::clamp(telemetry.hit_marker_timer / 0.22f, 0.0f, 1.0f);
+            simd_float4 hm_col = simd_make_float4(0.96f, 0.14f, 0.14f, alpha);
+            for (int d = 5; d <= 12; d += 2) {
+                float fd = static_cast<float>(d);
+                draw_ui_quad(verts, cx - fd - 1.5f, cy - fd - 1.5f, 3.0f, 3.0f, hm_col);
+                draw_ui_quad(verts, cx + fd - 1.5f, cy - fd - 1.5f, 3.0f, 3.0f, hm_col);
+                draw_ui_quad(verts, cx - fd - 1.5f, cy + fd - 1.5f, 3.0f, 3.0f, hm_col);
+                draw_ui_quad(verts, cx + fd - 1.5f, cy + fd - 1.5f, 3.0f, 3.0f, hm_col);
+            }
+        }
+
+        if (telemetry.disarm_prompt_visible) {
+            std::string dprompt = "[RIGHT CLICK / E] DISARM WEAPON";
+            float dw = float(dprompt.length()) * 11.5f + 28.0f;
+            float dx = (w - dw) * 0.5f;
+            float dy = cy + 46.0f;
+            draw_ui_quad(verts, dx, dy, dw, 26.0f, simd_make_float4(0.88f, 0.06f, 0.06f, 0.90f));
+            draw_ui_text(verts, dprompt, dx + 14.0f, dy + 6.0f, 1.8f, simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
 
         // 2. Bottom-Left Telemetry Panel Backdrop (Sleek Translucent Dark Glass + Red Runner Accent)
         draw_ui_quad(verts, 22.0f, h - 164.0f, 340.0f, 112.0f, simd_make_float4(0.04f, 0.06f, 0.09f, 0.72f));
@@ -2188,7 +2224,7 @@ struct MetalRenderer::Impl {
 
         std::string wep_str = telemetry.weapon.equipped ? (telemetry.weapon.name + " [" +
                               std::to_string(telemetry.weapon.ammo) + "/" +
-                              std::to_string(telemetry.weapon.max_ammo) + "]") : "UNARMED";
+                              std::to_string(telemetry.weapon.max_ammo) + "]") : "UNARMED (T/Y GUNS)";
         draw_ui_text(verts, "WEAPON: " + wep_str, rx, 95.0f, 1.8f,
                      telemetry.weapon.equipped ? simd_make_float4(0.95f, 0.22f, 0.22f, 1.0f)
                                                : simd_make_float4(0.82f, 0.86f, 0.92f, 0.92f));
@@ -2212,7 +2248,7 @@ struct MetalRenderer::Impl {
 
         // 6. Active Subtitle / Tutorial Prompt Banner (Bottom Center)
         std::string prompt = telemetry.active_subtitle.empty()
-            ? "[SPACE] JUMP / WALLRUN  |  [LSHIFT] CROUCH / SLIDE  |  [R] REACTION TIME"
+            ? "[LMB/F] MELEE/FIRE | [RMB/E] DISARM | [T/Y] CYCLE 11 GUNS | [G] DROP | [H] SPAWN SQUAD"
             : telemetry.active_subtitle;
 
         float banner_w = float(prompt.length()) * 11.0f + 40.0f;
@@ -2645,14 +2681,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->runner_vision_mesh.size()];
         }
 
-        // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies (only during gameplay)
+        // B2. Render 3D Articulated KrugerSec / CPF SWAT Enemies & 3D Weapons/Tracers (only during gameplay)
         // (the material sections above leave their own pipeline/depth state bound)
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
         [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
         if (!impl_->menu_open && !active_scene.enemies.empty()) {
             for (const auto& bot : active_scene.enemies) {
-                if (!bot.alive) continue;
+                if (!bot.alive && !impl_->anim_system.is_loaded()) continue;
                 if (impl_->anim_system.is_loaded()) {
                     impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
                 }
@@ -2670,6 +2706,35 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:v_count];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+        }
+
+        // B2a. Render 3D Dropped Weapons on Ground & 3D Bullet Tracers / Impact Sparks
+        if (!impl_->menu_open && impl_->anim_system.is_loaded() &&
+            (!active_scene.dropped_weapons.empty() || !active_scene.active_tracers.empty())) {
+            std::vector<Vertex> combat_fx_verts;
+            std::vector<Vertex> combat_rv_verts;
+            impl_->anim_system.evaluate_combat_world_fx(active_scene, telemetry.sim_time, combat_fx_verts, combat_rv_verts);
+            if (!combat_fx_verts.empty()) {
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                uniforms.is_runner_vision = 0.0f;
+                uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
+                bind_vertex_bytes_or_buffer(enc, combat_fx_verts.data(),
+                                            combat_fx_verts.size() * sizeof(Vertex), 0);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:combat_fx_verts.size()];
+            }
+            if (!combat_rv_verts.empty()) {
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                uniforms.is_runner_vision = 1.0f;
+                uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
+                bind_vertex_bytes_or_buffer(enc, combat_rv_verts.data(),
+                                            combat_rv_verts.size() * sizeof(Vertex), 0);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:combat_rv_verts.size()];
+                uniforms.is_runner_vision = 0.0f;
+            }
         }
 
         // B2b. Render Interactive 3D Elevator Cabs, Sliding Doors & Runner Vision Buttons

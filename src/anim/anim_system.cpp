@@ -842,42 +842,102 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         }
     }
 
-    // 4. Load Colt 1911 Weapon Skeletal Mesh & Textures (Weapons/WP_Colt1911.upk)
-    UPKPackage pkg_colt(cooked + "Weapons/WP_Colt1911.upk");
-    if (pkg_colt.is_valid()) {
-        for (const auto& exp : pkg_colt.get_exports()) {
-            if (pkg_colt.get_export_class(exp) == "SkeletalMesh" && exp.object_name == "SK_Colt1911") {
-                parse_skeletal_mesh(pkg_colt, exp, colt1911_mesh_);
+    // 4. Load Full 11-Weapon Retail Arsenal (CookedPC/Weapons/WP_*.upk)
+    struct WeaponPackageSpec {
+        const char* key;
+        const char* upk_file;
+        const char* skel_name;
+        const char* tex_d;
+        const char* tex_s;
+    };
+    static const WeaponPackageSpec kWeaponSpecs[] = {
+        {"Colt1911",     "Weapons/WP_Colt1911.upk",     "SK_Colt1911",     "T_Colt1911_D",     "T_Colt1911_S"},
+        {"Glock18",      "Weapons/WP_Glock18.upk",      "SK_Glock18",      "T_Glock18_D",      "T_Glock18_S"},
+        {"BerettaM93R",  "Weapons/WP_BerettaM93R.upk",  "SK_BerettaM93R",  "T_BerettaM93R_D",  "T_BerettaM93R_S"},
+        {"SteyrTMP",     "Weapons/WP_SteyrTMP.upk",     "SK_SteyrTMP",     "T_SteyrTMP_D",     "T_SteyrTMP_S"},
+        {"MP5K",         "Weapons/WP_MP5K.upk",         "SK_MP5K",         "T_MP5K_D",         "T_MP5K_S"},
+        {"G36C",         "Weapons/WP_G36C.upk",         "SK_G36C",         "T_G36C_D",         "T_G36C_S"},
+        {"FNSCARL",      "Weapons/WP_FNSCARL.upk",      "SK_FNSCARL",      "T_FNSCARL_D",      "T_FNSCARL_S"},
+        {"Remington870", "Weapons/WP_Remington870.upk", "SK_Remington870", "T_Remington870_D", "T_Remington870_S"},
+        {"Neostead",     "Weapons/WP_Neostead.upk",     "SK_Neostead",     "T_Neostead_D",     "T_Neostead_S"},
+        {"FNMinimi",     "Weapons/WP_FNMinimi.upk",     "SK_FNMinimi",     "T_FNMinimi_D",     "T_FNMinimi_S"},
+        {"M95",          "Weapons/WP_M95.upk",          "SK_M95",          "T_M95_D",          "T_M95_S"}
+    };
+
+    for (const auto& ws : kWeaponSpecs) {
+        UPKPackage pkg_w(cooked + ws.upk_file);
+        if (!pkg_w.is_valid()) continue;
+        SkeletalMeshAsset w_mesh{};
+        for (const auto& exp : pkg_w.get_exports()) {
+            if (pkg_w.get_export_class(exp) == "SkeletalMesh" && exp.object_name == ws.skel_name) {
+                parse_skeletal_mesh(pkg_w, exp, w_mesh);
                 break;
             }
         }
-        DXT1Texture tex_colt_d{}, tex_colt_s{};
-        parse_dxt1_texture(pkg_colt, "T_Colt1911_D", tex_colt_d);
-        parse_dxt1_texture(pkg_colt, "T_Colt1911_S", tex_colt_s);
-        for (auto& v : colt1911_mesh_.vertices) {
-            Vec3 d = tex_colt_d.is_valid() ? tex_colt_d.sample_rgb01(v.u, v.v) : Vec3(0.15f, 0.16f, 0.18f);
-            Vec3 s = tex_colt_s.is_valid() ? tex_colt_s.sample_rgb01(v.u, v.v) : Vec3(0.25f, 0.26f, 0.28f);
+        if (!w_mesh.is_valid()) continue;
+
+        DXT1Texture tex_d{}, tex_s{};
+        parse_dxt1_texture(pkg_w, ws.tex_d, tex_d);
+        parse_dxt1_texture(pkg_w, ws.tex_s, tex_s);
+        for (auto& v : w_mesh.vertices) {
+            Vec3 d = tex_d.is_valid() ? tex_d.sample_rgb01(v.u, v.v) : Vec3(0.15f, 0.16f, 0.18f);
+            Vec3 s = tex_s.is_valid() ? tex_s.sample_rgb01(v.u, v.v) : Vec3(0.25f, 0.26f, 0.28f);
             float r = std::pow(std::max(d.x, 0.0f), 0.45f) * 0.65f + s.x * 0.40f + 0.16f;
             float g = std::pow(std::max(d.y, 0.0f), 0.45f) * 0.67f + s.y * 0.42f + 0.17f;
             float b = std::pow(std::max(d.z, 0.0f), 0.45f) * 0.72f + s.z * 0.46f + 0.20f;
-            v.color = pack_rgba8(std::clamp(r, 0.16f, 0.75f),
-                                 std::clamp(g, 0.17f, 0.77f),
-                                 std::clamp(b, 0.19f, 0.82f));
+            v.color = pack_rgba8(std::clamp(r, 0.16f, 0.78f),
+                                 std::clamp(g, 0.17f, 0.80f),
+                                 std::clamp(b, 0.19f, 0.84f));
         }
+        if (std::string(ws.key) == "Colt1911") {
+            colt1911_mesh_ = w_mesh;
+        }
+        weapon_meshes_[ws.key] = std::move(w_mesh);
     }
 
-    // 5. Load Animation Sets (AS_C1P_Unarmed, AS_C1P_OneHanded_Common, AS_C1P_OneHanded_Colt1911, AS_AI_PatrolCop_OneHanded)
+    // 5. Load Animation Sets (Unarmed, 1H Common + Weapon Sets, 2H Common + Weapon Sets, AI 1H & 2H)
     UPKPackage pkg_as_unarmed(cooked + "Animations/AS_C1P_Unarmed.upk");
     if (pkg_as_unarmed.is_valid()) parse_anim_set_package(pkg_as_unarmed, faith_unarmed_set_);
 
     UPKPackage pkg_as_common(cooked + "Animations/AS_C1P_OneHanded_Common.upk");
     if (pkg_as_common.is_valid()) parse_anim_set_package(pkg_as_common, faith_common_set_);
 
+    UPKPackage pkg_as_2h_common(cooked + "Animations/AS_C1P_TwoHanded_Common.upk");
+    if (pkg_as_2h_common.is_valid()) parse_anim_set_package(pkg_as_2h_common, faith_2h_common_set_);
+
     UPKPackage pkg_as_colt(cooked + "Animations/AS_C1P_OneHanded_Colt1911.upk");
-    if (pkg_as_colt.is_valid()) parse_anim_set_package(pkg_as_colt, faith_colt_set_);
+    if (pkg_as_colt.is_valid()) {
+        parse_anim_set_package(pkg_as_colt, faith_colt_set_);
+        faith_weapon_sets_["Colt1911"] = faith_colt_set_;
+    }
+
+    struct WeaponAnimSpec {
+        const char* key;
+        const char* upk_file;
+    };
+    static const WeaponAnimSpec kWeaponAnimSpecs[] = {
+        {"Glock18",      "Animations/AS_C1P_OneHanded_Glock18.upk"},
+        {"BerettaM93R",  "Animations/AS_C1P_OneHanded_BerettaM93R.upk"},
+        {"G36C",         "Animations/AS_C1P_TwoHanded_G36C.upk"},
+        {"Remington870", "Animations/AS_C1P_TwoHanded_Remington.upk"},
+        {"FNSCARL",      "Animations/AS_C1P_TwoHanded_FNSCARL.upk"},
+        {"MP5K",         "Animations/AS_C1P_TwoHanded_MP5K.upk"}
+    };
+    for (const auto& was : kWeaponAnimSpecs) {
+        UPKPackage pkg_wa(cooked + was.upk_file);
+        if (pkg_wa.is_valid()) {
+            AnimSetAsset aset{};
+            if (parse_anim_set_package(pkg_wa, aset)) {
+                faith_weapon_sets_[was.key] = std::move(aset);
+            }
+        }
+    }
 
     UPKPackage pkg_as_swat(cooked + "Animations/AS_AI_PatrolCop_OneHanded.upk");
     if (pkg_as_swat.is_valid()) parse_anim_set_package(pkg_as_swat, swat_set_);
+
+    UPKPackage pkg_as_swat_2h(cooked + "Animations/AS_AI_Assault_TwoHanded.upk");
+    if (pkg_as_swat_2h.is_valid()) parse_anim_set_package(pkg_as_swat_2h, swat_2h_set_);
 
     loaded_ = faith_upper_.is_valid() && faith_lower_.is_valid() &&
               swat_mesh_.is_valid() && !faith_unarmed_set_.sequences.empty() &&
@@ -894,18 +954,101 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                   << "  - CH_TKY_Cop_SWAT: " << swat_mesh_.bones.size() << " bones, "
                   << swat_mesh_.vertices.size() << " skinned verts, "
                   << (swat_mesh_.indices.size() / 3) << " tris\n"
-                  << "  - SK_Colt1911: " << colt1911_mesh_.bones.size() << " bones, "
-                  << colt1911_mesh_.vertices.size() << " skinned verts, "
-                  << (colt1911_mesh_.indices.size() / 3) << " tris\n"
+                  << "  - Weapon SkeletalMeshes loaded: " << weapon_meshes_.size() << " ("
+                  << "Colt1911, Glock18, BerettaM93R, SteyrTMP, MP5K, G36C, FNSCARL, Remington870, Neostead, FNMinimi, M95)\n"
                   << "  - AS_C1P_Unarmed: " << faith_unarmed_set_.sequences.size() << " sequences\n"
                   << "  - AS_C1P_OneHanded_Common: " << faith_common_set_.sequences.size() << " sequences\n"
-                  << "  - AS_C1P_OneHanded_Colt1911: " << faith_colt_set_.sequences.size() << " sequences\n"
+                  << "  - AS_C1P_TwoHanded_Common: " << faith_2h_common_set_.sequences.size() << " sequences\n"
+                  << "  - Weapon-specific 1P AnimSets: " << faith_weapon_sets_.size() << " sets\n"
                   << "  - AS_AI_PatrolCop_OneHanded: " << swat_set_.sequences.size() << " sequences\n"
+                  << "  - AS_AI_Assault_TwoHanded: " << swat_2h_set_.sequences.size() << " sequences\n"
                   << "  - DefaultAnimation.ini CustomAnimNodes: " << blend_configs_.size() << std::endl;
     }
 
     return loaded_;
 }
+
+const SkeletalMeshAsset* AnimSystem::get_weapon_mesh(const std::string& weapon_name) const {
+    if (weapon_name.empty() || weapon_name == "None" || weapon_name == "Unarmed") return nullptr;
+    auto it = weapon_meshes_.find(weapon_name);
+    if (it != weapon_meshes_.end()) return &it->second;
+    std::string low = to_lower_str(weapon_name);
+    if (low.find("g36") != std::string::npos) {
+        it = weapon_meshes_.find("G36C");
+    } else if (low.find("remington") != std::string::npos || low.find("870") != std::string::npos) {
+        it = weapon_meshes_.find("Remington870");
+    } else if (low.find("neostead") != std::string::npos) {
+        it = weapon_meshes_.find("Neostead");
+    } else if (low.find("scar") != std::string::npos) {
+        it = weapon_meshes_.find("FNSCARL");
+    } else if (low.find("mp5") != std::string::npos) {
+        it = weapon_meshes_.find("MP5K");
+    } else if (low.find("minimi") != std::string::npos || low.find("m249") != std::string::npos) {
+        it = weapon_meshes_.find("FNMinimi");
+    } else if (low.find("m95") != std::string::npos || low.find("barret") != std::string::npos) {
+        it = weapon_meshes_.find("M95");
+    } else if (low.find("glock") != std::string::npos) {
+        it = weapon_meshes_.find("Glock18");
+    } else if (low.find("beretta") != std::string::npos || low.find("m93") != std::string::npos) {
+        it = weapon_meshes_.find("BerettaM93R");
+    } else if (low.find("tmp") != std::string::npos || low.find("steyr") != std::string::npos) {
+        it = weapon_meshes_.find("SteyrTMP");
+    }
+    if (it != weapon_meshes_.end()) return &it->second;
+    return colt1911_mesh_.is_valid() ? &colt1911_mesh_ : nullptr;
+}
+
+namespace {
+
+// Helper to append a 3D 4-fin muzzle flash star cone at `tip_pos` pointing along `forward_dir`
+void append_muzzle_flash_mesh(std::vector<Vertex>& out_tris, const Vec3& tip_pos,
+                              const Vec3& forward_dir, const Vec3& right_dir, const Vec3& up_dir,
+                              float radius, float length) {
+    uint32_t core_col = pack_rgba8(1.0f, 0.96f, 0.72f);
+    uint32_t outer_col = pack_rgba8(1.0f, 0.58f, 0.14f);
+    Vec3 apex = tip_pos + forward_dir * length;
+
+    auto add_tri = [&](const Vec3& a, const Vec3& b, const Vec3& c, uint32_t col_a, uint32_t col_bc) {
+        Vec3 n = (b - a).cross(c - a).normalized();
+        Vertex va{a, n, {1, 0, 0}, 0.5f, 0.5f, 0.0f, 0.0f, col_a};
+        Vertex vb{b, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, col_bc};
+        Vertex vc{c, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, col_bc};
+        out_tris.push_back(va); out_tris.push_back(vb); out_tris.push_back(vc);
+        // Backface so flash is visible from all angles
+        Vertex vb2 = vb; vb2.normal = n * -1.0f;
+        Vertex vc2 = vc; vc2.normal = n * -1.0f;
+        Vertex va2 = va; va2.normal = n * -1.0f;
+        out_tris.push_back(va2); out_tris.push_back(vc2); out_tris.push_back(vb2);
+    };
+
+    const Vec3 dirs[4] = {
+        right_dir,
+        up_dir,
+        (right_dir + up_dir).normalized(),
+        (right_dir - up_dir).normalized()
+    };
+    for (const Vec3& d : dirs) {
+        Vec3 p_pos = tip_pos + d * radius;
+        Vec3 p_neg = tip_pos - d * radius;
+        add_tri(tip_pos, p_pos, apex, core_col, outer_col);
+        add_tri(tip_pos, apex, p_neg, core_col, outer_col);
+    }
+}
+
+bool is_heavy_weapon_name(const std::string& wname) {
+    std::string low = to_lower_str(wname);
+    return (low.find("g36") != std::string::npos ||
+            low.find("scar") != std::string::npos ||
+            low.find("mp5") != std::string::npos ||
+            low.find("remington") != std::string::npos ||
+            low.find("870") != std::string::npos ||
+            low.find("neostead") != std::string::npos ||
+            low.find("minimi") != std::string::npos ||
+            low.find("m95") != std::string::npos ||
+            low.find("barret") != std::string::npos);
+}
+
+} // namespace
 
 // -----------------------------------------------------------------------------
 // Evaluate Faith's 1P Skeletal Viewmodel (AT_C1P Blend Tree + Linear Blend Skinning)
@@ -915,6 +1058,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     if (!loaded_ || !faith_upper_.is_valid()) return;
 
     const AnimSetAsset* active_set = &faith_unarmed_set_;
+    const AnimSetAsset* set_b_ptr = &faith_unarmed_set_;
     const AnimSequenceAsset* seq_a = nullptr;
     const AnimSequenceAsset* seq_b = nullptr;
     float blend_alpha = 0.0f;
@@ -923,17 +1067,174 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     // Viewmodel camera framing offset (places Faith's 1P forearms/hands in lower peripheral frustum)
     Vec3 vm_offset(0.0f, 16.0f, 14.0f);
     bool show_lower_body = false;
+    bool lower_body_high_kick = false;
 
     const float sim_t = telemetry.sim_time;
     const float speed = telemetry.speed_2d;
     const EMovement state = telemetry.move_state;
+    const float combat_progress = std::clamp(
+        telemetry.combat_anim_time / std::max(0.10f, telemetry.combat_anim_duration), 0.0f, 1.0f);
 
-    if (telemetry.weapon.equipped) {
-        active_set = &faith_colt_set_;
-        seq_a = active_set->find_sequence("standfire");
-        norm_time = (telemetry.weapon.cooldown > 0.0f) ? std::fmod(sim_t * 2.0f, 1.0f) : 0.0f;
-        vm_offset = Vec3(2.0f, 10.0f, 4.0f);
+    // Helper to resolve a sequence across weapon-specific -> 1H/2H common -> unarmed sets
+    auto resolve_seq = [&](const AnimSetAsset* pri, const AnimSetAsset* com,
+                           const std::string& seq_name, const AnimSetAsset** out_owner) -> const AnimSequenceAsset* {
+        if (pri) {
+            if (const auto* s = pri->find_sequence(seq_name)) {
+                if (out_owner) *out_owner = pri;
+                return s;
+            }
+        }
+        if (com) {
+            if (const auto* s = com->find_sequence(seq_name)) {
+                if (out_owner) *out_owner = com;
+                return s;
+            }
+        }
+        if (const auto* s = faith_unarmed_set_.find_sequence(seq_name)) {
+            if (out_owner) *out_owner = &faith_unarmed_set_;
+            return s;
+        }
+        return nullptr;
+    };
+
+    const AnimSetAsset* w_spec_set = nullptr;
+    const AnimSetAsset* w_comm_set = &faith_common_set_;
+    if (telemetry.weapon.equipped || state == EMovement::MOVE_Snatch) {
+        std::string wkey = telemetry.weapon.name;
+        if (wkey == "Neostead") wkey = "Remington870";
+        else if (wkey == "FNMinimi" || wkey == "M95") wkey = "FNSCARL";
+        else if (wkey == "SteyrTMP") wkey = "BerettaM93R";
+        auto it_ws = faith_weapon_sets_.find(wkey);
+        if (it_ws != faith_weapon_sets_.end()) w_spec_set = &it_ws->second;
+        bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
+        w_comm_set = (heavy && !faith_2h_common_set_.sequences.empty())
+                         ? &faith_2h_common_set_
+                         : &faith_common_set_;
+    }
+
+    // 1. Check high-priority combat moves (Snatch, Melee, MeleeAir, MeleeSlide, MeleeWallrun, Barge)
+    if (state == EMovement::MOVE_Snatch) {
+        const char* snatch_seq = telemetry.snatch_from_back ? "SnatchBack" : "SnatchFwd";
+        seq_a = resolve_seq(w_spec_set, w_comm_set, snatch_seq, &active_set);
+        if (!seq_a) seq_a = resolve_seq(w_spec_set, &faith_common_set_, "SnatchFwd", &active_set);
+        norm_time = std::clamp(0.15f + combat_progress * 0.75f, 0.0f, 0.96f);
+        float lunge = std::sin(combat_progress * PI);
+        vm_offset = Vec3(0.0f, 12.0f + lunge * 6.0f, 8.0f + lunge * 4.0f);
+    } else if (state == EMovement::MOVE_Melee) {
+        float strike_arc = std::sin(combat_progress * PI);
+        norm_time = combat_progress;
+        if (telemetry.melee_variant == 3) {
+            // Crouch Sweep / Uppercut
+            seq_a = resolve_seq(nullptr, nullptr, "MeleeCrouchHitUppercut", &active_set);
+            seq_b = resolve_seq(nullptr, nullptr, "MeleeCrouchStartUpperCut", &set_b_ptr);
+            blend_alpha = (combat_progress < 0.25f) ? (1.0f - combat_progress * 4.0f) : 0.0f;
+            vm_offset = Vec3(-2.0f, 12.0f + strike_arc * 10.0f, 10.0f + strike_arc * 8.0f);
+        } else if (telemetry.melee_variant == 2) {
+            // Standing High Kick (shows lower body boot kicking across foreground!)
+            seq_a = resolve_seq(nullptr, nullptr, "meleekickobject", &active_set);
+            if (!seq_a) seq_a = resolve_seq(nullptr, nullptr, "MeleeHit2Right", &active_set);
+            vm_offset = Vec3(0.0f, 12.0f + strike_arc * 8.0f, 12.0f);
+            show_lower_body = true;
+            lower_body_high_kick = true;
+        } else if (telemetry.melee_variant == 1) {
+            // Left Hook / Jab
+            const char* hit_name = telemetry.melee_hit_confirmed ? "MeleeHitLeft" : "MeleeMissedLeft";
+            seq_a = resolve_seq(nullptr, nullptr, hit_name, &active_set);
+            seq_b = resolve_seq(nullptr, nullptr, "MeleeStartLeft", &set_b_ptr);
+            blend_alpha = (combat_progress < 0.20f) ? (1.0f - combat_progress * 5.0f) : 0.0f;
+            vm_offset = Vec3(4.0f - strike_arc * 6.0f, 10.0f + strike_arc * 12.0f, 12.0f + strike_arc * 5.0f);
+        } else {
+            // Right Cross / Hook (Red Runner Glove punch)
+            const char* hit_name = telemetry.melee_hit_confirmed ? "MeleeHitRight" : "MeleeMissedRight";
+            seq_a = resolve_seq(nullptr, nullptr, hit_name, &active_set);
+            seq_b = resolve_seq(nullptr, nullptr, "MeleeStartRight", &set_b_ptr);
+            blend_alpha = (combat_progress < 0.20f) ? (1.0f - combat_progress * 5.0f) : 0.0f;
+            vm_offset = Vec3(-4.0f + strike_arc * 6.0f, 10.0f + strike_arc * 12.0f, 12.0f + strike_arc * 5.0f);
+        }
+    } else if (state == EMovement::MOVE_MeleeAir) {
+        // Flying Jump Kick (FirstPersonLowerBodyDPG = SDPG_Foreground)
+        const char* air_name = telemetry.melee_hit_confirmed ? "MeleeInAirHit" : "MeleeInAir";
+        seq_a = resolve_seq(nullptr, nullptr, air_name, &active_set);
+        seq_b = resolve_seq(nullptr, nullptr, "MeleeInAir2", &set_b_ptr);
+        norm_time = std::clamp(0.15f + combat_progress * 0.75f, 0.0f, 0.95f);
+        blend_alpha = 0.25f;
+        vm_offset = Vec3(0.0f, 10.0f, 12.0f);
+        show_lower_body = true;
+        lower_body_high_kick = true;
+    } else if (state == EMovement::MOVE_MeleeSlide) {
+        // Crouch Slide Kick
+        seq_a = resolve_seq(nullptr, nullptr, "MeleeSlideHard", &active_set);
+        if (!seq_a) seq_a = resolve_seq(nullptr, nullptr, "MeleeSlide", &active_set);
+        seq_b = resolve_seq(nullptr, nullptr, "CrouchSlide", &set_b_ptr);
+        norm_time = std::clamp(0.15f + combat_progress * 0.75f, 0.0f, 0.95f);
+        blend_alpha = 0.30f;
+        vm_offset = Vec3(0.0f, 6.0f, 14.0f);
+        show_lower_body = true;
+    } else if (state == EMovement::MOVE_MeleeWallrun) {
+        // Wallrun Spinning Kick
+        const char* wr_name = (telemetry.melee_variant == 6) ? "MeleeWallRunLeft" : "MeleeWallRunRight";
+        seq_a = resolve_seq(nullptr, nullptr, wr_name, &active_set);
+        norm_time = std::clamp(0.15f + combat_progress * 0.75f, 0.0f, 0.95f);
+        vm_offset = Vec3(0.0f, 10.0f, 12.0f);
+        show_lower_body = true;
+        lower_body_high_kick = true;
+    } else if (state == EMovement::MOVE_Barge) {
+        seq_a = resolve_seq(nullptr, nullptr, "bargeinleft", &active_set);
+        seq_b = resolve_seq(nullptr, nullptr, "MeleeHitShove", &set_b_ptr);
+        norm_time = combat_progress;
+        blend_alpha = 0.35f;
+        vm_offset = Vec3(2.0f, 10.0f, 10.0f);
+    } else if (telemetry.weapon.equipped) {
+        // 2. Armed 1P Animation Tree (TdAnimNodeBlendByArmed + TdAnimNodeBlendByFire + TdSkelControlRecoil)
+        bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
+        Vec3 base_armed_offset = heavy ? Vec3(3.0f, 12.0f, 5.5f) : Vec3(2.0f, 10.0f, 4.0f);
+
+        if (telemetry.weapon.drop_timer > 0.0f) {
+            seq_a = resolve_seq(w_spec_set, w_comm_set, "throwaway", &active_set);
+            norm_time = std::clamp(1.0f - (telemetry.weapon.drop_timer / 0.35f), 0.0f, 1.0f);
+            vm_offset = base_armed_offset + Vec3(0.0f, 4.0f * norm_time, -6.0f * norm_time);
+        } else if (telemetry.weapon.equip_timer > 0.0f) {
+            seq_a = resolve_seq(w_spec_set, w_comm_set, "unholster", &active_set);
+            if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+            norm_time = std::clamp(1.0f - (telemetry.weapon.equip_timer / 0.45f), 0.0f, 1.0f);
+            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, -5.0f * (1.0f - norm_time));
+        } else if (telemetry.weapon.fire_anim_timer > 0.0f) {
+            const char* fire_name = (telemetry.weapon.ammo == 0) ? "standfireempty" : "standfire";
+            seq_a = resolve_seq(w_spec_set, w_comm_set, fire_name, &active_set);
+            if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+            float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
+            float prog = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
+            norm_time = prog;
+            float recoil_env = std::sin( std::min(prog * 3.0f, 1.0f) * PI );
+            vm_offset = base_armed_offset + Vec3(0.0f, -2.8f * recoil_env, 1.8f * recoil_env);
+        } else if (state == EMovement::MOVE_Slide) {
+            seq_a = resolve_seq(w_spec_set, w_comm_set, "CrouchSlide", &active_set);
+            norm_time = 0.33f;
+            vm_offset = Vec3(0.0f, 6.0f, 10.0f);
+            show_lower_body = true;
+        } else if (state == EMovement::MOVE_Crouch) {
+            const char* cname = (speed > 20.0f) ? "crouchfwdready" : "crouchstill";
+            seq_a = resolve_seq(w_spec_set, w_comm_set, cname, &active_set);
+            if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+            norm_time = std::fmod(sim_t * 1.2f, 1.0f);
+            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, -1.5f);
+        } else if (state == EMovement::MOVE_WallRunningRight || state == EMovement::MOVE_WallRunningLeft) {
+            const char* wname = (state == EMovement::MOVE_WallRunningRight) ? "WallrunRight" : "WallrunLeft";
+            seq_a = resolve_seq(w_spec_set, &faith_common_set_, wname, &active_set);
+            norm_time = 0.12f;
+            vm_offset = base_armed_offset;
+        } else {
+            // Armed standing / walking / running with subtle weapon sway
+            seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+            norm_time = 0.0f;
+            float sway_freq = std::clamp(speed * 0.018f, 2.0f, 11.0f);
+            float sway_amp = std::clamp(speed / 450.0f, 0.08f, 1.0f);
+            float bob_x = std::sin(sim_t * sway_freq) * 1.4f * sway_amp;
+            float bob_z = std::abs(std::cos(sim_t * sway_freq)) * -1.2f * sway_amp;
+            vm_offset = base_armed_offset + Vec3(bob_x, 0.0f, bob_z);
+        }
     } else {
+        // 3. Unarmed Parkour & Locomotion Tree
         switch (state) {
             case EMovement::MOVE_SpringBoarding:
                 seq_a = active_set->find_sequence("SpringBoardRightLeg");
@@ -973,7 +1274,6 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 vm_offset = Vec3(2.0f, 62.0f, -4.0f);
                 break;
             case EMovement::MOVE_Slide:
-            case EMovement::MOVE_MeleeSlide:
             case EMovement::MOVE_Coil:
                 seq_a = active_set->find_sequence("CrouchSlide");
                 norm_time = 0.33f;
@@ -1000,6 +1300,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
                 break;
             case EMovement::MOVE_LedgeWalk:
+            case EMovement::MOVE_Balance:
                 seq_a = active_set->find_sequence("walkbalancefwd");
                 norm_time = std::fmod(sim_t * 1.2f, 1.0f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
@@ -1033,18 +1334,18 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         }
     }
 
-    if (!seq_a) seq_a = faith_unarmed_set_.find_sequence("Stand");
+    if (!seq_a) {
+        active_set = &faith_unarmed_set_;
+        seq_a = faith_unarmed_set_.find_sequence("Stand");
+    }
 
     std::vector<Vec3> local_pos, local_pos_b;
     std::vector<Quat4> local_quat, local_quat_b;
     sample_sequence_pose(faith_upper_, *active_set, seq_a, norm_time, local_pos, local_quat);
 
     if (seq_b && blend_alpha > 0.001f) {
-        const AnimSetAsset* set_b = (&faith_colt_set_.sequences == &active_set->sequences ||
-                                     faith_colt_set_.find_sequence(seq_b->name) == seq_b)
-                                        ? &faith_colt_set_
-                                        : active_set;
-        sample_sequence_pose(faith_upper_, *set_b, seq_b, norm_time, local_pos_b, local_quat_b);
+        const AnimSetAsset* owner_b = set_b_ptr ? set_b_ptr : active_set;
+        sample_sequence_pose(faith_upper_, *owner_b, seq_b, norm_time, local_pos_b, local_quat_b);
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
@@ -1066,15 +1367,26 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     // Note: vm_view = look_at((0,0,0), (0,100,0), (0,0,1)) has s = (-1,0,0),
     // so +rel.x maps to Screen Left (LeftHand) and -rel.x maps to Screen Right (RightHand Red Glove).
     // (rel.x, rel.z, -rel.y) is a proper right-handed 90-deg rotation (det = +1).
+    float kick_arc = std::sin(combat_progress * PI);
     auto raw_to_vm_pos = [&](const Vec3& raw_p, bool is_lower) -> Vec3 {
         Vec3 rel = eye_inv_quat.rotate(raw_p - eye_pos);
         if (!is_lower) {
             return Vec3(rel.x + vm_offset.x, rel.z + vm_offset.y, -rel.y + vm_offset.z);
         }
-        // For lower-body slide kick: shift hips behind near plane and pitch shins/boots into lower foreground
+        if (lower_body_high_kick) {
+            // For flying jump kick / high kick / wallrun kick: pitch legs higher into foreground view
+            float lx = rel.x - 4.0f;
+            float ly = rel.z - 46.0f + kick_arc * 18.0f;
+            float lz = -rel.y + 4.0f + kick_arc * 14.0f;
+            const float sin_p = 0.42f;
+            const float cos_p = 0.907f;
+            return Vec3(lx, ly * cos_p - lz * sin_p, ly * sin_p + lz * cos_p - 2.0f);
+        }
+        // For lower-body slide / slide-kick: shift hips behind near plane and pitch shins/boots into lower foreground
+        float slide_thrust = (state == EMovement::MOVE_MeleeSlide) ? (kick_arc * 14.0f) : 0.0f;
         float lx = rel.x - 6.0f;
-        float ly = rel.z - 54.0f;
-        float lz = -rel.y - 2.0f;
+        float ly = rel.z - 54.0f + slide_thrust;
+        float lz = -rel.y - 2.0f + (state == EMovement::MOVE_MeleeSlide ? kick_arc * 6.0f : 0.0f);
         const float sin_p = 0.28f;
         const float cos_p = 0.96f;
         return Vec3(lx, ly * cos_p - lz * sin_p, ly * sin_p + lz * cos_p - 8.0f);
@@ -1155,31 +1467,78 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         }
     };
 
-    out_triangles.reserve(faith_upper_.indices.size() + faith_lower_.indices.size() + colt1911_mesh_.indices.size());
+    const SkeletalMeshAsset* equipped_wmesh = (telemetry.weapon.equipped || state == EMovement::MOVE_Snatch)
+                                                  ? get_weapon_mesh(telemetry.weapon.name)
+                                                  : nullptr;
+    size_t w_idx_cnt = equipped_wmesh ? equipped_wmesh->indices.size() : 0;
+    out_triangles.reserve(faith_upper_.indices.size() + faith_lower_.indices.size() + w_idx_cnt + 48);
+
     append_skinned_mesh(faith_upper_, false);
     if (show_lower_body && faith_lower_.is_valid()) {
         append_skinned_mesh(faith_lower_, true);
     }
 
-    // Attach SK_Colt1911 to RightHand (Bone 48) when armed
-    if (telemetry.weapon.equipped && colt1911_mesh_.is_valid()) {
+    // Attach equipped weapon skeletal mesh (SK_Colt1911, SK_G36C, SK_Remington870, SK_MP5K, SK_FNSCARL, etc.)
+    if (equipped_wmesh && equipped_wmesh->is_valid()) {
         int32_t rh_idx = 48;
         auto it_rh = faith_upper_.bone_name_to_index.find("righthand");
         if (it_rh != faith_upper_.bone_name_to_index.end()) rh_idx = it_rh->second;
         Vec3 hand_vm = raw_to_vm_pos(comp_pos[rh_idx], false);
-        // SK_Colt1911 uses the same (x=Left, -y=Up, +z=Forward) Maya bind axes; scale by 0.62x into RightHand palm
-        const float gun_scale = 0.62f;
-        Vec3 gun_anchor = hand_vm + Vec3(1.5f, 4.5f, 4.8f);
 
-        for (size_t i = 0; i + 2 < colt1911_mesh_.indices.size(); i += 3) {
+        bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
+        const float gun_scale = heavy ? 0.50f : 0.62f;
+
+        // Align Wep_Trigger (bone[2]) to RightHand palm so both 1H pistols (trigger z~8)
+        // and 2H rifles/shotguns/LMGs/snipers (trigger z~33..39, stock at z=0) sit naturally in Faith's grip!
+        Vec3 trigger_bind = (equipped_wmesh->bones.size() > 2)
+                                ? equipped_wmesh->bones[2].bind_pos
+                                : Vec3(0.0f, 1.5f, 8.0f);
+        Vec3 palm_offset = heavy ? Vec3(1.2f, 8.5f, 4.2f) : Vec3(1.5f, 9.2f, 3.8f);
+
+        // Procedural slide/bolt blowback (Wep_Slide = bone 5) and trigger pull (Wep_Trigger = bone 2)
+        float slide_back = 0.0f;
+        float trigger_pull = 0.0f;
+        if (telemetry.weapon.fire_anim_timer > 0.0f) {
+            float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
+            float p = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
+            slide_back = std::sin(std::min(p * 3.5f, 1.0f) * PI) * (heavy ? 6.5f : 3.8f);
+            trigger_pull = std::sin(std::min(p * 4.0f, 1.0f) * PI) * 0.9f;
+        } else if (!heavy && telemetry.weapon.ammo == 0 && telemetry.weapon.max_ammo > 0) {
+            slide_back = 3.4f; // Pistol slide locked back on empty magazine (weaponposeempty)
+        }
+
+        // Recoil upward pitch rotation around grip
+        float recoil_pitch_rad = 0.0f;
+        if (telemetry.weapon.fire_anim_timer > 0.0f) {
+            float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
+            float p = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
+            recoil_pitch_rad = std::sin(std::min(p * 3.0f, 1.0f) * PI) * (heavy ? 0.09f : 0.14f);
+        }
+        float cos_r = std::cos(recoil_pitch_rad);
+        float sin_r = std::sin(recoil_pitch_rad);
+
+        auto transform_wep_pt = [&](const Vec3& bind_p, uint8_t dom_bone) -> Vec3 {
+            Vec3 bp = bind_p;
+            if (dom_bone == 5) bp.z -= slide_back;
+            else if (dom_bone == 2) bp.z -= trigger_pull;
+            Vec3 rel = (bp - trigger_bind) * gun_scale;
+            // Convert Maya weapon bind space (x=Left, -y=Up, +z=Forward) to VM space (+x=Left, +y=Forward, +z=Up)
+            float vx = rel.x;
+            float vy = rel.z;
+            float vz = -rel.y;
+            // Apply recoil pitch around grip
+            float ry = vy * cos_r - vz * sin_r;
+            float rz = vy * sin_r + vz * cos_r;
+            return hand_vm + palm_offset + Vec3(vx, ry, rz);
+        };
+
+        for (size_t i = 0; i + 2 < equipped_wmesh->indices.size(); i += 3) {
             for (int k = 0; k < 3; ++k) {
-                uint16_t vi = colt1911_mesh_.indices[i + k];
-                if (vi >= colt1911_mesh_.vertices.size()) continue;
-                const SkinnedVertex& sv = colt1911_mesh_.vertices[vi];
+                uint16_t vi = equipped_wmesh->indices[i + k];
+                if (vi >= equipped_wmesh->vertices.size()) continue;
+                const SkinnedVertex& sv = equipped_wmesh->vertices[vi];
                 Vertex out_v{};
-                out_v.position = gun_anchor + Vec3(sv.bind_pos.x * gun_scale,
-                                                   sv.bind_pos.z * gun_scale,
-                                                   -sv.bind_pos.y * gun_scale);
+                out_v.position = transform_wep_pt(sv.bind_pos, sv.bones[0]);
                 out_v.normal = Vec3(sv.bind_norm.x, sv.bind_norm.z, -sv.bind_norm.y).normalized();
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
@@ -1187,6 +1546,18 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 out_v.color = sv.color;
                 out_triangles.push_back(out_v);
             }
+        }
+
+        // Emit 3D Muzzle Flash at Wep_Flash (bone[3]) when firing
+        if (telemetry.weapon.muzzle_flash_timer > 0.0f && equipped_wmesh->bones.size() > 3) {
+            Vec3 flash_bind = equipped_wmesh->bones[3].bind_pos;
+            Vec3 flash_vm = transform_wep_pt(flash_bind, 3);
+            float flash_scale = heavy ? 5.2f : 3.6f;
+            append_muzzle_flash_mesh(out_triangles, flash_vm,
+                                     Vec3(0.0f, 1.0f, 0.0f),
+                                     Vec3(1.0f, 0.0f, 0.0f),
+                                     Vec3(0.0f, 0.0f, 1.0f),
+                                     flash_scale, flash_scale * 1.8f);
         }
     }
 }
@@ -1198,34 +1569,74 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
     out_triangles.clear();
     if (!loaded_ || !swat_mesh_.is_valid()) return;
 
+    bool two_handed = is_heavy_weapon_name(bot.weapon_name);
+    const AnimSetAsset* active_set = (two_handed && !swat_2h_set_.sequences.empty()) ? &swat_2h_set_ : &swat_set_;
     const AnimSequenceAsset* seq_a = nullptr;
     const AnimSequenceAsset* seq_b = nullptr;
     float blend_alpha = 0.0f;
     float norm_time = 0.0f;
 
-    if (bot.stunned) {
-        seq_a = swat_set_.find_sequence("HitHeavyHead");
-        if (!seq_a) seq_a = swat_set_.find_sequence("HitMeleeSlide");
-        norm_time = 0.45f;
-    } else if (reaction_disarm && bot.disarm_window) {
-        seq_a = swat_set_.find_sequence("SnatchFwd");
-        seq_b = swat_set_.find_sequence("standfire");
-        norm_time = 0.24f;
-        blend_alpha = 0.45f;
+    auto find_ai_seq = [&](const std::string& sname) -> const AnimSequenceAsset* {
+        if (const auto* s = active_set->find_sequence(sname)) return s;
+        return swat_set_.find_sequence(sname);
+    };
+
+    if (!bot.alive || bot.anim_state == EEnemyAnimState::KnockedOut) {
+        std::string dseq = bot.active_anim_seq.empty() ? "DeathByAuto" : bot.active_anim_seq;
+        seq_a = find_ai_seq(dseq);
+        if (!seq_a) seq_a = find_ai_seq("HitMeleeSlide");
+        norm_time = std::clamp(bot.anim_timer / std::max(0.25f, bot.anim_duration), 0.0f, 0.96f);
+        if (bot.anim_timer <= 0.0f) norm_time = 0.92f;
+    } else if (bot.anim_state == EEnemyAnimState::BeingDisarmed) {
+        std::string sseq = bot.active_anim_seq.empty() ? "SnatchFwd" : bot.active_anim_seq;
+        seq_a = find_ai_seq(sseq);
+        norm_time = std::clamp(bot.anim_timer / std::max(0.25f, bot.anim_duration), 0.0f, 0.95f);
+    } else if (bot.stunned || bot.anim_state == EEnemyAnimState::HitStagger) {
+        std::string hseq = bot.active_anim_seq.empty() ? "HitHeavyHead" : bot.active_anim_seq;
+        seq_a = find_ai_seq(hseq);
+        if (!seq_a) seq_a = find_ai_seq("HitHeavyHead");
+        norm_time = (bot.anim_timer > 0.0f)
+                        ? std::clamp(bot.anim_timer / std::max(0.25f, bot.anim_duration), 0.15f, 0.90f)
+                        : 0.45f;
+    } else if (bot.anim_state == EEnemyAnimState::MeleeWindup || (reaction_disarm && bot.disarm_window)) {
+        seq_a = find_ai_seq("MeleeStart");
+        seq_b = find_ai_seq("SnatchFwd");
+        if (!seq_a) seq_a = find_ai_seq("SnatchFwd");
+        norm_time = (bot.anim_timer > 0.0f)
+                        ? std::clamp(bot.anim_timer / std::max(0.20f, bot.anim_duration), 0.15f, 0.85f)
+                        : 0.24f;
+        blend_alpha = 0.35f;
+    } else if (bot.anim_state == EEnemyAnimState::MeleeStrike) {
+        seq_a = find_ai_seq("MeleeEnd");
+        if (!seq_a) seq_a = find_ai_seq("MeleeMiss");
+        norm_time = std::clamp(bot.anim_timer / std::max(0.20f, bot.anim_duration), 0.0f, 0.95f);
+    } else if (bot.anim_state == EEnemyAnimState::Chase || bot.velocity.length_xy() > 140.0f) {
+        seq_a = find_ai_seq("runfwd");
+        norm_time = std::fmod(sim_time * 1.5f, 1.0f);
+    } else if (bot.anim_state == EEnemyAnimState::Patrol || bot.velocity.length_xy() > 20.0f) {
+        seq_a = find_ai_seq("walkfwd");
+        norm_time = std::fmod(sim_time * 1.1f, 1.0f);
     } else {
-        seq_a = swat_set_.find_sequence("standfire");
-        seq_b = swat_set_.find_sequence("Stand");
+        seq_a = find_ai_seq("standfire");
+        seq_b = find_ai_seq("Stand");
         norm_time = std::fmod(sim_time * 1.2f, 1.0f);
         blend_alpha = 0.25f;
     }
 
-    if (!seq_a) seq_a = swat_set_.find_sequence("Stand");
+    if (!seq_a) {
+        active_set = &swat_set_;
+        seq_a = swat_set_.find_sequence("Stand");
+    }
+
+    // Ensure active_set owns seq_a for track mapping
+    const AnimSetAsset* owner_a = (active_set->find_sequence(seq_a->name) == seq_a) ? active_set : &swat_set_;
 
     std::vector<Vec3> local_pos, local_pos_b;
     std::vector<Quat4> local_quat, local_quat_b;
-    sample_sequence_pose(swat_mesh_, swat_set_, seq_a, norm_time, local_pos, local_quat);
+    sample_sequence_pose(swat_mesh_, *owner_a, seq_a, norm_time, local_pos, local_quat);
     if (seq_b && blend_alpha > 0.001f) {
-        sample_sequence_pose(swat_mesh_, swat_set_, seq_b, norm_time, local_pos_b, local_quat_b);
+        const AnimSetAsset* owner_b = (active_set->find_sequence(seq_b->name) == seq_b) ? active_set : &swat_set_;
+        sample_sequence_pose(swat_mesh_, *owner_b, seq_b, norm_time, local_pos_b, local_quat_b);
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
@@ -1255,7 +1666,12 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         skinned_norm[i] = Vec3(n_acc.z, -n_acc.x, -n_acc.y).normalized();
     }
 
-    out_triangles.reserve(swat_mesh_.indices.size() + colt1911_mesh_.indices.size());
+    const SkeletalMeshAsset* bot_wmesh = (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
+                                             ? get_weapon_mesh(bot.weapon_name)
+                                             : nullptr;
+    size_t bot_w_indices = bot_wmesh ? bot_wmesh->indices.size() : 0;
+    out_triangles.reserve(swat_mesh_.indices.size() + bot_w_indices + 48);
+
     for (size_t i = 0; i + 2 < swat_mesh_.indices.size(); i += 3) {
         for (int k = 0; k < 3; ++k) {
             uint16_t vi = swat_mesh_.indices[i + k];
@@ -1272,8 +1688,8 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         }
     }
 
-    // Attach weapon to SWAT officer's RightWeapon / RightHand bone when armed (!bot.stunned)
-    if (!bot.stunned && colt1911_mesh_.is_valid()) {
+    // Attach weapon to officer's RightWeapon / RightHand bone when armed
+    if (bot_wmesh && bot_wmesh->is_valid()) {
         int32_t rw_idx = 0;
         auto it_rw = swat_mesh_.bone_name_to_index.find("rightweapon");
         if (it_rw == swat_mesh_.bone_name_to_index.end()) {
@@ -1283,18 +1699,19 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
 
         Vec3 raw_hand = comp_pos[rw_idx];
         Vec3 hand_local(raw_hand.z, -raw_hand.x, -raw_hand.y);
-        uint32_t disarm_red = pack_rgba8(0.94f, 0.08f, 0.08f);
+        uint32_t disarm_red = pack_rgba8(0.95f, 0.08f, 0.08f);
 
-        const float bot_gun_scale = 0.65f;
-        for (size_t i = 0; i + 2 < colt1911_mesh_.indices.size(); i += 3) {
+        Vec3 trigger_bind = (bot_wmesh->bones.size() > 2) ? bot_wmesh->bones[2].bind_pos : Vec3(0.0f, 1.5f, 8.0f);
+        const float bot_gun_scale = two_handed ? 0.58f : 0.65f;
+
+        for (size_t i = 0; i + 2 < bot_wmesh->indices.size(); i += 3) {
             for (int k = 0; k < 3; ++k) {
-                uint16_t vi = colt1911_mesh_.indices[i + k];
-                if (vi >= colt1911_mesh_.vertices.size()) continue;
-                const SkinnedVertex& sv = colt1911_mesh_.vertices[vi];
+                uint16_t vi = bot_wmesh->indices[i + k];
+                if (vi >= bot_wmesh->vertices.size()) continue;
+                const SkinnedVertex& sv = bot_wmesh->vertices[vi];
+                Vec3 rel = (sv.bind_pos - trigger_bind) * bot_gun_scale;
                 Vertex out_v{};
-                out_v.position = hand_local + Vec3(sv.bind_pos.z * bot_gun_scale + 4.0f,
-                                                   -sv.bind_pos.x * bot_gun_scale,
-                                                   -sv.bind_pos.y * bot_gun_scale);
+                out_v.position = hand_local + Vec3(rel.z + 6.0f, -rel.x, -rel.y);
                 out_v.normal = Vec3(sv.bind_norm.z, -sv.bind_norm.x, -sv.bind_norm.y).normalized();
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
@@ -1302,6 +1719,116 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
                 out_v.color = bot.disarm_window ? disarm_red : sv.color;
                 out_triangles.push_back(out_v);
             }
+        }
+
+        // Emit 3D Muzzle Flash at enemy weapon barrel tip when firing
+        if (bot.muzzle_flash_timer > 0.0f && bot_wmesh->bones.size() > 3) {
+            Vec3 flash_rel = (bot_wmesh->bones[3].bind_pos - trigger_bind) * bot_gun_scale;
+            Vec3 flash_local = hand_local + Vec3(flash_rel.z + 6.0f, -flash_rel.x, -flash_rel.y);
+            append_muzzle_flash_mesh(out_triangles, flash_local,
+                                     Vec3(1.0f, 0.0f, 0.0f),
+                                     Vec3(0.0f, 1.0f, 0.0f),
+                                     Vec3(0.0f, 0.0f, 1.0f),
+                                     9.0f, 16.0f);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Evaluate 3D Dropped Weapons & Active Ballistic Bullet Tracers in World Space
+// -----------------------------------------------------------------------------
+void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float /*sim_time*/,
+                                          std::vector<Vertex>& out_world_tris,
+                                          std::vector<Vertex>& out_rv_tris) const {
+    out_world_tris.clear();
+    out_rv_tris.clear();
+
+    // 1. Render 3D Dropped Weapons on the ground / flying through air
+    for (const auto& dw : scene.dropped_weapons) {
+        const SkeletalMeshAsset* wmesh = get_weapon_mesh(dw.weapon_name);
+        if (!wmesh || !wmesh->is_valid()) continue;
+
+        float cy = std::cos(dw.yaw_deg * DEG2RAD);
+        float sy = std::sin(dw.yaw_deg * DEG2RAD);
+        float cr = std::cos(dw.roll_deg * DEG2RAD);
+        float sr = std::sin(dw.roll_deg * DEG2RAD);
+        const float scale = dw.is_heavy ? 0.62f : 0.72f;
+        Vec3 trigger_bind = (wmesh->bones.size() > 2) ? wmesh->bones[2].bind_pos : Vec3(0.0f, 0.0f, 10.0f);
+
+        for (size_t i = 0; i + 2 < wmesh->indices.size(); i += 3) {
+            for (int k = 0; k < 3; ++k) {
+                uint16_t vi = wmesh->indices[i + k];
+                if (vi >= wmesh->vertices.size()) continue;
+                const SkinnedVertex& sv = wmesh->vertices[vi];
+                Vec3 rel = (sv.bind_pos - trigger_bind) * scale;
+                // Local weapon (+X=Forward, +Y=Right, +Z=Up) then roll on side and yaw in world
+                float lx = rel.z;
+                float ly = -rel.x * cr - (-rel.y) * sr;
+                float lz = -rel.x * sr + (-rel.y) * cr;
+                Vec3 wp = dw.position + Vec3(lx * cy - ly * sy, lx * sy + ly * cy, lz + 4.0f);
+
+                float nx = sv.bind_norm.z;
+                float ny = -sv.bind_norm.x * cr - (-sv.bind_norm.y) * sr;
+                float nz = -sv.bind_norm.x * sr + (-sv.bind_norm.y) * cr;
+                Vec3 wn = Vec3(nx * cy - ny * sy, nx * sy + ny * cy, nz).normalized();
+
+                Vertex out_v{};
+                out_v.position = wp;
+                out_v.normal = wn;
+                out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
+                out_v.u = sv.u;
+                out_v.v = sv.v;
+                out_v.color = sv.color;
+                out_world_tris.push_back(out_v);
+            }
+        }
+    }
+
+    // 2. Render 3D Ballistic Bullet Tracers & Impact Sparks
+    for (const auto& tr : scene.active_tracers) {
+        Vec3 diff = tr.end_pos - tr.start_pos;
+        float len = diff.length();
+        if (len < 5.0f) continue;
+        Vec3 dir = diff * (1.0f / len);
+        Vec3 up = (std::abs(dir.z) < 0.9f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f);
+        Vec3 side = dir.cross(up).normalized();
+        Vec3 ortho = side.cross(dir).normalized();
+
+        float alpha = std::clamp(tr.timer / std::max(0.01f, tr.max_time), 0.0f, 1.0f);
+        // Animate streak segment traveling rapidly from start_pos to end_pos
+        float head_t = std::clamp(1.0f - alpha * 0.35f, 0.25f, 1.0f);
+        float tail_t = std::max(0.0f, head_t - 0.65f);
+        Vec3 p0 = tr.start_pos + diff * tail_t;
+        Vec3 p1 = tr.start_pos + diff * head_t;
+
+        float half_w = tr.from_player ? 1.3f : 1.6f;
+        uint32_t col = tr.from_player ? pack_rgba8(1.0f, 0.92f, 0.55f) : pack_rgba8(1.0f, 0.45f, 0.18f);
+
+        auto add_quad = [&](const Vec3& axis) {
+            Vec3 a = p0 - axis * half_w;
+            Vec3 b = p0 + axis * half_w;
+            Vec3 c = p1 + axis * half_w;
+            Vec3 d = p1 - axis * half_w;
+            Vec3 n = Vec3(0.0f, 0.0f, 1.0f);
+            Vertex va{a, n, {1, 0, 0}, 0.0f, 0.0f, 0.0f, 0.0f, col};
+            Vertex vb{b, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, col};
+            Vertex vc{c, n, {1, 0, 0}, 1.0f, 1.0f, 0.0f, 0.0f, col};
+            Vertex vd{d, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, col};
+            out_world_tris.push_back(va); out_world_tris.push_back(vb); out_world_tris.push_back(vc);
+            out_world_tris.push_back(va); out_world_tris.push_back(vc); out_world_tris.push_back(vd);
+            out_world_tris.push_back(va); out_world_tris.push_back(vc); out_world_tris.push_back(vb);
+            out_world_tris.push_back(va); out_world_tris.push_back(vd); out_world_tris.push_back(vc);
+        };
+        add_quad(side);
+        add_quad(ortho);
+
+        // Impact spark burst at end_pos
+        if (alpha > 0.3f) {
+            append_muzzle_flash_mesh(tr.hit_enemy ? out_rv_tris : out_world_tris,
+                                     tr.end_pos - dir * 3.0f,
+                                     dir * -1.0f, side, ortho,
+                                     tr.hit_enemy ? 10.0f : 6.0f,
+                                     tr.hit_enemy ? 16.0f : 10.0f);
         }
     }
 }
@@ -1313,6 +1840,7 @@ bool AnimSystem::verify_all() const {
     if (!loaded_) return false;
     if (faith_upper_.bones.size() != 74 || faith_lower_.bones.size() != 74) return false;
     if (swat_mesh_.bones.size() != 88 || colt1911_mesh_.bones.size() != 8) return false;
+    if (weapon_meshes_.size() < 10) return false;
     if (faith_unarmed_set_.sequences.size() < 250) return false;
     if (swat_set_.sequences.size() < 90) return false;
 
