@@ -60,6 +60,7 @@ enum class TexDefault : uint8_t { White = 0, FlatNormal = 1, Black = 2 };
 // Fixed binding points used by every generated material fragment function.
 namespace matbind {
 constexpr int kMaxTextureSlots = 14;     // texture(0..13) / sampler(0..13): material textures
+constexpr int kShadowMapTexture = 27;    // texture(27): directional sun shadow depth map
 constexpr int kSceneColorTexture = 28;   // texture(28): copy of opaque scene color (SceneTexture expressions)
 constexpr int kSceneDepthTexture = 29;   // texture(29): copy of opaque scene depth (DepthBiasedAlpha)
 constexpr int kSceneSampler = 15;        // sampler(15): clamp sampler for scene copies

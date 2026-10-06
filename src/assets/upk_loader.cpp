@@ -2665,22 +2665,23 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 
         Vec3 ms = out_scene.mod_shadow_color;
         float ms_max = std::max({ms.x, ms.y, ms.z, 1e-4f});
-        Vec3 ms_norm = (ms_max > 0.05f) ? (ms * (1.0f / ms_max)) : Vec3(0.565f, 0.753f, 1.0f);
+        Vec3 ms_norm = (ms_max > 0.05f) ? (ms * (1.0f / ms_max)) : Vec3(0.494f, 0.659f, 0.875f);
 
-        Vec3 upper_blend = up_norm * 0.65f + ms_norm * 0.35f;
+        // Preserve Mirror's Edge signature cool cerulean-azure sky fill (ModShadowColor + SkyLight)
+        Vec3 upper_blend = up_norm * 0.40f + ms_norm * 0.60f;
         out_scene.sky_upper_color = Vec3(
-            std::clamp(upper_blend.x, 0.60f, 1.0f),
-            std::clamp(upper_blend.y, 0.76f, 1.0f),
-            std::clamp(upper_blend.z, 0.90f, 1.0f));
+            std::clamp(upper_blend.x * 0.82f, 0.36f, 0.62f),
+            std::clamp(upper_blend.y * 0.94f, 0.62f, 0.82f),
+            std::clamp(upper_blend.z, 0.92f, 1.00f));
 
+        // Preserve warm sunlit concrete ground/wall radiosity bounce (FSkyLightSceneProxy LowerColor)
         Vec3 lo_src = level_ambient.sky_lower_color;
         float lo_max = std::max({lo_src.x, lo_src.y, lo_src.z, 1e-4f});
-        Vec3 lo_norm = (lo_max > 0.05f) ? (lo_src * (0.86f / lo_max)) : Vec3(0.82f, 0.84f, 0.88f);
-        Vec3 lower_blend = lo_norm * 0.55f + Vec3(0.82f, 0.84f, 0.88f) * 0.45f;
+        Vec3 lo_norm = (lo_max > 0.05f) ? (lo_src * (1.0f / lo_max)) : Vec3(1.0f, 0.88f, 0.74f);
         out_scene.sky_lower_color = Vec3(
-            std::clamp(lower_blend.x, 0.74f, 0.92f),
-            std::clamp(lower_blend.y, 0.74f, 0.92f),
-            std::clamp(lower_blend.z, 0.72f, 0.92f));
+            std::clamp(lo_norm.x * 0.96f, 0.82f, 0.98f),
+            std::clamp(lo_norm.y * 0.82f, 0.68f, 0.84f),
+            std::clamp(lo_norm.z * 0.64f, 0.46f, 0.66f));
     }
     if (level_ambient.has_skylight || level_ambient.has_world_sky) {
         std::cout << "[Level] Ambient from " << out_scene.sky_light_source
