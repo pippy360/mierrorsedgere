@@ -678,6 +678,46 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     renderer.set_menu_open(false);
     std::cout << "  -> Stage 9 Result: PASS (Rendered SP01 and Chapter Select Menu)" << std::endl;
 
+    // Stage 10: Render SP00/Tutorial_p.me1 Rooftop Training Progression Screenshots
+    std::cout << "[Oracle Stage 10] Rendering SP00/Tutorial_p.me1 Rooftop Training Screenshots..." << std::endl;
+    struct TutorialShotSpec {
+        int cp_idx;
+        Vec3 pos_offset;
+        float yaw_deg;
+        float pitch_deg;
+        const char* filename;
+    };
+    static const TutorialShotSpec kTutorialShots[] = {
+        {0,  Vec3(0.0f, 0.0f, 0.0f),     0.0f,  -2.0f, "tutorial_1_rooftop_start.png"},
+        {2,  Vec3(0.0f, 0.0f, 0.0f),    -4.0f,  -2.0f, "tutorial_2_slide_airduct_gap.png"},
+        {5,  Vec3(0.0f, 0.0f, 0.0f),   180.0f,  -2.0f, "tutorial_3_wallrun_speedvault.png"},
+        {8,  Vec3(-240.0f, 0.0f, 0.0f), 175.0f, -4.0f, "tutorial_4_balance_wallclimb.png"},
+        {14, Vec3(0.0f, 0.0f, 0.0f),    -2.0f, -10.0f, "tutorial_5_zipline_skillroll.png"},
+        {16, Vec3(0.0f, 0.0f, 0.0f),     1.5f,  -1.0f, "tutorial_6_springboard_combat.png"}
+    };
+    for (const auto& shot : kTutorialShots) {
+        if (shot.cp_idx < static_cast<int>(sp00_scene.checkpoints.size())) {
+            PlayerTelemetry tt = controller.get_telemetry();
+            tt.reaction_active = false;
+            tt.in_elevator = false;
+            tt.weapon.equipped = false;
+            tt.move_state = EMovement::MOVE_Walking;
+            tt.speed_2d = 0.0f;
+            tt.fov_deg = 90.0f;
+            tt.camera_roll_deg = 0.0f;
+            tt.position = sp00_scene.checkpoints[shot.cp_idx] + shot.pos_offset;
+            tt.yaw_deg = shot.yaw_deg;
+            tt.pitch_deg = shot.pitch_deg;
+            tt.active_checkpoint = shot.cp_idx;
+            if (shot.cp_idx < static_cast<int>(sp00_scene.subtitles.size())) {
+                tt.active_subtitle = sp00_scene.subtitles[shot.cp_idx];
+            }
+            renderer.render_frame(sp00_scene, tt);
+            save_and_publish_png(shot.filename);
+        }
+    }
+    std::cout << "  -> Stage 10 Result: PASS (Rendered 6 SP00/Tutorial_p.me1 screenshots)" << std::endl;
+
     // Write complete telemetry log
     std::ofstream tel_file("/tmp/me_oracle_telemetry.json");
     if (tel_file.is_open()) {
