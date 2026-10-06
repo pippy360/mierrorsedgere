@@ -108,6 +108,11 @@ public:
     std::vector<SoundClip> extract_audio() const;
     bool extract_static_mesh_bounds(int32_t export_index, Vec3& out_origin, Vec3& out_extent, float& out_radius) const;
     void extract_static_meshes(std::unordered_map<std::string, StaticMeshAsset>& out_meshes) const;
+    void extract_level_streaming_and_checkpoints(std::vector<LevelCheckpointInfo>& out_checkpoints,
+                                                 std::vector<LevelStreamingActionInfo>& out_streaming_actions,
+                                                 std::vector<std::string>& out_streaming_packages) const;
+    void extract_elevators(const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+                           std::vector<ElevatorInstance>& out_elevators) const;
 
     // Built-in LZO1X-1 decompressor
     static bool lzo1x_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t expected_len);
@@ -132,6 +137,10 @@ private:
 // Level Loading and Contiguous Rooftop / Parkour Geometry Generation
 // -----------------------------------------------------------------------------
 bool load_level_scene(const std::string& game_root, const std::string& map_rel_path, LevelScene& out_scene);
+
+// Dynamically stream sub-levels in/out to match a TdCheckpoint's StreamingLevels list
+// (or an Elevator's mid-shaft SeqAct_MultiLevelStreaming transition).
+bool stream_level_to_checkpoint(const std::string& game_root, LevelScene& scene, int checkpoint_idx);
 
 // Helper to construct a contiguous, playable 3D rooftop mesh around extracted actors.
 // When `out_material_paths` is non-null, real static meshes are emitted as per-material

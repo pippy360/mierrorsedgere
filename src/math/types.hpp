@@ -499,6 +499,8 @@ struct LevelActor {
     bool is_swing_bar = false;
     bool is_enemy = false;
     bool is_bag = false;
+    bool is_elevator_part = false;
+    std::string source_package;
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
     std::vector<std::string> material_overrides;
@@ -578,6 +580,69 @@ struct ChapterInfo {
 };
 
 // -----------------------------------------------------------------------------
+// Level Streaming & Checkpoint Info (Reverse-engineered from TdCheckpoint &
+// LevelStreamingKismet / SeqAct_MultiLevelStreaming in *_p.me1)
+// -----------------------------------------------------------------------------
+struct LevelCheckpointInfo {
+    std::string object_name;
+    std::string checkpoint_name;
+    int checkpoint_weight = 0;
+    bool default_checkpoint = false;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Rotator rotation{0.0f, 0.0f, 0.0f};
+    std::vector<std::string> streaming_levels; // LevelStreamingKismet.PackageName list
+};
+
+struct LevelStreamingActionInfo {
+    std::string object_name;
+    std::vector<std::string> package_names;    // Sublevel packages controlled by SeqAct_MultiLevelStreaming
+};
+
+// -----------------------------------------------------------------------------
+// Interactive Elevator System (Reverse-engineered from *_Slc.me1 / *_Spt.me1
+// InterpActor + SeqAct_Interp + InterpTrackMove)
+// -----------------------------------------------------------------------------
+enum class ElevatorState : uint8_t {
+    IdleStart = 0,     // Waiting at start floor with lower doors open
+    DoorsClosing = 1,  // Player entered cab / pressed button; lower doors sliding shut (0.7s)
+    Moving = 2,        // Cab riding along InterpTrackMove PosTrack curve + streaming sublevels
+    DoorsOpening = 3,  // Arrived at destination floor; upper doors sliding open (0.7s)
+    IdleEnd = 4        // Arrived at destination floor with upper doors open
+};
+
+struct ElevatorKeyframe {
+    float time = 0.0f;
+    Vec3 pos{0.0f, 0.0f, 0.0f};
+};
+
+struct ElevatorInstance {
+    std::string name;                  // e.g. "Escape_Intro-Off_Slc:mainlift"
+    std::string source_package;        // e.g. "Escape_Intro-Off_Spt"
+    std::string cab_mesh_name;         // e.g. "S_Elevator_01" or "S_SP09_ElevatorWithTop_01"
+    Vec3 start_pos{0.0f, 0.0f, 0.0f};  // Initial cab world position (floor center/origin)
+    Vec3 end_pos{0.0f, 0.0f, 0.0f};    // Target cab world position after InterpTrackMove
+    Vec3 current_pos{0.0f, 0.0f, 0.0f};
+    Vec3 prev_pos{0.0f, 0.0f, 0.0f};
+    Rotator rotation{0.0f, 0.0f, 0.0f};
+    Vec3 cab_half_extents{120.0f, 132.5f, 131.0f}; // Interior half-extents (S_Elevator_01: 240x265x262)
+    Vec3 cab_local_offset{0.0f, 0.0f, 0.0f};       // Offset from actor Location to cab floor center
+    float ride_duration = 5.0f;        // Matinee InterpLength (default 5.0s, Subway_Elev = 12.0s)
+    float door_duration = 0.7f;        // Matinee lowerdoors InterpLength (0.7s, slides 76 units each)
+    float timer = 0.0f;
+    float door_open_Start = 1.0f;      // 1.0 = fully open (+76u apart), 0.0 = closed
+    float door_open_End = 0.0f;        // 1.0 = fully open (+76u apart), 0.0 = closed
+    ElevatorState state = ElevatorState::IdleStart;
+    bool move_frame_world = false;     // true if IMF_World, false if IMF_RelativeToInitial
+    bool auto_trigger_on_enter = true; // Trigger automatically when Faith steps inside cab / presses button
+    bool streaming_triggered = false;  // Whether mid-shaft sublevel streaming has fired
+    int target_checkpoint_idx = -1;    // Optional target checkpoint whose StreamingLevels are loaded mid-ride
+    std::vector<std::string> stream_in_packages;
+    std::vector<std::string> stream_out_packages;
+    std::vector<ElevatorKeyframe> keyframes; // Full InterpTrackMove PosTrack curve
+    Vec3 button_pos{0.0f, 0.0f, 0.0f};       // Interior/exterior S_ElevatorButton_Single world position
+};
+
+// -----------------------------------------------------------------------------
 // Input Frame (Mapped from Keyboard, Mouse, or Gamepad)
 // -----------------------------------------------------------------------------
 struct InputFrame {
@@ -594,6 +659,7 @@ struct InputFrame {
     bool fire = false;
     bool reaction_time = false;
     bool look_at = false;
+    bool use = false;              // E / Interact button (e.g. Elevator button)
 };
 
 // -----------------------------------------------------------------------------
@@ -618,7 +684,12 @@ struct PlayerTelemetry {
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;
+    std::string active_checkpoint_name;
     int bags_collected = 0;
+    bool in_elevator = false;
+    int active_elevator_idx = -1;
+    float elevator_progress = 0.0f;
+    int streamed_sublevel_count = 0;
     WeaponState weapon;
     std::string active_subtitle;
 };
@@ -638,6 +709,11 @@ struct LevelScene {
     std::vector<AABB> colliders;
     std::vector<EnemyBot> enemies;
     std::vector<Vec3> checkpoints;
+    std::vector<LevelCheckpointInfo> checkpoint_infos;
+    std::vector<LevelStreamingActionInfo> streaming_actions;
+    std::vector<std::string> all_streaming_packages;
+    std::vector<std::string> loaded_sublevel_packages;
+    std::vector<ElevatorInstance> elevators;
     std::vector<SoundClip> sounds;
     std::vector<std::string> subtitles;
     // Resolved + compiled Mirror's Edge materials and textures referenced by MeshSection::material
@@ -645,3 +721,4 @@ struct LevelScene {
 };
 
 } // namespace me
+

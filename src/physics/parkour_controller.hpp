@@ -60,6 +60,7 @@ private:
     void update_ai_bots(float dt, LevelScene& scene);
     void update_health_and_regen(float dt);
     void update_checkpoints_and_volumes(LevelScene& scene);
+    void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
 
     // Collision Detection and Swept Physics
     struct Capsule {
@@ -87,6 +88,7 @@ private:
     TraceHit sweep_capsule(const Capsule& capsule, const Vec3& delta, const LevelScene& scene) const;
     TraceHit trace_ray(const Vec3& start, const Vec3& end, const LevelScene& scene) const;
     bool check_ground(const LevelScene& scene, float& floor_z, Vec3& floor_normal);
+
 
     // Parkour Movement Resolvers
     void update_ground_locomotion(const InputFrame& input, float dt, const LevelScene& scene);

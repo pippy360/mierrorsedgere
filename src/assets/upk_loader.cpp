@@ -782,15 +782,25 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         size_t avail_sz = std::min<size_t>(exp_end - prop_start, data_.size() - prop_start);
         auto props = parse_properties(prop_start, avail_sz);
 
-        // Also parse Archetype properties if this Actor inherits from an in-package Prefab Archetype
+        // Follow the full in-package Prefab Archetype chain (some actors inherit 2+ levels deep)
         std::unordered_map<std::string, PropertyValue> arch_props;
-        if (exp.archetype > 0 && static_cast<size_t>(exp.archetype) <= exports_.size()) {
-            const auto& aexp = exports_[exp.archetype - 1];
-            size_t ap_start = find_property_start(aexp);
-            size_t aexp_end = static_cast<size_t>(aexp.serial_offset) + static_cast<size_t>(aexp.serial_size);
-            if (ap_start < data_.size() && ap_start < aexp_end) {
-                arch_props = parse_properties(ap_start, std::min<size_t>(aexp_end - ap_start, data_.size() - ap_start));
+        int32_t cur_arch = exp.archetype;
+        int arch_guard = 0;
+        while (cur_arch > 0 && static_cast<size_t>(cur_arch) <= exports_.size() && arch_guard++ < 8) {
+            const auto& aexp = exports_[cur_arch - 1];
+            if (aexp.serial_offset >= 0 && aexp.serial_size >= 8) {
+                size_t ap_start = find_property_start(aexp);
+                size_t aexp_end = static_cast<size_t>(aexp.serial_offset) + static_cast<size_t>(aexp.serial_size);
+                if (ap_start < data_.size() && ap_start < aexp_end) {
+                    auto ap = parse_properties(ap_start, std::min<size_t>(aexp_end - ap_start, data_.size() - ap_start));
+                    for (auto& [k, v] : ap) {
+                        if (arch_props.find(k) == arch_props.end()) {
+                            arch_props.emplace(k, std::move(v));
+                        }
+                    }
+                }
             }
+            cur_arch = aexp.archetype;
         }
 
         auto get_prop = [&](const std::string& key) -> const PropertyValue* {
@@ -804,6 +814,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         LevelActor a;
         a.class_name = cls_name;
         a.object_name = exp.object_name;
+        a.source_package = package_name_of(*this);
 
         if (const auto* p = get_prop("Location")) a.location = p->vec_val;
         if (const auto* p = get_prop("Rotation")) a.rotation = p->rot_val;
@@ -817,7 +828,15 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         bool b_hidden = false;
         if (const auto* p = get_prop("bHidden")) b_hidden = p->bool_val;
 
-        // Resolve StaticMeshComponent -> StaticMesh (checking both instance and archetype)
+        // InterpActor (elevators, doors, buttons, moving platforms) frequently stores its
+        // mesh reference in ReplicatedMesh on the Actor / Archetype.
+        if (const auto* rm = get_prop("ReplicatedMesh")) {
+            if (!rm->obj_ref_name.empty() && rm->obj_ref_name != "None") {
+                a.mesh_name = rm->obj_ref_name;
+            }
+        }
+
+        // Resolve StaticMeshComponent -> StaticMesh (checking instance and full archetype chain)
         int32_t comp_idx = 0;
         if (const auto* p = get_prop("StaticMeshComponent")) {
             comp_idx = p->obj_ref_index;
@@ -837,7 +856,8 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             size_t cexp_end = static_cast<size_t>(comp_exp.serial_offset) + static_cast<size_t>(comp_exp.serial_size);
             if (cp_start < data_.size() && cp_start < cexp_end) {
                 auto comp_props = parse_properties(cp_start, std::min<size_t>(cexp_end - cp_start, data_.size() - cp_start));
-                if (comp_props.find("StaticMesh") != comp_props.end()) {
+                if (comp_props.find("StaticMesh") != comp_props.end() && !comp_props["StaticMesh"].obj_ref_name.empty() &&
+                    comp_props["StaticMesh"].obj_ref_name != "None") {
                     a.mesh_name = comp_props["StaticMesh"].obj_ref_name;
                 }
                 if (comp_props.find("HiddenGame") != comp_props.end() && comp_props["HiddenGame"].bool_val) {
@@ -852,19 +872,24 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     a.draw_scale_3d.z *= comp_props["Scale3D"].vec_val.z;
                 }
             }
-            if (a.mesh_name.empty() && comp_exp.archetype > 0 && static_cast<size_t>(comp_exp.archetype) <= exports_.size()) {
-                const auto& acomp_exp = exports_[comp_exp.archetype - 1];
+            int32_t c_arch = comp_exp.archetype;
+            int c_guard = 0;
+            while (a.mesh_name.empty() && c_arch > 0 && static_cast<size_t>(c_arch) <= exports_.size() && c_guard++ < 8) {
+                const auto& acomp_exp = exports_[c_arch - 1];
                 size_t acp_start = find_property_start(acomp_exp);
                 size_t acexp_end = static_cast<size_t>(acomp_exp.serial_offset) + static_cast<size_t>(acomp_exp.serial_size);
                 if (acp_start < data_.size() && acp_start < acexp_end) {
                     auto acomp_props = parse_properties(acp_start, std::min<size_t>(acexp_end - acp_start, data_.size() - acp_start));
-                    if (acomp_props.find("StaticMesh") != acomp_props.end()) {
+                    if (acomp_props.find("StaticMesh") != acomp_props.end() &&
+                        !acomp_props["StaticMesh"].obj_ref_name.empty() &&
+                        acomp_props["StaticMesh"].obj_ref_name != "None") {
                         a.mesh_name = acomp_props["StaticMesh"].obj_ref_name;
                     }
                     if (acomp_props.find("HiddenGame") != acomp_props.end() && acomp_props["HiddenGame"].bool_val) {
                         b_hidden = true;
                     }
                 }
+                c_arch = acomp_exp.archetype;
             }
 
             // StaticMeshComponent.Materials[] overrides the mesh's per-element materials
@@ -900,6 +925,10 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             low_mesh.clear();
         }
 
+        bool is_elev_button = (low_mesh.find("elevatorbutton") != std::string::npos);
+        bool is_elev_mesh = (low_mesh.find("elevator") != std::string::npos ||
+                             low_mesh.find("s_lift") != std::string::npos);
+
         a.is_checkpoint = (low_class.find("checkpoint") != std::string::npos || low_obj.find("checkpoint") != std::string::npos);
         a.is_trigger = (low_class.find("trigger") != std::string::npos);
         a.is_zipline = (low_class.find("zipline") != std::string::npos || low_mesh.find("zipline") != std::string::npos);
@@ -910,7 +939,16 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         a.is_swing_bar = (low_class.find("swing") != std::string::npos || low_mesh.find("swingpole") != std::string::npos);
         a.is_enemy = (low_class.find("ai") != std::string::npos || low_class.find("botpawn") != std::string::npos || low_class.find("cop") != std::string::npos);
         a.is_bag = (low_class.find("bag") != std::string::npos || low_obj.find("bag") != std::string::npos || low_mesh.find("s_bag") != std::string::npos);
-        a.is_runner_vision = b_loi || a.is_springboard || a.is_zipline || a.is_ladder || a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
+        a.is_elevator_part = is_elev_mesh || is_elev_button;
+        a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline || a.is_ladder || a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
+
+        // Hollow elevator cabs (S_Elevator_01, S_SP09_ElevatorWithTop_01, etc.), elevator frames,
+        // and sliding doors (S_ElevatorDoor_01) must NOT become solid static AABB bricks in out_colliders,
+        // otherwise the player cannot walk through the doorway or stand inside the cab.
+        // Instead, ElevatorInstance provides dynamic floor/ceiling/wall/door collision.
+        if (a.is_elevator_part || a.is_trigger || a.is_checkpoint) {
+            a.is_collidable = false;
+        }
 
         // Approximate initial world bounds (refined later when StaticMeshAsset is bound)
         float r_xy = 150.0f * std::abs(a.draw_scale) * std::max(std::abs(a.draw_scale_3d.x), std::abs(a.draw_scale_3d.y));
@@ -925,6 +963,380 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
     return actors;
 }
+
+void UPKPackage::extract_level_streaming_and_checkpoints(
+    std::vector<LevelCheckpointInfo>& out_checkpoints,
+    std::vector<LevelStreamingActionInfo>& out_streaming_actions,
+    std::vector<std::string>& out_streaming_packages) const {
+
+    // 1. Map all LevelStreamingKismet exports (1-based export index -> PackageName)
+    std::unordered_map<int32_t, std::string> lsk_map;
+    std::set<std::string> seen_pkgs(out_streaming_packages.begin(), out_streaming_packages.end());
+    auto add_pkg_name = [&](const std::string& pname) {
+        if (pname.empty() || pname == "None") return;
+        if (seen_pkgs.insert(pname).second) {
+            out_streaming_packages.push_back(pname);
+        }
+    };
+
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx_1 = static_cast<int32_t>(i) + 1;
+        std::string cls = get_export_class(exports_[i]);
+        if (cls.find("LevelStreaming") == std::string::npos) continue;
+
+        UPropertyList props;
+        parse_export_properties(*this, idx_1, props);
+        std::string pkg_name = prop_name(props, "PackageName");
+        if (!pkg_name.empty() && pkg_name != "None") {
+            lsk_map[idx_1] = pkg_name;
+            add_pkg_name(pkg_name);
+        }
+    }
+
+    // 2. Extract TdCheckpoint / TdPlaceableCheckpoint exports in PersistentLevel
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx_1 = static_cast<int32_t>(i) + 1;
+        std::string cls = get_export_class(exports_[i]);
+        if (cls.find("Checkpoint") == std::string::npos && cls.find("CheckPoint") == std::string::npos) continue;
+        if (cls.find("Volume") != std::string::npos || cls.find("Manager") != std::string::npos ||
+            cls.find("SeqAct") != std::string::npos) continue;
+
+        auto [outer_name, _] = resolve_object_index(exports_[i].outer_index);
+        if (outer_name != "PersistentLevel") continue;
+
+        UPropertyList props;
+        parse_export_properties(*this, idx_1, props);
+
+        LevelCheckpointInfo cp;
+        cp.object_name = export_object_name(*this, idx_1);
+        cp.checkpoint_name = prop_name(props, "CheckpointName", cp.object_name);
+        cp.checkpoint_weight = prop_int(props, "CheckpointWeight", 0);
+        cp.default_checkpoint = prop_bool(props, "DefaultCheckpoint", false);
+        if (const UProperty* loc = find_prop(props, "Location")) {
+            cp.location = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+        }
+        if (const UProperty* rot = find_prop(props, "Rotation")) {
+            cp.rotation = Rotator(static_cast<float>(rot->vi[0]),
+                                  static_cast<float>(rot->vi[1]),
+                                  static_cast<float>(rot->vi[2]));
+        }
+        if (const UProperty* sl = find_prop(props, "StreamingLevels")) {
+            for (int32_t ref : sl->ints) {
+                auto it = lsk_map.find(ref);
+                if (it != lsk_map.end()) {
+                    cp.streaming_levels.push_back(it->second);
+                } else if (ref > 0 && static_cast<size_t>(ref) <= exports_.size()) {
+                    UPropertyList lprops;
+                    parse_export_properties(*this, ref, lprops);
+                    std::string pname = prop_name(lprops, "PackageName");
+                    if (!pname.empty() && pname != "None") {
+                        cp.streaming_levels.push_back(pname);
+                        add_pkg_name(pname);
+                    }
+                }
+            }
+        }
+        out_checkpoints.push_back(std::move(cp));
+    }
+
+    std::sort(out_checkpoints.begin(), out_checkpoints.end(),
+              [](const LevelCheckpointInfo& a, const LevelCheckpointInfo& b) {
+                  if (a.default_checkpoint != b.default_checkpoint) return a.default_checkpoint;
+                  if (a.checkpoint_weight != b.checkpoint_weight) return a.checkpoint_weight < b.checkpoint_weight;
+                  return a.checkpoint_name < b.checkpoint_name;
+              });
+
+    // 3. Extract SeqAct_MultiLevelStreaming / SeqAct_LevelStreaming Kismet actions
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx_1 = static_cast<int32_t>(i) + 1;
+        std::string cls = get_export_class(exports_[i]);
+        if (cls.find("SeqAct_MultiLevelStreaming") == std::string::npos &&
+            cls.find("SeqAct_LevelStreaming") == std::string::npos) continue;
+
+        UPropertyList props;
+        parse_export_properties(*this, idx_1, props);
+
+        LevelStreamingActionInfo act;
+        act.object_name = export_object_name(*this, idx_1);
+
+        if (const UProperty* levels = find_prop(props, "Levels")) {
+            for (const auto& el : levels->elements) {
+                int32_t lref = prop_object(el, "Level");
+                std::string lname = prop_name(el, "LevelName");
+                if (lref > 0 && lsk_map.find(lref) != lsk_map.end()) {
+                    lname = lsk_map[lref];
+                }
+                if (!lname.empty() && lname != "None") {
+                    act.package_names.push_back(lname);
+                    add_pkg_name(lname);
+                }
+            }
+        }
+        int32_t single_level = prop_object(props, "Level");
+        if (single_level > 0 && lsk_map.find(single_level) != lsk_map.end()) {
+            act.package_names.push_back(lsk_map[single_level]);
+            add_pkg_name(lsk_map[single_level]);
+        }
+
+        if (!act.package_names.empty()) {
+            out_streaming_actions.push_back(std::move(act));
+        }
+    }
+}
+
+void UPKPackage::extract_elevators(
+    const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+    std::vector<ElevatorInstance>& out_elevators) const {
+
+    std::string pkg_name = package_name_of(*this);
+
+    // 1. Collect all InterpActor / StaticMeshActor elevator cab candidates and buttons in this package
+    struct CabCandidate {
+        int32_t exp_idx_1 = 0;
+        std::string obj_name;
+        std::string mesh_name;
+        Vec3 location{0.0f, 0.0f, 0.0f};
+        Rotator rotation{0.0f, 0.0f, 0.0f};
+        bool is_cab_mesh = false;
+    };
+    std::unordered_map<int32_t, CabCandidate> interp_actors;
+    std::vector<int32_t> cab_actor_indices;
+    std::vector<Vec3> button_positions;
+
+    auto resolve_actor_mesh = [&](int32_t exp_idx_1, const UPropertyList& props) -> std::string {
+        int32_t rm = prop_object(props, "ReplicatedMesh");
+        if (rm != 0) {
+            auto [mname, _] = resolve_object_index(rm);
+            if (!mname.empty() && mname != "None") return mname;
+        }
+        int32_t comp = prop_object(props, "StaticMeshComponent");
+        int guard = 0;
+        while (comp > 0 && static_cast<size_t>(comp) <= exports_.size() && guard++ < 8) {
+            UPropertyList cprops;
+            parse_export_properties(*this, comp, cprops);
+            int32_t sm = prop_object(cprops, "StaticMesh");
+            if (sm != 0) {
+                auto [mname, _] = resolve_object_index(sm);
+                if (!mname.empty() && mname != "None") return mname;
+            }
+            comp = exports_[comp - 1].archetype;
+        }
+        return "";
+    };
+
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx_1 = static_cast<int32_t>(i) + 1;
+        std::string cls = get_export_class(exports_[i]);
+        auto [outer_name, _] = resolve_object_index(exports_[i].outer_index);
+        if (outer_name != "PersistentLevel") continue;
+
+        if (cls == "InterpActor" || cls == "StaticMeshActor" || cls == "TdTrigger") {
+            UPropertyList props;
+            parse_export_properties(*this, idx_1, props);
+            Vec3 loc(0.0f, 0.0f, 0.0f);
+            if (const UProperty* lp = find_prop(props, "Location")) {
+                loc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+            }
+            Rotator rot(0.0f, 0.0f, 0.0f);
+            if (const UProperty* rp = find_prop(props, "Rotation")) {
+                rot = Rotator(static_cast<float>(rp->vi[0]),
+                              static_cast<float>(rp->vi[1]),
+                              static_cast<float>(rp->vi[2]));
+            }
+            std::string mname = resolve_actor_mesh(idx_1, props);
+            if (mname.empty() && exports_[i].archetype > 0 && static_cast<size_t>(exports_[i].archetype) <= exports_.size()) {
+                UPropertyList aprops;
+                parse_export_properties(*this, exports_[i].archetype, aprops);
+                mname = resolve_actor_mesh(exports_[i].archetype, aprops);
+            }
+            std::string low_m = to_lower(mname);
+
+            if (low_m.find("elevatorbutton") != std::string::npos || cls == "TdTrigger") {
+                button_positions.push_back(loc);
+            }
+
+            if (cls == "InterpActor") {
+                CabCandidate cc;
+                cc.exp_idx_1 = idx_1;
+                cc.obj_name = export_object_name(*this, idx_1);
+                cc.mesh_name = mname;
+                cc.location = loc;
+                cc.rotation = rot;
+                cc.is_cab_mesh = (low_m.find("s_elevator_01") != std::string::npos ||
+                                  low_m.find("elevatorwithtop") != std::string::npos ||
+                                  low_m.find("constructionelevator") != std::string::npos ||
+                                  low_m.find("cargoelevator") != std::string::npos ||
+                                  low_m.find("elevator_01_carriage") != std::string::npos ||
+                                  low_m.find("mall_elevator") != std::string::npos ||
+                                  low_m.find("s_lift") != std::string::npos);
+                interp_actors[idx_1] = cc;
+                if (cc.is_cab_mesh) {
+                    cab_actor_indices.push_back(idx_1);
+                }
+            }
+        }
+    }
+
+    // 2. Map SeqAct_Interp VariableLinks (LinkDesc -> ObjValue export index)
+    std::unordered_map<std::string, std::vector<int32_t>> group_to_actors;
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx_1 = static_cast<int32_t>(i) + 1;
+        if (get_export_class(exports_[i]) != "SeqAct_Interp") continue;
+
+        UPropertyList saprops;
+        parse_export_properties(*this, idx_1, saprops);
+        const UProperty* vlinks = find_prop(saprops, "VariableLinks");
+        if (!vlinks) continue;
+
+        for (const auto& vl : vlinks->elements) {
+            std::string desc = to_lower(prop_name(vl, "LinkDesc"));
+            const UProperty* lvars = find_prop(vl, "LinkedVariables");
+            if (!lvars || desc.empty()) continue;
+            for (int32_t sv_ref : lvars->ints) {
+                if (sv_ref <= 0 || static_cast<size_t>(sv_ref) > exports_.size()) continue;
+                UPropertyList svprops;
+                parse_export_properties(*this, sv_ref, svprops);
+                int32_t obj_val = prop_object(svprops, "ObjValue");
+                if (obj_val > 0) {
+                    group_to_actors[desc].push_back(obj_val);
+                }
+            }
+        }
+    }
+
+    // 3. Scan InterpTrackMove exports for vertical elevator trajectories
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t track_idx_1 = static_cast<int32_t>(i) + 1;
+        if (get_export_class(exports_[i]) != "InterpTrackMove") continue;
+
+        int32_t group_idx_1 = exports_[i].outer_index;
+        if (group_idx_1 <= 0 || static_cast<size_t>(group_idx_1) > exports_.size()) continue;
+        if (get_export_class(exports_[group_idx_1 - 1]) != "InterpGroup") continue;
+
+        UPropertyList gprops;
+        parse_export_properties(*this, group_idx_1, gprops);
+        std::string group_name = prop_name(gprops, "GroupName", "Elevator");
+        std::string low_group = to_lower(group_name);
+
+        // Skip non-elevator Matinee tracks (cameras, doors, helicopters, trains, boats, etc.)
+        if (low_group.find("cam") != std::string::npos || low_group.find("door") != std::string::npos ||
+            low_group.find("heli") != std::string::npos || low_group.find("chopper") != std::string::npos ||
+            low_group.find("train") != std::string::npos || low_group.find("wagen") != std::string::npos ||
+            low_group.find("boat") != std::string::npos || low_group.find("truck") != std::string::npos ||
+            low_group.find("faith") != std::string::npos || low_group.find("pawn") != std::string::npos ||
+            low_group.find("cop") != std::string::npos || low_group.find("gate") != std::string::npos) {
+            continue;
+        }
+
+        UPropertyList tprops;
+        parse_export_properties(*this, track_idx_1, tprops);
+        const UProperty* pos_track = find_prop(tprops, "PosTrack");
+        if (!pos_track) continue;
+        const UProperty* pts = find_prop(pos_track->fields, "Points");
+        if (!pts || pts->elements.size() < 2) continue;
+
+        std::vector<ElevatorKeyframe> raw_keys;
+        for (const auto& pt : pts->elements) {
+            ElevatorKeyframe kf;
+            kf.time = prop_float(pt, "InVal", 0.0f);
+            if (const UProperty* ov = find_prop(pt, "OutVal")) {
+                kf.pos = Vec3(ov->v[0], ov->v[1], ov->v[2]);
+            }
+            raw_keys.push_back(kf);
+        }
+
+        float total_dz = raw_keys.back().pos.z - raw_keys.front().pos.z;
+        if (std::abs(total_dz) < 400.0f) continue; // Floor-to-floor elevators travel at least 400 UE3 units vertically
+
+        std::string mf = prop_name(tprops, "MoveFrame", "IMF_RelativeToInitial");
+        bool is_world_frame = (mf == "IMF_World");
+
+        // Resolve linked InterpActor cab
+        const CabCandidate* chosen_cab = nullptr;
+        auto git = group_to_actors.find(low_group);
+        if (git != group_to_actors.end()) {
+            for (int32_t a_idx : git->second) {
+                auto ait = interp_actors.find(a_idx);
+                if (ait != interp_actors.end()) {
+                    chosen_cab = &ait->second;
+                    if (chosen_cab->is_cab_mesh) break;
+                }
+            }
+        }
+        bool is_named_elevator_group = (low_group.find("lift") != std::string::npos ||
+                                        low_group.find("elev") != std::string::npos);
+        if (!chosen_cab && is_named_elevator_group && !cab_actor_indices.empty()) {
+            chosen_cab = &interp_actors[cab_actor_indices.front()];
+        }
+        if (!chosen_cab && !is_named_elevator_group) {
+            continue;
+        }
+        if (chosen_cab && !chosen_cab->is_cab_mesh && !is_named_elevator_group) {
+            continue;
+        }
+
+        ElevatorInstance elev;
+        elev.source_package = pkg_name;
+        elev.name = pkg_name + ":" + group_name;
+        elev.move_frame_world = is_world_frame;
+        elev.cab_mesh_name = (chosen_cab && !chosen_cab->mesh_name.empty()) ? chosen_cab->mesh_name : "S_Elevator_01";
+        elev.rotation = chosen_cab ? chosen_cab->rotation : Rotator(0.0f, 0.0f, 0.0f);
+        elev.start_pos = is_world_frame ? raw_keys.front().pos
+                                        : (chosen_cab ? chosen_cab->location : raw_keys.front().pos);
+
+        for (const auto& rk : raw_keys) {
+            ElevatorKeyframe wk;
+            wk.time = rk.time;
+            wk.pos = is_world_frame ? rk.pos : (elev.start_pos + rk.pos);
+            elev.keyframes.push_back(wk);
+        }
+        elev.end_pos = elev.keyframes.back().pos;
+        elev.current_pos = elev.start_pos;
+        elev.prev_pos = elev.start_pos;
+        elev.ride_duration = std::max(1.0f, elev.keyframes.back().time);
+
+        // Compute world-space offset from actor pivot to cab interior floor center
+        // using the extracted UStaticMesh Bounds Origin & Extent (e.g. S_Elevator_01 has
+        // local Origin=(-120, -132.5, 131), Extent=(120, 132.5, 131)).
+        Vec3 local_origin(-120.0f, -132.5f, 131.0f);
+        Vec3 local_extent(120.0f, 132.5f, 131.0f);
+        std::string low_cab_mesh = to_lower(elev.cab_mesh_name);
+        auto mit = mesh_lib.find(low_cab_mesh);
+        if (mit != mesh_lib.end()) {
+            local_origin = mit->second.bounds_origin;
+            local_extent = mit->second.bounds_extent;
+        } else if (low_cab_mesh.find("elevatorwithtop") != std::string::npos) {
+            local_origin = Vec3(161.0f, -160.0f, 138.0f);
+            local_extent = Vec3(159.0f, 200.0f, 154.0f);
+        }
+
+        Vec3 rad = elev.rotation.to_radians();
+        float cy = std::cos(rad.y), sy = std::sin(rad.y);
+        Vec3 axis_x(cy, sy, 0.0f);
+        Vec3 axis_y(-sy, cy, 0.0f);
+        elev.cab_local_offset = axis_x * local_origin.x + axis_y * local_origin.y;
+        elev.cab_half_extents = Vec3(
+            std::max(90.0f, std::abs(local_extent.x * cy) + std::abs(local_extent.y * sy)),
+            std::max(90.0f, std::abs(local_extent.x * sy) + std::abs(local_extent.y * cy)),
+            std::max(120.0f, local_extent.z)
+        );
+
+        // Find nearest elevator button or trigger to the cab floor center
+        Vec3 floor_center = elev.start_pos + elev.cab_local_offset;
+        elev.button_pos = floor_center + Vec3(0.0f, 0.0f, 130.0f);
+        float best_btn_d2 = 1e18f;
+        for (const auto& bp : button_positions) {
+            float d2 = (bp - floor_center).length_sq();
+            if (d2 < best_btn_d2 && d2 < (600.0f * 600.0f)) {
+                best_btn_d2 = d2;
+                elev.button_pos = bp;
+            }
+        }
+
+        out_elevators.push_back(std::move(elev));
+    }
+}
+
 
 std::vector<SoundClip> UPKPackage::extract_audio() const {
     std::vector<SoundClip> sounds;
@@ -1642,6 +2054,11 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.meshes.clear();
     out_scene.colliders.clear();
     out_scene.checkpoints.clear();
+    out_scene.checkpoint_infos.clear();
+    out_scene.streaming_actions.clear();
+    out_scene.all_streaming_packages.clear();
+    out_scene.loaded_sublevel_packages.clear();
+    out_scene.elevators.clear();
     out_scene.sounds.clear();
     out_scene.enemies.clear();
     out_scene.materials.reset();
@@ -1663,6 +2080,12 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
 
     std::unordered_map<std::string, StaticMeshAsset> mesh_library;
+    std::vector<std::shared_ptr<UPKPackage>> loaded_packages;
+    loaded_packages.push_back(master_pkg);
+
+    // Extract LevelStreamingKismet, TdCheckpoint (with StreamingLevels), and SeqAct_MultiLevelStreaming
+    master_pkg->extract_level_streaming_and_checkpoints(
+        out_scene.checkpoint_infos, out_scene.streaming_actions, out_scene.all_streaming_packages);
 
     // Extract from master package
     master_pkg->extract_static_meshes(mesh_library);
@@ -1674,7 +2097,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.actors.insert(out_scene.actors.end(), master_actors.begin(), master_actors.end());
     out_scene.sounds.insert(out_scene.sounds.end(), master_sounds.begin(), master_sounds.end());
 
-    // Automatically discover and load adjacent sub-level geometry & art slices (*_Art, *_Bac, *_Slc, *_Pt1, *_Pt2)
+    // Automatically discover and load sub-level geometry, art slices, transition slices (*_Slc),
+    // and script/elevator packages (*_Spt) referenced by LevelStreamingKismet or adjacent in map_dir.
     fs::path map_dir = main_path.parent_path();
     std::string stem_prefix = main_path.stem().string();
     size_t underscore_p = stem_prefix.find("_p");
@@ -1687,24 +2111,32 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 
     std::set<std::string> sub_packages;
 
-    auto should_load_subpkg = [&](const std::string& fname) -> bool {
+    auto should_load_subpkg = [&](const std::string& fname, bool require_prefix = true) -> bool {
         std::string low = fname;
         std::transform(low.begin(), low.end(), low.begin(), ::tolower);
-        if (low.rfind(low_prefix, 0) != 0) {
+        if (require_prefix && low.rfind(low_prefix, 0) != 0) {
             return false;
         }
-        // Skip localization, music, audio, lightmap-only, script-only, kismet, and time-trial sub-packages
+        // Skip localization, music, audio, lightmap-only, cutscene-only, and time-trial sub-packages.
+        // Note: *_spt and *_slc MUST be loaded because Mirror's Edge places all interactive
+        // elevator cabs (InterpActor), doors, buttons, and Matinee InterpTrackMove curves in *_Spt / *_Slc!
         if (low.find("_loc_") != std::string::npos || low.find("_mus") != std::string::npos ||
             low.find("_aud") != std::string::npos || low.find("_peds") != std::string::npos ||
             low.find("_lookat") != std::string::npos || low.find("_lgts") != std::string::npos ||
-            low.find("_spt") != std::string::npos || low.find("_cs") != std::string::npos ||
-            low.rfind("tt_", 0) == 0) {
+            low.find("_cs") != std::string::npos || low.rfind("tt_", 0) == 0) {
             return false;
         }
         return true;
     };
 
-    // 1. From AdditionalPackagesToCook in master package header
+    // 1. From LevelStreamingKismet.PackageName and AdditionalPackagesToCook in master package
+    for (const auto& stream_pkg : out_scene.all_streaming_packages) {
+        if (!should_load_subpkg(stream_pkg, false)) continue;
+        fs::path p = map_dir / (stream_pkg + ".me1");
+        if (fs::exists(p)) sub_packages.insert(p.string());
+        p = map_dir / (stream_pkg + ".upk");
+        if (fs::exists(p)) sub_packages.insert(p.string());
+    }
     for (const auto& add_pkg : master_pkg->get_additional_packages()) {
         if (!should_load_subpkg(add_pkg)) continue;
         fs::path p = map_dir / (add_pkg + ".me1");
@@ -1728,18 +2160,84 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
     }
 
-    // Load geometry & art sub-packages
+    // Load geometry, art, slice (*_Slc), and script/elevator (*_Spt) sub-packages
     size_t loaded_sub = 0;
     for (const auto& sub_path : sub_packages) {
-        if (loaded_sub++ >= 32) break;
+        if (loaded_sub++ >= 96) break;
         auto sub_pkg = std::make_shared<UPKPackage>(sub_path);
         if (!sub_pkg->is_valid()) continue;
 
+        loaded_packages.push_back(sub_pkg);
         sub_pkg->extract_static_meshes(mesh_library);
         auto sub_actors = sub_pkg->extract_actors();
         out_scene.actors.insert(out_scene.actors.end(), sub_actors.begin(), sub_actors.end());
+        sub_pkg->extract_level_streaming_and_checkpoints(
+            out_scene.checkpoint_infos, out_scene.streaming_actions, out_scene.all_streaming_packages);
         scan_level_suns(*sub_pkg, level_sun);
-        if (pm) pm->add_loaded(fs::path(sub_path).stem().string(), sub_pkg);
+        std::string sub_stem = fs::path(sub_path).stem().string();
+        out_scene.loaded_sublevel_packages.push_back(sub_stem);
+        if (pm) pm->add_loaded(sub_stem, sub_pkg);
+    }
+
+    // Extract all interactive elevators (InterpActor + SeqAct_Interp + InterpTrackMove)
+    // now that mesh_library has all UStaticMesh bounds (S_Elevator_01, S_SP09_ElevatorWithTop_01, etc.)
+    for (const auto& pkg : loaded_packages) {
+        pkg->extract_elevators(mesh_library, out_scene.elevators);
+    }
+
+    // Link each extracted elevator to the checkpoints at its start and destination floors so
+    // riding the elevator streams in the destination zone's sub-packages (SeqAct_MultiLevelStreaming)
+    for (auto& elev : out_scene.elevators) {
+        int start_cp = -1;
+        int end_cp = -1;
+        float best_start_d2 = 1e18f;
+        float best_end_d2 = 1e18f;
+        for (size_t c = 0; c < out_scene.checkpoint_infos.size(); ++c) {
+            const auto& cp = out_scene.checkpoint_infos[c];
+            if (cp.streaming_levels.empty()) continue;
+            float ds2 = (cp.location - elev.start_pos).length_sq();
+            float de2 = (cp.location - elev.end_pos).length_sq();
+            if (ds2 < best_start_d2) {
+                best_start_d2 = ds2;
+                start_cp = static_cast<int>(c);
+            }
+            if (de2 < best_end_d2 && static_cast<int>(c) != start_cp) {
+                best_end_d2 = de2;
+                end_cp = static_cast<int>(c);
+            }
+        }
+        if (end_cp >= 0) {
+            elev.target_checkpoint_idx = end_cp;
+            const auto& dst_levels = out_scene.checkpoint_infos[end_cp].streaming_levels;
+            std::set<std::string> src_set;
+            if (start_cp >= 0) {
+                for (const auto& s : out_scene.checkpoint_infos[start_cp].streaming_levels) {
+                    src_set.insert(to_lower(s));
+                }
+            }
+            std::set<std::string> dst_set;
+            for (const auto& d : dst_levels) {
+                dst_set.insert(to_lower(d));
+                if (src_set.find(to_lower(d)) == src_set.end()) {
+                    elev.stream_in_packages.push_back(d);
+                }
+            }
+            if (start_cp >= 0) {
+                for (const auto& s : out_scene.checkpoint_infos[start_cp].streaming_levels) {
+                    if (dst_set.find(to_lower(s)) == dst_set.end()) {
+                        elev.stream_out_packages.push_back(s);
+                    }
+                }
+            }
+        }
+        if (elev.stream_in_packages.empty() && !out_scene.streaming_actions.empty()) {
+            elev.stream_in_packages = out_scene.streaming_actions.front().package_names;
+        }
+    }
+
+    // Initialize loaded_sublevel_packages from DefaultCheckpoint.StreamingLevels when available
+    if (!out_scene.checkpoint_infos.empty() && !out_scene.checkpoint_infos.front().streaming_levels.empty()) {
+        out_scene.loaded_sublevel_packages = out_scene.checkpoint_infos.front().streaming_levels;
     }
 
     // The sun lives in the *_Lgts lighting packages, which carry no geometry: open them for lights only.
@@ -1785,8 +2283,17 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
     pm.reset();
 
-    // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry
+    // Find the best outdoor rooftop PlayerStart / TdTutorialStart / TdCheckpoint surrounded by dense 3D geometry.
+    // Prefer the chapter's DefaultCheckpoint when it has valid coordinates.
     bool found_start = false;
+    for (const auto& cp : out_scene.checkpoint_infos) {
+        if (cp.default_checkpoint && (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f)) {
+            out_scene.player_spawn_pos = cp.location + Vec3(0.0f, 0.0f, 35.0f);
+            out_scene.player_spawn_yaw = cp.rotation.to_degrees().y;
+            found_start = true;
+            break;
+        }
+    }
     int best_score = -100000;
     for (const auto& a : out_scene.actors) {
         bool is_spawn_candidate = (a.class_name.find("PlayerStart") != std::string::npos ||
@@ -1818,7 +2325,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
         int score = nearby + (has_floor_below ? 400 : 0) +
                     ((a.class_name.find("TutorialStart") != std::string::npos && nearby > 150) ? 500 : 0);
-        if (score > best_score) {
+        if (!found_start && score > best_score) {
             best_score = score;
             out_scene.player_spawn_pos = a.location + Vec3(0.0f, 0.0f, 35.0f);
             out_scene.player_spawn_yaw = a.rotation.to_degrees().y;
@@ -1829,9 +2336,14 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         out_scene.player_spawn_pos = out_scene.actors.front().location + Vec3(0, 0, 96.0f);
     }
 
-    // Collect checkpoints and enemies
+    // Collect checkpoints (ordered by TdCheckpoint weight first) and enemies
+    for (const auto& cp : out_scene.checkpoint_infos) {
+        if (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f) {
+            out_scene.checkpoints.push_back(cp.location);
+        }
+    }
     for (const auto& a : out_scene.actors) {
-        if (a.is_checkpoint) {
+        if (a.is_checkpoint && out_scene.checkpoints.empty()) {
             out_scene.checkpoints.push_back(a.location);
         }
         if (a.is_enemy) {
@@ -1848,7 +2360,34 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.colliders.emplace_back(Vec3(sp.x - 600.0f, sp.y - 600.0f, sp.z - 120.0f),
                                      Vec3(sp.x + 600.0f, sp.y + 600.0f, sp.z - 40.0f));
 
+    std::cout << "[Level] Streaming summary for " << out_scene.map_name << ": "
+              << out_scene.all_streaming_packages.size() << " LevelStreamingKismet sublevels, "
+              << out_scene.checkpoint_infos.size() << " TdCheckpoints, "
+              << out_scene.streaming_actions.size() << " SeqAct_MultiLevelStreaming actions, "
+              << out_scene.elevators.size() << " interactive elevators" << std::endl;
+
+    return true;
+}
+
+bool stream_level_to_checkpoint(const std::string& /*game_root*/, LevelScene& scene, int checkpoint_idx) {
+    if (checkpoint_idx < 0 || static_cast<size_t>(checkpoint_idx) >= scene.checkpoint_infos.size()) {
+        return false;
+    }
+    const auto& cp = scene.checkpoint_infos[static_cast<size_t>(checkpoint_idx)];
+    if (!cp.streaming_levels.empty()) {
+        scene.loaded_sublevel_packages = cp.streaming_levels;
+    }
+    if (cp.location.x != 0.0f || cp.location.y != 0.0f || cp.location.z != 0.0f) {
+        scene.player_spawn_pos = cp.location + Vec3(0.0f, 0.0f, 35.0f);
+        scene.player_spawn_yaw = cp.rotation.to_degrees().y;
+        Vec3 sp = scene.player_spawn_pos;
+        scene.colliders.emplace_back(Vec3(sp.x - 400.0f, sp.y - 400.0f, sp.z - 120.0f),
+                                     Vec3(sp.x + 400.0f, sp.y + 400.0f, sp.z - 40.0f));
+    }
+    std::cout << "[Streaming] TdCheckpoint '" << cp.checkpoint_name << "' (weight " << cp.checkpoint_weight
+              << ") active -> " << scene.loaded_sublevel_packages.size() << " sublevels streamed in" << std::endl;
     return true;
 }
 
 } // namespace me
+
