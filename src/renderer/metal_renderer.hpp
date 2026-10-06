@@ -60,11 +60,12 @@ public:
     [[nodiscard]] int height() const;
     [[nodiscard]] uint64_t frame_count() const;
 
-    // Interactive UI & Chapter Select controls
+    // Interactive UI, Cutscene & Chapter Select controls
     void set_menu_open(bool open);
     [[nodiscard]] bool is_menu_open() const;
     void set_selected_chapter(int idx);
     [[nodiscard]] int selected_chapter() const;
+    void set_cutscene_player(const class CutscenePlayer* player);
 
     // Raw Metal device handles (for external toolchain probes)
     [[nodiscard]] void* raw_device() const;

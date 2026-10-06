@@ -33,6 +33,7 @@ set(SOURCES
     src/assets/material_system.cpp
     src/assets/ini_config.cpp
     src/audio/audio_engine.cpp
+    src/cutscene/cutscene_player.cpp
     src/physics/parkour_controller.cpp
     src/ui/main_menu.cpp
     src/renderer/metal_renderer.mm
@@ -44,6 +45,11 @@ add_executable(mirrorsedge_macos ${SOURCES})
 # Target libraries & frameworks
 target_link_libraries(mirrorsedge_macos PRIVATE
     SDL2
+    avformat
+    avcodec
+    swscale
+    swresample
+    avutil
     vorbisfile
     vorbis
     ogg

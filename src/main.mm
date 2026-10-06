@@ -9,6 +9,7 @@
 #include "assets/upk_loader.hpp"
 #include "assets/ini_config.hpp"
 #include "audio/audio_engine.hpp"
+#include "cutscene/cutscene_player.hpp"
 #include "physics/parkour_controller.hpp"
 #include "renderer/metal_renderer.hpp"
 
@@ -750,6 +751,29 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     }
     std::cout << "  -> Stage 10 Result: PASS (Rendered 6 SP00/Tutorial_p.me1 screenshots)" << std::endl;
 
+    // Stage 11: Bink (.bik) Cutscene Video/Audio Decoder, Subtitle Sync & In-Engine Matinee Cutscenes
+    std::cout << "[Oracle Stage 11] Testing Bink (.bik) Video/Audio Decoder, Subtitle Sync & Matinee Cutscenes..." << std::endl;
+    CutscenePlayer oracle_cutscenes;
+    bool cs_init_ok = oracle_cutscenes.init(game_root, /*headless=*/true);
+    renderer.set_cutscene_player(&oracle_cutscenes);
+    bool cs_bink_ok = oracle_cutscenes.play_bink_movie("Scene_01", false) &&
+                      oracle_cutscenes.seek_and_decode_bink_frame(8.5f);
+    std::string cs_sub_text = oracle_cutscenes.get_active_subtitle();
+    bool cs_sub_ok = (cs_sub_text.find("city") != std::string::npos);
+    bool cs_aud_ok = (oracle_cutscenes.get_decoded_audio_samples() > 100000);
+    if (cs_bink_ok) {
+        renderer.render_frame(sp00_scene, controller.get_telemetry());
+        save_and_publish_png("oracle_9_cutscene_bink_player.png");
+    }
+    oracle_cutscenes.stop();
+    renderer.set_cutscene_player(nullptr);
+    bool s11_pass = cs_init_ok && cs_bink_ok && cs_sub_ok && cs_aud_ok;
+    std::cout << "  -> Stage 11 Result: " << (s11_pass ? "PASS" : "FAIL")
+              << " (Movies=" << oracle_cutscenes.get_available_movie_count()
+              << ", Video=" << oracle_cutscenes.get_video_width() << "x" << oracle_cutscenes.get_video_height()
+              << ", AudioSamples=" << oracle_cutscenes.get_decoded_audio_samples()
+              << ", Subtitle=\"" << cs_sub_text << "\")" << std::endl;
+
     // Write complete telemetry log
     std::ofstream tel_file("/tmp/me_oracle_telemetry.json");
     if (tel_file.is_open()) {
@@ -846,12 +870,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
     }
 
-    // Load active level
+    // Load active level & Cutscene Player
     LevelScene active_scene;
     int current_chapter_idx = std::clamp(initial_chapter, 0, 9);
     renderer.set_selected_chapter(current_chapter_idx);
 
     ParkourController controller(move_cfg);
+
+    CutscenePlayer cutscene_player;
+    cutscene_player.init(game_root, /*headless=*/(max_frames > 0));
+    renderer.set_cutscene_player(&cutscene_player);
 
     auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path) {
         std::string map_file = custom_path;
@@ -884,6 +912,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         if (!active_scene.subtitles.empty() && !active_scene.subtitles[0].empty()) {
             controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
+
+        // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in)
+        if (max_frames == 0) {
+            std::string intro_movie = CutscenePlayer::get_chapter_intro_movie(map_file);
+            if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
+                // Bink movie started; will transition into 3D rooftop intro on finish
+            } else {
+                cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+            }
+        }
     };
 
     load_chapter_or_level(current_chapter_idx, custom_level);
@@ -900,19 +938,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     int prev_checkpoint = 0;
     float footstep_timer = 0.0f;
     bool reaction_toggled = false;
+    bool suppress_space_until_release = false;
 
     std::cout << "\n[Controls]" << std::endl;
     std::cout << "  WASD: Move (Sprint active by default, momentum acceleration)" << std::endl;
     std::cout << "  Mouse: Look (Yaw/Pitch)" << std::endl;
-    std::cout << "  Space: Jump / Wallrun / Wallclimb / Vault / Springboard / Pull-Up" << std::endl;
+    std::cout << "  Space: Jump / Wallrun / Wallclimb / Vault / Springboard / Skip Cutscene" << std::endl;
     std::cout << "  Left Ctrl / C / Left Shift: Crouch / Slide / Mid-Air Coil / Skill Roll" << std::endl;
+    std::cout << "  O (or C during Cutscene): Play / Cycle All 12 Bink & 3D Cutscenes" << std::endl;
     std::cout << "  Q: 180° Turn" << std::endl;
     std::cout << "  Left Mouse / F: Melee Punch/Kick or Fire Weapon" << std::endl;
     std::cout << "  Right Mouse / E: Disarm Enemy / Use Elevator" << std::endl;
     std::cout << "  X: Toggle Reaction Time (Slow-Motion)" << std::endl;
     std::cout << "  V / Left Alt: Runner Vision Look-At" << std::endl;
     std::cout << "  Tab / M: Toggle Chapter Select Menu" << std::endl;
-    std::cout << "  1..9, 0: Directly load Chapter 0 through 9" << std::endl;
+    std::cout << "  1..9, 0: Directly load Chapter 0 through 9 (with Chapter Cutscene)" << std::endl;
     std::cout << "  [ / ] (or B / N): Previous / Next Tutorial Checkpoint" << std::endl;
     std::cout << "  R: Reset to Active Checkpoint" << std::endl;
     std::cout << "  P / F12: Screenshot PNG" << std::endl;
@@ -938,7 +978,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     renderer.resize(drawable_w, drawable_h);
                 }
             } else if (ev.type == SDL_MOUSEMOTION) {
-                if (SDL_GetRelativeMouseMode() == SDL_TRUE) {
+                if (SDL_GetRelativeMouseMode() == SDL_TRUE && !cutscene_player.is_playing()) {
                     float sens = 0.15f;
                     input.look_yaw_delta += float(ev.motion.xrel) * sens;
                     input.look_pitch_delta -= float(ev.motion.yrel) * sens;
@@ -946,7 +986,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
                 if (!renderer.is_menu_open() && SDL_GetRelativeMouseMode() != SDL_TRUE) {
                     SDL_SetRelativeMouseMode(SDL_TRUE);
-                } else if (frame_counter >= 15 && !renderer.is_menu_open()) {
+                } else if (frame_counter >= 15 && !renderer.is_menu_open() && !cutscene_player.is_playing()) {
                     if (ev.button.button == SDL_BUTTON_LEFT) {
                         if (controller.get_weapon().equipped) input.fire = true;
                         else input.melee = true;
@@ -955,7 +995,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     }
                 }
             } else if (ev.type == SDL_MOUSEWHEEL) {
-                if (!renderer.is_menu_open() && ev.wheel.y != 0) {
+                if (!renderer.is_menu_open() && !cutscene_player.is_playing() && ev.wheel.y != 0) {
                     input.cycle_weapon_dir = (ev.wheel.y > 0) ? 1 : -1;
                 }
             } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
@@ -964,9 +1004,24 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     if (renderer.is_menu_open()) {
                         renderer.set_menu_open(false);
                         SDL_SetRelativeMouseMode(SDL_TRUE);
+                    } else if (cutscene_player.is_playing()) {
+                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        cutscene_player.stop();
                     } else {
                         running = false;
                     }
+                } else if ((key == SDLK_SPACE || key == SDLK_RETURN) && cutscene_player.is_playing()) {
+                    suppress_space_until_release = true;
+                    if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo) {
+                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 3.2f);
+                    } else {
+                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        cutscene_player.stop();
+                    }
+                } else if (key == SDLK_o || (key == SDLK_c && cutscene_player.is_playing())) {
+                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    cutscene_player.cycle_next_cutscene(active_scene, controller.get_telemetry());
                 } else if (key == SDLK_TAB || key == SDLK_m) {
                     bool menu = !renderer.is_menu_open();
                     renderer.set_menu_open(menu);
@@ -980,6 +1035,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (key == SDLK_h) {
                     input.spawn_combat_squad = true;
                 } else if (key == SDLK_r) {
+                    cutscene_player.stop();
                     int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
                                         std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
                     Vec3 spawn = active_scene.checkpoints.empty() ? active_scene.player_spawn_pos : active_scene.checkpoints[cp];
@@ -994,6 +1050,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         controller.get_telemetry().active_subtitle = active_scene.subtitles[cp];
                     }
                 } else if (key == SDLK_RIGHTBRACKET || key == SDLK_n || key == SDLK_LEFTBRACKET || key == SDLK_b) {
+                    cutscene_player.stop();
                     if (!active_scene.checkpoints.empty()) {
                         int delta_cp = (key == SDLK_RIGHTBRACKET || key == SDLK_n) ? 1 : -1;
                         int next_cp = std::clamp(controller.get_telemetry().active_checkpoint + delta_cp,
@@ -1028,9 +1085,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         // Keyboard & Mouse Button State Polling (supports held LMB for full-auto weapons)
         const Uint8* state = SDL_GetKeyboardState(nullptr);
+        if (!state[SDL_SCANCODE_SPACE]) {
+            suppress_space_until_release = false;
+        }
         Uint32 mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
         if ((mouse_buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) && frame_counter >= 15 &&
-            !renderer.is_menu_open() && SDL_GetRelativeMouseMode() == SDL_TRUE &&
+            !renderer.is_menu_open() && !cutscene_player.is_playing() &&
+            SDL_GetRelativeMouseMode() == SDL_TRUE &&
             controller.get_weapon().equipped) {
             input.fire = true;
         }
@@ -1040,7 +1101,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         if (state[SDL_SCANCODE_D] || state[SDL_SCANCODE_RIGHT]) input.strafe += 1.0f;
         if (state[SDL_SCANCODE_A] || state[SDL_SCANCODE_LEFT]) input.strafe -= 1.0f;
 
-        if (state[SDL_SCANCODE_SPACE]) input.jump = true;
+        if (state[SDL_SCANCODE_SPACE] && !suppress_space_until_release) input.jump = true;
         if (state[SDL_SCANCODE_C] || state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_LSHIFT]) input.crouch = true;
         if (state[SDL_SCANCODE_Q]) input.turn_180 = true;
         if (state[SDL_SCANCODE_F]) {
@@ -1082,9 +1143,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) input.turn_180 = true;
         }
 
-        // Advance simulation step
+        // Advance simulation or active cutscene step
         Vec3 pre_vel = controller.get_velocity();
-        controller.step(input, dt, active_scene);
+        if (cutscene_player.is_playing()) {
+            cutscene_player.update(dt, active_scene, controller.get_telemetry());
+            if (!cutscene_player.is_playing()) {
+                controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+            }
+        } else {
+            controller.step(input, dt, active_scene);
+        }
         const auto& tel = controller.get_telemetry();
 
         // Live movement telemetry logging for run diagnostics
