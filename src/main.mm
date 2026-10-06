@@ -340,7 +340,15 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << sp01_scene.meshes.size() << " meshes, "
               << sp01_scene.all_streaming_packages.size() << " streaming sublevels, "
               << sp01_scene.checkpoint_infos.size() << " TdCheckpoints, "
-              << sp01_scene.elevators.size() << " elevators)" << std::endl;
+              << sp01_scene.elevators.size() << " elevators, "
+              << sp01_scene.reflection_captures.size() << " reflection captures, "
+              << sp01_scene.reflection_volumes.size() << " TdReflectionVolumes)" << std::endl;
+    if (!sp01_scene.reflection_captures.empty()) {
+        const auto& rc = sp01_scene.reflection_captures.front();
+        std::cout << "[Oracle]   Planar Reflection: " << rc.actor_name << " -> Target=" << rc.texture_target
+                  << ", Plane=(N=(" << rc.mirror_normal.x << "," << rc.mirror_normal.y << "," << rc.mirror_normal.z
+                  << "), W=" << rc.plane_w << "), Volume=" << rc.reflection_volume << std::endl;
+    }
 
     // Verify real cooked elevator extraction from SP01/Escape_Intro-Off_Spt.me1
     UPKPackage esc_elev_pkg(game_root + "/TdGame/CookedPC/Maps/SP01/Escape_Intro-Off_Spt.me1");

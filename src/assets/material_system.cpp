@@ -660,7 +660,7 @@ Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std
         warn("texture sample (" + nd.cls + ") without a texture");
         return {};
     }
-    const bool cube = param_cube || cls == "TextureCube";
+    const bool cube = param_cube || cls == "TextureCube" || cls == "TextureRenderTargetCube";
 
     // UE3 bakes the unpack scale/bias of the expression's own texture into the shader.
     TextureInfo info;
@@ -1012,11 +1012,18 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
     if (c == "Transform") {
         Val v = input(p, "Input");
         if (!v.ok()) return {};
+        const std::string src_tt = enum_prop(p, "TransformSourceType");
         const std::string tt = enum_prop(p, "TransformType");
+        const bool src_world = src_tt == "TRANSFORMSOURCE_World" || src_tt == "2";
         const bool view = tt == "TRANSFORM_View" || tt == "1";
+        const bool tangent = tt == "TRANSFORM_Tangent" || tt == "3";
         Val v3 = v.n == 4 ? swizzle(v, {0, 1, 2}) : coerce(v, 3);
-        std::string w = "mat_tangent_to_world(P, " + v3.code + ")";
-        if (view) w = "mat_world_to_view(F, " + w + ")";
+        std::string w = src_world ? v3.code : ("mat_tangent_to_world(P, " + v3.code + ")");
+        if (view) {
+            w = "mat_world_to_view(F, " + w + ")";
+        } else if (tangent && src_world) {
+            w = "float3(dot(P.T, " + w + "), dot(P.B, " + w + "), dot(P.N, " + w + "))";
+        }
         if (v.n == 4) return emit(4, "float4(" + w + ", " + swizzle(v, {3}).code + ")");
         return emit(3, w);
     }
@@ -1533,6 +1540,7 @@ void MaterialBuilder::load_textures() {
         size_t index;
         ObjRef ref;
         bool cube;
+        bool render_target;
     };
     std::vector<Job> jobs;
     for (size_t i = 0; i < lib_.textures.size(); ++i) {
@@ -1543,13 +1551,15 @@ void MaterialBuilder::load_textures() {
             continue;
         }
         const std::string cls = object_class_name(*r.pkg, r.index);
-        const bool cube_cls = cls == "TextureCube";
-        const bool tex2d_cls = cls.find("Texture2D") != std::string::npos || cls == "TextureFlipBook";
+        const bool rt_cube = (cls == "TextureRenderTargetCube");
+        const bool rt_2d = (cls == "TextureRenderTarget2D" || cls == "TextureMovie");
+        const bool cube_cls = (cls == "TextureCube" || rt_cube);
+        const bool tex2d_cls = (cls.find("Texture2D") != std::string::npos || cls == "TextureFlipBook" || rt_2d);
         if ((t.is_cube && !cube_cls) || (!t.is_cube && !tex2d_cls)) {
             if (lib_.errors.size() < 256) lib_.errors.push_back("texture '" + t.name + "' has unsupported class " + cls);
             continue;
         }
-        jobs.push_back({i, r, t.is_cube});
+        jobs.push_back({i, r, t.is_cube, rt_cube || rt_2d});
     }
 
     unsigned threads = opts_.num_threads > 0 ? static_cast<unsigned>(opts_.num_threads)
@@ -1565,8 +1575,23 @@ void MaterialBuilder::load_textures() {
             const Job& job = jobs[j];
             SceneTexture tex;
             std::string err;
-            const bool ok = job.cube ? load_texture_cube(pm_, *job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err)
-                                     : load_texture2d(pm_, *job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+            bool ok = false;
+            if (job.cube) {
+                if (job.render_target) {
+                    ok = load_texture_render_target_cube(*job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+                } else {
+                    ok = load_texture_cube(pm_, *job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+                    if (!ok) {
+                        ok = load_texture_render_target_cube(*job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+                    }
+                }
+            } else {
+                if (job.render_target) {
+                    ok = load_texture_render_target2d(*job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+                } else {
+                    ok = load_texture2d(pm_, *job.ref.pkg, job.ref.index, opts_.max_texture_size, tex, &err);
+                }
+            }
             if (ok && tex.valid()) {
                 tex.name = lib_.textures[job.index].name;
                 tex.is_cube = job.cube;

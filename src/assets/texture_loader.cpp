@@ -151,7 +151,7 @@ bool read_texture_info(const UPKPackage& pkg, int32_t export_index_1based, Textu
     UPropertyList props;
     if (parse_export_properties(pkg, export_index_1based, props) == 0) return false;
     out.size_x = prop_int(props, "SizeX", 0);
-    out.size_y = prop_int(props, "SizeY", 0);
+    out.size_y = prop_int(props, "SizeY", out.size_x);
     out.format_name = prop_name(props, "Format", "PF_A8R8G8B8");
     out.format = parse_format(out.format_name);
     out.srgb = prop_bool(props, "SRGB", true);
@@ -297,6 +297,207 @@ bool load_texture_cube(PackageManager& pm, const UPKPackage& pkg, int32_t export
             for (int k = 0; k < f; ++k) out.faces[k].resize(n);
         }
         out.faces[f] = std::move(face.mips);
+    }
+    return true;
+}
+
+namespace {
+
+int floor_pow2(int v) {
+    int p = 1;
+    while (p * 2 <= v) p *= 2;
+    return p;
+}
+
+// Evaluates a procedural City of Glass environment color (BGRA8 sRGB) for planar screen-space
+// reflection targets (T_EdgeReflection_01_R, T_CityReflection_01_R, T_ElevatorReflection_01_R).
+void eval_planar_reflection_bgra(float u, float v, uint8_t bgra[4]) {
+    const float uf = u - std::floor(u);
+    const float vf = std::clamp(v, 0.0f, 1.0f);
+
+    // Base sky-to-horizon-to-water reflection gradient
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (vf < 0.52f) {
+        const float t = vf / 0.52f;
+        const float ts = t * t * (3.0f - 2.0f * t);
+        r = (52.0f * (1.0f - ts) + 216.0f * ts);
+        g = (124.0f * (1.0f - ts) + 234.0f * ts);
+        b = (224.0f * (1.0f - ts) + 252.0f * ts);
+    } else {
+        const float t = (vf - 0.52f) / 0.48f;
+        const float ts = t * t * (3.0f - 2.0f * t);
+        r = (216.0f * (1.0f - ts) + 128.0f * ts);
+        g = (234.0f * (1.0f - ts) + 166.0f * ts);
+        b = (252.0f * (1.0f - ts) + 212.0f * ts);
+    }
+
+    // Reflected City of Glass skyscraper silhouettes across the horizon band
+    const int col = static_cast<int>(uf * 24.0f);
+    const float col_frac = uf * 24.0f - static_cast<float>(col);
+    const uint32_t h = static_cast<uint32_t>(col * 2654435761u);
+    const float tower_top = 0.18f + static_cast<float>(h & 0xFFu) / 255.0f * 0.28f;
+    const float tower_bot = 0.78f;
+    const bool in_gap = (col_frac < 0.08f || col_frac > 0.92f);
+    if (!in_gap && vf >= tower_top && vf <= tower_bot) {
+        const bool sunlit = (col_frac < 0.58f);
+        const float win_x = std::sin(uf * 24.0f * 6.0f * 3.14159265f);
+        const float win_y = std::sin(vf * 48.0f * 3.14159265f);
+        const float mullion = (win_x > 0.75f || win_y > 0.78f) ? 1.0f : 0.0f;
+        float tr = sunlit ? 236.0f : 152.0f;
+        float tg = sunlit ? 240.0f : 182.0f;
+        float tb = sunlit ? 246.0f : 220.0f;
+        tr = tr * (0.90f + 0.10f * mullion);
+        tg = tg * (0.91f + 0.09f * mullion);
+        tb = tb * (0.93f + 0.07f * mullion);
+        const float fade = std::clamp(1.0f - std::abs(vf - 0.48f) * 1.6f, 0.25f, 0.88f);
+        r = r * (1.0f - fade) + tr * fade;
+        g = g * (1.0f - fade) + tg * fade;
+        b = b * (1.0f - fade) + tb * fade;
+    }
+
+    bgra[0] = static_cast<uint8_t>(std::clamp(b, 0.0f, 255.0f));
+    bgra[1] = static_cast<uint8_t>(std::clamp(g, 0.0f, 255.0f));
+    bgra[2] = static_cast<uint8_t>(std::clamp(r, 0.0f, 255.0f));
+    bgra[3] = 255;
+}
+
+// Evaluates a 3D direction (dx, dy, dz in UE3 Z-up world space) into a City of Glass cubemap texel.
+void eval_cube_reflection_bgra(float dx, float dy, float dz, uint8_t bgra[4]) {
+    const float len = std::sqrt(std::max(dx * dx + dy * dy + dz * dz, 1e-12f));
+    dx /= len;
+    dy /= len;
+    dz /= len;
+
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+    if (dz >= 0.0f) {
+        // Upper hemisphere: zenith cobalt blue to bright horizon cyan-white
+        const float t = std::pow(1.0f - dz, 2.2f);
+        r = 54.0f * (1.0f - t) + 224.0f * t;
+        g = 126.0f * (1.0f - t) + 238.0f * t;
+        b = 228.0f * (1.0f - t) + 254.0f * t;
+    } else {
+        // Lower hemisphere: horizon haze into cool white/slate rooftop bounce
+        const float t = std::min(1.0f, -dz * 2.5f);
+        r = 224.0f * (1.0f - t) + 148.0f * t;
+        g = 238.0f * (1.0f - t) + 168.0f * t;
+        b = 254.0f * (1.0f - t) + 196.0f * t;
+    }
+
+    // Horizon skyline band (-0.18 <= dz <= +0.35)
+    if (dz >= -0.18f && dz <= 0.35f) {
+        const float az = (std::atan2(dy, dx) + 3.14159265f) / (2.0f * 3.14159265f);
+        const int sector = static_cast<int>(az * 32.0f);
+        const float sfrac = az * 32.0f - static_cast<float>(sector);
+        const uint32_t h = static_cast<uint32_t>(sector * 2654435761u);
+        const float roof_z = 0.05f + static_cast<float>(h & 0xFFu) / 255.0f * 0.26f;
+        if (sfrac > 0.08f && sfrac < 0.92f && dz <= roof_z) {
+            const float sun_dot = std::max(0.0f, -0.4f * dx + 0.6f * dy + 0.7f * dz);
+            const float tr = 175.0f + 70.0f * sun_dot;
+            const float tg = 196.0f + 52.0f * sun_dot;
+            const float tb = 224.0f + 28.0f * sun_dot;
+            const float blend = std::clamp(1.0f - std::abs(dz) * 2.2f, 0.3f, 0.85f);
+            r = r * (1.0f - blend) + tr * blend;
+            g = g * (1.0f - blend) + tg * blend;
+            b = b * (1.0f - blend) + tb * blend;
+        }
+    }
+
+    bgra[0] = static_cast<uint8_t>(std::clamp(b, 0.0f, 255.0f));
+    bgra[1] = static_cast<uint8_t>(std::clamp(g, 0.0f, 255.0f));
+    bgra[2] = static_cast<uint8_t>(std::clamp(r, 0.0f, 255.0f));
+    bgra[3] = 255;
+}
+
+void cube_face_direction(int face, float u, float v, float& dx, float& dy, float& dz) {
+    // Standard cube face mapping in [0,1]^2 -> [-1,+1]^2
+    const float sc = 2.0f * u - 1.0f;
+    const float tc = 2.0f * v - 1.0f;
+    switch (face) {
+        case 0: dx =  1.0f; dy = -tc;   dz = -sc;   break; // +X
+        case 1: dx = -1.0f; dy = -tc;   dz =  sc;   break; // -X
+        case 2: dx =  sc;   dy =  1.0f; dz =  tc;   break; // +Y
+        case 3: dx =  sc;   dy = -1.0f; dz = -tc;   break; // -Y
+        case 4: dx =  sc;   dy = -tc;   dz =  1.0f; break; // +Z
+        default:dx = -sc;   dy = -tc;   dz = -1.0f; break; // -Z
+    }
+}
+
+}  // namespace
+
+bool load_texture_render_target2d(const UPKPackage& pkg, int32_t export_index_1based, int max_size,
+                                  SceneTexture& out, std::string* /*error*/) {
+    TextureInfo info;
+    read_texture_info(pkg, export_index_1based, info);
+
+    out.name = object_canonical_path(pkg, export_index_1based);
+    out.format = TexFormat::BGRA8;
+    out.srgb = info.srgb;
+    out.address_x = info.address_x;
+    out.address_y = info.address_y;
+    out.is_cube = false;
+    out.mips.clear();
+
+    const int cap = std::clamp(max_size, 16, 256);
+    int w = floor_pow2(std::clamp(info.size_x > 0 ? info.size_x : 256, 16, cap));
+    int h = floor_pow2(std::clamp(info.size_y > 0 ? info.size_y : 256, 16, cap));
+
+    for (;;) {
+        TextureMip mip;
+        mip.width = w;
+        mip.height = h;
+        mip.data.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+        for (int y = 0; y < h; ++y) {
+            const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(h);
+            for (int x = 0; x < w; ++x) {
+                const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(w);
+                eval_planar_reflection_bgra(u, v, &mip.data[(static_cast<size_t>(y) * w + x) * 4]);
+            }
+        }
+        out.mips.push_back(std::move(mip));
+        if (w == 1 && h == 1) break;
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+    }
+    return true;
+}
+
+bool load_texture_render_target_cube(const UPKPackage& pkg, int32_t export_index_1based, int max_size,
+                                     SceneTexture& out, std::string* /*error*/) {
+    TextureInfo info;
+    read_texture_info(pkg, export_index_1based, info);
+
+    out.name = object_canonical_path(pkg, export_index_1based);
+    out.format = TexFormat::BGRA8;
+    out.srgb = info.srgb;
+    out.address_x = TexAddress::Clamp;
+    out.address_y = TexAddress::Clamp;
+    out.is_cube = true;
+    out.mips.clear();
+
+    const int cap = std::clamp(max_size, 16, 128);
+    const int base_dim = floor_pow2(std::clamp(info.size_x > 0 ? info.size_x : 128, 16, cap));
+
+    for (int f = 0; f < 6; ++f) {
+        out.faces[f].clear();
+        int dim = base_dim;
+        for (;;) {
+            TextureMip mip;
+            mip.width = dim;
+            mip.height = dim;
+            mip.data.resize(static_cast<size_t>(dim) * static_cast<size_t>(dim) * 4);
+            for (int y = 0; y < dim; ++y) {
+                const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(dim);
+                for (int x = 0; x < dim; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(dim);
+                    float dx = 0.0f, dy = 0.0f, dz = 1.0f;
+                    cube_face_direction(f, u, v, dx, dy, dz);
+                    eval_cube_reflection_bgra(dx, dy, dz, &mip.data[(static_cast<size_t>(y) * dim + x) * 4]);
+                }
+            }
+            out.faces[f].push_back(std::move(mip));
+            if (dim == 1) break;
+            dim = std::max(1, dim / 2);
+        }
     }
     return true;
 }

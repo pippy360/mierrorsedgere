@@ -2164,6 +2164,87 @@ static void scan_level_suns(const UPKPackage& pkg, LevelSun& best) {
 }
 
 // -----------------------------------------------------------------------------
+// Real-Time Planar Reflection Capture & Volume Extractor
+// (Reverse-engineered from SceneCaptureReflectActor / SceneCaptureReflectComponent
+// in UnSceneCapture.cpp @ VA 0x00f99390..0x00f9d312 and TdReflectionVolume @ VA 0x00f9bdde..0x00f9bed9)
+// -----------------------------------------------------------------------------
+void UPKPackage::extract_reflections(std::vector<SceneCaptureReflectInfo>& out_captures,
+                                     std::vector<ReflectionVolumeInfo>& out_volumes) const {
+    const std::string pkg_stem = package_name_of(*this);
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        const int32_t idx = static_cast<int32_t>(i) + 1;
+        const std::string cls = object_class_name(*this, idx);
+        if (cls == "SceneCaptureReflectActor") {
+            UPropertyList actor_props;
+            parse_export_properties(*this, idx, actor_props);
+
+            SceneCaptureReflectInfo cap;
+            cap.actor_name = pkg_stem + "." + export_object_name(*this, idx);
+
+            if (const UProperty* loc = find_prop(actor_props, "Location")) {
+                cap.location = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            }
+            // SceneCaptureReflectActor default archetype rotation is Pitch=16384 (+90 deg -> Normal=(0,0,1))
+            int32_t pitch = 16384, yaw = 0, roll = 0;
+            if (const UProperty* rot = find_prop(actor_props, "Rotation")) {
+                pitch = rot->vi[0];
+                yaw = rot->vi[1];
+                roll = rot->vi[2];
+            }
+            cap.rotation = Rotator(static_cast<float>(pitch), static_cast<float>(yaw), static_cast<float>(roll));
+
+            // USceneCaptureReflectComponent::UpdateTransform (VA 0x00f99390):
+            // MirrorNormal = FRotator(Owner->Rotation).Vector(), MirrorPlane = FPlane(Owner->Location, MirrorNormal)
+            const float kUnit = 3.14159265358979f / 32768.0f;
+            const float p = static_cast<float>(pitch) * kUnit;
+            const float y = static_cast<float>(yaw) * kUnit;
+            cap.mirror_normal = Vec3(std::cos(p) * std::cos(y), std::cos(p) * std::sin(y), std::sin(p)).normalized();
+            cap.plane_w = cap.location.dot(cap.mirror_normal);
+
+            const int32_t vol_ref = prop_object(actor_props, "ReflectionVolume");
+            if (vol_ref != 0) {
+                cap.reflection_volume = object_canonical_path(*this, vol_ref);
+            }
+
+            const int32_t comp_ref = prop_object(actor_props, "SceneCapture");
+            if (comp_ref > 0) {
+                cap.component_name = export_object_name(*this, comp_ref);
+                UPropertyList comp_props;
+                parse_export_properties(*this, comp_ref, comp_props);
+                const int32_t rt_ref = prop_object(comp_props, "TextureTarget");
+                if (rt_ref != 0) {
+                    cap.texture_target = object_canonical_path(*this, rt_ref);
+                }
+                cap.scale_fov = prop_float(comp_props, "ScaleFOV", 1.0f);
+                cap.near_plane = prop_float(comp_props, "NearPlane", 20.0f);
+                cap.far_plane = prop_float(comp_props, "FarPlane", 500.0f);
+                cap.far_culling_distance = prop_float(comp_props, "FarCullingDistance", 0.0f);
+                cap.max_update_dist = prop_float(comp_props, "MaxUpdateDist", 0.0f);
+                cap.max_streaming_update_dist = prop_float(comp_props, "MaxStreamingUpdateDist", 0.0f);
+                cap.frame_rate = prop_float(comp_props, "FrameRate", 1000.0f);
+            }
+            out_captures.push_back(std::move(cap));
+        } else if (cls == "TdReflectionVolume") {
+            UPropertyList vol_props;
+            parse_export_properties(*this, idx, vol_props);
+
+            ReflectionVolumeInfo vol;
+            vol.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            if (const UProperty* loc = find_prop(vol_props, "Location")) {
+                vol.location = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            }
+            if (const UProperty* rot = find_prop(vol_props, "Rotation")) {
+                vol.rotation = Rotator(static_cast<float>(rot->vi[0]),
+                                       static_cast<float>(rot->vi[1]),
+                                       static_cast<float>(rot->vi[2]));
+            }
+            vol.enabled = prop_bool(vol_props, "bEnabled", true);
+            out_volumes.push_back(std::move(vol));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // High-Level Level Loader
 // -----------------------------------------------------------------------------
 bool load_level_scene(const std::string& game_root, const std::string& map_rel_path, LevelScene& out_scene) {
@@ -2197,6 +2278,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.all_streaming_packages.clear();
     out_scene.loaded_sublevel_packages.clear();
     out_scene.elevators.clear();
+    out_scene.reflection_captures.clear();
+    out_scene.reflection_volumes.clear();
     out_scene.sounds.clear();
     out_scene.enemies.clear();
     out_scene.materials.reset();
@@ -2323,9 +2406,10 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
 
     // Extract all interactive elevators (InterpActor + SeqAct_Interp + InterpTrackMove)
-    // now that mesh_library has all UStaticMesh bounds (S_Elevator_01, S_SP09_ElevatorWithTop_01, etc.)
+    // and real-time planar reflection actors/volumes (SceneCaptureReflectActor + TdReflectionVolume)
     for (const auto& pkg : loaded_packages) {
         pkg->extract_elevators(mesh_library, out_scene.elevators);
+        pkg->extract_reflections(out_scene.reflection_captures, out_scene.reflection_volumes);
     }
 
     // Link each extracted elevator to the checkpoints at its start and destination floors so
@@ -2555,7 +2639,9 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
               << out_scene.all_streaming_packages.size() << " LevelStreamingKismet sublevels, "
               << out_scene.checkpoint_infos.size() << " TdCheckpoints, "
               << out_scene.streaming_actions.size() << " SeqAct_MultiLevelStreaming actions, "
-              << out_scene.elevators.size() << " interactive elevators" << std::endl;
+              << out_scene.elevators.size() << " interactive elevators, "
+              << out_scene.reflection_captures.size() << " SceneCaptureReflectActors, "
+              << out_scene.reflection_volumes.size() << " TdReflectionVolumes" << std::endl;
 
     return true;
 }

@@ -113,6 +113,8 @@ public:
                                                  std::vector<std::string>& out_streaming_packages) const;
     void extract_elevators(const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                            std::vector<ElevatorInstance>& out_elevators) const;
+    void extract_reflections(std::vector<SceneCaptureReflectInfo>& out_captures,
+                             std::vector<ReflectionVolumeInfo>& out_volumes) const;
 
     // Built-in LZO1X-1 decompressor
     static bool lzo1x_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t expected_len);
