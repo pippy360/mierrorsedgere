@@ -332,6 +332,16 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << " (" << sp00_scene.actors.size() << " actors, "
               << sp00_scene.meshes.size() << " meshes, "
               << sp00_scene.colliders.size() << " colliders)" << std::endl;
+    std::cout << "[Oracle]   SP00 Ambient Lighting (" << sp00_scene.sky_light_source
+              << "): FSkyLightSceneProxy UpperLinear=(" << sp00_scene.raw_sky_upper_linear.x << ","
+              << sp00_scene.raw_sky_upper_linear.y << "," << sp00_scene.raw_sky_upper_linear.z
+              << "), LowerLinear=(" << sp00_scene.raw_sky_lower_linear.x << ","
+              << sp00_scene.raw_sky_lower_linear.y << "," << sp00_scene.raw_sky_lower_linear.z
+              << "), ModShadowColor=(" << sp00_scene.mod_shadow_color.x << ","
+              << sp00_scene.mod_shadow_color.y << "," << sp00_scene.mod_shadow_color.z
+              << "), WorldInfo.SkyColor=(" << sp00_scene.world_sky_color.x << ","
+              << sp00_scene.world_sky_color.y << "," << sp00_scene.world_sky_color.z
+              << ") IBL=" << sp00_scene.ibl_intensity << std::endl;
 
     LevelScene sp01_scene;
     bool sp01_ok = load_level_scene(game_root, "Maps/SP01/Edge_p.me1", sp01_scene);

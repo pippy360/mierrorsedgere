@@ -308,15 +308,19 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float3 N = normalize(mix(geo_N, vtx_N, 0.55));
     float3 L = normalize(float3(-0.42, -0.58, 0.70));
 
-    // 1. Directional Sun + Beast Sky/Ground Radiosity (carefully calibrated so whites never blow out)
+    // 1. Directional Sun + UE3 BasePass GetMaterialHemisphereLightTransferFull (MaterialTemplate.usf)
     float NdotL = max(dot(N, L), 0.0);
     // Secondary directional fill so X-facing and Y-facing shadow walls have distinct tonal separation
     float side_contrast = 0.5 + 0.5 * N.x - 0.25 * N.y;
 
     float3 sun_light = float3(0.54, 0.52, 0.49) * NdotL;
     float sky_hemi = saturate(N.z * 0.5 + 0.5);
-    // Cool azure shadow bounce in shadowed planes (signature Mirror's Edge blue shadows)
-    float3 sky_bounce = mix(float3(0.32, 0.42, 0.56), float3(0.46, 0.52, 0.58), sky_hemi) * (0.78 + 0.22 * side_contrast);
+    // Quadratic hemisphere transfer: w = (0.5, 0.5) + (0.5, -0.5) * N.z; w *= w
+    float2 hemi_w = float2(0.5, 0.5) + float2(0.5, -0.5) * N.z;
+    hemi_w *= hemi_w;
+    float3 upper_sky = float3(uniforms.sky_color) * 0.64;
+    float3 lower_sky = float3(uniforms.ground_color) * 0.44;
+    float3 sky_bounce = (upper_sky * hemi_w.x + lower_sky * hemi_w.y + float3(0.11, 0.14, 0.18)) * (0.78 + 0.22 * side_contrast);
     float3 lighting = sun_light + sky_bounce;
 
     // 2. Base Albedo & Procedural Architectural Material Detailing
@@ -2247,8 +2251,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         Vec3 sun_d = active_scene.sun_direction.normalized();
         uniforms.sun_dir = simd_make_float3(sun_d.x, sun_d.y, sun_d.z);
         uniforms.sun_color = simd_make_float3(active_scene.sun_color.x, active_scene.sun_color.y, active_scene.sun_color.z);
-        uniforms.sky_color = simd_make_float3(0.68f, 0.84f, 1.0f);
-        uniforms.ground_color = simd_make_float3(0.82f, 0.84f, 0.88f);
+        uniforms.sky_color = simd_make_float3(active_scene.sky_upper_color.x, active_scene.sky_upper_color.y, active_scene.sky_upper_color.z);
+        uniforms.ground_color = simd_make_float3(active_scene.sky_lower_color.x, active_scene.sky_lower_color.y, active_scene.sky_lower_color.z);
         uniforms.speed_2d = impl_->menu_open ? 0.0f : telemetry.speed_2d;
         uniforms.reaction_active = (!impl_->menu_open && telemetry.reaction_active) ? 1.0f : 0.0f;
         uniforms.health = impl_->menu_open ? 100.0f : telemetry.health;

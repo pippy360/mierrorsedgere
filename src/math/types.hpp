@@ -735,6 +735,16 @@ struct LevelScene {
     float player_spawn_yaw = 0.0f;
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
+    // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)
+    Vec3 sky_upper_color{0.68f, 0.84f, 1.0f};       // Calibrated UpperSkyColor for BasePass GetMaterialHemisphereLightTransferFull
+    Vec3 sky_lower_color{0.82f, 0.84f, 0.88f};      // Calibrated LowerSkyColor for BasePass GetMaterialHemisphereLightTransferFull
+    Vec3 raw_sky_upper_linear{0.194f, 0.269f, 0.400f}; // Exact FSkyLightSceneProxy UpperColor = pow(LightColor, 2.2) * Brightness
+    Vec3 raw_sky_lower_linear{0.230f, 0.161f, 0.076f}; // Exact FSkyLightSceneProxy LowerColor = pow(LowerColor, 2.2) * LowerBrightness
+    Vec3 mod_shadow_color{0.494f, 0.659f, 0.875f};  // DirectionalLightComponent.ModShadowColor (sRGB 0..1 azure shadow tint)
+    Vec3 world_sky_color{0.30f, 0.52f, 0.65f};      // WorldInfo.SkyColor (Beast environment sky radiosity color)
+    Vec3 haze_color{0.76f, 0.86f, 0.96f};           // PostProcessSettings.HazeColor / HeightFog LightColor
+    float ibl_intensity = 1.0f;                     // WorldInfo.IBLIntensity
+    std::string sky_light_source;                   // Package.ObjectName of resolved SkyLightComponent
     std::vector<LevelActor> actors;
     std::vector<MeshBuffer> meshes;
     std::vector<AABB> colliders;
