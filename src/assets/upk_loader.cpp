@@ -2428,6 +2428,204 @@ void UPKPackage::extract_bsp_collision(std::vector<Vec3>& out_triangles) const {
     }
 }
 
+void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, std::vector<Vertex>>>& out_bins,
+                                             AABB& inout_bounds) const {
+    constexpr uint32_t PF_Invisible = 0x00000001u;
+    constexpr uint32_t PF_TwoSided  = 0x00000100u;
+    constexpr uint32_t PF_Portal    = 0x04000000u;
+
+    std::unordered_map<std::string, size_t> bin_index;
+    for (size_t i = 0; i < out_bins.size(); ++i) {
+        bin_index.emplace(to_lower(out_bins[i].first), i);
+    }
+    auto get_bin = [&](const std::string& mat_path) -> std::vector<Vertex>& {
+        const std::string key = to_lower(mat_path);
+        auto it = bin_index.find(key);
+        if (it != bin_index.end()) return out_bins[it->second].second;
+        const size_t idx = out_bins.size();
+        out_bins.emplace_back(mat_path, std::vector<Vertex>{});
+        bin_index.emplace(key, idx);
+        return out_bins.back().second;
+    };
+
+    auto unpack_normal = [](const uint8_t* b) {
+        return Vec3(static_cast<float>(b[0]) / 127.5f - 1.0f,
+                    static_cast<float>(b[1]) / 127.5f - 1.0f,
+                    static_cast<float>(b[2]) / 127.5f - 1.0f);
+    };
+
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        const auto& exp = exports_[i];
+        if (get_export_class(exp) != "Model") continue;
+        if (resolve_object_index(exp.outer_index).first != "PersistentLevel") continue;
+        UPropertyList props;
+        size_t off = parse_export_properties(*this, static_cast<int32_t>(i) + 1, props);
+        const size_t end = std::min(data_.size(), static_cast<size_t>(exp.serial_offset) + static_cast<size_t>(exp.serial_size));
+        if (off == 0 || off + 28 > end) continue;
+        off += 28;  // Bounds
+
+        auto rd = [&](size_t o) {
+            int32_t v = 0;
+            std::memcpy(&v, data_.data() + o, 4);
+            return v;
+        };
+        struct Bulk {
+            size_t data = 0;
+            int32_t elem = 0;
+            int32_t count = 0;
+        };
+        auto bulk = [&](Bulk& b) -> bool {
+            if (off + 8 > end) return false;
+            b.elem = rd(off);
+            b.count = rd(off + 4);
+            if (b.elem <= 0 || b.elem > 256 || b.count < 0 ||
+                off + 8 + static_cast<size_t>(b.elem) * static_cast<size_t>(b.count) > end) {
+                return false;
+            }
+            b.data = off + 8;
+            off = b.data + static_cast<size_t>(b.elem) * static_cast<size_t>(b.count);
+            return true;
+        };
+        Bulk vectors, points, nodes, verts;
+        if (!bulk(vectors) || !bulk(points) || !bulk(nodes)) continue;
+        if (points.elem != 12 || nodes.elem != 64 || nodes.count == 0) continue;
+        if (off + 8 > end) continue;
+        const int32_t surf_count = rd(off + 4);  // TTransArray: Owner, then the TArray
+        constexpr size_t kSurfSize = 56;
+        const size_t surfs = off + 8;
+        if (surf_count < 0 || surfs + kSurfSize * static_cast<size_t>(surf_count) > end) continue;
+        off = surfs + kSurfSize * static_cast<size_t>(surf_count);
+        if (!bulk(verts) || verts.elem < 4) continue;
+
+        // Locate the cooked FModelVertexBuffer at the end of UModel (36 bytes/vertex:
+        // Position(12), TangentX(4), TangentZ(4), TexCoord(8), ShadowTexCoord(8)).
+        const uint8_t* vb_data = nullptr;
+        int32_t vb_count = 0;
+        for (size_t scan = off; scan + 8 <= end; scan += 4) {
+            const int32_t esz = rd(scan);
+            const int32_t cnt = rd(scan + 4);
+            if (esz == 36 && cnt >= 0 && scan + 8 + 36ULL * static_cast<size_t>(cnt) == end) {
+                vb_data = data_.data() + scan + 8;
+                vb_count = cnt;
+                break;
+            }
+        }
+
+        for (int32_t n = 0; n < nodes.count; ++n) {
+            const uint8_t* nd = data_.data() + nodes.data + static_cast<size_t>(n) * 64;
+            int32_t vert_pool = 0, surf = 0, vert_idx = 0;
+            std::memcpy(&vert_pool, nd + 16, 4);
+            std::memcpy(&surf, nd + 20, 4);
+            std::memcpy(&vert_idx, nd + 24, 4);
+            const uint8_t num_verts = nd[54];
+            if (num_verts < 3) continue;
+            if (vert_pool < 0 || vert_pool + num_verts > verts.count) continue;
+            if (surf < 0 || surf >= surf_count) continue;
+
+            const size_t so = surfs + kSurfSize * static_cast<size_t>(surf);
+            const int32_t mat_ref = rd(so);
+            uint32_t poly_flags = 0;
+            std::memcpy(&poly_flags, data_.data() + so + 4, 4);
+            if (poly_flags & (PF_Invisible | PF_Portal)) continue;
+
+            std::string mat_path = (mat_ref != 0) ? object_canonical_path(*this, mat_ref) : std::string();
+            if (mat_path == "EngineMaterials.RemoveSurfaceMaterial") continue;
+            if (mat_path.empty()) mat_path = "EngineMaterials.DefaultMaterial";
+
+            const int32_t p_base = rd(so + 8);
+            const int32_t v_normal = rd(so + 12);
+            const int32_t v_tex_u = rd(so + 16);
+            const int32_t v_tex_v = rd(so + 20);
+
+            float px = 0.0f, py = 0.0f, pz = 1.0f;
+            std::memcpy(&px, nd + 0, 4);
+            std::memcpy(&py, nd + 4, 4);
+            std::memcpy(&pz, nd + 8, 4);
+            Vec3 surf_n(px, py, pz);
+            if (vectors.elem == 12 && v_normal >= 0 && v_normal < vectors.count) {
+                std::memcpy(&surf_n, data_.data() + vectors.data + static_cast<size_t>(v_normal) * 12, 12);
+            }
+            surf_n = (surf_n.length_sq() > 1e-12f) ? surf_n.normalized() : Vec3(0.0f, 0.0f, 1.0f);
+
+            Vec3 base_pt(0.0f, 0.0f, 0.0f), tex_u(1.0f, 0.0f, 0.0f), tex_v(0.0f, 1.0f, 0.0f);
+            if (p_base >= 0 && p_base < points.count) {
+                std::memcpy(&base_pt, data_.data() + points.data + static_cast<size_t>(p_base) * 12, 12);
+            }
+            if (vectors.elem == 12 && v_tex_u >= 0 && v_tex_u < vectors.count) {
+                std::memcpy(&tex_u, data_.data() + vectors.data + static_cast<size_t>(v_tex_u) * 12, 12);
+            }
+            if (vectors.elem == 12 && v_tex_v >= 0 && v_tex_v < vectors.count) {
+                std::memcpy(&tex_v, data_.data() + vectors.data + static_cast<size_t>(v_tex_v) * 12, 12);
+            }
+
+            Vertex poly_v[256];
+            int count = 0;
+            for (int k = 0; k < num_verts; ++k) {
+                Vertex v{};
+                v.color = 0xFFFFFFFFu;
+                if (vb_data && vert_idx >= 0 && vert_idx + num_verts <= vb_count) {
+                    const uint8_t* vptr = vb_data + static_cast<size_t>(vert_idx + k) * 36;
+                    std::memcpy(&v.position, vptr + 0, 12);
+                    const Vec3 tx = unpack_normal(vptr + 12);
+                    const Vec3 tz = unpack_normal(vptr + 16);
+                    v.normal = (tz.length_sq() > 0.25f) ? tz.normalized() : surf_n;
+                    v.tangent = (tx.length_sq() > 0.25f) ? tx.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+                    v.tangent_sign = (vptr[19] >= 128) ? 1.0f : -1.0f;
+                    std::memcpy(&v.u, vptr + 20, 4);
+                    std::memcpy(&v.v, vptr + 24, 4);
+                    std::memcpy(&v.u2, vptr + 28, 4);
+                    std::memcpy(&v.v2, vptr + 32, 4);
+                } else {
+                    const int32_t pv = rd(verts.data + static_cast<size_t>(verts.elem) * static_cast<size_t>(vert_pool + k));
+                    if (pv < 0 || pv >= points.count) continue;
+                    std::memcpy(&v.position, data_.data() + points.data + static_cast<size_t>(pv) * 12, 12);
+                    v.normal = surf_n;
+                    v.tangent = (tex_u.length_sq() > 1e-12f) ? tex_u.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+                    v.tangent_sign = 1.0f;
+                    const Vec3 dp = v.position - base_pt;
+                    v.u = dp.dot(tex_u) / 128.0f;
+                    v.v = dp.dot(tex_v) / 128.0f;
+                    if (verts.elem >= 16) {
+                        const uint8_t* fv = data_.data() + verts.data + static_cast<size_t>(verts.elem) * static_cast<size_t>(vert_pool + k);
+                        std::memcpy(&v.u2, fv + 8, 4);
+                        std::memcpy(&v.v2, fv + 12, 4);
+                    }
+                }
+                inout_bounds.expand(v.position);
+                poly_v[count++] = v;
+            }
+            if (count < 3) continue;
+
+            std::vector<Vertex>& dst = get_bin(mat_path);
+            for (int k = 1; k + 1 < count; ++k) {
+                const Vertex& a = poly_v[0];
+                const Vertex& b = poly_v[k];
+                const Vertex& c = poly_v[k + 1];
+                // Ensure counter-clockwise screen winding when viewed along +surf_n.
+                const Vec3 cr = (b.position - a.position).cross(c.position - a.position);
+                const bool flip = (cr.dot(surf_n) > 0.0f);
+                const Vertex& v1 = flip ? c : b;
+                const Vertex& v2 = flip ? b : c;
+                dst.push_back(a);
+                dst.push_back(v1);
+                dst.push_back(v2);
+                if (poly_flags & PF_TwoSided) {
+                    Vertex ba = a, bv1 = v2, bv2 = v1;
+                    ba.normal = ba.normal * -1.0f;
+                    bv1.normal = bv1.normal * -1.0f;
+                    bv2.normal = bv2.normal * -1.0f;
+                    ba.tangent_sign = -ba.tangent_sign;
+                    bv1.tangent_sign = -bv1.tangent_sign;
+                    bv2.tangent_sign = -bv2.tangent_sign;
+                    dst.push_back(ba);
+                    dst.push_back(bv1);
+                    dst.push_back(bv2);
+                }
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Level geometry: real UStaticMesh render batches + UE3 collision
 // -----------------------------------------------------------------------------
@@ -2492,6 +2690,25 @@ public:
         }
     }
     [[nodiscard]] bool use_materials() const { return material_paths_ != nullptr; }
+
+    void emit_bsp(const std::vector<std::pair<std::string, std::vector<Vertex>>>& bsp_bins,
+                  std::map<int32_t, std::vector<Vertex>>& bins,
+                  std::vector<Vertex>& flat) {
+        for (const auto& [mat_path, verts] : bsp_bins) {
+            if (verts.empty()) continue;
+            if (use_materials()) {
+                const int32_t mat = material_id(mat_path);
+                auto& dst = bins[mat];
+                dst.insert(dst.end(), verts.begin(), verts.end());
+            } else {
+                const size_t base = flat.size();
+                flat.insert(flat.end(), verts.begin(), verts.end());
+                for (size_t i = base; i < flat.size(); ++i) {
+                    flat[i].color = 0xFFF2F0EEu;
+                }
+            }
+        }
+    }
 
     // Material mode: appends to `bins` (material id -> vertices). Legacy mode: appends palette
     // coloured vertices to `flat`. Returns the world AABB of the emitted vertices.
@@ -2633,7 +2850,9 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           std::vector<MeshBuffer>& out_meshes,
                           CollisionWorld& out_collision,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-                          std::vector<std::string>* out_material_paths) {
+                          std::vector<std::string>* out_material_paths,
+                          const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins,
+                          const AABB* bsp_bounds) {
     out_meshes.clear();
 
     // Batched world buffers for single-draw-call-per-material rendering
@@ -2680,6 +2899,14 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             a.world_bounds = box;
             overall.expand(box.min_pt);
             overall.expand(box.max_pt);
+        }
+    }
+
+    if (bsp_render_bins && !bsp_render_bins->empty()) {
+        emitter.emit_bsp(*bsp_render_bins, world_bins, world_batch.vertices);
+        if (bsp_bounds && valid_box(*bsp_bounds)) {
+            overall.expand(bsp_bounds->min_pt);
+            overall.expand(bsp_bounds->max_pt);
         }
     }
 
@@ -3492,20 +3719,26 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
                   << out_scene.sky_lower_color.y << ", " << out_scene.sky_lower_color.z << ")" << std::endl;
     }
 
-    // Real UStaticMesh render batches + UE3 collision (populating each actor's transformed world_bounds),
+    // Real UStaticMesh + BSP UModel render batches + UE3 collision (populating each actor's transformed world_bounds),
     // then the moving elevator parts with their own buffers and collision.
     std::vector<std::string> material_paths;
     auto collision = std::make_shared<CollisionWorld>();
+    std::vector<std::pair<std::string, std::vector<Vertex>>> bsp_render_bins;
+    AABB bsp_bounds(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
     {
-        // Level BSP (rooms, interiors blocked out with brushes) collides as world geometry.
+        // Level BSP (rooms, interiors blocked out with brushes) collides and renders as world geometry.
         std::vector<Vec3> bsp;
-        for (const auto& pkg : loaded_packages) pkg->extract_bsp_collision(bsp);
+        for (const auto& pkg : loaded_packages) {
+            pkg->extract_bsp_collision(bsp);
+            pkg->extract_bsp_render_geometry(bsp_render_bins, bsp_bounds);
+        }
         collision->reserve(bsp.size() / 3 + 1024);
         for (size_t i = 0; i + 2 < bsp.size(); i += 3) {
             collision->add_triangle(bsp[i], bsp[i + 1], bsp[i + 2], -1, COLL_BlockAll);
         }
     }
-    build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr);
+    build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr,
+                         &bsp_render_bins, &bsp_bounds);
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
 
