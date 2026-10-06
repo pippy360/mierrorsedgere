@@ -2090,7 +2090,26 @@ struct LevelSun {
     float score = -1e30f;
     Vec3 direction{-0.4f, 0.6f, 0.7f};  // world-space direction *towards* the sun
     Vec3 color{2.0f, 1.96f, 1.9f};      // linear RGB * brightness
+    Vec3 mod_shadow_color{0.494f, 0.659f, 0.875f}; // DirectionalLightComponent.ModShadowColor (sRGB 0..1)
     std::string source;
+};
+
+// Reverse-engineered ambient lighting state from WorldInfo, SkyLightComponent, and HeightFogComponent
+// (FSkyLightSceneProxy::FSkyLightSceneProxy @ VA 0x00ED4100, FLightSceneInfo @ VA 0x0103F0D0).
+struct LevelAmbient {
+    bool has_skylight = false;
+    float sky_score = -1e30f;
+    Vec3 sky_light_color{0.722f, 0.835f, 1.0f};      // SkyLightComponent.LightColor (sRGB 0..1)
+    float sky_brightness = 0.4f;                     // SkyLightComponent.Brightness
+    Vec3 sky_lower_color{0.737f, 0.627f, 0.447f};    // SkyLightComponent.LowerColor (sRGB 0..1)
+    float sky_lower_brightness = 0.45f;              // SkyLightComponent.LowerBrightness
+    std::string sky_source;
+
+    bool has_world_sky = false;
+    Vec3 world_sky_color{0.30f, 0.52f, 0.65f};       // WorldInfo.SkyColor (Beast environment sky radiosity)
+    float ibl_intensity = 1.0f;                      // WorldInfo.IBLIntensity
+    Vec3 haze_color{0.76f, 0.86f, 0.96f};            // DefaultPostProcessSettings.HazeColor / HeightFog LightColor
+    std::string world_source;
 };
 }  // namespace
 
@@ -2133,6 +2152,12 @@ static void scan_level_suns(const UPKPackage& pkg, LevelSun& best) {
             }
         }
 
+        // ModShadowColor: DICE's azure shadow fill color on DirectionalLightComponent
+        Vec3 mod_shadow(0.494f, 0.659f, 0.875f);
+        if (const UProperty* ms = find_prop(comp_props, "ModShadowColor")) {
+            mod_shadow = Vec3(ms->v[0], ms->v[1], ms->v[2]);
+        }
+
         const float score = (baked ? 1000.0f : 0.0f) + (affects_static ? 100.0f : 0.0f) + brightness;
         if (best.found && score <= best.score) continue;
 
@@ -2153,7 +2178,126 @@ static void scan_level_suns(const UPKPackage& pkg, LevelSun& best) {
         best.direction = Vec3(-forward.x, -forward.y, -forward.z);
         best.color = Vec3(srgb_byte_to_linear(rgb[0]) * brightness, srgb_byte_to_linear(rgb[1]) * brightness,
                           srgb_byte_to_linear(rgb[2]) * brightness);
+        best.mod_shadow_color = mod_shadow;
         best.source = package_name_of(pkg) + "." + export_object_name(pkg, idx);
+    }
+}
+
+static Vec3 read_color_or_vec3(const UProperty* p, const Vec3& def) {
+    if (!p) return def;
+    if (p->immutable_struct) {
+        return Vec3(p->v[0], p->v[1], p->v[2]);
+    }
+    if (!p->fields.empty()) {
+        if (find_prop(p->fields, "R") || find_prop(p->fields, "G") || find_prop(p->fields, "B")) {
+            float r = prop_float(p->fields, "R", def.x);
+            float g = prop_float(p->fields, "G", def.y);
+            float b = prop_float(p->fields, "B", def.z);
+            if (p->struct_name == "Color" && (r > 1.0f || g > 1.0f || b > 1.0f)) {
+                return Vec3(r / 255.0f, g / 255.0f, b / 255.0f);
+            }
+            return Vec3(r, g, b);
+        }
+        return Vec3(prop_float(p->fields, "X", def.x),
+                    prop_float(p->fields, "Y", def.y),
+                    prop_float(p->fields, "Z", def.z));
+    }
+    return def;
+}
+
+static void scan_level_ambient(const UPKPackage& pkg, LevelAmbient& amb) {
+    const auto& exports = pkg.get_exports();
+    for (size_t i = 0; i < exports.size(); ++i) {
+        const int32_t idx = static_cast<int32_t>(i) + 1;
+        const std::string cls = object_class_name(pkg, idx);
+
+        if (cls == "WorldInfo") {
+            // Lighting artists often set WorldInfo.SkyColor in the *_Lgts package; prefer any non-default override.
+            UPropertyList wi_props;
+            parse_export_properties(pkg, idx, wi_props);
+            if (const UProperty* sc = find_prop(wi_props, "SkyColor")) {
+                Vec3 c = read_color_or_vec3(sc, amb.world_sky_color);
+                const bool is_default_sky = (std::abs(c.x - 0.3f) < 0.01f && std::abs(c.y - 0.7f) < 0.01f && std::abs(c.z - 1.0f) < 0.01f);
+                if (!amb.has_world_sky || !is_default_sky) {
+                    amb.has_world_sky = true;
+                    amb.world_sky_color = c;
+                    amb.world_source = package_name_of(pkg) + "." + export_object_name(pkg, idx);
+                }
+            }
+            if (find_prop(wi_props, "IBLIntensity")) {
+                amb.ibl_intensity = prop_float(wi_props, "IBLIntensity", amb.ibl_intensity);
+                if (amb.world_source.empty()) {
+                    amb.has_world_sky = true;
+                    amb.world_source = package_name_of(pkg) + "." + export_object_name(pkg, idx);
+                }
+            }
+            if (const UProperty* pp = find_prop(wi_props, "DefaultPostProcessSettings")) {
+                if (const UProperty* hc = find_prop(pp->fields, "HazeColor")) {
+                    amb.haze_color = read_color_or_vec3(hc, amb.haze_color);
+                }
+            }
+        } else if (cls == "SkyLight" || cls == "SkyLightToggleable") {
+            UPropertyList actor_props;
+            parse_export_properties(pkg, idx, actor_props);
+            const int32_t comp_idx = prop_object(actor_props, "LightComponent");
+            if (comp_idx <= 0) continue;
+            UPropertyList comp_props;
+            parse_export_properties(pkg, comp_idx, comp_props);
+
+            const bool enabled = prop_bool(comp_props, "bEnabled", true) && prop_bool(actor_props, "bEnabled", true);
+            if (!enabled) continue;
+
+            bool affects_static = true;
+            bool affects_dynamic = true;
+            bool special_channel_only = false;
+            if (const UProperty* lc = find_prop(comp_props, "LightingChannels")) {
+                affects_static = prop_bool(lc->fields, "Static", true);
+                affects_dynamic = prop_bool(lc->fields, "Dynamic", true);
+                for (const auto& f : lc->fields) {
+                    if ((f.name.find("Cinematic") != std::string::npos ||
+                         f.name.find("Gameplay") != std::string::npos) && f.b) {
+                        special_channel_only = true;
+                    }
+                }
+                if (!affects_dynamic) special_channel_only = true;
+            }
+            const bool baked = prop_bool(comp_props, "bHasLightEverBeenBuiltIntoLightMap", false);
+            const float brightness = prop_float(comp_props, "Brightness", 1.0f);
+            const float lower_brightness = prop_float(comp_props, "LowerBrightness", 0.5f);
+
+            // USkyLightComponent archetype defaults in Engine.u:
+            // LightColor=(R=184,G=213,B=255), Brightness=1.0, LowerColor=(R=188,G=160,B=114), LowerBrightness=0.0
+            Vec3 upper_col(184.0f / 255.0f, 213.0f / 255.0f, 1.0f);
+            Vec3 lower_col(188.0f / 255.0f, 160.0f / 255.0f, 114.0f / 255.0f);
+            if (const UProperty* uc = find_prop(comp_props, "LightColor")) {
+                upper_col = read_color_or_vec3(uc, upper_col);
+            }
+            if (const UProperty* lc = find_prop(comp_props, "LowerColor")) {
+                lower_col = read_color_or_vec3(lc, lower_col);
+            }
+
+            // Prefer the world SkyLight (Static + Dynamic channels) over Cinematic/Gameplay-only channel lights.
+            const float score = (baked ? 1000.0f : 0.0f) + (affects_static ? 200.0f : 0.0f) +
+                                (affects_dynamic ? 200.0f : 0.0f) - (special_channel_only ? 2000.0f : 0.0f) +
+                                brightness + lower_brightness;
+            if (amb.has_skylight && score <= amb.sky_score) continue;
+
+            amb.has_skylight = true;
+            amb.sky_score = score;
+            amb.sky_light_color = upper_col;
+            amb.sky_brightness = brightness;
+            amb.sky_lower_color = lower_col;
+            amb.sky_lower_brightness = lower_brightness;
+            amb.sky_source = package_name_of(pkg) + "." + export_object_name(pkg, idx);
+        } else if (cls == "HeightFogComponent") {
+            UPropertyList fog_props;
+            parse_export_properties(pkg, idx, fog_props);
+            if (prop_bool(fog_props, "bEnabled", true)) {
+                if (const UProperty* fc = find_prop(fog_props, "LightColor")) {
+                    amb.haze_color = read_color_or_vec3(fc, amb.haze_color);
+                }
+            }
+        }
     }
 }
 
@@ -2307,7 +2451,9 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     auto master_actors = master_pkg->extract_actors();
     auto master_sounds = master_pkg->extract_audio();
     LevelSun level_sun;
+    LevelAmbient level_ambient;
     scan_level_suns(*master_pkg, level_sun);
+    scan_level_ambient(*master_pkg, level_ambient);
 
     out_scene.actors.insert(out_scene.actors.end(), master_actors.begin(), master_actors.end());
     out_scene.sounds.insert(out_scene.sounds.end(), master_sounds.begin(), master_sounds.end());
@@ -2395,6 +2541,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         sub_pkg->extract_level_streaming_and_checkpoints(
             out_scene.checkpoint_infos, out_scene.streaming_actions, out_scene.all_streaming_packages);
         scan_level_suns(*sub_pkg, level_sun);
+        scan_level_ambient(*sub_pkg, level_ambient);
         out_scene.loaded_sublevel_packages.push_back(sub_stem);
         if (pm) pm->add_loaded(sub_stem, sub_pkg);
     }
@@ -2461,7 +2608,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         out_scene.loaded_sublevel_packages = out_scene.checkpoint_infos.front().streaming_levels;
     }
 
-    // The sun lives in the *_Lgts lighting packages, which carry no geometry: open them for lights only.
+    // The sun and SkyLight live in the *_Lgts lighting packages, which carry no geometry: open them for lights only.
     if (fs::exists(map_dir)) {
         std::vector<fs::path> light_packages;
         for (const auto& entry : fs::directory_iterator(map_dir)) {
@@ -2477,16 +2624,77 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         std::sort(light_packages.begin(), light_packages.end());
         for (const auto& lp : light_packages) {
             UPKPackage light_pkg(lp.string());
-            if (light_pkg.is_valid()) scan_level_suns(light_pkg, level_sun);
+            if (light_pkg.is_valid()) {
+                scan_level_suns(light_pkg, level_sun);
+                scan_level_ambient(light_pkg, level_ambient);
+            }
         }
     }
     if (level_sun.found) {
         out_scene.sun_direction = level_sun.direction.normalized();
         out_scene.sun_color = level_sun.color;
+        out_scene.mod_shadow_color = level_sun.mod_shadow_color;
         std::cout << "[Level] Sun from " << level_sun.source << ": direction (" << out_scene.sun_direction.x << ", "
                   << out_scene.sun_direction.y << ", " << out_scene.sun_direction.z << "), linear colour ("
-                  << out_scene.sun_color.x << ", " << out_scene.sun_color.y << ", " << out_scene.sun_color.z << ")"
-                  << std::endl;
+                  << out_scene.sun_color.x << ", " << out_scene.sun_color.y << ", " << out_scene.sun_color.z
+                  << "), ModShadowColor (" << out_scene.mod_shadow_color.x << ", " << out_scene.mod_shadow_color.y
+                  << ", " << out_scene.mod_shadow_color.z << ")" << std::endl;
+    }
+
+    // Populate reverse-engineered ambient lighting (FSkyLightSceneProxy @ VA 0x00ED4100 + WorldInfo.SkyColor)
+    out_scene.world_sky_color = level_ambient.world_sky_color;
+    out_scene.ibl_intensity = level_ambient.ibl_intensity;
+    out_scene.haze_color = level_ambient.haze_color;
+    out_scene.sky_light_source = level_ambient.has_skylight ? level_ambient.sky_source : level_ambient.world_source;
+    out_scene.raw_sky_upper_linear = Vec3(
+        srgb_byte_to_linear(level_ambient.sky_light_color.x) * level_ambient.sky_brightness,
+        srgb_byte_to_linear(level_ambient.sky_light_color.y) * level_ambient.sky_brightness,
+        srgb_byte_to_linear(level_ambient.sky_light_color.z) * level_ambient.sky_brightness);
+    out_scene.raw_sky_lower_linear = Vec3(
+        srgb_byte_to_linear(level_ambient.sky_lower_color.x) * level_ambient.sky_lower_brightness,
+        srgb_byte_to_linear(level_ambient.sky_lower_color.y) * level_ambient.sky_lower_brightness,
+        srgb_byte_to_linear(level_ambient.sky_lower_color.z) * level_ambient.sky_lower_brightness);
+
+    // Calibrate real-time UpperSkyColor & LowerSkyColor for BasePass GetMaterialHemisphereLightTransferFull
+    // (combining SkyLightComponent.LightColor/LowerColor, DirectionalLight.ModShadowColor, and WorldInfo.SkyColor
+    // so unbaked real-time rooftops receive authentic City of Glass cool azure shadows + warm ground bounce).
+    {
+        Vec3 up_src = level_ambient.has_skylight ? level_ambient.sky_light_color : level_ambient.world_sky_color;
+        float up_max = std::max({up_src.x, up_src.y, up_src.z, 1e-4f});
+        Vec3 up_norm = up_src * (1.0f / up_max);
+
+        Vec3 ms = out_scene.mod_shadow_color;
+        float ms_max = std::max({ms.x, ms.y, ms.z, 1e-4f});
+        Vec3 ms_norm = (ms_max > 0.05f) ? (ms * (1.0f / ms_max)) : Vec3(0.565f, 0.753f, 1.0f);
+
+        Vec3 upper_blend = up_norm * 0.65f + ms_norm * 0.35f;
+        out_scene.sky_upper_color = Vec3(
+            std::clamp(upper_blend.x, 0.60f, 1.0f),
+            std::clamp(upper_blend.y, 0.76f, 1.0f),
+            std::clamp(upper_blend.z, 0.90f, 1.0f));
+
+        Vec3 lo_src = level_ambient.sky_lower_color;
+        float lo_max = std::max({lo_src.x, lo_src.y, lo_src.z, 1e-4f});
+        Vec3 lo_norm = (lo_max > 0.05f) ? (lo_src * (0.86f / lo_max)) : Vec3(0.82f, 0.84f, 0.88f);
+        Vec3 lower_blend = lo_norm * 0.55f + Vec3(0.82f, 0.84f, 0.88f) * 0.45f;
+        out_scene.sky_lower_color = Vec3(
+            std::clamp(lower_blend.x, 0.74f, 0.92f),
+            std::clamp(lower_blend.y, 0.74f, 0.92f),
+            std::clamp(lower_blend.z, 0.72f, 0.92f));
+    }
+    if (level_ambient.has_skylight || level_ambient.has_world_sky) {
+        std::cout << "[Level] Ambient from " << out_scene.sky_light_source
+                  << ": FSkyLightSceneProxy UpperLinear=(" << out_scene.raw_sky_upper_linear.x << ", "
+                  << out_scene.raw_sky_upper_linear.y << ", " << out_scene.raw_sky_upper_linear.z
+                  << "), LowerLinear=(" << out_scene.raw_sky_lower_linear.x << ", "
+                  << out_scene.raw_sky_lower_linear.y << ", " << out_scene.raw_sky_lower_linear.z
+                  << "), WorldInfo.SkyColor=(" << out_scene.world_sky_color.x << ", "
+                  << out_scene.world_sky_color.y << ", " << out_scene.world_sky_color.z
+                  << ") IBL=" << out_scene.ibl_intensity
+                  << ", Calibrated Hemisphere Upper=(" << out_scene.sky_upper_color.x << ", "
+                  << out_scene.sky_upper_color.y << ", " << out_scene.sky_upper_color.z
+                  << ") Lower=(" << out_scene.sky_lower_color.x << ", "
+                  << out_scene.sky_lower_color.y << ", " << out_scene.sky_lower_color.z << ")" << std::endl;
     }
 
     // Construct real 3D UStaticMesh rooftop geometry and colliders (populating each actor's transformed world_bounds)
