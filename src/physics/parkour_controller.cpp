@@ -40,6 +40,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_momentum_timer = 0.0f;
     m_state_timer = 0.0f;
     m_wallrun_timer = 0.0f;
+    m_wallrun_cooldown = 0.0f;
+    m_wallrun_begin_speed = 0.0f;
     m_slide_timer = 0.0f;
     m_coil_timer = 0.0f;
     m_turn_180_timer = 0.0f;
@@ -49,6 +51,9 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_fall_peak_z = spawn_pos.z;
     m_crouch_landing_buffer = 0.0f;
     m_melee_cooldown = 0.0f;
+    m_jump_consumed = false;
+    m_prev_turn_180 = false;
+    m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
@@ -56,6 +61,10 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
     if (dt <= 0.0f) return;
+
+    if (!input.jump) {
+        m_jump_consumed = false;
+    }
 
     // 1. Reaction Time Slow-Motion
     float effective_dt = dt;
@@ -73,6 +82,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         remaining_time -= step_dt;
 
         m_state_timer += step_dt;
+        m_wallrun_cooldown = std::max(0.0f, m_wallrun_cooldown - step_dt);
         if (input.crouch) {
             m_crouch_landing_buffer = 0.35f;
         } else {
@@ -208,6 +218,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
 
             m_telemetry.position.z = floor_z;
             m_telemetry.grounded = true;
+            m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
             if (m_telemetry.velocity.z < 0.0f) {
                 m_telemetry.velocity.z = 0.0f;
             }
@@ -245,6 +256,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     update_checkpoints_and_volumes(scene);
 
     // 8. Final Telemetry Update
+    m_prev_turn_180 = input.turn_180;
     m_telemetry.tick++;
     m_telemetry.sim_time += effective_dt;
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
@@ -280,8 +292,8 @@ void ParkourController::update_reaction_time(const InputFrame& input, float dt, 
 // Camera, Orientation & Look-At Objective Hint Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_camera_and_inputs(const InputFrame& input, float dt, const LevelScene& scene) {
-    // 180° Quick Turn
-    if (input.turn_180 && m_turn_180_timer <= 0.0f) {
+    // 180° Quick Turn (edge-triggered on fresh press)
+    if (input.turn_180 && !m_prev_turn_180 && m_turn_180_timer <= 0.0f) {
         m_turn_180_timer = m_config.turn_180_time;
         m_turn_180_target_yaw = m_telemetry.yaw_deg + 180.0f;
         if (m_telemetry.move_state != EMovement::MOVE_WallClimbing) {
@@ -518,8 +530,8 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
 bool ParkourController::check_ground(const LevelScene& scene, float& floor_z, Vec3& floor_normal) {
     Capsule cap;
     cap.base = m_telemetry.position + Vec3(0.0f, 0.0f, 10.0f); // slight upward probe
-    cap.radius = 28.0f;
-    cap.height = 96.0f;
+    cap.radius = 30.0f;
+    cap.height = 90.0f;
     cap.bottom_offset = 0.0f;
 
     Vec3 delta(0.0f, 0.0f, -35.0f); // probe down beneath feet
@@ -540,7 +552,8 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     if (try_initiate_zipline(scene)) return;
 
     // Jump initiation
-    if (input.jump) {
+    if (input.jump && !m_jump_consumed) {
+        m_jump_consumed = true;
         if (try_initiate_springboard(input, scene)) return;
         if (try_initiate_vault(input, scene)) return;
 
@@ -631,11 +644,11 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
         m_telemetry.velocity.y = dir.y * speed;
     }
 
-    // Continuous Swept Movement with Auto Step-Up
+    // Continuous Swept Movement with Auto Step-Up (TdPawn: Radius=30, Height=90, MaxWallStepHeight=35)
     Capsule cap;
     cap.base = m_telemetry.position;
-    cap.radius = 34.0f;
-    cap.height = (m_telemetry.move_state == EMovement::MOVE_Crouch) ? 48.0f : 96.0f;
+    cap.radius = 30.0f;
+    cap.height = (m_telemetry.move_state == EMovement::MOVE_Crouch) ? 45.0f : 90.0f;
     cap.bottom_offset = 0.0f;
 
     Vec3 move_delta = Vec3(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f) * dt;
@@ -656,14 +669,25 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
             m_telemetry.position += move_delta;
             m_telemetry.move_state = EMovement::MOVE_AutoStepUp;
         } else {
-            // Slide along collision normal
-            m_telemetry.position += move_delta * hit.fraction;
+            // Slide along collision normal with secondary sweep check
+            m_telemetry.position += move_delta * std::max(0.0f, hit.fraction - 0.001f);
             Vec3 remaining = move_delta * (1.0f - hit.fraction);
             remaining -= hit.normal * remaining.dot(hit.normal);
-            m_telemetry.position += remaining;
+            if (remaining.length_sq() > 1e-6f) {
+                Capsule slide_cap = cap;
+                slide_cap.base = m_telemetry.position;
+                TraceHit slide_hit = sweep_capsule(slide_cap, remaining, scene);
+                if (!slide_hit.hit) {
+                    m_telemetry.position += remaining;
+                } else {
+                    m_telemetry.position += remaining * std::max(0.0f, slide_hit.fraction - 0.001f);
+                }
+            }
 
             // Dampen velocity along normal
-            m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+            if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
+                m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+            }
         }
     }
 }
@@ -690,21 +714,31 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     // Apply gravity
     m_telemetry.velocity.z -= m_config.gravity * dt;
 
-    // Subtle air control (0.025 - 0.09)
+    // Subtle air control (TdPawn AirControl = 0.025..0.09, capped at max(current_spd_2d, SprintVelocity))
     Rotator view_rot = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f);
     Vec3 fwd = view_rot.forward();
     Vec3 right = view_rot.right();
     Vec3 air_dir = (fwd * input.forward + right * input.strafe).normalized();
 
-    constexpr float AIR_CONTROL = 450.0f;
-    m_telemetry.velocity.x += air_dir.x * AIR_CONTROL * dt;
-    m_telemetry.velocity.y += air_dir.y * AIR_CONTROL * dt;
+    if (air_dir.length_sq() > 1e-4f) {
+        float cur_spd_2d = m_telemetry.velocity.length_xy();
+        float max_air_spd = std::max(cur_spd_2d, m_config.sprint_speed);
+        constexpr float AIR_CONTROL = 350.0f;
+        m_telemetry.velocity.x += air_dir.x * AIR_CONTROL * dt;
+        m_telemetry.velocity.y += air_dir.y * AIR_CONTROL * dt;
+        float new_spd_2d = m_telemetry.velocity.length_xy();
+        if (new_spd_2d > max_air_spd && new_spd_2d > 1e-4f) {
+            float scale = max_air_spd / new_spd_2d;
+            m_telemetry.velocity.x *= scale;
+            m_telemetry.velocity.y *= scale;
+        }
+    }
 
-    // Swept displacement
+    // Swept displacement with slide-along-normal so touching a ledge/wall at fraction=0 never freezes Faith
     Capsule cap;
     cap.base = m_telemetry.position;
-    cap.radius = 34.0f;
-    cap.height = 96.0f;
+    cap.radius = 30.0f;
+    cap.height = 90.0f;
     cap.bottom_offset = (m_telemetry.move_state == EMovement::MOVE_Coil) ? m_config.coil_height_boost : 0.0f;
 
     Vec3 delta = m_telemetry.velocity * dt;
@@ -714,16 +748,31 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
         m_telemetry.position += delta;
     } else {
         m_telemetry.position += delta * std::max(0.0f, hit.fraction - 0.001f);
-        m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+        Vec3 remaining = delta * (1.0f - hit.fraction);
+        remaining -= hit.normal * remaining.dot(hit.normal);
+        if (remaining.length_sq() > 1e-6f) {
+            Capsule slide_cap = cap;
+            slide_cap.base = m_telemetry.position;
+            TraceHit slide_hit = sweep_capsule(slide_cap, remaining, scene);
+            if (!slide_hit.hit) {
+                m_telemetry.position += remaining;
+            } else {
+                m_telemetry.position += remaining * std::max(0.0f, slide_hit.fraction - 0.001f);
+            }
+        }
+        if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
+            m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+        }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Wallrun Subsystem (Left & Right with 15° Camera Roll)
+// Wallrun Subsystem (Left & Right with 15° Camera Roll - TdMove_WallRun)
 // -----------------------------------------------------------------------------
 bool ParkourController::try_initiate_wallrun(const InputFrame& input, const LevelScene& scene) {
     (void)input;
     if (m_telemetry.weapon.is_heavy) return false;
+    if (m_wallrun_cooldown > 0.0f) return false;
     if (m_telemetry.velocity.length_xy() < m_config.wallrun_min_speed) return false;
 
     Rotator view_rot = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f);
@@ -738,6 +787,11 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
     auto can_run = [&](const TraceHit& hit, bool is_right) -> bool {
         if (!hit.hit || std::abs(hit.normal.z) > 0.2f) return false;
 
+        // TdMove_WallRun: cannot re-attach to the same wall normal in mid-air without landing first
+        if (m_last_wallrun_normal.length_sq() > 0.5f && hit.normal.dot(m_last_wallrun_normal) > 0.85f) {
+            return false;
+        }
+
         // Tangent along wall in player's forward direction
         Vec3 up(0, 0, 1);
         Vec3 tangent = is_right ? up.cross(hit.normal) : hit.normal.cross(up);
@@ -749,15 +803,20 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
         if (angle_deg <= m_config.wallrun_max_angle_deg) {
             m_telemetry.move_state = is_right ? EMovement::MOVE_WallRunningRight : EMovement::MOVE_WallRunningLeft;
             m_telemetry.wall_normal = hit.normal;
+            m_last_wallrun_normal = hit.normal;
             m_wall_tangent = tangent;
             m_wallrun_timer = 0.0f;
             m_telemetry.camera_roll_deg = is_right ? -15.0f : 15.0f;
+            if (input.jump) {
+                m_jump_consumed = true;
+            }
 
-            // Initial vertical boost
+            // Initial vertical boost (WallRunningHorisontalInitialZHeight = 170)
             m_telemetry.velocity.z = std::max(m_telemetry.velocity.z, m_config.wallrun_initial_z);
 
-            // Align velocity with wall tangent
-            float spd = std::max(m_telemetry.velocity.length_xy(), 350.0f);
+            // Align velocity with wall tangent (capped at SprintVelocity)
+            float spd = std::clamp(m_telemetry.velocity.length_xy(), 350.0f, m_config.sprint_speed);
+            m_wallrun_begin_speed = spd;
             m_telemetry.velocity.x = tangent.x * spd;
             m_telemetry.velocity.y = tangent.y * spd;
             return true;
@@ -773,8 +832,10 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
 void ParkourController::update_wallrun(const InputFrame& input, float dt, const LevelScene& scene) {
     m_wallrun_timer += dt;
 
-    // Wallrun Jump
-    if (input.jump) {
+    // Wallrun Jump (TdMove_WallrunJump: requires fresh Jump press after attaching to wall)
+    if (input.jump && !m_jump_consumed && m_wallrun_timer >= 0.08f) {
+        m_jump_consumed = true;
+        m_wallrun_cooldown = 0.15f;
         m_telemetry.move_state = EMovement::MOVE_WallRunJump;
         m_telemetry.velocity = m_telemetry.wall_normal * 320.0f + m_wall_tangent * 400.0f + Vec3(0, 0, 450.0f);
         m_telemetry.camera_roll_deg = 0.0f;
@@ -783,18 +844,20 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
 
     // Wallrun Kick
     if (input.melee) {
+        m_wallrun_cooldown = 0.15f;
         m_telemetry.move_state = EMovement::MOVE_MeleeWallrun;
         m_telemetry.velocity = m_telemetry.wall_normal * 200.0f + m_wall_tangent * 350.0f + Vec3(0, 0, -200.0f);
         m_telemetry.camera_roll_deg = 0.0f;
         return;
     }
 
-    // Kinematics: early forward acceleration then decay
+    // Kinematics: early forward alignment (capped at SprintVelocity = 630 u/s) then deceleration
     float spd = m_telemetry.velocity.length_xy();
+    float max_wr_spd = std::max(m_wallrun_begin_speed, m_config.sprint_speed);
     if (m_wallrun_timer < 0.6f) {
-        spd += m_config.wallrun_accel * dt;
+        spd = std::min(max_wr_spd, spd + m_config.wallrun_accel * dt);
     } else {
-        spd -= m_config.wallrun_decel * dt;
+        spd = std::max(0.0f, spd - m_config.wallrun_decel * dt);
     }
     m_telemetry.velocity.x = m_wall_tangent.x * spd;
     m_telemetry.velocity.y = m_wall_tangent.y * spd;
@@ -807,29 +870,34 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
     TraceHit wall_check = trace_ray(probe_start, probe_start - m_telemetry.wall_normal * 80.0f, scene);
 
     if (!wall_check.hit || m_wallrun_timer >= m_config.wallrun_duration || spd < 150.0f) {
+        m_wallrun_cooldown = 0.15f;
         m_telemetry.move_state = EMovement::MOVE_Falling;
         m_telemetry.camera_roll_deg = 0.0f;
         return;
     }
 
-    // Sweep movement along wall
+    // Sweep movement along wall (TdPawn: Radius=30, Height=90)
     Capsule cap;
     cap.base = m_telemetry.position;
-    cap.radius = 34.0f;
-    cap.height = 96.0f;
+    cap.radius = 30.0f;
+    cap.height = 90.0f;
     Vec3 delta = m_telemetry.velocity * dt;
     TraceHit hit = sweep_capsule(cap, delta, scene);
     if (!hit.hit) {
         m_telemetry.position += delta;
     } else {
-        m_telemetry.position += delta * hit.fraction;
+        m_telemetry.position += delta * std::max(0.0f, hit.fraction - 0.001f);
+        if (m_telemetry.velocity.dot(hit.normal) < 0.0f) {
+            m_telemetry.velocity -= hit.normal * m_telemetry.velocity.dot(hit.normal);
+        }
+        m_wallrun_cooldown = 0.20f;
         m_telemetry.move_state = EMovement::MOVE_Falling;
         m_telemetry.camera_roll_deg = 0.0f;
     }
 }
 
 // -----------------------------------------------------------------------------
-// Wallclimb & 180° Turn Jump Subsystem
+// Wallclimb & 180° Turn Jump Subsystem (TdMove_WallClimb / TdMove_WallClimb180TurnJump)
 // -----------------------------------------------------------------------------
 bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const LevelScene& scene) {
     if (m_telemetry.weapon.is_heavy || !input.jump) return false;
@@ -846,10 +914,12 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
                 m_telemetry.position.z <= act.world_bounds.max_pt.z + 80.0f) {
                 m_telemetry.move_state = EMovement::MOVE_WallClimbing;
                 m_telemetry.wall_normal = -fwd;
+                m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
                 m_telemetry.velocity.x = 0.0f;
                 m_telemetry.velocity.y = 0.0f;
                 m_telemetry.velocity.z = m_config.wallclimb_boost_z;
                 m_state_timer = 0.0f;
+                m_jump_consumed = true;
                 return true;
             }
         }
@@ -864,10 +934,12 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
     if (angle_deg <= m_config.wallclimb_max_angle_deg) {
         m_telemetry.move_state = EMovement::MOVE_WallClimbing;
         m_telemetry.wall_normal = hit.normal;
+        m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
         m_telemetry.velocity.x = 0.0f;
         m_telemetry.velocity.y = 0.0f;
         m_telemetry.velocity.z = m_config.wallclimb_boost_z;
         m_state_timer = 0.0f;
+        m_jump_consumed = true;
         return true;
     }
     return false;
@@ -876,8 +948,14 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
 void ParkourController::update_wallclimb(const InputFrame& input, float dt, const LevelScene& scene) {
     m_state_timer += dt;
 
-    // 180° Turn Jump off vertical climb
-    if (input.turn_180 || (input.jump && m_state_timer > 0.15f)) {
+    // Check for top ledge grab during climb (TdMove_WallClimb.bCheckForGrab = true)
+    if (try_initiate_ledge_grab(scene)) {
+        return;
+    }
+
+    // 180° Turn Jump off vertical climb (TdMove_WallClimb180TurnJump: triggered by Q / turn_180 or a fresh Jump press)
+    if ((input.turn_180 && !m_prev_turn_180) || (input.jump && !m_jump_consumed && m_state_timer > 0.15f)) {
+        m_jump_consumed = true;
         m_telemetry.move_state = EMovement::MOVE_WallClimb180TurnJump;
         m_telemetry.yaw_deg += 180.0f;
         m_telemetry.velocity = m_telemetry.wall_normal * 400.0f + Vec3(0, 0, 450.0f);
@@ -891,7 +969,7 @@ void ParkourController::update_wallclimb(const InputFrame& input, float dt, cons
     Vec3 chest = m_telemetry.position + Vec3(0, 0, 70);
     TraceHit top_check = trace_ray(chest, chest - m_telemetry.wall_normal * 80.0f, scene);
 
-    if (!top_check.hit && m_telemetry.velocity.z <= 100.0f) {
+    if (!top_check.hit && m_telemetry.velocity.z <= 120.0f) {
         // Clear top of ledge: auto pull up!
         m_telemetry.position += -m_telemetry.wall_normal * 60.0f + Vec3(0, 0, 40.0f);
         m_telemetry.move_state = EMovement::MOVE_Walking;
@@ -937,7 +1015,8 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
     m_telemetry.velocity.y = dir.y * spd;
 
     // Jump cancels slide into ground jump
-    if (input.jump) {
+    if (input.jump && !m_jump_consumed) {
+        m_jump_consumed = true;
         m_telemetry.move_state = EMovement::MOVE_Jump;
         m_telemetry.velocity.z = m_config.base_jump_z;
         m_telemetry.eye_height = 84.0f;
@@ -953,8 +1032,8 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
 
     Capsule cap;
     cap.base = m_telemetry.position;
-    cap.radius = 34.0f;
-    cap.height = 48.0f; // low slide clearance!
+    cap.radius = 30.0f;
+    cap.height = 45.0f; // low slide clearance!
     cap.bottom_offset = 0.0f;
 
     Vec3 delta = m_telemetry.velocity * dt;

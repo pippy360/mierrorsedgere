@@ -863,11 +863,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     input.look_pitch_delta -= float(ev.motion.yrel) * sens;
                 }
             } else if (ev.type == SDL_MOUSEBUTTONDOWN) {
-                if (ev.button.button == SDL_BUTTON_LEFT) {
-                    if (controller.get_weapon().equipped) input.fire = true;
-                    else input.melee = true;
-                } else if (ev.button.button == SDL_BUTTON_RIGHT) {
-                    input.disarm = true;
+                if (!renderer.is_menu_open() && SDL_GetRelativeMouseMode() != SDL_TRUE) {
+                    SDL_SetRelativeMouseMode(SDL_TRUE);
+                } else if (frame_counter >= 15 && !renderer.is_menu_open()) {
+                    if (ev.button.button == SDL_BUTTON_LEFT) {
+                        if (controller.get_weapon().equipped) input.fire = true;
+                        else input.melee = true;
+                    } else if (ev.button.button == SDL_BUTTON_RIGHT) {
+                        input.disarm = true;
+                    }
                 }
             } else if (ev.type == SDL_KEYDOWN) {
                 SDL_Keycode key = ev.key.keysym.sym;
@@ -979,8 +983,49 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Advance simulation step
+        Vec3 pre_vel = controller.get_velocity();
         controller.step(input, dt, active_scene);
         const auto& tel = controller.get_telemetry();
+
+        // Live movement telemetry logging for run diagnostics
+        static std::ofstream live_trace("/tmp/me_live_run_telemetry.jsonl", std::ios::out | std::ios::trunc);
+        bool state_changed = (tel.move_state != prev_state);
+        bool cp_changed = (tel.active_checkpoint != prev_checkpoint);
+        bool speed_drop = (pre_vel.length_xy() - tel.speed_2d > 120.0f);
+        bool any_action_key = (input.jump || input.crouch || input.turn_180 || input.melee || input.disarm || input.look_at);
+        if (live_trace.is_open() && (state_changed || cp_changed || speed_drop || any_action_key || (tel.tick % 3 == 0))) {
+            live_trace << "{\"tick\":" << tel.tick
+                       << ",\"t\":" << std::fixed << std::setprecision(3) << tel.sim_time
+                       << ",\"dt\":" << dt
+                       << ",\"state\":\"" << move_state_name(tel.move_state) << "\""
+                       << ",\"prev_state\":\"" << move_state_name(prev_state) << "\""
+                       << ",\"grounded\":" << (tel.grounded ? "true" : "false")
+                       << ",\"pos\":[" << std::setprecision(1) << tel.position.x << "," << tel.position.y << "," << tel.position.z << "]"
+                       << ",\"vel\":[" << tel.velocity.x << "," << tel.velocity.y << "," << tel.velocity.z << "]"
+                       << ",\"spd2d\":" << tel.speed_2d
+                       << ",\"yaw\":" << tel.yaw_deg << ",\"pitch\":" << tel.pitch_deg << ",\"roll\":" << tel.camera_roll_deg
+                       << ",\"cp\":" << tel.active_checkpoint
+                       << ",\"in\":{\"fwd\":" << input.forward << ",\"str\":" << input.strafe
+                       << ",\"jmp\":" << (input.jump ? 1 : 0) << ",\"crc\":" << (input.crouch ? 1 : 0)
+                       << ",\"q180\":" << (input.turn_180 ? 1 : 0) << ",\"mel\":" << (input.melee ? 1 : 0)
+                       << ",\"dis\":" << (input.disarm ? 1 : 0) << "}"
+                       << ",\"wall_norm\":[" << std::setprecision(2) << tel.wall_normal.x << "," << tel.wall_normal.y << "," << tel.wall_normal.z << "]"
+                       << "}\n";
+            live_trace.flush();
+        }
+        if (state_changed || cp_changed || speed_drop) {
+            std::cout << "[RunTrace t=" << std::fixed << std::setprecision(2) << tel.sim_time
+                      << "s tick=" << tel.tick << "] "
+                      << move_state_name(prev_state) << " -> " << move_state_name(tel.move_state)
+                      << " | grounded=" << (tel.grounded ? 1 : 0)
+                      << " | pos=(" << std::setprecision(1) << tel.position.x << ", " << tel.position.y << ", " << tel.position.z << ")"
+                      << " | vel=(" << tel.velocity.x << ", " << tel.velocity.y << ", " << tel.velocity.z << ") spd2d=" << tel.speed_2d
+                      << " | yaw=" << tel.yaw_deg << " pitch=" << tel.pitch_deg
+                      << " | cp=" << tel.active_checkpoint
+                      << " | in(W=" << input.forward << ",A/D=" << input.strafe
+                      << ",J=" << input.jump << ",C=" << input.crouch << ",Q=" << input.turn_180 << ")"
+                      << std::endl;
+        }
 
         // Audio state triggers
         if (tel.move_state != prev_state) {
@@ -1030,7 +1075,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         // Render frame
         renderer.render_frame(active_scene, tel);
 
-        if (max_frames > 0 && ++frame_counter >= max_frames) {
+        ++frame_counter;
+        if (max_frames > 0 && frame_counter >= max_frames) {
             std::cout << "[Game] Reached max-frames limit (" << max_frames << "). Exiting cleanly." << std::endl;
             running = false;
         }

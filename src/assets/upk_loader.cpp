@@ -1897,8 +1897,6 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                         low_mesh.find("sky") != std::string::npos ||
                         low_mesh.find("cloud") != std::string::npos ||
                         low_mesh.find("airliner") != std::string::npos ||
-                        low_mesh.find("bd_") != std::string::npos ||
-                        low_mesh.find("_bd") != std::string::npos ||
                         low_mesh.find("road_") != std::string::npos ||
                         low_mesh.find("street") != std::string::npos ||
                         low_mesh.find("signad") != std::string::npos ||
@@ -1938,8 +1936,8 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                             float min_z = std::min({p0.z, p1.z, p2.z});
                             float max_z = std::max({p0.z, p1.z, p2.z});
 
-                            if (n.z >= 0.55f) {
-                                // Walkable floor or ramp surface
+                            if (std::abs(n.z) >= 0.55f) {
+                                // Walkable floor, ramp, or overhead soffit surface (extrude downward so top is exactly max_z)
                                 if ((max_z - min_z) > 16.0f && depth < 3) {
                                     Vec3 m01 = (p0 + p1) * 0.5f;
                                     Vec3 m12 = (p1 + p2) * 0.5f;
@@ -1952,10 +1950,6 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                                 }
                                 out_colliders.emplace_back(Vec3(min_x, min_y, max_z - 12.0f),
                                                            Vec3(max_x, max_y, max_z));
-                            } else if (n.z <= -0.55f) {
-                                // Ceiling / overhead airduct soffit (blocks standing walk, allows crouch-slide underneath)
-                                out_colliders.emplace_back(Vec3(min_x, min_y, min_z),
-                                                           Vec3(max_x, max_y, min_z + 12.0f));
                             } else {
                                 // Vertical wall / parapet / fence
                                 if ((max_z - min_z) < 18.0f) return;
@@ -1980,7 +1974,7 @@ void generate_rooftop_level_geometry(std::vector<LevelActor>& actors,
                             Vec3 p2 = xform_pt(sm->triangles[det_sign < 0.0f ? i + 1 : i + 2].position);
                             Vec3 e1 = p1 - p0;
                             Vec3 e2 = p2 - p0;
-                            Vec3 fn = e1.cross(e2);
+                            Vec3 fn = e2.cross(e1);
                             float len_sq = fn.length_sq();
                             if (len_sq < 1e-6f) continue;
                             fn = fn * (1.0f / std::sqrt(len_sq));
