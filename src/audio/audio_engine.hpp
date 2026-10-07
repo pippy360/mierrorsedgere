@@ -86,6 +86,8 @@ public:
     // Playback APIs (supports both direct wave names and UE3 SoundCue names/paths)
     void play_sound(const std::string& name, float volume = 1.0f, float pitch = 1.0f);
     void play_sound_3d(const std::string& name, const Vec3& world_pos, float volume = 1.0f, float pitch = 1.0f);
+    void play_vo(const std::string& name, float volume = 1.0f);
+    void play_level_loaded_cues();
     void play_effect(EAudioEffect effect, float volume = 1.0f, float pitch = 1.0f);
     void play_effect_3d(EAudioEffect effect, const Vec3& world_pos, float volume = 1.0f, float pitch = 1.0f);
 
@@ -107,8 +109,11 @@ public:
     // Stop all playing sound sources
     void stop_all();
 
-    // Access loaded clips, cues, and spatial ambient emitters
+    // Access loaded clips, cues, level-loaded VO cues, and spatial ambient emitters
     [[nodiscard]] const SoundClip* get_clip(const std::string& name) const;
+    [[nodiscard]] bool is_vo_playing() const { return vo_duration_ > 0.0f && vo_elapsed_ < vo_duration_; }
+    [[nodiscard]] const std::string& get_active_vo_subtitle() const { return active_vo_subtitle_; }
+    [[nodiscard]] const std::vector<std::string>& get_level_loaded_cues() const { return level_loaded_cues_; }
     [[nodiscard]] size_t get_clip_count() const { return sound_clips_.size(); }
     [[nodiscard]] size_t get_cue_count() const { return sound_cues_.size(); }
     [[nodiscard]] size_t get_ambient_emitter_count() const { return ambient_emitters_.size(); }
@@ -124,8 +129,11 @@ private:
     void invalidate_cached_buffer(const std::string& key);
     void clear_chapter_music_clips();
     void rebind_music_stem_buffers();
+    void stitch_concatenator_cues();
 
-    bool load_package_audio_and_cues(const std::string& pkg_path, std::vector<std::string>* out_clip_keys = nullptr);
+    bool load_package_audio_and_cues(const std::string& pkg_path,
+                                     std::vector<std::string>* out_clip_keys = nullptr,
+                                     bool extract_level_loaded = false);
     const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const;
     const SoundClip* pick_first_available_clip(std::initializer_list<const char*> candidates) const;
 
@@ -162,6 +170,13 @@ private:
     float wind_surge_env_ = 0.0f;
     bool max_speed_wind_active_ = false;
 
+    // Dedicated non-stealable 2D radio/dialogue VO source (DialogueRadio / DialogueFaith / DialogueOther)
+    uint32_t vo_source_ = 0;
+    float vo_elapsed_ = 0.0f;
+    float vo_duration_ = 0.0f;
+    std::string active_vo_clip_;
+    std::string active_vo_subtitle_;
+
     // 4 Dedicated looping 3D sources for level *_Aud.me1 AmbientSound emitters
     static constexpr size_t kAmbientPoolSize = 4;
     uint32_t ambient_sources_[kAmbientPoolSize] = {0};
@@ -178,9 +193,10 @@ private:
     float breath_bus_gain_ = 1.0f;
     float slomo_pitch_scale_ = 1.0f;
 
-    // Sound clips, UE3 SoundCue graphs, level 3D ambients, and OpenAL buffer cache
+    // Sound clips, UE3 SoundCue graphs, Kismet SeqEvent_LevelLoaded cues, level 3D ambients, and OpenAL buffer cache
     std::unordered_map<std::string, SoundClip> sound_clips_;
     std::unordered_map<std::string, SoundCueDef> sound_cues_;
+    std::vector<std::string> level_loaded_cues_;
     std::vector<AmbientEmitterInfo> ambient_emitters_;
     std::unordered_map<std::string, uint32_t> al_buffers_;
 };

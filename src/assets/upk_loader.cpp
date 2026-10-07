@@ -1823,10 +1823,11 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
         const uint8_t* p = data_.data() + exp.serial_offset;
         size_t sz = exp.serial_size;
 
-        // Parse UE3 SoundNodeWave properties (SampleRate, NumChannels, Duration)
+        // Parse UE3 SoundNodeWave properties (SampleRate, NumChannels, Duration, Subtitles)
         int prop_rate = 44100;
         int prop_channels = 2;
         float prop_duration = 0.0f;
+        std::vector<SoundSubtitleLine> parsed_subtitles;
         size_t prop_start = find_property_start(exp);
         if (prop_start < data_.size() && prop_start < static_cast<size_t>(exp.serial_offset) + sz) {
             auto props = parse_properties(prop_start, static_cast<size_t>(exp.serial_offset) + sz - prop_start);
@@ -1838,6 +1839,21 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
             }
             if (auto it = props.find("Duration"); it != props.end() && it->second.float_val > 0.0f) {
                 prop_duration = it->second.float_val;
+            }
+        }
+        {
+            UPropertyList uprops;
+            parse_export_properties(*this, static_cast<int32_t>(exp_idx) + 1, uprops);
+            if (const UProperty* subs = find_prop(uprops, "Subtitles")) {
+                for (const auto& el : subs->elements) {
+                    const UProperty* txt = find_prop(el, "Text");
+                    if (txt && !txt->s.empty() && txt->s != " ") {
+                        SoundSubtitleLine line;
+                        line.time = prop_float(el, "Time", 0.0f);
+                        line.text = txt->s;
+                        parsed_subtitles.push_back(std::move(line));
+                    }
+                }
             }
         }
 
@@ -1867,6 +1883,7 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
                 clip.duration = (prop_duration > 0.0f)
                     ? prop_duration
                     : static_cast<float>(ogg_sz) / (static_cast<float>(prop_rate) * 4.0f);
+                clip.subtitles = std::move(parsed_subtitles);
                 sounds.push_back(std::move(clip));
                 break;
             }
@@ -1874,6 +1891,40 @@ std::vector<SoundClip> UPKPackage::extract_audio() const {
     }
 
     return sounds;
+}
+
+void UPKPackage::extract_level_loaded_sound_cues(std::vector<std::string>& out_cue_names) const {
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        std::string cls = get_export_class(exports_[i]);
+        if (cls != "SeqEvent_LevelLoaded" && cls != "SeqEvent_LevelBeginning") continue;
+
+        UPropertyList props;
+        parse_export_properties(*this, static_cast<int32_t>(i) + 1, props);
+        const UProperty* ol = find_prop(props, "OutputLinks");
+        if (!ol) continue;
+
+        for (size_t k = 0; k < ol->elements.size(); ++k) {
+            const UProperty* lnks = find_prop(ol->elements[k], "Links");
+            if (!lnks) continue;
+            for (const auto& l : lnks->elements) {
+                int32_t op = prop_object(l, "LinkedOp");
+                if (op <= 0 || static_cast<size_t>(op) > exports_.size()) continue;
+                std::string ocls = get_export_class(exports_[op - 1]);
+                if (ocls.find("PlaySound") != std::string::npos) {
+                    UPropertyList sp;
+                    parse_export_properties(*this, op, sp);
+                    int32_t ps = prop_object(sp, "PlaySound");
+                    if (ps != 0) {
+                        auto [ps_name, ps_cls] = resolve_object_index(ps);
+                        if (!ps_name.empty() && ps_name != "None" &&
+                            std::find(out_cue_names.begin(), out_cue_names.end(), ps_name) == out_cue_names.end()) {
+                            out_cue_names.push_back(ps_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_cues,
@@ -1918,6 +1969,12 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
 
         if (ncls.find("SoundNodeLooping") != std::string::npos) {
             cue.looping = true;
+        }
+        if (ncls.find("SoundNodeConcatenator") != std::string::npos) {
+            cue.is_concatenator = true;
+        }
+        if (ncls.find("SoundNodeModulator") != std::string::npos) {
+            cue.has_modulator = true;
         }
 
         auto nprops = parse_exp_props(obj_idx);

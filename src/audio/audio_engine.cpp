@@ -188,6 +188,17 @@ bool AudioEngine::init_openal() {
 
     rebind_music_stem_buffers();
 
+    // Create dedicated non-stealable 2D VO source (DialogueRadio / DialogueFaith / DialogueOther)
+    {
+        ALuint vsrc = 0;
+        alGenSources(1, &vsrc);
+        vo_source_ = vsrc;
+        alSourcei(vsrc, AL_LOOPING, AL_FALSE);
+        alSourcei(vsrc, AL_SOURCE_RELATIVE, AL_TRUE);
+        alSource3f(vsrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
+        alSourcef(vsrc, AL_GAIN, 1.0f);
+    }
+
     // Create 4 dedicated 3D ambient emitter sources (*_Aud.me1 AmbientSound pool)
     for (size_t i = 0; i < kAmbientPoolSize; ++i) {
         ALuint asrc = 0;
@@ -222,6 +233,12 @@ void AudioEngine::cleanup_openal() {
             alSourceStop(run_wind_source_);
             alDeleteSources(1, &run_wind_source_);
             run_wind_source_ = 0;
+        }
+
+        if (vo_source_) {
+            alSourceStop(vo_source_);
+            alDeleteSources(1, &vo_source_);
+            vo_source_ = 0;
         }
 
         for (size_t i = 0; i < kAmbientPoolSize; ++i) {
@@ -291,6 +308,14 @@ void AudioEngine::invalidate_cached_buffer(const std::string& key) {
         if (it != al_buffers_.end()) {
             ALuint b = it->second;
             if (b) {
+                if (vo_source_) {
+                    ALint cur_vo = 0;
+                    alGetSourcei(vo_source_, AL_BUFFER, &cur_vo);
+                    if (static_cast<ALuint>(cur_vo) == b) {
+                        alSourceStop(vo_source_);
+                        alSourcei(vo_source_, AL_BUFFER, 0);
+                    }
+                }
                 for (int i = 0; i < 4; ++i) {
                     if (music_stem_buffers_[i] == b) {
                         alSourceStop(music_stem_sources_[i]);
@@ -514,11 +539,36 @@ void AudioEngine::update(float dt,
                          const Vec3& listener_up,
                          float player_speed,
                          bool reaction_active) {
-    // Automatically toggle ReactionTime SoundGroupEffects mode 3 (DefaultEngine.ini line 187)
+    // Advance active voice-over playback timer and synchronized subtitle lines
+    if (vo_duration_ > 0.0f) {
+        vo_elapsed_ += std::max(0.0f, dt);
+        if (vo_elapsed_ >= vo_duration_) {
+            vo_elapsed_ = 0.0f;
+            vo_duration_ = 0.0f;
+            active_vo_clip_.clear();
+            active_vo_subtitle_.clear();
+            if (sound_mode_ == ESoundGroupEffectMode::IngameVO) {
+                sound_mode_ = ESoundGroupEffectMode::Normal;
+            }
+        } else {
+            auto it = sound_clips_.find(active_vo_clip_);
+            if (it != sound_clips_.end() && !it->second.subtitles.empty()) {
+                for (const auto& sub : it->second.subtitles) {
+                    if (vo_elapsed_ >= sub.time) {
+                        active_vo_subtitle_ = sub.text;
+                    }
+                }
+            }
+        }
+    }
+
+    // Automatically toggle ReactionTime (Mode 3) or IngameVO (Mode 2) SoundGroupEffects
     if (reaction_active && sound_mode_ == ESoundGroupEffectMode::Normal) {
         sound_mode_ = ESoundGroupEffectMode::ReactionTime;
     } else if (!reaction_active && sound_mode_ == ESoundGroupEffectMode::ReactionTime) {
-        sound_mode_ = ESoundGroupEffectMode::Normal;
+        sound_mode_ = is_vo_playing() ? ESoundGroupEffectMode::IngameVO : ESoundGroupEffectMode::Normal;
+    } else if (!reaction_active && is_vo_playing() && sound_mode_ == ESoundGroupEffectMode::Normal) {
+        sound_mode_ = ESoundGroupEffectMode::IngameVO;
     }
 
     // Evaluate target SoundGroup bus adjusters matching DefaultEngine.ini lines 177-209
@@ -703,7 +753,9 @@ void AudioEngine::update(float dt,
 #endif
 }
 
-bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path, std::vector<std::string>* out_clip_keys) {
+bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
+                                              std::vector<std::string>* out_clip_keys,
+                                              bool extract_level_loaded) {
     namespace fs = std::filesystem;
     if (!fs::exists(pkg_path)) {
         return false;
@@ -753,7 +805,96 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path, std::
         ambient_emitters_.push_back(std::move(em));
     }
 
+    if (extract_level_loaded) {
+        pkg.extract_level_loaded_sound_cues(level_loaded_cues_);
+    }
+
     return !clips.empty() || !cues.empty();
+}
+
+void AudioEngine::stitch_concatenator_cues() {
+    for (const auto& [key, cue] : sound_cues_) {
+        if (!cue.is_concatenator || cue.wave_names.empty()) continue;
+        if (key != cue.name) continue; // Only synthesize once per unique SoundCue
+
+        int target_rate = 0;
+        std::vector<const SoundClip*> parts;
+        for (const auto& wname : cue.wave_names) {
+            auto it = sound_clips_.find(wname);
+            if (it != sound_clips_.end() && !it->second.pcm_data.empty()) {
+                parts.push_back(&it->second);
+                target_rate = std::max(target_rate, it->second.sample_rate);
+            }
+        }
+        if (parts.empty() || target_rate <= 0) continue;
+
+        std::vector<int16_t> stitched_mono;
+        std::vector<SoundSubtitleLine> stitched_subs;
+        double offset_sec = 0.0;
+
+        for (const SoundClip* part : parts) {
+            size_t frame_bytes = static_cast<size_t>(std::max(1, part->channels)) * sizeof(int16_t);
+            size_t src_frames = part->pcm_data.size() / frame_bytes;
+            if (src_frames == 0) continue;
+
+            const int16_t* raw = reinterpret_cast<const int16_t*>(part->pcm_data.data());
+            std::vector<int16_t> mono(src_frames);
+            if (part->channels >= 2) {
+                for (size_t i = 0; i < src_frames; ++i) {
+                    int32_t s = static_cast<int32_t>(raw[i * 2 + 0]) + static_cast<int32_t>(raw[i * 2 + 1]);
+                    mono[i] = static_cast<int16_t>(s / 2);
+                }
+            } else {
+                std::memcpy(mono.data(), raw, src_frames * sizeof(int16_t));
+            }
+
+            for (const auto& sub : part->subtitles) {
+                SoundSubtitleLine s;
+                s.time = static_cast<float>(offset_sec) + sub.time;
+                s.text = sub.text;
+                stitched_subs.push_back(std::move(s));
+            }
+
+            if (part->sample_rate == target_rate) {
+                stitched_mono.insert(stitched_mono.end(), mono.begin(), mono.end());
+                offset_sec += static_cast<double>(src_frames) / static_cast<double>(target_rate);
+            } else {
+                size_t dst_frames = std::max<size_t>(
+                    1, static_cast<size_t>(std::llround(static_cast<double>(src_frames) *
+                                                        static_cast<double>(target_rate) /
+                                                        static_cast<double>(part->sample_rate))));
+                double ratio = static_cast<double>(src_frames - 1) / static_cast<double>(std::max<size_t>(1, dst_frames - 1));
+                for (size_t d = 0; d < dst_frames; ++d) {
+                    double src_pos = d * ratio;
+                    size_t i0 = static_cast<size_t>(src_pos);
+                    size_t i1 = std::min(i0 + 1, src_frames - 1);
+                    double frac = src_pos - static_cast<double>(i0);
+                    double v = static_cast<double>(mono[i0]) * (1.0 - frac) + static_cast<double>(mono[i1]) * frac;
+                    stitched_mono.push_back(static_cast<int16_t>(std::clamp(v, -32768.0, 32767.0)));
+                }
+                offset_sec += static_cast<double>(dst_frames) / static_cast<double>(target_rate);
+            }
+        }
+
+        if (stitched_mono.empty()) continue;
+
+        SoundClip combined;
+        combined.name = cue.name;
+        combined.full_path = cue.full_path;
+        combined.sample_rate = target_rate;
+        combined.channels = 1;
+        combined.duration = static_cast<float>(stitched_mono.size()) / static_cast<float>(target_rate);
+        combined.pcm_data.resize(stitched_mono.size() * sizeof(int16_t));
+        std::memcpy(combined.pcm_data.data(), stitched_mono.data(), combined.pcm_data.size());
+        combined.subtitles = std::move(stitched_subs);
+
+        invalidate_cached_buffer(combined.name);
+        sound_clips_[combined.name] = combined;
+        if (!combined.full_path.empty()) {
+            invalidate_cached_buffer(combined.full_path);
+            sound_clips_[combined.full_path] = combined;
+        }
+    }
 }
 
 bool AudioEngine::load_sound_bank(const std::string& game_root, const std::string& bank_name) {
@@ -798,6 +939,11 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
 bool AudioEngine::load_level_audio(const std::string& game_root, const std::string& map_file) {
     namespace fs = std::filesystem;
     ambient_emitters_.clear();
+    level_loaded_cues_.clear();
+    vo_elapsed_ = 0.0f;
+    vo_duration_ = 0.0f;
+    active_vo_clip_.clear();
+    active_vo_subtitle_.clear();
     for (size_t i = 0; i < kAmbientPoolSize; ++i) {
         active_ambient_indices_[i] = -1;
     }
@@ -842,7 +988,31 @@ bool AudioEngine::load_level_audio(const std::string& game_root, const std::stri
         load_package_audio_and_cues(bank_path.string(), &active_music_clip_keys_);
     }
 
-    // Scan map directory for streaming *_Aud.me1 spatial audio sublevels matching this level's prefix
+    // Load chapter-matched English voice-over banks from CookedPC/Audio/int/ (e.g. A_VO_SP00.upk + A_VO_SP00_CUE.upk)
+    std::string vo_prefix;
+    if (map_file.find("SP00") != std::string::npos || map_file.find("Tutorial") != std::string::npos) vo_prefix = "A_VO_SP00";
+    else if (map_file.find("SP01") != std::string::npos) vo_prefix = "A_VO_SP01";
+    else if (map_file.find("SP02") != std::string::npos) vo_prefix = "A_VO_SP02";
+    else if (map_file.find("SP03") != std::string::npos) vo_prefix = "A_VO_SP03";
+    else if (map_file.find("SP04") != std::string::npos) vo_prefix = "A_VO_SP04";
+    else if (map_file.find("SP05") != std::string::npos) vo_prefix = "A_VO_SP05";
+    else if (map_file.find("SP06") != std::string::npos) vo_prefix = "A_VO_SP06";
+    else if (map_file.find("SP07") != std::string::npos) vo_prefix = "A_VO_SP07";
+    else if (map_file.find("SP08") != std::string::npos) vo_prefix = "A_VO_SP08";
+    else if (map_file.find("SP09") != std::string::npos) vo_prefix = "A_VO_SP09";
+
+    fs::path vo_dir = fs::path(game_root) / "TdGame" / "CookedPC" / "Audio" / "int";
+    if (!vo_prefix.empty() && fs::exists(vo_dir)) {
+        for (const auto& entry : fs::directory_iterator(vo_dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string fn = entry.path().filename().string();
+            if (fn.rfind(vo_prefix, 0) == 0 && entry.path().extension() == ".upk") {
+                load_package_audio_and_cues(entry.path().string());
+            }
+        }
+    }
+
+    // Scan map directory for streaming *_LOC_int.upk dialogue packages and *_Aud.me1 sublevels matching this level's prefix
     fs::path full_map = fs::path(game_root) / "TdGame" / "CookedPC" / map_file;
     if (!fs::exists(full_map)) {
         full_map = fs::path(map_file);
@@ -861,14 +1031,27 @@ bool AudioEngine::load_level_audio(const std::string& game_root, const std::stri
             if (!entry.is_regular_file()) continue;
             std::string fn = entry.path().filename().string();
             if (!map_stem.empty() && fn.rfind(prefix_underscore, 0) != 0) continue;
-            if (fn.find("_Aud.me1") != std::string::npos || fn.find("_Audio0.me1") != std::string::npos) {
+            std::string fn_low = fn;
+            std::transform(fn_low.begin(), fn_low.end(), fn_low.begin(), ::tolower);
+            if (fn_low.find("_loc_int.upk") != std::string::npos) {
                 if (load_package_audio_and_cues(entry.path().string())) {
+                    loaded_any_aud = true;
+                }
+            }
+        }
+        for (const auto& entry : fs::directory_iterator(full_map.parent_path())) {
+            if (!entry.is_regular_file()) continue;
+            std::string fn = entry.path().filename().string();
+            if (!map_stem.empty() && fn.rfind(prefix_underscore, 0) != 0) continue;
+            if (fn.find("_Aud.me1") != std::string::npos || fn.find("_Audio0.me1") != std::string::npos) {
+                if (load_package_audio_and_cues(entry.path().string(), nullptr, /*extract_level_loaded=*/true)) {
                     loaded_any_aud = true;
                 }
             }
         }
     }
 
+    stitch_concatenator_cues();
     rebind_music_stem_buffers();
     return loaded_any_aud;
 }
@@ -884,13 +1067,25 @@ const SoundClip* AudioEngine::pick_first_available_clip(std::initializer_list<co
 }
 
 const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const {
-    // 1. Check UE3 SoundCue graph first (supports SoundNodeRandom variation + SoundNodeModulator jitter)
+    // 1. Check UE3 SoundCue graph first (supports SoundNodeConcatenator, SoundNodeRandom + SoundNodeModulator)
     auto cue_it = sound_cues_.find(name);
     if (cue_it != sound_cues_.end() && !cue_it->second.wave_names.empty()) {
         const auto& cue = cue_it->second;
         io_vol *= cue.volume_multiplier;
-        // Apply subtle SoundNodeModulator random pitch variation (±4%)
-        io_pitch *= cue.pitch_multiplier * (0.96f + 0.08f * rand_normalized());
+        if (cue.has_modulator && !cue.is_concatenator && cue.sound_group.find("Dialogue") == std::string::npos) {
+            io_pitch *= cue.pitch_multiplier * (0.96f + 0.08f * rand_normalized());
+        } else {
+            io_pitch *= cue.pitch_multiplier;
+        }
+
+        // If this SoundCue is a stitched SoundNodeConcatenator (e.g. radio squelch + Merc VO + squelch),
+        // return the complete concatenated SoundClip directly.
+        if (cue.is_concatenator) {
+            auto sit = sound_clips_.find(cue.name);
+            if (sit != sound_clips_.end() && !sit->second.pcm_data.empty()) {
+                return &sit->second;
+            }
+        }
 
         size_t idx = static_cast<size_t>(std::rand()) % cue.wave_names.size();
         const std::string& wname = cue.wave_names[idx];
@@ -939,6 +1134,45 @@ void AudioEngine::play_sound(const std::string& name, float volume, float pitch)
 #else
     (void)final_vol; (void)final_pitch;
 #endif
+}
+
+void AudioEngine::play_vo(const std::string& name, float volume) {
+    float final_vol = volume;
+    float final_pitch = 1.0f;
+    const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
+    if (!clip) return;
+
+    active_vo_clip_ = clip->name;
+    vo_duration_ = clip->duration;
+    vo_elapsed_ = 0.0f;
+    active_vo_subtitle_.clear();
+    if (!clip->subtitles.empty()) {
+        active_vo_subtitle_ = clip->subtitles.front().text;
+    }
+
+    std::cout << "[Audio] Playing VO '" << name << "' (" << clip->duration << "s, "
+              << clip->sample_rate << " Hz)" << std::endl;
+
+#ifndef ME_NO_OPENAL
+    if (headless_ || !alc_context_ || !vo_source_) return;
+
+    uint32_t buf = get_or_create_buffer(*clip, false);
+    if (!buf) return;
+
+    alSourceStop(vo_source_);
+    alSourcei(vo_source_, AL_BUFFER, static_cast<ALint>(buf));
+    alSourcef(vo_source_, AL_GAIN, std::clamp(volume, 0.0f, 1.5f));
+    alSourcef(vo_source_, AL_PITCH, 1.0f);
+    alSourcei(vo_source_, AL_SOURCE_RELATIVE, AL_TRUE);
+    alSource3f(vo_source_, AL_POSITION, 0.0f, 0.0f, 0.0f);
+    alSourcePlay(vo_source_);
+#endif
+}
+
+void AudioEngine::play_level_loaded_cues() {
+    for (const auto& cue_name : level_loaded_cues_) {
+        play_vo(cue_name, 1.0f);
+    }
 }
 
 void AudioEngine::play_sound_3d(const std::string& name, const Vec3& world_pos, float volume, float pitch) {

@@ -615,12 +615,23 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     oracle_cutscenes.stop();
     controller.get_telemetry().intro_active = false;
     renderer.set_cutscene_player(nullptr);
-    bool s11_pass = cs_init_ok && cs_bink_ok && cs_sub_ok && cs_aud_ok && cs_intro_ok;
+
+    // Verify SP00 Tutorial_Aud SeqEvent_LevelLoaded -> A_VO_SP00_Opening_1_1_Merc_Cue radio transmission
+    audio.load_level_audio(game_root, "Maps/SP00/Tutorial_p.me1");
+    const SoundClip* merc_opening_clip = audio.get_clip("A_VO_SP00_Opening_1_1_Merc_Cue");
+    bool tut_vo_ok = (merc_opening_clip != nullptr &&
+                      merc_opening_clip->duration > 13.5f &&
+                      !merc_opening_clip->subtitles.empty() &&
+                      merc_opening_clip->subtitles.front().text.find("fall took you out of commission") != std::string::npos &&
+                      !audio.get_level_loaded_cues().empty());
+
+    bool s11_pass = cs_init_ok && cs_bink_ok && cs_sub_ok && cs_aud_ok && cs_intro_ok && tut_vo_ok;
     std::cout << "  -> Stage 11 Result: " << (s11_pass ? "PASS" : "FAIL")
               << " (Movies=" << oracle_cutscenes.get_available_movie_count()
               << ", Video=" << oracle_cutscenes.get_video_width() << "x" << oracle_cutscenes.get_video_height()
               << ", AudioSamples=" << oracle_cutscenes.get_decoded_audio_samples()
               << ", LevelIntro=" << sp01_scene.level_intro.seq_name
+              << ", TutorialOpeningVO=" << (merc_opening_clip ? merc_opening_clip->duration : 0.0f) << "s"
               << ", Subtitle=\"" << cs_sub_text << "\")" << std::endl;
 
     // Stage 12: Interactive Door Barging (`TdMove_Barge` & Hinge Rotation on SP00 Rooftop Doorway)
@@ -772,6 +783,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     cutscene_player.init(game_root, /*headless=*/(max_frames > 0));
     renderer.set_cutscene_player(&cutscene_player);
 
+    bool pending_level_loaded_audio = false;
+    bool was_vo_playing = false;
+
     auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path, bool play_intro = true) {
         std::string map_file = custom_path;
         if (map_file.empty()) {
@@ -804,10 +818,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
         audio.load_level_audio(game_root, map_file);
+        pending_level_loaded_audio = true;
+        was_vo_playing = false;
 
-        // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in)
+        // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in).
+        // When loading a direct map via --level, enter the 3D level directly so SeqEvent_LevelLoaded VO plays immediately.
         if (max_frames == 0 && play_intro) {
-            std::string intro_movie = CutscenePlayer::get_chapter_intro_movie(map_file);
+            std::string intro_movie = custom_path.empty() ? CutscenePlayer::get_chapter_intro_movie(map_file) : "";
             if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
                 // Bink movie started; will transition into 3D rooftop intro on finish
             } else {
@@ -1074,6 +1091,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         // Advance simulation or active cutscene step (paused while Main Menu is open)
         Vec3 pre_vel = controller.get_velocity();
         if (!renderer.is_menu_open()) {
+            if (cutscene_player.get_mode() != ECutsceneMode::BinkVideo && pending_level_loaded_audio) {
+                pending_level_loaded_audio = false;
+                audio.play_level_loaded_cues();
+            }
             if (cutscene_player.is_playing()) {
                 cutscene_player.update(dt, active_scene, controller.get_telemetry());
                 if (!cutscene_player.is_playing()) {
@@ -1081,6 +1102,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 }
             } else {
                 controller.step(input, dt, active_scene);
+            }
+            if (audio.is_vo_playing()) {
+                was_vo_playing = true;
+                std::string vo_sub = audio.get_active_vo_subtitle();
+                if (!vo_sub.empty()) {
+                    controller.get_telemetry().active_subtitle = vo_sub;
+                }
+            } else if (was_vo_playing) {
+                was_vo_playing = false;
+                int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
+                                    std::max(0, static_cast<int>(active_scene.subtitles.size()) - 1));
+                controller.get_telemetry().active_subtitle =
+                    (!active_scene.subtitles.empty() && !active_scene.subtitles[cp].empty())
+                        ? active_scene.subtitles[cp]
+                        : "";
             }
         }
         const auto& tel = controller.get_telemetry();
