@@ -2,6 +2,7 @@
 #include "material_system.hpp"
 #include "package_manager.hpp"
 #include "ue3_props.hpp"
+#include "../anim/anim_system.hpp"
 #include "../physics/collision_world.hpp"
 #include <fstream>
 #include <cstring>
@@ -3499,13 +3500,13 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         if (require_prefix && low.rfind(low_prefix, 0) != 0) {
             return false;
         }
-        // Skip localization, music, audio, lightmap-only, cutscene-only, and time-trial sub-packages.
-        // Note: *_spt and *_slc MUST be loaded because Mirror's Edge places all interactive
-        // elevator cabs (InterpActor), doors, buttons, and Matinee InterpTrackMove curves in *_Spt / *_Slc!
+        // Skip localization, music, audio, lightmap-only, and time-trial sub-packages.
+        // Note: *_spt, *_slc, and *_cs MUST be loaded because Mirror's Edge places all interactive
+        // elevator cabs, level intro Matinee sequences (e.g. Edge_Pt1_CS), and floating title credits there!
         if (low.find("_loc_") != std::string::npos || low.find("_mus") != std::string::npos ||
             low.find("_aud") != std::string::npos || low.find("_peds") != std::string::npos ||
             low.find("_lookat") != std::string::npos || low.find("_lgts") != std::string::npos ||
-            low.find("_cs") != std::string::npos || low.rfind("tt_", 0) == 0) {
+            low.rfind("tt_", 0) == 0) {
             return false;
         }
         return true;
@@ -3573,6 +3574,145 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
     // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
     assign_elevator_parts(out_scene, door_infos, mesh_library);
+
+    // Extract the chapter's cooked Matinee opening intro sequence (SeqAct_Interp -> SeqVar_TdLocalPawn +
+    // SkeletalMeshActorMAT -> 82-bone Faith 1P UAnimSequence: sp01_intro..sp09_intro).
+    auto rig_to_world_pos = [](const Vec3& actor_loc, float actor_yaw_deg, const Vec3& rig_p) -> Vec3 {
+        float yaw_rad = actor_yaw_deg * DEG2RAD;
+        float cy = std::cos(yaw_rad);
+        float sy = std::sin(yaw_rad);
+        Vec3 fwd(cy, sy, 0.0f);     // +Z_rig -> Actor Forward
+        Vec3 left(sy, -cy, 0.0f);   // +X_rig -> Actor Left
+        Vec3 up(0.0f, 0.0f, 1.0f);  // -Y_rig -> World +Z
+        return actor_loc + left * rig_p.x + up * (-rig_p.y) + fwd * rig_p.z;
+    };
+    auto rig_to_world_vec = [](float actor_yaw_deg, const Vec3& rig_v) -> Vec3 {
+        float yaw_rad = actor_yaw_deg * DEG2RAD;
+        float cy = std::cos(yaw_rad);
+        float sy = std::sin(yaw_rad);
+        Vec3 fwd(cy, sy, 0.0f);
+        Vec3 left(sy, -cy, 0.0f);
+        Vec3 up(0.0f, 0.0f, 1.0f);
+        return left * rig_v.x + up * (-rig_v.y) + fwd * rig_v.z;
+    };
+
+    for (const auto& pkg : loaded_packages) {
+        if (out_scene.level_intro.valid) break;
+        const auto& exps = pkg->get_exports();
+        for (size_t i = 0; i < exps.size(); ++i) {
+            if (pkg->get_export_class(exps[i]) != "SeqAct_Interp") continue;
+            UPropertyList sap;
+            parse_export_properties(*pkg, static_cast<int32_t>(i) + 1, sap);
+            const UProperty* vlinks = find_prop(sap, "VariableLinks");
+            if (!vlinks) continue;
+
+            bool has_local_pawn = false;
+            int32_t mat_actor_idx = 0;
+            int32_t interp_data_idx = 0;
+            for (const auto& vl : vlinks->elements) {
+                const UProperty* lvars = find_prop(vl, "LinkedVariables");
+                if (!lvars) continue;
+                for (int32_t sv : lvars->ints) {
+                    if (sv <= 0 || static_cast<size_t>(sv) > exps.size()) continue;
+                    std::string sv_cls = pkg->get_export_class(exps[sv - 1]);
+                    if (sv_cls == "SeqVar_TdLocalPawn") has_local_pawn = true;
+                    if (sv_cls == "InterpData") interp_data_idx = sv;
+                    UPropertyList svp;
+                    parse_export_properties(*pkg, sv, svp);
+                    int32_t objv = prop_object(svp, "ObjValue");
+                    if (objv > 0 && static_cast<size_t>(objv) <= exps.size() &&
+                        pkg->get_export_class(exps[objv - 1]) == "SkeletalMeshActorMAT") {
+                        mat_actor_idx = objv;
+                    }
+                }
+            }
+            if (!has_local_pawn || mat_actor_idx <= 0 || interp_data_idx <= 0) continue;
+
+            // Find an InterpTrackAnimControl under this InterpData whose AnimSeqName contains "intro"
+            std::string found_seq_name;
+            float found_start_offset = 0.0f;
+            for (size_t g = 0; g < exps.size(); ++g) {
+                if (exps[g].outer_index != interp_data_idx) continue;
+                int32_t gidx = static_cast<int32_t>(g) + 1;
+                for (size_t t = 0; t < exps.size(); ++t) {
+                    if (exps[t].outer_index != gidx) continue;
+                    if (pkg->get_export_class(exps[t]) == "InterpTrackAnimControl") {
+                        UPropertyList tp;
+                        parse_export_properties(*pkg, static_cast<int32_t>(t) + 1, tp);
+                        if (const UProperty* ak = find_prop(tp, "AnimSeqs")) {
+                            for (const auto& el : ak->elements) {
+                                std::string sname = prop_name(el, "AnimSeqName");
+                                if (to_lower(sname).find("intro") != std::string::npos) {
+                                    found_seq_name = sname;
+                                    found_start_offset = prop_float(el, "StartTime", 0.0f);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!found_seq_name.empty()) break;
+            }
+            if (found_seq_name.empty()) continue;
+
+            // Locate the matching 82-bone Faith 1P AnimSequence export inside this package
+            int32_t anim_exp_1 = 0;
+            AnimSetAsset parsed_intro_set{};
+            for (size_t e = 0; e < exps.size(); ++e) {
+                if (pkg->get_export_class(exps[e]) != "AnimSequence") continue;
+                UPropertyList ep;
+                parse_export_properties(*pkg, static_cast<int32_t>(e) + 1, ep);
+                if (to_lower(prop_name(ep, "SequenceName")) != to_lower(found_seq_name)) continue;
+                const UProperty* cto = find_prop(ep, "CompressedTrackOffsets");
+                if (!cto || cto->ints.size() != 82 * 4) continue;
+                if (AnimSystem::parse_single_anim_sequence(*pkg, static_cast<int32_t>(e) + 1, parsed_intro_set)) {
+                    anim_exp_1 = static_cast<int32_t>(e) + 1;
+                    break;
+                }
+            }
+            if (anim_exp_1 <= 0 || parsed_intro_set.sequences.empty()) continue;
+
+            const AnimSequenceAsset& intro_seq = parsed_intro_set.sequences.begin()->second;
+            if (intro_seq.tracks.empty() || intro_seq.tracks[0].positions.empty()) continue;
+
+            UPropertyList ap;
+            parse_export_properties(*pkg, mat_actor_idx, ap);
+            Vec3 actor_loc(0.0f, 0.0f, 0.0f);
+            float actor_yaw = 90.0f;
+            if (const UProperty* lp = find_prop(ap, "Location")) actor_loc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+            if (const UProperty* rp = find_prop(ap, "Rotation")) actor_yaw = Rotator(rp->vi[0], rp->vi[1], rp->vi[2]).to_degrees().y;
+
+            Vec3 w_start = rig_to_world_pos(actor_loc, actor_yaw, intro_seq.tracks[0].positions.front());
+            Vec3 w_end   = rig_to_world_pos(actor_loc, actor_yaw, intro_seq.tracks[0].positions.back());
+
+            // Compute final camera facing yaw at end of intro from Bone[0] * Bone[72] (EyeJoint)
+            Quat4 q_root = intro_seq.tracks[0].rotations.empty() ? Quat4() : intro_seq.tracks[0].rotations.back();
+            Quat4 q_eye  = (intro_seq.tracks.size() > 72 && !intro_seq.tracks[72].rotations.empty())
+                               ? intro_seq.tracks[72].rotations.back()
+                               : Quat4();
+            Quat4 q_comp = Quat4::multiply(q_root, q_eye).normalized();
+            Vec3 world_fwd = rig_to_world_vec(actor_yaw, q_comp.rotate(Vec3(0.0f, 0.0f, 1.0f))).normalized();
+            float end_yaw = std::atan2(world_fwd.y, world_fwd.x) * RAD2DEG;
+
+            out_scene.level_intro.valid = true;
+            out_scene.level_intro.seq_name = intro_seq.name;
+            out_scene.level_intro.package_path = pkg->get_file_path();
+            out_scene.level_intro.anim_export_index_1 = anim_exp_1;
+            out_scene.level_intro.actor_location = actor_loc;
+            out_scene.level_intro.actor_yaw_deg = actor_yaw;
+            out_scene.level_intro.start_offset_sec = found_start_offset;
+            out_scene.level_intro.duration_sec = intro_seq.length;
+            out_scene.level_intro.start_feet_pos = w_start;
+            out_scene.level_intro.end_feet_pos = w_end;
+            out_scene.level_intro.end_yaw_deg = end_yaw;
+            std::cout << "[Level] Extracted cooked Matinee level intro '" << intro_seq.name
+                      << "' (" << intro_seq.length << "s, " << intro_seq.num_frames << " frames): "
+                      << "start=(" << int(w_start.x) << "," << int(w_start.y) << "," << int(w_start.z)
+                      << ") -> end=(" << int(w_end.x) << "," << int(w_end.y) << "," << int(w_end.z)
+                      << ", yaw=" << int(end_yaw) << ")" << std::endl;
+            break;
+        }
+    }
 
     // Link each extracted elevator to the checkpoints at its start and destination floors so
     // riding the elevator streams in the destination zone's sub-packages (SeqAct_MultiLevelStreaming)
@@ -3889,6 +4029,14 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
         if (!found_start && !out_scene.actors.empty()) {
             out_scene.player_spawn_pos = out_scene.actors.front().location + Vec3(0, 0, 96.0f);
+        }
+
+        // If the chapter has a cooked Matinee level intro ending on a valid world-space rooftop
+        // (e.g. Edge_Pt1_CS sp01_intro where DefaultCheckpoint is the pre-intro sky camera point at Z=15277
+        // while Faith runs to the rooftop ledge at Z=8424), set post-intro gameplay spawn to that exact floor pose.
+        if (out_scene.level_intro.valid && out_scene.level_intro.end_feet_pos.length_xy() > 100.0f) {
+            out_scene.player_spawn_pos = out_scene.level_intro.end_feet_pos + Vec3(0.0f, 0.0f, 96.0f);
+            out_scene.player_spawn_yaw = out_scene.level_intro.end_yaw_deg;
         }
 
         // Collect checkpoints (ordered by TdCheckpoint weight first) and enemies

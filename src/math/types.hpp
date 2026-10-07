@@ -967,6 +967,13 @@ struct PlayerTelemetry {
     float hit_marker_timer = 0.0f;
     float damage_flash_timer = 0.0f;
     std::string active_subtitle;
+
+    // Cooked level intro Matinee / 1P skeletal animation playback state
+    bool intro_active = false;
+    std::string intro_anim_name;
+    std::string intro_pkg_path;
+    int32_t intro_anim_exp_1 = 0;
+    float intro_anim_time = 0.0f;
 };
 
 // -----------------------------------------------------------------------------
@@ -1000,6 +1007,20 @@ struct ReflectionVolumeInfo {
     bool enabled = true;
 };
 
+struct LevelIntroSequence {
+    bool valid = false;
+    std::string seq_name;                  // e.g. "sp01_intro", "sp02_intro", ..., "sp09_intro"
+    std::string package_path;              // full path to cooked .me1 package owning the 82-bone AnimSequence
+    int32_t anim_export_index_1 = 0;       // 1-based export index of the 82-bone UAnimSequence
+    Vec3 actor_location{0.0f, 0.0f, 0.0f}; // SkeletalMeshActorMAT world Location
+    float actor_yaw_deg = 90.0f;           // SkeletalMeshActorMAT world Rotation Yaw (degrees)
+    float start_offset_sec = 0.0f;         // InterpTrackAnimControl.StartTime
+    float duration_sec = 0.0f;             // UAnimSequence.SequenceLength
+    Vec3 start_feet_pos{0.0f, 0.0f, 0.0f}; // World-space root position at t = 0
+    Vec3 end_feet_pos{0.0f, 0.0f, 0.0f};   // World-space root position at end of intro (post-intro floor)
+    float end_yaw_deg = 0.0f;              // World-space camera/body facing yaw at end of intro
+};
+
 // -----------------------------------------------------------------------------
 // Level Scene representation
 // -----------------------------------------------------------------------------
@@ -1008,6 +1029,7 @@ struct LevelScene {
     std::string chapter_title;
     Vec3 player_spawn_pos{0.0f, 0.0f, 100.0f};
     float player_spawn_yaw = 0.0f;
+    LevelIntroSequence level_intro{};
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)

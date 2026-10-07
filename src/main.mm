@@ -607,13 +607,20 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         renderer.render_frame(sp00_scene, controller.get_telemetry());
         save_and_publish_png("oracle_9_cutscene_bink_player.png");
     }
+    oracle_cutscenes.play_in_engine_intro(sp01_scene, controller.get_telemetry());
+    oracle_cutscenes.update(1.0f, sp01_scene, controller.get_telemetry());
+    bool cs_intro_ok = sp01_scene.level_intro.valid &&
+                       sp01_scene.level_intro.seq_name == "sp01_intro" &&
+                       controller.get_telemetry().intro_active;
     oracle_cutscenes.stop();
+    controller.get_telemetry().intro_active = false;
     renderer.set_cutscene_player(nullptr);
-    bool s11_pass = cs_init_ok && cs_bink_ok && cs_sub_ok && cs_aud_ok;
+    bool s11_pass = cs_init_ok && cs_bink_ok && cs_sub_ok && cs_aud_ok && cs_intro_ok;
     std::cout << "  -> Stage 11 Result: " << (s11_pass ? "PASS" : "FAIL")
               << " (Movies=" << oracle_cutscenes.get_available_movie_count()
               << ", Video=" << oracle_cutscenes.get_video_width() << "x" << oracle_cutscenes.get_video_height()
               << ", AudioSamples=" << oracle_cutscenes.get_decoded_audio_samples()
+              << ", LevelIntro=" << sp01_scene.level_intro.seq_name
               << ", Subtitle=\"" << cs_sub_text << "\")" << std::endl;
 
     // Write complete telemetry log
@@ -875,6 +882,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         running = false;
                     } else if (cutscene_player.is_playing()) {
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        controller.get_telemetry().intro_active = false;
                         cutscene_player.stop();
                     } else {
                         renderer.set_menu_open(true);
@@ -900,10 +908,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 3.2f);
                     } else {
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        controller.get_telemetry().intro_active = false;
                         cutscene_player.stop();
                     }
                 } else if (key == SDLK_o || (key == SDLK_c && cutscene_player.is_playing())) {
                     controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    controller.get_telemetry().intro_active = false;
                     cutscene_player.cycle_next_cutscene(active_scene, controller.get_telemetry());
                 } else if (key == SDLK_TAB || key == SDLK_m) {
                     bool menu = !renderer.is_menu_open();
@@ -918,6 +928,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (key == SDLK_h) {
                     input.spawn_combat_squad = true;
                 } else if (key == SDLK_r) {
+                    controller.get_telemetry().intro_active = false;
                     cutscene_player.stop();
                     int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
                                         std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
