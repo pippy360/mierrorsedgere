@@ -554,23 +554,33 @@ fragment float4 post_fragment(PostVertexOut in [[stage_in]],
     float2 uv = in.uv;
     float speed = uniforms.speed_2d;
 
-    // 1. Radial Velocity Motion Blur (TdMotionBlurShader.usf - peripheral only)
+    // 1. Radial Velocity Motion Blur & Aerodynamic Dispersion (TdMotionBlurShader.usf - peripheral only)
     float3 scene_color = float3(0.0);
     float2 D = uv - float2(0.5, 0.5);
     float r = length(D);
-    if (speed > 420.0 && r > 0.22) {
-        float speed_factor = saturate((speed - 420.0) / 230.0);
-        float periph = smoothstep(0.22, 0.65, r);
-        float delta_r = min(0.025 * speed_factor * periph, 0.03);
-        float2 v_step = (r > 1e-4) ? ((D / r) * (delta_r / 6.0)) : float2(0.0);
+    float max_wind = smoothstep(640.0, 715.0, speed);
+    if (speed > 420.0 && r > 0.20) {
+        float speed_factor = saturate((speed - 420.0) / 300.0);
+        float periph = smoothstep(0.20, 0.68, r);
+        float delta_r = min((0.024 * speed_factor + 0.018 * max_wind) * periph, 0.044);
+        float2 dir_uv = (r > 1e-4) ? (D / r) : float2(0.0);
+        float2 v_step = dir_uv * (delta_r / 8.0);
 
         float total_weight = 0.0;
-        for (int k = 0; k < 6; ++k) {
-            float w = 1.0 - float(k) / 6.0;
-            scene_color += scene_tex.sample(smp, clamp(uv - float(k) * v_step, 0.001, 0.999)).rgb * w;
+        for (int k = 0; k < 8; ++k) {
+            float w = 1.0 - float(k) / 8.0;
+            float2 sample_uv = clamp(uv - float(k) * v_step, 0.001, 0.999);
+            scene_color += scene_tex.sample(smp, sample_uv).rgb * w;
             total_weight += w;
         }
         scene_color /= total_weight;
+
+        // Subtle peripheral R/B aerodynamic dispersion at max speed
+        if (max_wind > 0.01) {
+            float2 disp = dir_uv * (0.0032 * max_wind * periph);
+            scene_color.r = mix(scene_color.r, scene_tex.sample(smp, clamp(uv - disp, 0.001, 0.999)).r, 0.45);
+            scene_color.b = mix(scene_color.b, scene_tex.sample(smp, clamp(uv + disp, 0.001, 0.999)).b, 0.45);
+        }
     } else {
         scene_color = scene_tex.sample(smp, uv).rgb;
     }
@@ -586,6 +596,35 @@ fragment float4 post_fragment(PostVertexOut in [[stage_in]],
     float3 x = max(scene_color * 1.02, 0.0);
     float3 toned = (x * (1.06 * x + 0.16)) / (x * (1.08 * x + 0.44) + 0.14);
     toned = saturate(toned);
+
+    // 2b. On-Screen Max-Speed Wind Streamlines (FX_Wind_Streaks peripheral airflow rays)
+    if (max_wind > 0.01) {
+        float2 D_asp = D * float2(max(uniforms.aspect, 1.0), 1.0);
+        float r_asp = length(D_asp);
+        float periph_mask = smoothstep(0.32, 0.72, r_asp);
+        if (periph_mask > 0.001) {
+            float theta = atan2(D_asp.y, D_asp.x);
+
+            // Layer 1: Primary fast aerodynamic wind filaments
+            float a1 = theta * 14.0;
+            float id1 = floor(a1);
+            float f1 = abs(fract(a1) - 0.5) * 2.0;
+            float h1 = fract(sin(id1 * 127.1 + 311.7) * 43758.5453);
+            float streak_t1 = fract(r_asp * 2.1 - uniforms.sim_time * (2.6 + 1.4 * h1) + h1 * 6.2831);
+            float ray1 = smoothstep(0.45, 0.0, f1) * smoothstep(0.0, 0.25, streak_t1) * smoothstep(0.95, 0.35, streak_t1);
+
+            // Layer 2: Secondary fine high-frequency air slipstream threads
+            float a2 = theta * 26.0 + 1.7;
+            float id2 = floor(a2);
+            float f2 = abs(fract(a2) - 0.5) * 2.0;
+            float h2 = fract(sin(id2 * 269.5 + 183.3) * 43758.5453);
+            float streak_t2 = fract(r_asp * 2.8 - uniforms.sim_time * (3.4 + 1.6 * h2) + h2 * 6.2831);
+            float ray2 = smoothstep(0.38, 0.0, f2) * smoothstep(0.0, 0.22, streak_t2) * smoothstep(0.92, 0.40, streak_t2);
+
+            float wind_streak = saturate((ray1 * 0.65 + ray2 * 0.45) * periph_mask * max_wind);
+            toned = saturate(toned + float3(0.88, 0.95, 1.0) * (wind_streak * 0.28));
+        }
+    }
 
     // Subtle vignette for crisp screen framing
     float vig_dist = length(D * float2(1.0, 0.85));
@@ -1996,15 +2035,18 @@ struct MetalRenderer::Impl {
 
         float speed = telemetry.speed_2d;
         float kmh = speed * 0.06f;
+        bool at_max_speed = (speed >= 695.0f);
         std::ostringstream ss_spd;
         ss_spd << "SPEED: " << std::fixed << std::setprecision(0) << speed << " u/s ("
                << std::setprecision(1) << kmh << " km/h)";
+        if (at_max_speed) ss_spd << " MAX";
         draw_ui_text(verts, ss_spd.str(), 35.0f, h - 88.0f, 2.0f, simd_make_float4(1.0f, 1.0f, 1.0f, 0.98f));
 
-        // Flow momentum bar frame
+        // Flow momentum bar frame (scaled to 720 u/s top ground speed)
         draw_ui_quad(verts, 35.0f, h - 68.0f, 240.0f, 10.0f, simd_make_float4(0.12f, 0.15f, 0.20f, 0.85f));
-        float bar_fill = std::clamp(speed / 630.0f, 0.0f, 1.0f);
-        simd_float4 bar_col = (speed > 400.0f) ? simd_make_float4(0.902f, 0.078f, 0.078f, 1.0f)
+        float bar_fill = std::clamp(speed / 720.0f, 0.0f, 1.0f);
+        simd_float4 bar_col = at_max_speed ? simd_make_float4(0.92f, 0.98f, 1.0f, 1.0f)
+                            : (speed > 400.0f) ? simd_make_float4(0.902f, 0.078f, 0.078f, 1.0f)
                                                : simd_make_float4(0.30f, 0.78f, 0.98f, 0.95f);
         draw_ui_quad(verts, 37.0f, h - 66.0f, 236.0f * bar_fill, 6.0f, bar_col);
 
