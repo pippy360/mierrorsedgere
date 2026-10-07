@@ -397,3 +397,82 @@ Stages 1–7 run on Tutorial_p at the tutorial's own training spots; stage 8 run
 - The wall climb rises only ~63 u (main's tuning), so the stage-10 ledge cannot be reached by climbing.
 - Holding jump re-triggers the wall climb (`try_initiate_wallclimb` ignores `m_jump_consumed`).
 - The three terrace guards in Tutorial_p come from the combat merge and are not part of the retail map.
+
+---
+
+## 9. Stable sun shadows (agent/sun-shadow-stability, 2026-10-07)
+
+**Bug (user report):** "the sun shadows move as my camera moves". This was the real-time sun shadow map from
+1357fb4. It is the only sun shadowing in the game, because the lighting is a virtual light map built from it.
+
+### 9.1 Root causes
+- **Sliding texel grid.** The 4096² orthographic map sat 1300 UU ahead of the camera and was snapped on world
+  X/Y/Z. Those axes are oblique to the light's texel axes, so the grid slid by up to 0.5 texel on every move or
+  turn and every shadow edge crawled.
+- **Screen-space filter.** The 12-tap PCF disk was rotated by interleaved-gradient noise of `screen_uv`, so the
+  filter pattern was fixed to the screen instead of the world.
+- **Clipped tall casters.** The caster depth range was a ±7000 UU slab that followed the camera. It cut through
+  the towers (B_C_06 up to z ≈ 19k, BD_Commercial_06 ≈ 15.5k, the cranes ≈ 25–31k), so their shadows grew and
+  shrank as the camera moved or turned.
+- **Moving map edge.** Shadows beyond the single 7200 UU square faded to lit. Because of the forward offset,
+  that edge swept across the world when turning (0–23.5% of the screen lay outside the map).
+
+### 9.2 Changes
+- `src/renderer/sun_shadow.hpp` (new) holds the CPU matrices and the MSL lookup. It is shared by
+  `metal_renderer.mm` and the generated material shaders (`material_system.cpp`).
+  - The light basis depends only on the sun direction. Each map's centre is snapped to whole texels along the
+    light's own axes, depth included.
+  - **Near cascade (slice 0):** 7200 UU square centred on the camera (no forward offset), 1.76 UU texels,
+    depth 60k UU sunward / 20k behind. Draws every caster, every frame.
+  - **Far cascade (slice 1):** 49152 UU square, 12 UU texels, centre snapped to 1536 UU, depth 120k / 60k.
+    Static geometry only. Re-rendered only when its matrix changes or the vertex cache is rebuilt.
+  - Both cascades share one 2-slice `Depth32Float` array at texture(27). `sun_view_proj_far` is appended to the
+    three mirrored `FrameUniforms`.
+  - **Filter:** 3×3 hardware `sample_compare` bilinear taps, a 4×4-texel footprint fixed to the map. Near hands
+    over to far across 0.75–0.97 of the near square; far fades to lit at its edge.
+  - Depth biases are in UU with the old values, so they do not depend on the depth range.
+  - **No depth clamp.** It flattened the sky domes, 600k–840k UU sunward, to depth 0 and shaded the whole
+    scene, so fixed reaches are used instead.
+- **Rebased onto main (9a6b45f, then 814c5f0 and 09767b2).**
+  - Main had enabled shadows in the main menu. The menu keeps main's fixed 2400 UU square at (0, 0, 120) around
+    the City of Glass and main's 0.06 offset scale in `mat_shadow`. It uses a single map (`use_far = false`,
+    `shadow_enabled == 2`) with main's 0.88–0.98 edge fade, and draws no far cascade.
+  - Main's exclusion of `Skydome` materials from the shadow pass is kept.
+  - Main's hinged barge doors move, so the lazily updated far cascade skips them, like the elevator parts.
+    The near cascade still draws them every frame.
+
+### 9.3 Results
+- **Grid drift.** Numeric probe over 4 sun directions, including Escape's 25° sun: walking or turning drifted
+  0.5 texel before; now ≤ 0.00006 texel in both cascades.
+- **End-to-end A/B (build rebased onto 9a6b45f).** `ME_SHADOW_PROBE` (scratch only) moves just the camera the
+  cascades are built from, across 11 shots:
+
+  | Shadow-camera perturbation | Pixels changing by > 8 |
+  |---|---|
+  | 20° yaw | 0% (bit-identical, max diff 0) |
+  | (0.9, 0.4) UU | 0% (max diff 2) |
+  | (37, −23, 5) UU | 0% (max diff 7) |
+  | (700, −500) UU | 0.32% max (tutorial_4: thin pipes in the near/far blend band) |
+
+  Before the fix, a 20° yaw changed up to 9.8% of the pixels and a 37 UU move up to 5.4%.
+- **`--verify-all` on 09767b2 + this change:** `ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!`. Material
+  shaders compiled 213/213, 520/520, 288/288 and 6/6. Same 26 compiler warnings as main, none in the files
+  touched here.
+- **Against main's renders (09767b2).** At most 0.32% of a shot's pixels get brighter by more than 20
+  (tutorial_4).
+  - Pixels darker by more than 20: tutorial_1 34.5%, oracle_5 22.8%, oracle_1 20.3%, tutorial_5 7.6%,
+    tutorial_3 5.9%, oracle_4 5.2%, tutorial_2 3.5%, oracle_3 2.6%, the rest ≤ 0.6%.
+  - CPU ray casts from the roofs toward the sun identify the large new roof shadows:
+    - tutorial_1: `S_BD_Commercial_06` (StaticMeshActor_323), hit at t ≈ 7.4–8k UU.
+    - oracle_5: `S_C_06_SP01_F` (StaticMeshActor_463, B_C_06), hit at t ≈ 16k UU.
+  - Both actors are visible and `CastShadow=True` in the level data; the old 7000 UU slab clipped them.
+  - Main's new BSP geometry plays no part: removing it leaves those shots identical.
+- **Main menu:** visually unchanged (0.12% of pixels differ by > 8, filter edges only).
+
+### 9.4 Remaining gaps
+- Fine detail switches to the far cascade about 2.7–3.5k UU from the camera. That band moves with the camera's
+  position, not its rotation.
+- UE3 `CastShadow=False` is not honoured: 971 of 15,066 placed actors (fence doors, canal debris, `_bd` cars)
+  still cast.
+- SSAO in `post_fragment` is screen-space and unchanged.
+- Shadow memory is 2 × 64 MB (was 64 MB). The far map re-renders about once per 1536 UU of travel.
