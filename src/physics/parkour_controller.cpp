@@ -403,12 +403,16 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 EMovement combat_air_state = m_telemetry.move_state;
                 float saved_timer = m_state_timer;
                 update_air_locomotion(input, step_dt, scene);
-                if (m_telemetry.move_state == EMovement::MOVE_Falling ||
+                if (m_telemetry.move_state == combat_air_state ||
+                    m_telemetry.move_state == EMovement::MOVE_Falling ||
                     m_telemetry.move_state == EMovement::MOVE_Jump) {
-                    if (saved_timer < m_telemetry.combat_anim_duration) {
+                    if (saved_timer < m_telemetry.combat_anim_duration && !m_telemetry.grounded) {
                         m_telemetry.move_state = combat_air_state;
                         m_state_timer = saved_timer;
                         m_telemetry.combat_anim_time = saved_timer;
+                    } else if (!m_telemetry.grounded) {
+                        m_telemetry.move_state = EMovement::MOVE_Falling;
+                        m_state_timer = 0.0f;
                     }
                 }
                 break;
@@ -419,13 +423,19 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 EMovement combat_gnd_state = m_telemetry.move_state;
                 float saved_timer = m_state_timer;
                 update_ground_locomotion(input, step_dt, scene);
-                if (m_telemetry.move_state == EMovement::MOVE_Walking ||
+                if (m_telemetry.move_state == combat_gnd_state ||
+                    m_telemetry.move_state == EMovement::MOVE_Walking ||
                     m_telemetry.move_state == EMovement::MOVE_Crouch ||
                     m_telemetry.move_state == EMovement::MOVE_AutoStepUp) {
-                    if (saved_timer < m_telemetry.combat_anim_duration) {
+                    if (saved_timer < m_telemetry.combat_anim_duration && m_telemetry.grounded) {
                         m_telemetry.move_state = combat_gnd_state;
                         m_state_timer = saved_timer;
                         m_telemetry.combat_anim_time = saved_timer;
+                    } else if (m_telemetry.grounded) {
+                        const bool crouch = input.crouch || !has_room(kPawnHeight, scene);
+                        m_telemetry.move_state = crouch ? EMovement::MOVE_Crouch : EMovement::MOVE_Walking;
+                        m_state_timer = 0.0f;
+                        set_stance(crouch ? kEyeHeightCrouch : kEyeHeightStand);
                     }
                 }
                 break;
