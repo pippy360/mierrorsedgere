@@ -20,14 +20,17 @@
 
 namespace me::fe {
 
+// The display gamma the game encodes with. TdEngine.ini says 2.2, but
+// TdPlayerController.SetVideoProfileSettings replaces it with the profile's Brightness, and what a
+// default profile gives, measured on retail frames, is 2.73. Both the canvas and the scene use it.
+constexpr float kDisplayGamma = 2.73f;
+
 // What the canvas does to a linear colour on its way to the back buffer:
-// pow(max(c, KINDA_SMALL_NUMBER), 1 / DisplayGamma). Measured on retail frames the gamma is 2.73,
-// not the 2.2 of TdEngine.ini: TdPlayerController.SetVideoProfileSettings replaces it with the
-// profile's Brightness, and this is what a default profile gives. The floor is why "black" UI
-// text is (9, 9, 9). Materials drawn in the UI (the columns) do not go through it.
+// pow(max(c, KINDA_SMALL_NUMBER), 1 / DisplayGamma). The floor is why "black" UI text is
+// (9, 9, 9). Materials drawn in the UI (the columns) do not go through it.
 inline float canvas_encode(float linear) {
     const float c = linear < 1.0e-4f ? 1.0e-4f : (linear > 1.0f ? 1.0f : linear);
-    return std::pow(c, 1.0f / 2.73f);
+    return std::pow(c, 1.0f / kDisplayGamma);
 }
 
 enum class Screen : uint8_t { Start, MainMenu };
@@ -83,7 +86,7 @@ struct Frame {
 struct Profile {
     bool can_continue = true;         // CONTINUE GAME
     bool chapters_unlocked = true;    // PLAY CHAPTER
-    bool all_levels_unlocked = true;  // SPEED RUN
+    bool all_levels_unlocked = false; // SPEED RUN
     bool controller = false;          // GAMEPAD SETUP, and "Accept" in the button bar
 };
 

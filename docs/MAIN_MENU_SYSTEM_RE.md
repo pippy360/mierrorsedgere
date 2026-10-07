@@ -143,9 +143,40 @@ So a column is centred on its widget and `0.9 * StickWidth` of the widget wide: 
 | `CameraActor_0` … `_11` | twelve viewpoints (section 6) |
 | `InterpActor_0` … `_11` | twelve hidden `UI_City.CC_Target` meshes, scale 5.23: the cameras' look-at targets |
 
-Materials in `UI_City`: `M_CityBuildings_01`, `M_CityBase_01`, `M_CityReflection_01`, `M_CityWaves_01`, `M_Skydome_Menu`, and one instance per chapter `MI_SP00_01` … `MI_SP09_01` (the `Selected` parameter lights a district on the chapter-select screen, not here).
+### 4.1 Materials (`UI_City`)
 
-`WorldInfo.DefaultPostProcessSettings`: `Bloom_Scale` 0.15, `DOF_BlurKernelSize` 50, `DOF_MaxNearBlurAmount` 0.2, `DOF_FocusType` `FOCUS_Position`, `DOF_FocusInnerRadius` 22500, `Scene_ExposureManual` 0.83, and a 16-segment per-channel tone curve (`Curves.Ms` / `Bs`).
+Every one is small enough to state whole.
+
+| Material | Used by | Graph |
+|---|---|---|
+| `M_CityBuildings_01` (and `MI_SP00_01` … `MI_SP09_01`, its instances) | the five city meshes | Diffuse (0.8, 0.83, 0.9); specular (1.2, 0.5, 0.18), power 6. The `Selected` parameter (0 here) lights a district on the chapter-select screen. |
+| `M_CityBase_01` | ground, mountains | `fade = T_CityFade_01_A(uv1)`. Diffuse `fade * (0.8, 0.83, 0.9)`; emissive `(1 - fade) * (T_Skydome_Menu(uv2) * 2.2 - 0.5)`: the ground dissolves into the sky's colour toward the horizon. |
+| `M_CityReflection_01` | water | Emissive `lerp(T_CityReflection_01_R(screen position) * 1.4 - 0.05, T_Skydome_Menu(uv2) * 2.0 - 0.3, 1 - T_CityFade_01_A(uv1).g)`. |
+| `M_CityWaves_01` | the second water plane | Additive, unlit: emissive 200, opacity `T_Waves_01_A(uv0 * 25, panned 0.005/s) * T_Waves_01_A(uv0 * 15, panned 0.015/s)`. |
+| `M_Skydome_Menu` | sky dome | Unlit: `Desaturation((VertexColor * 2.4 - 0.55) * (0.75, 0.88, 1.0), 0.7)`. |
+
+### 4.2 Baked lighting
+
+Each lit component carries an `FLightMap2D` in its native data, after the tagged properties:
+
+```
+int32 LOD count (1) { ShadowMaps[] (0) ; ShadowVertexBuffers[] (0) ; int32 type (2 = 2D) ;
+  LightGuids[] ; 4 x { LightMapTexture2D ref ; float3 ScaleVector } ; float2 CoordinateScale ; float2 CoordinateBias }
+```
+
+Textures 0 to 2 are the directional coefficients (2048x2048 `PF_DXT1`, sRGB-encoded, each scaled by its `ScaleVector` of about 4), texture 3 is the simple light map. The light maps are addressed with **UV channel 0** (`LightMapCoordinateIndex` is left at its default; these meshes have no textures, so channel 0 is free for the unwrap). The coefficients are Half-Life 2 basis light: a normal is lit by `dot(N, basis)^2` of each, which for the surface normal is the plain average of the three.
+
+### 4.3 Post process (`WorldInfo.DefaultPostProcessSettings`)
+
+`Bloom_Scale` 0.15; `Scene_ExposureManual` 0.83 with `Scene_ExposureLow` 0.79 and `Scene_ExposureHigh` 0.95; and `Curves`, a colour curve stored as 16 slopes `Ms` and intercepts `Bs` per channel. Piece `i` covers `[i/15, (i+1)/15)`: consecutive pieces meet exactly at the fifteenths, and piece 15 is the identity that only `1.0` reaches. `DOF_*` values are set but `bEnableDOF` is not, and `HazeEnabled` is false, so neither applies.
+
+From linear scene colour to the screen (section 8 has the measurements):
+
+```
+x       = scene + Bloom_Scale * wide_blur(scene)
+g       = pow(saturate(x * 0.52), 1 / DisplayGamma)        DisplayGamma = 2.73
+display = Ms[i] * g + Bs[i],  i = floor(g * 15)            per channel
+```
 
 ---
 
@@ -204,7 +235,7 @@ Loop Matinees (60 s, `bLooping`):
 | OPTIONS (`InterpData_27`) | 0: (1.872, -1337, 104.5); 60: (65.91, -677.2, 104.5) | 0: (511.6, -918.8, 111.4); 60: (575.6, -470.8, 111.4) | 80 → 90 |
 | EXTRAS (`InterpData_57`) | 0: (1143, -21.51, 163.9); 60: (1038, -616.9, 147.9) | fixed (-784.4, -166.8, 175.4) | 60 |
 
-The full keys with tangents and modes are what `src/ui/frontend/` carries; `build/re/interp.py`-style dumps reproduce them.
+The port reads the full keys, tangents and modes out of the level at load (`load_matinee` in `frontend_assets.cpp`); `python tools/ue3_tree.py <TdMainMenu.me1> --dump InterpData_18` and its groups' tracks print them.
 
 Clicking a sub-button sets `Sub_Menu` and plays a 0.5 s "sub menu camera" Matinee; those belong to the sub-menu screens and are not covered here.
 
@@ -224,11 +255,70 @@ Clicking a sub-button sets `Sub_Menu` and plays a 0.5 s "sub menu camera" Matine
 
 ## 8. Measured from retail frames
 
-Taken from the retail game's back buffer at 1280x720 with `tools/retail`'s `d3d9` hook, which does not touch the game's input.
+Taken from the retail game's back buffer at 1280x720 with `tools/retail`'s `d3d9` hook (`tools/retail/menu_capture.py`), which does not touch the game's input for the passive captures.
 
-* The open STORY column is solid from x = 82 to 382 and its edges wander by a pixel or two over a minute; the three sticks are 5 to 9 px wide and drift about 10 px either way. Both agree with section 3.4.
-* Column red is (233, 0, 0). `StickColor` is 0.91575, and 0.91575 x 255 = 233.5: the UI's material colours reach the screen without a gamma step.
-* The shadow to the right of a column is `ShadowColor` at about 44% over the background, 4 px wide, then fades out over 3 more.
-* The selection bar is pure white from the column's left edge to its right edge, exactly the focused button's top and bottom (321.75 to 375.3 for CONTINUE GAME).
+**The columns**
 
-Not established: the start scene's native tick (the fade-in rate and whether "Press Any Key" pulses), because that needs a restart of the game on its start screen.
+* The open STORY column is solid from x = 82 to 382 and its edges wander by a pixel or two over a minute; a stick that has never been opened is 5 to 9 px wide and drifts about 10 px either way. That is the material of section 3.4 with one addition: `UpdatePanelAnimation` only runs while a column animates, so a column that has not been opened yet still has the material's own `StickWidth` default, 0.005, not `UnfocusedPanelBGWidth`.
+* Column red is (233, 0, 0). `StickColor` is 0.91575, and 0.91575 x 255 = 233.5: a material drawn in the UI reaches the screen without a gamma step.
+* The shadow to the right of a column is `ShadowColor` at 43.6% over the background: `T_StickMaskRightShadow_01` peaks at 176/255, which is 0.434 once the sampler has undone its sRGB encoding.
+
+**Canvas colours and the display gamma**
+
+Text and image tiles do go through a gamma step, and it is not the 2.2 of `TdEngine.ini`:
+
+| Drawn | Linear colour | On screen |
+|---|---|---|
+| focused sub-button text | (0, 0, 0) | (9, 9, 9) |
+| description text | (0, 0.0037, 0.0278) | (9, 33, 69) |
+| sub-button drop shadow, 50% over column red | (0, 0.078, 0.227) | (121, 50, 74) |
+| button bar image `button_full` | texel (232, 0, 0) | (237, 9, 9) |
+
+All four are `pow(max(c, 1e-4), 1 / 2.73)`. The floor is UE3's `KINDA_SMALL_NUMBER`; the 2.73 is the display gamma the game runs with after `TdPlayerController.SetVideoProfileSettings` has applied the profile's `Brightness` (`SetGamma(Brightness / 10)`, native). The scene is encoded with the same gamma (below), so it is one setting for the whole frame.
+
+**Text placement**
+
+String positions are rounded to whole pixels. Vertical centring uses the font's tallest glyph cell (26 for `Helvetica_Medium_Italic`, 55 for the headline font at 720 lines). With that, the port's text boxes for CONTINUE GAME, PLAY CHAPTER, NEW GAME and STORY land on retail's to the pixel. The button bar's red boxes are the label's rectangle grown by 20 px a side and 4.7 px above and below (`StylePadding` is -20; why the vertical figure differs is not established).
+
+**The scene's transfer curve**
+
+Retail frames were paired with port frames of the same camera pose (found by edge correlation over the 60 s loop), and the port's linear scene colour binned against retail's pixel values. With the light maps averaged as in section 4.2 and the bloom of section 4.3 added, the sky and the buildings fall on one curve, and that curve is the level's own `Curves` applied to `pow(x * 0.52, 1 / 2.73)`. The 0.52 is the one fitted number; it holds to a few percent from mid-grey to white. Over the part of a STORY frame the UI does not cover, port and retail then differ by 1.4 levels out of 255 on average (median 1).
+
+Two readings that looked right and were not: weighting the light-map coefficients by `dot(N, basis)` (1/sqrt(3) each) makes the buildings 1.73 times too bright against the sky; and cutting the curve's pieces at sixteenths instead of fifteenths puts a visible band across the sky.
+
+**Timing**
+
+* On the test machine one pass of the STORY camera loop takes 66 s of wall clock, not the Matinee's 60: retail's menu clock runs at about 0.9 of real time there. The port plays the Matinee at its authored length.
+
+**Not established**
+
+* The start scene's native tick: the fade-in rate, and whether "Press Any Key" pulses.
+* The RACE column's camera. STORY, OPTIONS and EXTRAS frames match the port's Matinee evaluation (edge correlation 0.84 to 0.91); a RACE frame matches none of the level's 51 Matinees and its camera barely moves over five seconds, where `InterpData_23` moves 16 units a second.
+
+---
+
+## 9. The port (`src/ui/frontend/`)
+
+| File | What |
+|---|---|
+| `frontend_assets.*`, `frontend_city.cpp` | reads the fonts, textures, widget rectangles, strings, Matinees, city meshes, light maps and post-process settings out of the retail packages |
+| `frontend.*` | the state machine: `TdUIScene_Start`, `TdUIScene_MainMenu`, `TdMenuPostProcesWrapper` and the camera Kismet. Input and time in, a `Frame` out: a camera and a list of 2D draw operations |
+| `soft_render.*`, `soft_city.cpp` | the reference renderer for a `Frame`, on the CPU: the stick material per pixel, canvas text and tiles, and the city with its reflection, bloom and tone curve |
+| `src/tools/menu_main.cpp` | `me_menu`: runs the front end headless from a script and writes PNGs |
+
+It is plain C++ with no window, GPU or audio, so it builds wherever the asset loader does, including the Windows machine that has retail installed.
+
+```bash
+cmake --build build --target me_menu
+./build/me_menu --out shots --script "wait 6; shot start.png; key any; wait 46; shot story.png; key right; wait 6; shot race.png"
+python -m tools.retail.menu_capture columns                      # Windows, retail on its main menu
+python -m tools.retail.side_by_side retail.png shots/story.png out.png --title STORY
+```
+
+Retail on the left, the port on the right, same camera pose:
+
+![STORY](../screenshots/menu/main_menu_story.png)
+![OPTIONS](../screenshots/menu/main_menu_options.png)
+![EXTRAS](../screenshots/menu/main_menu_extras.png)
+
+Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the screens the sub-buttons open, and the attract movie.

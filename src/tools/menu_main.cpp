@@ -11,6 +11,7 @@
 //   shot <file.png>                 render the current frame into --out
 //   state                           print the screen, column and focused button
 //   linear <file.f32>               the 3D scene before tone mapping, raw float32 RGB
+//   camera <eye xyz> <target xyz> <fov>   override the camera for the shots that follow
 //   menu                            go straight to the main menu
 
 #include "../ui/frontend/frontend.hpp"
@@ -103,6 +104,7 @@ int main(int argc, char** argv) {
     std::string dump_dir;
     int width = 1280, height = 720;
     bool background = true, ui = true;
+    me::fe::Profile profile;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -119,6 +121,13 @@ int main(int argc, char** argv) {
             background = false;
         } else if (a == "--no-ui") {
             ui = false;
+        } else if (a == "--no-save") {
+            profile.can_continue = false;
+            profile.chapters_unlocked = false;
+        } else if (a == "--all-levels") {
+            profile.all_levels_unlocked = true;
+        } else if (a == "--controller") {
+            profile.controller = true;
         } else if (a == "--size") {
             const std::string s = next();
             const size_t x = s.find('x');
@@ -128,6 +137,7 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--help" || a == "-h") {
             std::cout << "me_menu --game-root <install> --out <dir> [--size 1280x720] [--no-background] [--no-ui]\n"
+                         "        [--no-save] [--all-levels] [--controller]   what the save file would unlock\n"
                          "        [--dump-assets <dir>] --script \"wait 5; shot start.png; key any; wait 4; shot menu.png\"\n";
             return 0;
         } else {
@@ -137,6 +147,7 @@ int main(int argc, char** argv) {
     }
 
     me::fe::Frontend fe;
+    fe.set_profile(profile);
     std::string error;
     if (!fe.init(game_root, width, height, error)) {
         std::cerr << "me_menu: " << error << "\n";
@@ -154,6 +165,8 @@ int main(int argc, char** argv) {
 
     const float dt = 1.0f / 60.0f;
     std::vector<uint8_t> rgba;
+    bool camera_override = false;
+    float cam[7] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 90.0f};
     std::stringstream commands(script);
     std::string command;
     while (std::getline(commands, command, ';')) {
@@ -185,10 +198,19 @@ int main(int argc, char** argv) {
         } else if (verb == "state") {
             std::cout << (fe.screen() == me::fe::Screen::Start ? "start" : "menu") << " column " << fe.panel() << " focus "
                       << fe.focused_button() << (fe.animating() ? " (animating)" : "") << "\n";
+        } else if (verb == "camera") {
+            // camera <x y z> <target x y z> <fov>: look from here in the shots that follow ("camera" alone: back to the menu's own)
+            camera_override = static_cast<bool>(cs >> cam[0] >> cam[1] >> cam[2] >> cam[3] >> cam[4] >> cam[5] >> cam[6]);
         } else if (verb == "shot") {
             std::string name;
             cs >> name;
-            const me::fe::Frame& frame = fe.frame();
+            me::fe::Frame frame = fe.frame();
+            if (camera_override) {
+                frame.camera = me::Vec3{cam[0], cam[1], cam[2]};
+                frame.target = me::Vec3{cam[3], cam[4], cam[5]};
+                frame.fov = cam[6];
+                frame.white = 0.0f;
+            }
             renderer.render(frame, rgba);
             const std::string path = out_dir + "/" + name;
             if (!me::fe::write_png(path, frame.width, frame.height, rgba.data())) {

@@ -541,7 +541,7 @@ void Frontend::draw_menu(Frame& f) const {
         for (size_t b = 0; b < cur.buttons.size(); ++b) {
             const bool focused = static_cast<int>(b) == cur.focus;
             draw_label(f, assets_.medium_italic, cur.buttons[b].caption, to_view(cur.buttons[b].rect), 0, 1,
-                       focused ? black : white, focused ? nullptr : shadow, 0.06f, 0.1f);
+                       focused ? black : white, shadow, 0.06f, 0.1f);
         }
     }
 

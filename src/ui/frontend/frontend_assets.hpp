@@ -123,8 +123,9 @@ struct City {
     Image waves;  // UI_City.T_Waves_01_A
     Vec3 sun_dir{0.0f, 0.0f, 1.0f};  // towards the sun
     float water_z = 0.0f;            // the reflection plane (SceneCaptureReflectActor)
-    // WorldInfo.DefaultPostProcessSettings: Bloom_Scale, and Curves, the colour curve as sixteen
-    // linear pieces per channel (out = m * in + b over in = [i/16, (i+1)/16)).
+    // WorldInfo.DefaultPostProcessSettings: Bloom_Scale, and Curves, the colour curve as linear
+    // pieces per channel: out = m[i] * in + b[i] with i = floor(in * 15). (Consecutive pieces
+    // meet exactly at the fifteenths; piece 15 is only reached at in = 1.)
     float bloom_scale = 0.0f;
     float curve_m[16][3];
     float curve_b[16][3];

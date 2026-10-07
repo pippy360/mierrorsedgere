@@ -333,12 +333,12 @@ void draw_pass(const Pass& pass) {
     }
 }
 
-// The scene's exposure, measured: with the level's bloom and colour curve in place this is the
-// one number left that makes a retail frame's sky and buildings land where they do. It is
-// 0.61 in the mid-tones and 0.55 at the top of the range; the level asks for
-// Scene_ExposureManual 0.83 inside an automatic range of 0.79 to 0.95, so the tone mapper
-// evidently does more than multiply.
-constexpr float kExposure = 0.58f;
+// The scene's exposure, measured: with the level's bloom, the display gamma and the level's colour
+// curve in place, this is the one number left that puts a retail frame's sky and buildings where
+// they are. It holds within a few percent from mid-grey to white. The level asks for
+// Scene_ExposureManual 0.83 inside an automatic range of 0.79 to 0.95; how the tone mapper gets
+// from that to this is not established.
+constexpr float kExposure = 0.52f;
 
 // Bloom, exposure, gamma and the level's colour curve: linear scene colour to display values.
 void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom, std::vector<float>& out) {
@@ -411,8 +411,8 @@ void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom,
                 const float b = (bloom[(static_cast<size_t>(y0) * bw + x0) * 3 + c] * (1.0f - tx) + bloom[(static_cast<size_t>(y0) * bw + x1) * 3 + c] * tx) * (1.0f - ty) +
                                 (bloom[(static_cast<size_t>(y1) * bw + x0) * 3 + c] * (1.0f - tx) + bloom[(static_cast<size_t>(y1) * bw + x1) * 3 + c] * tx) * ty;
                 const float v = std::clamp((s[c] + b * city.bloom_scale) * kExposure, 0.0f, 1.0f);
-                const float g = std::pow(v, 1.0f / 2.2f);
-                const int i = std::min(static_cast<int>(g * 16.0f), 15);
+                const float g = std::pow(v, 1.0f / kDisplayGamma);
+                const int i = std::min(static_cast<int>(g * 15.0f), 15);
                 o[c] = std::clamp(city.curve_m[i][c] * g + city.curve_b[i][c], 0.0f, 1.0f);
             }
         }
