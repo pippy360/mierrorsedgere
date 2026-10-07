@@ -1506,9 +1506,10 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             norm_time = prog;
             float recoil_env = std::sin(std::min(prog * 3.5f, 1.0f) * PI);
             vm_offset = base_armed_offset + Vec3(0.0f, -1.2f * recoil_env, 0.8f * recoil_env);
-        } else if (state == EMovement::MOVE_Slide) {
+        } else if (state == EMovement::MOVE_Slide || state == EMovement::MOVE_RumpSlide) {
             seq_a = resolve_seq(w_spec_set, w_comm_set, "CrouchSlide", &active_set);
-            norm_time = 0.33f;
+            float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.5f;
+            norm_time = std::clamp(telemetry.combat_anim_time / dur, 0.0f, 0.96f);
             vm_offset = base_armed_offset + Vec3(0.0f, -4.0f, 4.0f);
             show_lower_body = true;
         } else if (state == EMovement::MOVE_Crouch) {
@@ -1520,8 +1521,63 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         } else if (state == EMovement::MOVE_WallRunningRight || state == EMovement::MOVE_WallRunningLeft) {
             const char* wname = (state == EMovement::MOVE_WallRunningRight) ? "WallrunRight" : "WallrunLeft";
             seq_a = resolve_seq(w_spec_set, &faith_common_set_, wname, &active_set);
-            norm_time = 0.12f;
+            float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.533f;
+            norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
             vm_offset = base_armed_offset;
+        } else if (state == EMovement::MOVE_GrabPullUp || state == EMovement::MOVE_Grabbing ||
+                   state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_Climb ||
+                   state == EMovement::MOVE_SpeedVaulting || state == EMovement::MOVE_VaultOver ||
+                   state == EMovement::MOVE_SpringBoarding || state == EMovement::MOVE_Swing ||
+                   state == EMovement::MOVE_WallClimbing || state == EMovement::MOVE_SkillRoll) {
+            // Two-handed parkour climb / vault / hang / swing maneuvers holster viewmodel to unarmed anim set
+            active_set = &faith_unarmed_set_;
+            if (state == EMovement::MOVE_GrabPullUp) {
+                seq_a = active_set->find_sequence("HangHeaveUp");
+                float dur = (telemetry.combat_anim_duration > 0.1f)
+                                ? telemetry.combat_anim_duration
+                                : ((seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.65f);
+                norm_time = std::clamp(telemetry.combat_anim_time / dur, 0.0f, 0.98f);
+                vm_offset = Vec3(0.0f, 14.0f, 8.0f);
+            } else if (state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_Grabbing) {
+                seq_a = (telemetry.combat_anim_time < 0.35f) ? active_set->find_sequence("HangHardStart")
+                                                             : active_set->find_sequence("Hang");
+                norm_time = std::fmod(telemetry.combat_anim_time * 0.8f, 1.0f);
+                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+            } else if (state == EMovement::MOVE_Climb) {
+                const bool alternate_hand = (static_cast<int>(telemetry.combat_anim_time * 3.0f) & 1) != 0;
+                seq_a = active_set->find_sequence(alternate_hand ? "LadderClimbUpLeftHand" : "LadderClimbUpRightHand");
+                norm_time = std::fmod(telemetry.combat_anim_time * 3.0f, 1.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 12.0f);
+            } else if (state == EMovement::MOVE_WallClimbing) {
+                seq_a = active_set->find_sequence("WallRunVertical");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.467f;
+                norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+            } else if (state == EMovement::MOVE_SpringBoarding) {
+                seq_a = active_set->find_sequence("SpringBoardRightLeg");
+                float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.72f;
+                norm_time = std::clamp(0.18f + 0.72f * (telemetry.combat_anim_time / dur), 0.12f, 0.94f);
+                vm_offset = Vec3(0.0f, 8.0f, -6.0f);
+                show_lower_body = true;
+            } else if (state == EMovement::MOVE_Swing) {
+                seq_a = active_set->find_sequence("swingposefronttop");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.667f;
+                norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
+                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
+                show_lower_body = true;
+            } else if (state == EMovement::MOVE_SkillRoll) {
+                seq_a = active_set->find_sequence("fallinglandroll");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.85f;
+                norm_time = std::clamp(telemetry.combat_anim_time / dur, 0.0f, 0.98f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                show_lower_body = true;
+            } else {
+                seq_a = active_set->find_sequence("VaultOver");
+                float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.50f;
+                norm_time = std::clamp(0.10f + 0.82f * (telemetry.combat_anim_time / dur), 0.08f, 0.94f);
+                vm_offset = Vec3(0.0f, 10.0f, -4.0f);
+                show_lower_body = true;
+            }
         } else if (speed > 55.0f) {
             // Armed walking / running ready cycle (runfwdready / walkfwdready blended with WeaponPose)
             const char* move_name = (speed < 240.0f) ? "walkfwdready" : "runfwdready";
@@ -1552,84 +1608,257 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, bob_z);
         }
     } else {
-        // 3. Unarmed Parkour & Locomotion Tree
+        // 3. Unarmed Parkour & Locomotion Tree (cooked UE3 AS_C1P_Unarmed sequences with live state progression)
+        const float st = std::max(0.0f, telemetry.combat_anim_time);
         switch (state) {
-            case EMovement::MOVE_SpringBoarding:
+            case EMovement::MOVE_SpringBoarding: {
                 seq_a = active_set->find_sequence("SpringBoardRightLeg");
                 seq_b = active_set->find_sequence("VaultOver");
-                norm_time = 0.55f; // Frame 31/57: both hands vaulted forward into view
-                blend_alpha = 0.25f;
+                float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.72f;
+                norm_time = std::clamp(0.18f + 0.72f * (st / dur), 0.12f, 0.94f);
+                blend_alpha = 0.22f;
                 vm_offset = Vec3(0.0f, 8.0f, -6.0f);
+                show_lower_body = true;
                 break;
+            }
             case EMovement::MOVE_SpeedVaulting:
-            case EMovement::MOVE_VaultOver:
+            case EMovement::MOVE_VaultOver: {
                 seq_a = active_set->find_sequence("VaultOver");
-                norm_time = 0.45f;
+                float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.50f;
+                norm_time = std::clamp(0.10f + 0.82f * (st / dur), 0.08f, 0.94f);
                 vm_offset = Vec3(0.0f, 10.0f, -4.0f);
+                show_lower_body = true;
                 break;
-            case EMovement::MOVE_WallRunningRight:
+            }
+            case EMovement::MOVE_StepUp:
+            case EMovement::MOVE_AutoStepUp: {
+                seq_a = active_set->find_sequence("VaultOnto");
+                if (!seq_a) seq_a = active_set->find_sequence("stepuprightleg48");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.36f;
+                norm_time = std::clamp(st / dur, 0.05f, 0.95f);
+                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
+                show_lower_body = true;
+                break;
+            }
+            case EMovement::MOVE_GrabPullUp: {
+                seq_a = active_set->find_sequence("HangHeaveUp");
+                seq_b = active_set->find_sequence("HangHeaveOver");
+                float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.65f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.98f);
+                blend_alpha = 0.25f;
+                vm_offset = Vec3(0.0f, 14.0f, 8.0f);
+                break;
+            }
+            case EMovement::MOVE_IntoGrab: {
+                seq_a = active_set->find_sequence("HangHardStart");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.55f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+                break;
+            }
+            case EMovement::MOVE_Grabbing: {
+                if (st < 0.32f) {
+                    seq_a = active_set->find_sequence("HangHardStart");
+                    norm_time = std::clamp(st / 0.65f, 0.0f, 0.65f);
+                } else if (speed > 25.0f) {
+                    // Lateral shimmy along ledge
+                    seq_a = active_set->find_sequence("HangStrafeRight");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.067f;
+                    norm_time = std::fmod(st / dur, 1.0f);
+                } else {
+                    seq_a = active_set->find_sequence("Hang");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 2.0f;
+                    norm_time = std::fmod((st - 0.32f) / dur, 1.0f);
+                }
+                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+                break;
+            }
+            case EMovement::MOVE_GrabJump: {
+                seq_a = active_set->find_sequence("hangturnjump");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.85f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.95f);
+                vm_offset = Vec3(0.0f, 14.0f, 12.0f);
+                break;
+            }
+            case EMovement::MOVE_Climb: {
+                const float climb_vz = telemetry.velocity.z;
+                if (climb_vz < -15.0f) {
+                    seq_a = active_set->find_sequence("LadderClimbDownFast");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.5f;
+                    norm_time = std::fmod(st / dur, 1.0f);
+                } else if (std::abs(climb_vz) > 10.0f || speed > 10.0f) {
+                    const float rung_cycle = st * 2.8f;
+                    const bool left_hand = (static_cast<int>(rung_cycle) & 1) != 0;
+                    seq_a = active_set->find_sequence(left_hand ? "LadderClimbUpLeftHand" : "LadderClimbUpRightHand");
+                    norm_time = std::fmod(rung_cycle, 1.0f);
+                } else {
+                    seq_a = active_set->find_sequence("LadderClimbUpRightHandStill");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 2.0f;
+                    norm_time = std::fmod(st / dur, 1.0f);
+                }
+                vm_offset = Vec3(0.0f, 16.0f, 12.0f);
+                break;
+            }
+            case EMovement::MOVE_WallRunningRight: {
                 seq_a = active_set->find_sequence("WallrunRight");
                 seq_b = active_set->find_sequence("SprintFwd");
-                norm_time = 0.12f; // Frame 2/16: right hand touching wall, left hand pumping
-                blend_alpha = 0.35f;
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.533f;
+                norm_time = std::fmod(st / dur, 1.0f);
+                blend_alpha = 0.25f;
                 vm_offset = Vec3(4.0f, 14.0f, 14.0f);
                 break;
-            case EMovement::MOVE_WallRunningLeft:
+            }
+            case EMovement::MOVE_WallRunningLeft: {
                 seq_a = active_set->find_sequence("WallrunLeft");
                 seq_b = active_set->find_sequence("SprintFwd");
-                norm_time = 0.12f;
-                blend_alpha = 0.35f;
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.533f;
+                norm_time = std::fmod(st / dur, 1.0f);
+                blend_alpha = 0.25f;
                 vm_offset = Vec3(-4.0f, 14.0f, 14.0f);
                 break;
-            case EMovement::MOVE_WallClimbing:
-                seq_a = active_set->find_sequence("WallRunVertical");
-                norm_time = std::fmod(sim_t * 1.8f, 1.0f);
+            }
+            case EMovement::MOVE_WallRunJump: {
+                seq_a = active_set->find_sequence("wallrunjumpright");
+                if (!seq_a) seq_a = active_set->find_sequence("jumpfast");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.90f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.92f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                show_lower_body = true;
+                break;
+            }
+            case EMovement::MOVE_WallClimbing: {
+                if (st < 0.18f && active_set->find_sequence("wallrunverticalstart")) {
+                    seq_a = active_set->find_sequence("wallrunverticalstart");
+                    norm_time = std::clamp(st / 0.18f, 0.0f, 1.0f);
+                } else {
+                    seq_a = active_set->find_sequence("WallRunVertical");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.467f;
+                    norm_time = std::fmod(st / dur, 1.0f);
+                }
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
                 break;
-            case EMovement::MOVE_ZipLine:
+            }
+            case EMovement::MOVE_WallClimb180TurnJump: {
+                seq_a = active_set->find_sequence("wallrunvertical180turn");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.633f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            }
+            case EMovement::MOVE_180Turn: {
+                seq_a = active_set->find_sequence("RunTurn180");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.65f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            }
+            case EMovement::MOVE_180TurnInAir: {
+                seq_a = active_set->find_sequence("JumpTurnFly");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.60f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            }
+            case EMovement::MOVE_DodgeJump: {
+                seq_a = active_set->find_sequence("dodgejumpright");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.65f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.95f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            }
+            case EMovement::MOVE_Swing: {
+                if (st < 0.22f && active_set->find_sequence("swinghardstart")) {
+                    seq_a = active_set->find_sequence("swinghardstart");
+                    norm_time = std::clamp(st / 0.22f, 0.0f, 1.0f);
+                } else {
+                    seq_a = active_set->find_sequence("swingposefronttop");
+                    float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.667f;
+                    norm_time = std::fmod(st / dur, 1.0f);
+                }
+                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
+                show_lower_body = true;
+                break;
+            }
+            case EMovement::MOVE_ZipLine: {
                 seq_a = active_set->find_sequence("ZipLine");
-                norm_time = 0.10f;
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.0f;
+                norm_time = std::fmod(st / dur, 1.0f);
                 vm_offset = Vec3(2.0f, 62.0f, -4.0f);
                 break;
+            }
+            case EMovement::MOVE_Coil: {
+                seq_a = active_set->find_sequence("jumpcoil");
+                if (!seq_a) seq_a = active_set->find_sequence("CrouchSlide");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.55f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 8.0f, 10.0f);
+                show_lower_body = true;
+                break;
+            }
             case EMovement::MOVE_Slide:
-            case EMovement::MOVE_Coil:
+            case EMovement::MOVE_RumpSlide: {
                 seq_a = active_set->find_sequence("CrouchSlide");
-                norm_time = 0.33f;
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.5f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
                 vm_offset = Vec3(0.0f, 6.0f, 14.0f);
                 show_lower_body = true;
                 break;
-            case EMovement::MOVE_Jump:
-            case EMovement::MOVE_Falling:
-            case EMovement::MOVE_WallRunJump:
+            }
+            case EMovement::MOVE_Jump: {
                 seq_a = active_set->find_sequence("jumpfast");
                 if (!seq_a) seq_a = active_set->find_sequence("jumpair");
-                norm_time = 0.30f;
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.90f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.88f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
                 break;
-            case EMovement::MOVE_Crouch:
+            }
+            case EMovement::MOVE_Falling: {
+                seq_a = active_set->find_sequence("jumpair");
+                if (!seq_a) seq_a = active_set->find_sequence("jumpfast");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.0f;
+                norm_time = std::fmod(st / dur, 1.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            }
+            case EMovement::MOVE_Crouch: {
                 seq_a = (speed > 20.0f) ? active_set->find_sequence("crouchfwd")
                                         : active_set->find_sequence("crouchstill");
                 norm_time = std::fmod(sim_t * 1.2f, 1.0f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
                 break;
-            case EMovement::MOVE_SkillRoll:
+            }
+            case EMovement::MOVE_SkillRoll: {
                 seq_a = active_set->find_sequence("fallinglandroll");
-                norm_time = std::fmod(sim_t * 1.5f, 1.0f);
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.85f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.98f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                show_lower_body = true;
                 break;
+            }
+            case EMovement::MOVE_SoftLanding: {
+                seq_a = active_set->find_sequence("fallinglandsoftlanding");
+                if (!seq_a) seq_a = active_set->find_sequence("JumpLand");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.45f;
+                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 15.0f, 13.0f);
+                show_lower_body = true;
+                break;
+            }
             case EMovement::MOVE_Landing:
-            case EMovement::MOVE_LayOnGround:
+            case EMovement::MOVE_LayOnGround: {
                 seq_a = active_set->find_sequence("fallinglandhard");
-                norm_time = std::clamp(telemetry.combat_anim_time / 1.8f, 0.0f, 0.96f);
+                norm_time = std::clamp(st / 1.8f, 0.0f, 0.96f);
                 vm_offset = Vec3(0.0f, 14.0f, 12.0f);
                 show_lower_body = true;
                 break;
+            }
             case EMovement::MOVE_LedgeWalk:
-            case EMovement::MOVE_Balance:
+            case EMovement::MOVE_Balance: {
                 seq_a = active_set->find_sequence("walkbalancefwd");
                 norm_time = std::fmod(sim_t * 1.2f, 1.0f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
                 break;
+            }
             default: {
                 // TdAnimNodeWalkingState: blend Stand -> walkfwd -> runfwd -> SprintFwd by speed_2d
                 const AnimSequenceAsset* s_walk  = active_set->find_sequence("walkfwd");

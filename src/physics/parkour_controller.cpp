@@ -1083,6 +1083,7 @@ void ParkourController::walk_move(const Vec3& delta, float height, const LevelSc
         if (step_up(remaining, height, scene)) {
             if (m_telemetry.position.z - z_before > 8.0f && m_telemetry.move_state == EMovement::MOVE_Walking) {
                 m_telemetry.move_state = EMovement::MOVE_AutoStepUp;
+                m_state_timer = 0.0f;
             }
             return;
         }
@@ -1628,6 +1629,8 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
             if (st == EMovement::MOVE_SoftLanding) {
                 m_landing_timer -= dt;
                 if (m_landing_timer <= 0.0f) st = EMovement::MOVE_Walking;
+            } else if (st == EMovement::MOVE_AutoStepUp || st == EMovement::MOVE_StepUp) {
+                if (m_state_timer >= 0.34f) st = EMovement::MOVE_Walking;
             } else {
                 st = EMovement::MOVE_Walking;
             }
@@ -2018,7 +2021,7 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
 // -----------------------------------------------------------------------------
 bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const LevelScene& scene) {
     const MovementConfig& c = m_config;
-    if (m_telemetry.weapon.is_heavy) return false;
+    if (m_telemetry.weapon.is_heavy || m_climb_cooldown > 0.0f) return false;
     // Native CanDoMove: rising (VelocityStartLimit 0), MoveActionHint forward, facing the wall
     // within WallClimbingVerticalStartAngle, the wall within WallClimbingMaxDistance2D and at
     // least MinWallHeight tall.
@@ -2260,9 +2263,12 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     // GrabMaxAngle: facing the wall; and not moving away from it.
     if (fwd.dot(into) < std::cos(c.grab_max_angle_deg * DEG2RAD)) return false;
     if (horiz(m_telemetry.velocity).dot(ledge.normal) > 50.0f) return false;
-    // No re-grabbing the wall just jumped off.
+    // No re-grabbing the wall just jumped off or same wall immediately after pipe jump-off.
     if (m_last_wallrun_normal.length_sq() > 0.5f && ledge.normal.dot(m_last_wallrun_normal) > 0.9f &&
         m_illegal_wall_timer > 0.0f && st != EMovement::MOVE_WallClimbing) {
+        return false;
+    }
+    if (m_climb_cooldown > 0.12f && ledge.normal.dot(m_climb_normal) > 0.9f) {
         return false;
     }
     // Room for the body on top (standing, or crouched under a low ceiling).
@@ -2347,6 +2353,7 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         if (facing_wall) {
             st = EMovement::MOVE_GrabPullUp;
             m_state_timer = 0.0f;
+            m_telemetry.combat_anim_duration = c.grab_pull_up_time;
             return;
         }
         const float push = std::clamp(fwd.dot(n), 0.0f, 1.0f);
@@ -2363,6 +2370,7 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
     if (input.forward > 0.8f && facing_wall && m_hang_time > 0.1f) {
         st = EMovement::MOVE_GrabPullUp;
         m_state_timer = 0.0f;
+        m_telemetry.combat_anim_duration = c.grab_pull_up_time;
         return;
     }
     if (m_crouch_pressed || (input.forward < -0.8f && m_hang_time > 0.2f)) {
@@ -2445,6 +2453,7 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
     m_telemetry.move_state = EMovement::MOVE_SpringBoarding;
     m_takeoff_move = EMovement::MOVE_SpringBoarding;
     m_state_timer = 0.0f;
+    m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
     m_telemetry.grounded = false;
     m_base_actor = -1;
     m_fall_peak_z = m_telemetry.position.z;
@@ -2576,6 +2585,7 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     m_telemetry.move_state = (speed >= 350.0f) ? EMovement::MOVE_SpeedVaulting : EMovement::MOVE_VaultOver;
     m_takeoff_move = EMovement::MOVE_SpeedVaulting;
     m_state_timer = 0.0f;
+    m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
     m_telemetry.grounded = false;
     m_base_actor = -1;
     m_fall_peak_z = top_z + c.vault_ledge_offset_z;
@@ -2716,7 +2726,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
     if (m_telemetry.weapon.is_heavy || input.forward < -0.3f) return false;
     if (m_telemetry.grounded && input.forward <= 0.3f) return false;
 
-    const float max_horiz = m_telemetry.grounded ? 95.0f : 115.0f;
+    const float max_horiz = m_telemetry.grounded ? 95.0f : 135.0f;
     for (const auto& act : scene.actors) {
         if (!act.is_ladder) continue;
         const Vec3 base = (act.location.z <= act.end_point.z) ? act.location : act.end_point;
@@ -2731,8 +2741,25 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         const float h_dist = horiz(m_telemetry.position - base).length();
         if (h_dist > max_horiz) continue;
 
-        // Native UE3 TdLadderVolume: actor Rotation faces into the wall/ladder; -Rotation.forward() points outward
-        Vec3 wall_out = horiz(-act.rotation.forward()).normalized();
+        // Native UE3 TdLadderVolume: actor Rotation faces into the wall/ladder when non-zero;
+        // unrotated brush volumes (Rotation == 0,0,0) detect the mounting wall normal directly from scene collision.
+        Vec3 wall_out(0.0f, 0.0f, 0.0f);
+        if (std::abs(act.rotation.yaw) > 1.0f || std::abs(act.rotation.pitch) > 1.0f) {
+            wall_out = horiz(-act.rotation.forward()).normalized();
+        }
+        if (wall_out.length_sq() < 0.25f) {
+            const float mid_z = 0.5f * (base.z + top.z);
+            const Vec3 probe_origin(base.x, base.y, mid_z);
+            float best_frac = 1.0f;
+            for (const Vec3& dir : {Vec3(0.0f, 1.0f, 0.0f), Vec3(0.0f, -1.0f, 0.0f),
+                                    Vec3(1.0f, 0.0f, 0.0f), Vec3(-1.0f, 0.0f, 0.0f)}) {
+                const TraceHit wh = trace_ray(probe_origin - dir * 24.0f, probe_origin + dir * 64.0f, scene);
+                if (wh.hit && std::abs(wh.normal.z) < 0.4f && wh.fraction < best_frac) {
+                    best_frac = wh.fraction;
+                    wall_out = horiz(wh.normal).normalized();
+                }
+            }
+        }
         if (wall_out.length_sq() < 0.25f) {
             wall_out = horiz(m_telemetry.position - base).normalized();
         }
@@ -2742,7 +2769,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         if ((m_telemetry.position - base).dot(wall_out) < -25.0f) continue;
         if (facing_forward().dot(-wall_out) < -0.30f) continue;
 
-        const Vec3 climb_xy = Vec3(base.x, base.y, 0.0f) + wall_out * 44.0f;
+        const Vec3 climb_xy = Vec3(base.x, base.y, 0.0f) + wall_out * 64.0f;
         const float clamped_z = std::clamp(m_telemetry.position.z, base.z, std::max(base.z, top.z - 35.0f));
 
         m_telemetry.position = Vec3(climb_xy.x, climb_xy.y, clamped_z);
@@ -2770,7 +2797,7 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
     }
 
     const Vec3 into = -m_climb_normal;
-    const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 44.0f;
+    const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 64.0f;
     m_telemetry.position.x = climb_xy.x;
     m_telemetry.position.y = climb_xy.y;
 
@@ -2779,16 +2806,18 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
     // facing straight into the pipe with neutral strafe drops/pushes cleanly off.
     if (jump_pressed()) {
         consume_jump();
-        m_climb_cooldown = 0.45f;
+        m_climb_cooldown = 0.65f;
+        m_last_wallrun_normal = m_climb_normal;
+        m_illegal_wall_timer = 0.65f;
         const Vec3 fwd = facing_forward();
         const bool aiming_away = (fwd.dot(into) < 0.78f);
         const bool strafing = (std::abs(input.strafe) > 0.25f);
         if (aiming_away || strafing || input.forward < -0.25f) {
             Vec3 launch_dir = aiming_away
                 ? fwd
-                : (facing_right() * sign_of(input.strafe) + m_climb_normal * 0.25f).normalized();
-            if (launch_dir.dot(m_climb_normal) < -0.05f) {
-                launch_dir = (launch_dir - m_climb_normal * launch_dir.dot(m_climb_normal)).normalized();
+                : (facing_right() * sign_of(input.strafe) + m_climb_normal * 0.28f).normalized();
+            if (launch_dir.dot(m_climb_normal) < 0.28f) {
+                launch_dir = (launch_dir - m_climb_normal * launch_dir.dot(m_climb_normal) + m_climb_normal * 0.28f).normalized();
             }
             if (launch_dir.length_sq() < 0.1f) launch_dir = m_climb_normal;
             m_telemetry.velocity = launch_dir * 420.0f + Vec3(0.0f, 0.0f, 440.0f);
