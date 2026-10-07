@@ -667,19 +667,39 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     // Stage 12: Interactive Door Barging (`TdMove_Barge` & Hinge Rotation on SP00 Rooftop Doorway)
     std::cout << "[Oracle Stage 12] Testing Interactive Door Barging (TdMove_Barge & Hinge Swing)..." << std::endl;
     bool s12_pass = false;
+    bool no_auto_barge = false;
     bool saw_move_barge = false;
     float final_door_deg = 0.0f;
     float final_door_x = 0.0f;
     if (!sp00_scene.barge_doors.empty()) {
         BargeDoorInstance& door = sp00_scene.barge_doors[0];
+        // 12A: Verify running at a closed door WITHOUT melee does NOT automatically barge it open
         door.state = DoorState::Closed;
         door.open_angle_rad = 0.0f;
         door.model_matrix = Mat4::identity();
         controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
-        InputFrame barge_in{};
-        barge_in.forward = 1.0f;
-        barge_in.sprint = true;
+        InputFrame run_only{};
+        run_only.forward = 1.0f;
+        run_only.sprint = true;
+        for (int step = 0; step < 50; ++step) {
+            controller.step(run_only, kDt, sp00_scene);
+        }
+        no_auto_barge = (door.state == DoorState::Closed && controller.get_telemetry().move_state != EMovement::MOVE_Barge);
+
+        // 12B: Verify pressing melee/attack barges the door open with TdMove_Barge
+        door.state = DoorState::Closed;
+        door.open_angle_rad = 0.0f;
+        door.model_matrix = Mat4::identity();
+        controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
         for (int step = 0; step < 72; ++step) {
+            InputFrame barge_in{};
+            barge_in.forward = 1.0f;
+            barge_in.sprint = true;
+            // Press melee as we reach the doorway
+            const float dx = std::abs(controller.get_position().x - door.center_pos.x);
+            if (dx <= 185.0f && door.state == DoorState::Closed) {
+                barge_in.melee = true;
+            }
             controller.step(barge_in, kDt, sp00_scene);
             if (controller.get_telemetry().move_state == EMovement::MOVE_Barge) {
                 saw_move_barge = true;
@@ -687,10 +707,11 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         }
         final_door_deg = door.open_angle_rad * (180.0f / 3.14159265f);
         final_door_x = controller.get_telemetry().position.x;
-        s12_pass = saw_move_barge && (std::abs(door.open_angle_rad) > 1.5f) && (final_door_x < -4300.0f);
+        s12_pass = no_auto_barge && saw_move_barge && (std::abs(door.open_angle_rad) > 1.5f) && (final_door_x < -4300.0f);
     }
     std::cout << "  -> Stage 12 Result: " << (s12_pass ? "PASS" : "FAIL")
               << " (Doors=" << sp00_scene.barge_doors.size()
+              << ", NoAutoBarge=" << (no_auto_barge ? "OK" : "FAIL")
               << ", MoveBarge=" << (saw_move_barge ? "OK" : "NO")
               << ", Swing=" << final_door_deg << " deg"
               << ", EndX=" << final_door_x << ")" << std::endl;
@@ -803,9 +824,103 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         }
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, and SP02 forward sprint stage 14
+    // Stage 15: Zipline Shift Drop, Horizontal Swing Bar & Narrow Ledge Walk
+    bool s15_pass = false;
+    {
+        std::cout << "[Oracle Stage 15] Testing Zipline Shift Drop, Swing Bar & Ledge Walk..." << std::endl;
+        // 15A. Zipline Shift Drop: attach to zipline in sim_scene, press Shift (crouch=true), verify immediate drop to MOVE_Falling
+        bool zip_drop_ok = false;
+        for (const auto& act : sim_scene.actors) {
+            if (!act.is_zipline) continue;
+            const Vec3 zs = act.location;
+            const Vec3 ze = act.end_point;
+            const Vec3 high_pt = (zs.z >= ze.z) ? zs : ze;
+            const Vec3 low_pt  = (zs.z >= ze.z) ? ze : zs;
+            const Vec3 seg = low_pt - high_pt;
+            const Vec3 start_pos = high_pt + seg * 0.10f - Vec3(0.0f, 0.0f, 110.0f);
+            controller.reset(start_pos, 0.0f);
+            InputFrame in_idle{};
+            bool attached = false;
+            for (int i = 0; i < 15; ++i) {
+                controller.step(in_idle, kDt, sim_scene);
+                if (controller.get_move_state() == EMovement::MOVE_ZipLine) {
+                    attached = true;
+                    break;
+                }
+            }
+            if (attached) {
+                InputFrame in_drop{};
+                in_drop.crouch = true; // Shift / Crouch to detach from zip line
+                controller.step(in_drop, kDt, sim_scene);
+                zip_drop_ok = (controller.get_move_state() == EMovement::MOVE_Falling);
+            }
+            break;
+        }
+
+        // 15B. Horizontal Swing Bar: jump into TdSwingVolume in sim_scene and verify MOVE_Swing pendulum + jump release
+        bool swing_ok = false;
+        for (const auto& act : sim_scene.actors) {
+            if (!act.is_swing_bar) continue;
+            const Vec3 mid = (act.location + act.end_point) * 0.5f;
+            const Vec3 bar_axis = (act.end_point - act.location).normalized();
+            const Vec3 approach(-bar_axis.y, bar_axis.x, 0.0f);
+            controller.reset(mid - approach * 65.0f - Vec3(0.0f, 0.0f, 155.0f),
+                             std::atan2(approach.y, approach.x) * (180.0f / 3.14159265f));
+            controller.set_velocity(approach * 320.0f);
+            bool caught_bar = false;
+            for (int i = 0; i < 24; ++i) {
+                InputFrame in_grab{};
+                in_grab.forward = 1.0f;
+                in_grab.jump = (i == 0);
+                controller.step(in_grab, kDt, sim_scene);
+                if (controller.get_move_state() == EMovement::MOVE_Swing) {
+                    caught_bar = true;
+                    break;
+                }
+            }
+            if (caught_bar) {
+                InputFrame in_fwd{};
+                in_fwd.forward = 1.0f;
+                for (int i = 0; i < 12; ++i) controller.step(in_fwd, kDt, sim_scene);
+                InputFrame in_jump{};
+                in_jump.jump = true;
+                controller.step(in_jump, kDt, sim_scene);
+                swing_ok = ((controller.get_move_state() == EMovement::MOVE_Jump ||
+                             controller.get_move_state() == EMovement::MOVE_Falling) &&
+                            controller.get_telemetry().speed_2d > 400.0f);
+            }
+            break;
+        }
+
+        // 15C. Narrow Ledge Walk (TdLedgeWalkVolume): step onto ledge walk volume and shimmy across
+        bool ledge_walk_ok = false;
+        LevelActor synthetic_ledge{};
+        synthetic_ledge.is_ledge = true;
+        synthetic_ledge.location    = Vec3(-4000.0f, -6000.0f, 4224.0f);
+        synthetic_ledge.end_point   = Vec3(-4300.0f, -6000.0f, 4224.0f);
+        synthetic_ledge.wall_normal   = Vec3(0.0f, -1.0f, 0.0f);
+        sim_scene.actors.push_back(synthetic_ledge);
+        controller.reset(Vec3(-4020.0f, -6000.0f, 4224.0f), 90.0f);
+        InputFrame in_shimmy{};
+        in_shimmy.strafe = -1.0f;
+        for (int i = 0; i < 30; ++i) {
+            controller.step(in_shimmy, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_LedgeWalk) {
+                ledge_walk_ok = true;
+            }
+        }
+        sim_scene.actors.pop_back();
+
+        s15_pass = zip_drop_ok && swing_ok && ledge_walk_ok;
+        std::cout << "  -> Stage 15 Result: " << (s15_pass ? "PASS" : "FAIL")
+                  << " (ZiplineDrop=" << (zip_drop_ok ? "OK" : "FAIL")
+                  << ", SwingBar=" << (swing_ok ? "OK" : "FAIL")
+                  << ", LedgeWalk=" << (ledge_walk_ok ? "OK" : "FAIL") << ")" << std::endl;
+    }
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, and zipline/swing/ledge stage 15
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -1336,7 +1451,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         if (state[SDL_SCANCODE_A] || state[SDL_SCANCODE_LEFT]) input.strafe -= 1.0f;
 
         if (state[SDL_SCANCODE_SPACE] && !suppress_space_until_release) input.jump = true;
-        if (state[SDL_SCANCODE_C] || state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_LSHIFT]) input.crouch = true;
+        if (state[SDL_SCANCODE_C] || state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_RCTRL] ||
+            state[SDL_SCANCODE_LSHIFT] || state[SDL_SCANCODE_RSHIFT]) input.crouch = true;
         if (state[SDL_SCANCODE_Q]) input.turn_180 = true;
         if (state[SDL_SCANCODE_F]) {
             if (controller.get_weapon().equipped) input.fire = true;

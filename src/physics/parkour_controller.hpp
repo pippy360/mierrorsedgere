@@ -217,6 +217,7 @@ private:
     void update_swing_bar(const InputFrame& input, float dt, const LevelScene& scene);
     void update_climb(const InputFrame& input, float dt, const LevelScene& scene);
     void update_balance(const InputFrame& input, float dt, const LevelScene& scene);
+    void update_ledge_walk(const InputFrame& input, float dt, const LevelScene& scene);
     void update_landing_moves(const InputFrame& input, float dt, const LevelScene& scene);
 
     // Transition Helpers
@@ -226,8 +227,10 @@ private:
     bool try_initiate_springboard(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_ledge_grab(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_zipline(const LevelScene& scene);
+    bool try_initiate_swing_bar(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_climb(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_balance(const LevelScene& scene);
+    bool try_initiate_ledge_walk(const LevelScene& scene);
     bool try_initiate_dodge_jump(const InputFrame& input);
     void start_jump(const LevelScene& scene);
     void land(const FloorHit& floor, const LevelScene& scene);
@@ -296,6 +299,7 @@ private:
     bool m_wallclimb_reached = false;              // TdMove_WallClimb.bHasReachedWall
     Vec3 m_zipline_start{0.0f, 0.0f, 0.0f};
     Vec3 m_zipline_end{0.0f, 0.0f, 0.0f};
+    float m_zipline_cooldown = 0.0f;
     Vec3 m_climb_base{0.0f, 0.0f, 0.0f};
     Vec3 m_climb_top{0.0f, 0.0f, 0.0f};
     Vec3 m_climb_normal{0.0f, 0.0f, 0.0f};
@@ -304,9 +308,17 @@ private:
     Vec3 m_balance_end{0.0f, 0.0f, 0.0f};
     float m_balance_lean = 0.0f;
     float m_balance_cooldown = 0.0f;
+    Vec3 m_ledge_walk_start{0.0f, 0.0f, 0.0f};
+    Vec3 m_ledge_walk_end{0.0f, 0.0f, 0.0f};
+    Vec3 m_ledge_walk_normal{0.0f, 0.0f, 0.0f};
+    float m_ledge_walk_cooldown = 0.0f;
     Vec3 m_swing_anchor{0.0f, 0.0f, 0.0f};
+    Vec3 m_swing_bar_start{0.0f, 0.0f, 0.0f};
+    Vec3 m_swing_bar_end{0.0f, 0.0f, 0.0f};
+    Vec3 m_swing_dir{1.0f, 0.0f, 0.0f};
     float m_swing_angle = 0.0f;
     float m_swing_angular_vel = 0.0f;
+    float m_swing_cooldown = 0.0f;
     float m_ledge_z = 0.0f;  // top of the grabbed ledge (MOVE_Grabbing / MOVE_GrabPullUp)
     float m_hang_time = 0.0f;
     bool m_grab_rail = false;  // hanging under a lip a rail blocks: no pull-up, jump transfers to the rail

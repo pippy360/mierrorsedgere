@@ -1421,6 +1421,11 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
             const auto* ps = get_prop("Start");
             const auto* pe = get_prop("End");
+            const auto* pc = get_prop("Center");
+            const auto* pm = get_prop("Middle");
+            if (const auto* pwn = get_prop("WallNormal"); pwn && is_valid_world_vec(pwn->vec_val) && pwn->vec_val.length_sq() > 0.25f) {
+                a.wall_normal = pwn->vec_val.normalized();
+            }
             const bool valid_se = ps && pe && is_valid_world_vec(ps->vec_val) && is_valid_world_vec(pe->vec_val) &&
                                   (pe->vec_val - ps->vec_val).length_sq() >= 100.0f;
 
@@ -1478,6 +1483,40 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     if (!rebuilt) {
                         a.is_ladder = false;
                     }
+                }
+            } else if (a.is_swing_bar && low_class.find("swingvolume") != std::string::npos) {
+                // TdSwingVolume serializes Center/Location at the bar midpoint and WallNormal perpendicular
+                // to the horizontal swing bar in XY (while Start/End span the vertical brush height or unbaked local coords).
+                Vec3 bar_center = orig_loc;
+                if (pc && is_valid_world_vec(pc->vec_val) && (pc->vec_val - orig_loc).length() < 250.0f) {
+                    bar_center = pc->vec_val;
+                } else if (pm && is_valid_world_vec(pm->vec_val) && (pm->vec_val - orig_loc).length() < 250.0f) {
+                    bar_center = pm->vec_val;
+                }
+                Vec3 wn(a.wall_normal.x, a.wall_normal.y, 0.0f);
+                if (wn.length_sq() < 1e-4f) {
+                    const Vec3 rf = a.rotation.forward();
+                    wn = Vec3(rf.x, rf.y, 0.0f);
+                }
+                if (wn.length_sq() < 1e-4f) wn = Vec3(1.0f, 0.0f, 0.0f);
+                wn = wn.normalized();
+                a.wall_normal = wn;
+                const Vec3 bar_axis = Vec3(-wn.y, wn.x, 0.0f).normalized();
+                float half_w = 115.0f;
+                if (valid_se) {
+                    const float se_xy = (pe->vec_val - ps->vec_val).length_xy();
+                    const float se_len = (pe->vec_val - ps->vec_val).length();
+                    if (se_xy >= 60.0f && (0.5f * (ps->vec_val + pe->vec_val) - bar_center).length() < 250.0f) {
+                        a.location = ps->vec_val;
+                        a.end_point = pe->vec_val;
+                    } else {
+                        half_w = std::clamp(0.5f * se_len, 80.0f, 200.0f);
+                        a.location = bar_center - bar_axis * half_w;
+                        a.end_point = bar_center + bar_axis * half_w;
+                    }
+                } else {
+                    a.location = bar_center - bar_axis * half_w;
+                    a.end_point = bar_center + bar_axis * half_w;
                 }
             } else if (valid_se) {
                 a.location = ps->vec_val;
