@@ -3712,12 +3712,18 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             Vec3 w_start = rig_to_world_pos(actor_loc, actor_yaw, intro_seq.tracks[0].positions.front());
             Vec3 w_end   = rig_to_world_pos(actor_loc, actor_yaw, intro_seq.tracks[0].positions.back());
 
-            // Compute final camera facing yaw at end of intro from Bone[0] * Bone[72] (EyeJoint)
-            Quat4 q_root = intro_seq.tracks[0].rotations.empty() ? Quat4() : intro_seq.tracks[0].rotations.back();
+            // Compute final camera facing yaw at end of intro from Bone[0] * Bone[72] (EyeJoint) * Bone[73] (CameraJoint)
+            // Note: UAnimSequence NoW quaternions are stored with negated w (-q_true^*), so conjugate() recovers q_true.
+            Quat4 q_root = intro_seq.tracks[0].rotations.empty()
+                               ? Quat4()
+                               : intro_seq.tracks[0].rotations.back().conjugate();
             Quat4 q_eye  = (intro_seq.tracks.size() > 72 && !intro_seq.tracks[72].rotations.empty())
-                               ? intro_seq.tracks[72].rotations.back()
+                               ? intro_seq.tracks[72].rotations.back().conjugate()
                                : Quat4();
-            Quat4 q_comp = Quat4::multiply(q_root, q_eye).normalized();
+            Quat4 q_cam  = (intro_seq.tracks.size() > 73 && !intro_seq.tracks[73].rotations.empty())
+                               ? intro_seq.tracks[73].rotations.back().conjugate()
+                               : Quat4();
+            Quat4 q_comp = Quat4::multiply(Quat4::multiply(q_root, q_eye), q_cam).normalized();
             Vec3 world_fwd = rig_to_world_vec(actor_yaw, q_comp.rotate(Vec3(0.0f, 0.0f, 1.0f))).normalized();
             float end_yaw = std::atan2(world_fwd.y, world_fwd.x) * RAD2DEG;
 

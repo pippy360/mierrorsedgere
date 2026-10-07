@@ -661,10 +661,12 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             const Vec3 actor_loc = scene.level_intro.actor_location;
 
             Vec3 r_pos = eval_track_pos(cooked_seq->tracks[0], norm);
-            Quat4 r_q  = eval_track_quat(cooked_seq->tracks[0], norm);
+            Quat4 r_q  = eval_track_quat(cooked_seq->tracks[0], norm).conjugate();
             Vec3 e_pos = eval_track_pos(cooked_seq->tracks[72], norm);
-            Quat4 e_q  = eval_track_quat(cooked_seq->tracks[72], norm);
-            Quat4 c_q  = (cooked_seq->tracks.size() > 73) ? eval_track_quat(cooked_seq->tracks[73], norm) : Quat4();
+            Quat4 e_q  = eval_track_quat(cooked_seq->tracks[72], norm).conjugate();
+            Quat4 c_q  = (cooked_seq->tracks.size() > 73)
+                             ? eval_track_quat(cooked_seq->tracks[73], norm).conjugate()
+                             : Quat4();
 
             Vec3 comp_eye = r_pos + r_q.rotate(e_pos);
             Quat4 comp_q  = Quat4::multiply(Quat4::multiply(r_q, e_q), c_q).normalized();
