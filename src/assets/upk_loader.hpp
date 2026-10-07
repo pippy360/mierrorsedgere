@@ -76,6 +76,9 @@ struct StaticMeshAsset {
     Vec3 bounds_extent{100.0f, 100.0f, 100.0f};
     float bounds_radius = 173.2f;
     std::vector<Vertex> triangles; // 3 vertices per triangle in local space, grouped by element
+    // UV channel 2 of each entry of `triangles` (u, v pairs), when the mesh has one. The menu
+    // city's ground and water look the sky up through it; Vertex only has room for two channels.
+    std::vector<float> uv_channel2;
     std::vector<StaticMeshElement> elements;
 
     // Collision (local space, 3 vertices per triangle). UStaticMeshComponent::LineCheck uses the

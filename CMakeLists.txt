@@ -50,6 +50,24 @@ if(MINGW)
     target_link_options(me_replay PRIVATE -static)
 endif()
 
+# The front end ("Press Any Key" and the main menu): its state machine and the CPU reference
+# renderer. Plain C++, so it builds wherever the core does.
+set(FRONTEND_SOURCES
+    src/ui/frontend/frontend_assets.cpp
+    src/ui/frontend/frontend_city.cpp
+    src/ui/frontend/frontend.cpp
+    src/ui/frontend/soft_city.cpp
+    src/ui/frontend/soft_render.cpp
+)
+
+# me_menu: renders front-end frames to PNG, headless (docs/MAIN_MENU_SYSTEM_RE.md).
+find_package(Threads REQUIRED)
+add_executable(me_menu src/tools/menu_main.cpp ${FRONTEND_SOURCES} ${CORE_SOURCES})
+target_link_libraries(me_menu PRIVATE ZLIB::ZLIB Threads::Threads)
+if(MINGW)
+    target_link_options(me_menu PRIVATE -static)
+endif()
+
 if(APPLE)
 
 # Source files
