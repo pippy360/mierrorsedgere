@@ -12,14 +12,17 @@
 //   state                           print the screen, column and focused button
 //   linear <file.f32>               the 3D scene before tone mapping, raw float32 RGB
 //   camera <eye xyz> <target xyz> <fov>   override the camera for the shots that follow
+//   bench <frames>                  time the reference renderer
 //   menu                            go straight to the main menu
 
 #include "../ui/frontend/frontend.hpp"
 #include "../ui/frontend/soft_render.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -115,6 +118,12 @@ int main(int argc, char** argv) {
             out_dir = next();
         } else if (a == "--script") {
             script = next();
+        } else if (a == "--script-file") {
+            // A long script: the command line has a length limit.
+            std::ifstream in(next());
+            std::stringstream ss;
+            ss << in.rdbuf();
+            script = ss.str();
         } else if (a == "--dump-assets") {
             dump_dir = next();
         } else if (a == "--no-background") {
@@ -138,7 +147,7 @@ int main(int argc, char** argv) {
         } else if (a == "--help" || a == "-h") {
             std::cout << "me_menu --game-root <install> --out <dir> [--size 1280x720] [--no-background] [--no-ui]\n"
                          "        [--no-save] [--all-levels] [--controller]   what the save file would unlock\n"
-                         "        [--dump-assets <dir>] --script \"wait 5; shot start.png; key any; wait 4; shot menu.png\"\n";
+                         "        [--dump-assets <dir>] [--script-file <file>] --script \"wait 5; shot start.png; key any; wait 4; shot menu.png\"\n";
             return 0;
         } else {
             std::cerr << "me_menu: unknown option " << a << "\n";
@@ -198,6 +207,17 @@ int main(int argc, char** argv) {
         } else if (verb == "state") {
             std::cout << (fe.screen() == me::fe::Screen::Start ? "start" : "menu") << " column " << fe.panel() << " focus "
                       << fe.focused_button() << (fe.animating() ? " (animating)" : "") << "\n";
+        } else if (verb == "bench") {
+            // bench <frames>: run and render that many frames, print the average time of one
+            int frames = 60;
+            cs >> frames;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int n = 0; n < frames; ++n) {
+                fe.update(dt);
+                renderer.render(fe.frame(), rgba);
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::cout << "bench: " << (ms / std::max(frames, 1)) << " ms a frame at " << width << "x" << height << "\n";
         } else if (verb == "camera") {
             // camera <x y z> <target x y z> <fov>: look from here in the shots that follow ("camera" alone: back to the menu's own)
             camera_override = static_cast<bool>(cs >> cam[0] >> cam[1] >> cam[2] >> cam[3] >> cam[4] >> cam[5] >> cam[6]);

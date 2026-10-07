@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <thread>
 
 namespace me::fe {
 
@@ -39,11 +41,6 @@ Camera make_camera(const Vec3& pos, const Vec3& target, float fov_deg, int w, in
     c.tan_y = c.tan_x * static_cast<float>(h) / static_cast<float>(w);
     return c;
 }
-
-struct Vtx {
-    float x, y, iz;       // screen position and 1 / view depth
-    float a[kAttrs];      // attributes, already divided by view depth
-};
 
 struct Surface {
     int w = 0, h = 0;
@@ -83,7 +80,6 @@ struct Pass {
 // One pixel of one material. `a` holds the interpolated attributes.
 bool shade(const Pass& pass, const CityBatch& batch, const float a[kAttrs], float out[3]) {
     const City& city = *pass.city;
-    if (pass.mirror && a[11] < city.water_z) return false;
     float s[4];
     switch (batch.material) {
         case CityMaterial::Sky: {
@@ -162,178 +158,310 @@ bool shade(const Pass& pass, const CityBatch& batch, const float a[kAttrs], floa
     return false;
 }
 
-inline float edge(const Vtx& a, const Vtx& b, float x, float y) { return (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x); }
+// --- rasterisation ------------------------------------------------------------------------
+//
+// A visibility buffer: every opaque triangle is first drawn as depth and an id only, then each
+// pixel is shaded once from the triangle that won it. The city overdraws itself several times
+// from most cameras, and interpolating a dozen attributes for pixels that end up hidden was
+// most of a frame.
 
-// Rasterises one screen-space triangle into rows [row0, row1).
-void raster(const Pass& pass, const CityBatch& batch, const Vtx& v0, const Vtx& v1, const Vtx& v2, int row0, int row1) {
-    Surface& t = *pass.target;
-    float area = edge(v0, v1, v2.x, v2.y);
-    if (area == 0.0f) return;
-    const Vtx* p0 = &v0;
-    const Vtx* p1 = &v1;
-    const Vtx* p2 = &v2;
-    if (area < 0.0f) {
-        std::swap(p1, p2);
-        area = -area;
-    }
-    const float minx = std::min({p0->x, p1->x, p2->x}), maxx = std::max({p0->x, p1->x, p2->x});
-    const float miny = std::min({p0->y, p1->y, p2->y}), maxy = std::max({p0->y, p1->y, p2->y});
-    const int x0 = std::max(0, static_cast<int>(std::ceil(minx - 0.5f)));
-    const int x1 = std::min(t.w - 1, static_cast<int>(std::floor(maxx - 0.5f)));
-    const int y0 = std::max(row0, static_cast<int>(std::ceil(miny - 0.5f)));
-    const int y1 = std::min(row1 - 1, static_cast<int>(std::floor(maxy - 0.5f)));
-    if (x0 > x1 || y0 > y1) return;
-    const bool additive = batch.material == CityMaterial::Waves;
-    const float inv_area = 1.0f / area;
-    for (int y = y0; y <= y1; ++y) {
-        const float py = static_cast<float>(y) + 0.5f;
-        for (int x = x0; x <= x1; ++x) {
-            const float px = static_cast<float>(x) + 0.5f;
-            const float w0 = edge(*p1, *p2, px, py), w1 = edge(*p2, *p0, px, py), w2 = edge(*p0, *p1, px, py);
-            if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
-            const float b0 = w0 * inv_area, b1 = w1 * inv_area, b2 = w2 * inv_area;
-            const float iz = b0 * p0->iz + b1 * p1->iz + b2 * p2->iz;
-            const size_t pix = static_cast<size_t>(y) * t.w + x;
-            if (additive) {
-                if (iz < t.depth[pix]) continue;  // behind something solid
-            } else if (iz <= t.depth[pix]) {
-                continue;
-            }
-            float a[kAttrs];
-            const float z = 1.0f / iz;
-            for (int k = 0; k < kAttrs; ++k) a[k] = (b0 * p0->a[k] + b1 * p1->a[k] + b2 * p2->a[k]) * z;
-            float c[3];
-            if (!shade(pass, batch, a, c)) continue;
-            float* d = &t.rgb[pix * 3];
-            if (additive) {
-                d[0] += c[0];
-                d[1] += c[1];
-                d[2] += c[2];
-            } else {
-                d[0] = c[0];
-                d[1] = c[1];
-                d[2] = c[2];
-                t.depth[pix] = iz;
-            }
-        }
-    }
-}
+// A triangle on screen. `first` is its first vertex in the batch, or its slot in the pass's
+// clipped attributes when the near plane cut it.
+struct ScreenTri {
+    float x[3], y[3], iz[3];
+    float wz[3];           // world height at each corner, for the reflection's water-plane cut
+    float ymin, ymax;
+    uint32_t batch;
+    uint32_t first;
+    bool clipped;
+    bool crosses_water;
+};
+
+struct ClippedAttrs {
+    float a[3][kAttrs];
+};
+
+struct TriList {
+    std::vector<ScreenTri> tris;
+    std::vector<ClippedAttrs> clipped;
+};
 
 struct ViewVtx {
     float vx, vy, vz;  // camera space: right, up, forward
     float a[kAttrs];
 };
 
-ViewVtx to_view(const Camera& cam, const CityVertex& v) {
-    ViewVtx o;
-    const Vec3 d = v.pos - cam.pos;
-    o.vx = d.dot(cam.right);
-    o.vy = d.dot(cam.up);
-    o.vz = d.dot(cam.fwd);
-    o.a[0] = v.uv[0][0];
-    o.a[1] = v.uv[0][1];
-    o.a[2] = v.uv[1][0];
-    o.a[3] = v.uv[1][1];
-    o.a[4] = v.uv[2][0];
-    o.a[5] = v.uv[2][1];
-    o.a[6] = v.color[0];
-    o.a[7] = v.color[1];
-    o.a[8] = v.color[2];
-    o.a[9] = v.pos.x;
-    o.a[10] = v.pos.y;
-    o.a[11] = v.pos.z;
-    return o;
+void vertex_attrs(const CityVertex& v, float a[kAttrs]) {
+    a[0] = v.uv[0][0];
+    a[1] = v.uv[0][1];
+    a[2] = v.uv[1][0];
+    a[3] = v.uv[1][1];
+    a[4] = v.uv[2][0];
+    a[5] = v.uv[2][1];
+    a[6] = v.color[0];
+    a[7] = v.color[1];
+    a[8] = v.color[2];
+    a[9] = v.pos.x;
+    a[10] = v.pos.y;
+    a[11] = v.pos.z;
 }
 
-Vtx project(const Camera& cam, const ViewVtx& v, int w, int h) {
-    Vtx o;
-    o.iz = 1.0f / v.vz;
-    o.x = (v.vx * o.iz / cam.tan_x * 0.5f + 0.5f) * static_cast<float>(w);
-    o.y = (0.5f - v.vy * o.iz / cam.tan_y * 0.5f) * static_cast<float>(h);
-    for (int k = 0; k < kAttrs; ++k) o.a[k] = v.a[k] * o.iz;
-    return o;
-}
-
-// Draws every batch of `additive`-ness into rows [row0, row1) of the pass's target.
-void draw_rows(const Pass& pass, bool additive, int row0, int row1) {
-    const Surface& t = *pass.target;
+// Transforms, clips and projects the triangles [t0, t1) of the flattened batch list.
+void build_tris(const Pass& pass, const std::vector<size_t>& batch_start, size_t t0, size_t t1, TriList& out) {
+    const City& city = *pass.city;
     const Camera& cam = pass.cam;
-    const float fw = static_cast<float>(t.w), fh = static_cast<float>(t.h);
-    for (const CityBatch& batch : pass.city->batches) {
-        if ((batch.material == CityMaterial::Waves) != additive) continue;
+    const float fw = static_cast<float>(pass.target->w), fh = static_cast<float>(pass.target->h);
+    auto to_screen = [&](float vx, float vy, float vz, float& sx, float& sy, float& iz) {
+        iz = 1.0f / vz;
+        sx = (vx * iz / cam.tan_x * 0.5f + 0.5f) * fw;
+        sy = (0.5f - vy * iz / cam.tan_y * 0.5f) * fh;
+    };
+    size_t b = 0;
+    while (b + 1 < batch_start.size() && batch_start[b + 1] <= t0) ++b;
+    for (size_t t = t0; t < t1; ++t) {
+        while (b + 1 < batch_start.size() && batch_start[b + 1] <= t) ++b;
+        const CityBatch& batch = city.batches[b];
         if (pass.mirror && (batch.material == CityMaterial::Water || batch.material == CityMaterial::Waves)) continue;
-        const size_t n = batch.tris.size() / 3;
-        for (size_t i = 0; i < n; ++i) {
-            const CityVertex* cv = &batch.tris[i * 3];
-            // Cheap rejects on depth and on the row band before any attribute work.
-            float vz[3], sy[3], sx[3];
-            int behind = 0;
+        const uint32_t first = static_cast<uint32_t>((t - batch_start[b]) * 3);
+        const CityVertex* cv = &batch.tris[first];
+        float vx[3], vy[3], vz[3];
+        int behind = 0;
+        for (int k = 0; k < 3; ++k) {
+            const Vec3 d = cv[k].pos - cam.pos;
+            vx[k] = d.dot(cam.right);
+            vy[k] = d.dot(cam.up);
+            vz[k] = d.dot(cam.fwd);
+            behind += vz[k] < kNear ? 1 : 0;
+        }
+        if (behind == 3) continue;
+        const float zmin = std::min({cv[0].pos.z, cv[1].pos.z, cv[2].pos.z});
+        const float zmax = std::max({cv[0].pos.z, cv[1].pos.z, cv[2].pos.z});
+        if (pass.mirror && zmax < city.water_z) continue;
+
+        ScreenTri st;
+        st.batch = static_cast<uint32_t>(b);
+        st.crosses_water = pass.mirror && zmin < city.water_z;
+        if (behind == 0) {
             for (int k = 0; k < 3; ++k) {
-                const Vec3 d = cv[k].pos - cam.pos;
-                vz[k] = d.dot(cam.fwd);
-                if (vz[k] < kNear) {
-                    ++behind;
-                    continue;
-                }
-                sx[k] = (d.dot(cam.right) / (vz[k] * cam.tan_x) * 0.5f + 0.5f) * fw;
-                sy[k] = (0.5f - d.dot(cam.up) / (vz[k] * cam.tan_y) * 0.5f) * fh;
+                to_screen(vx[k], vy[k], vz[k], st.x[k], st.y[k], st.iz[k]);
+                st.wz[k] = cv[k].pos.z;
             }
-            if (behind == 3) continue;
-            if (behind == 0) {
-                if (std::max({sy[0], sy[1], sy[2]}) < static_cast<float>(row0) || std::min({sy[0], sy[1], sy[2]}) > static_cast<float>(row1)) continue;
-                if (std::max({sx[0], sx[1], sx[2]}) < 0.0f || std::min({sx[0], sx[1], sx[2]}) > fw) continue;
-                const Vtx p0 = project(cam, to_view(cam, cv[0]), t.w, t.h);
-                const Vtx p1 = project(cam, to_view(cam, cv[1]), t.w, t.h);
-                const Vtx p2 = project(cam, to_view(cam, cv[2]), t.w, t.h);
-                raster(pass, batch, p0, p1, p2, row0, row1);
-                continue;
+            st.first = first;
+            st.clipped = false;
+            st.ymin = std::min({st.y[0], st.y[1], st.y[2]});
+            st.ymax = std::max({st.y[0], st.y[1], st.y[2]});
+            if (st.ymax < 0.0f || st.ymin > fh) continue;
+            if (std::max({st.x[0], st.x[1], st.x[2]}) < 0.0f || std::min({st.x[0], st.x[1], st.x[2]}) > fw) continue;
+            out.tris.push_back(st);
+            continue;
+        }
+        // Crosses the near plane: clip to it (at most a quad) and keep the corners' attributes.
+        ViewVtx in[3];
+        for (int k = 0; k < 3; ++k) {
+            in[k].vx = vx[k];
+            in[k].vy = vy[k];
+            in[k].vz = vz[k];
+            vertex_attrs(cv[k], in[k].a);
+        }
+        ViewVtx poly[4];
+        int count = 0;
+        for (int k = 0; k < 3; ++k) {
+            const ViewVtx& p = in[k];
+            const ViewVtx& q = in[(k + 1) % 3];
+            const bool pin = p.vz >= kNear, qin = q.vz >= kNear;
+            if (pin) poly[count++] = p;
+            if (pin != qin) {
+                const float s = (kNear - p.vz) / (q.vz - p.vz);
+                ViewVtx c;
+                c.vx = p.vx + (q.vx - p.vx) * s;
+                c.vy = p.vy + (q.vy - p.vy) * s;
+                c.vz = kNear;
+                for (int j = 0; j < kAttrs; ++j) c.a[j] = p.a[j] + (q.a[j] - p.a[j]) * s;
+                poly[count++] = c;
             }
-            // Crosses the near plane: clip the triangle to it (at most a quad).
-            ViewVtx in[3] = {to_view(cam, cv[0]), to_view(cam, cv[1]), to_view(cam, cv[2])};
-            ViewVtx poly[4];
-            int count = 0;
-            for (int k = 0; k < 3; ++k) {
-                const ViewVtx& a = in[k];
-                const ViewVtx& b = in[(k + 1) % 3];
-                const bool ain = a.vz >= kNear, bin = b.vz >= kNear;
-                if (ain) poly[count++] = a;
-                if (ain != bin) {
-                    const float s = (kNear - a.vz) / (b.vz - a.vz);
-                    ViewVtx c;
-                    c.vx = a.vx + (b.vx - a.vx) * s;
-                    c.vy = a.vy + (b.vy - a.vy) * s;
-                    c.vz = kNear;
-                    for (int j = 0; j < kAttrs; ++j) c.a[j] = a.a[j] + (b.a[j] - a.a[j]) * s;
-                    poly[count++] = c;
-                }
+        }
+        for (int k = 1; k + 1 < count; ++k) {
+            const ViewVtx* corner[3] = {&poly[0], &poly[k], &poly[k + 1]};
+            ClippedAttrs ca;
+            for (int c = 0; c < 3; ++c) {
+                to_screen(corner[c]->vx, corner[c]->vy, corner[c]->vz, st.x[c], st.y[c], st.iz[c]);
+                st.wz[c] = corner[c]->a[11];
+                std::memcpy(ca.a[c], corner[c]->a, sizeof(float) * kAttrs);
             }
-            if (count < 3) continue;
-            const Vtx p0 = project(cam, poly[0], t.w, t.h);
-            for (int k = 1; k + 1 < count; ++k) {
-                raster(pass, batch, p0, project(cam, poly[k], t.w, t.h), project(cam, poly[k + 1], t.w, t.h), row0, row1);
-            }
+            st.first = static_cast<uint32_t>(out.clipped.size());
+            st.clipped = true;
+            st.ymin = std::min({st.y[0], st.y[1], st.y[2]});
+            st.ymax = std::max({st.y[0], st.y[1], st.y[2]});
+            out.clipped.push_back(ca);
+            out.tris.push_back(st);
         }
     }
 }
 
-void draw_pass(const Pass& pass) {
-    const int h = pass.target->h;
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const int threads = static_cast<int>(std::min<unsigned>(hw, 16u));
-    // Bands, not a work queue: each thread owns its rows, so nothing is shared while drawing.
-    // Opaque geometry first, then the additive water sparkle against the finished depth.
-    for (bool additive : {false, true}) {
-        std::vector<std::thread> pool;
-        for (int i = 0; i < threads; ++i) {
-            const int row0 = h * i / threads, row1 = h * (i + 1) / threads;
-            if (row0 == row1) continue;
-            pool.emplace_back([&pass, additive, row0, row1] { draw_rows(pass, additive, row0, row1); });
-        }
-        for (std::thread& th : pool) th.join();
-    }
+// Barycentric weights of pixel centre (px, py) in `t`; false when it is outside.
+inline bool barycentric(const ScreenTri& t, float px, float py, float b[3]) {
+    const float area = (t.x[1] - t.x[0]) * (t.y[2] - t.y[0]) - (t.y[1] - t.y[0]) * (t.x[2] - t.x[0]);
+    if (area == 0.0f) return false;
+    const float inv = 1.0f / area;
+    b[0] = ((t.x[2] - t.x[1]) * (py - t.y[1]) - (t.y[2] - t.y[1]) * (px - t.x[1])) * inv;
+    b[1] = ((t.x[0] - t.x[2]) * (py - t.y[2]) - (t.y[0] - t.y[2]) * (px - t.x[2])) * inv;
+    b[2] = 1.0f - b[0] - b[1];
+    return b[0] >= 0.0f && b[1] >= 0.0f && b[2] >= 0.0f;
 }
 
-// The scene's exposure, measured: with the level's bloom, the display gamma and the level's colour
+// The attributes at a point of a triangle, perspective-correct.
+void interpolate(const Pass& pass, const TriList& list, const ScreenTri& t, const float b[3], float a[kAttrs]) {
+    const float w0 = b[0] * t.iz[0], w1 = b[1] * t.iz[1], w2 = b[2] * t.iz[2];
+    const float z = 1.0f / (w0 + w1 + w2);
+    if (t.clipped) {
+        const ClippedAttrs& ca = list.clipped[t.first];
+        for (int k = 0; k < kAttrs; ++k) a[k] = (w0 * ca.a[0][k] + w1 * ca.a[1][k] + w2 * ca.a[2][k]) * z;
+        return;
+    }
+    const CityVertex* cv = &pass.city->batches[t.batch].tris[t.first];
+    float a0[kAttrs], a1[kAttrs], a2[kAttrs];
+    vertex_attrs(cv[0], a0);
+    vertex_attrs(cv[1], a1);
+    vertex_attrs(cv[2], a2);
+    for (int k = 0; k < kAttrs; ++k) a[k] = (w0 * a0[k] + w1 * a1[k] + w2 * a2[k]) * z;
+}
+
+// ME_MENU_PROF=1 prints where a frame's time goes.
+struct StageTimer {
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    bool on = std::getenv("ME_MENU_PROF") != nullptr;
+    void mark(const char* what) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "  %-22s %7.2f ms\n", what, std::chrono::duration<double, std::milli>(now - t).count());
+        t = now;
+    }
+};
+
+void draw_pass(const Pass& pass, TriList& list, std::vector<uint32_t>& visibility) {
+    StageTimer timer;
+    const City& city = *pass.city;
+    Surface& target = *pass.target;
+    const int w = target.w, h = target.h;
+
+    // 1. Every triangle to the screen, in parallel over the flattened batch list.
+    std::vector<size_t> batch_start(city.batches.size() + 1, 0);
+    for (size_t b = 0; b < city.batches.size(); ++b) batch_start[b + 1] = batch_start[b] + city.batches[b].tris.size() / 3;
+    const size_t total = batch_start.back();
+    const int workers = worker_count();
+    std::vector<TriList> parts(static_cast<size_t>(workers));
+    parallel_rows(workers, [&](int p0, int p1) {
+        for (int p = p0; p < p1; ++p) {
+            build_tris(pass, batch_start, total * static_cast<size_t>(p) / workers, total * static_cast<size_t>(p + 1) / workers,
+                       parts[static_cast<size_t>(p)]);
+        }
+    });
+    list.tris.clear();
+    list.clipped.clear();
+    for (TriList& part : parts) {
+        const uint32_t offset = static_cast<uint32_t>(list.clipped.size());
+        for (ScreenTri& t : part.tris) {
+            if (t.clipped) t.first += offset;
+            list.tris.push_back(t);
+        }
+        list.clipped.insert(list.clipped.end(), part.clipped.begin(), part.clipped.end());
+    }
+
+    timer.mark(pass.mirror ? "mirror: triangles" : "main: triangles");
+    // 2. Depth and triangle id.
+    visibility.assign(static_cast<size_t>(w) * h, 0u);
+    parallel_rows(h, [&](int row0, int row1) {
+        for (size_t i = 0; i < list.tris.size(); ++i) {
+            const ScreenTri& t = list.tris[i];
+            if (city.batches[t.batch].material == CityMaterial::Waves) continue;
+            if (t.ymax < static_cast<float>(row0) || t.ymin > static_cast<float>(row1)) continue;
+            const int x0 = std::max(0, static_cast<int>(std::ceil(std::min({t.x[0], t.x[1], t.x[2]}) - 0.5f)));
+            const int x1 = std::min(w - 1, static_cast<int>(std::floor(std::max({t.x[0], t.x[1], t.x[2]}) - 0.5f)));
+            const int y0 = std::max(row0, static_cast<int>(std::ceil(t.ymin - 0.5f)));
+            const int y1 = std::min(row1 - 1, static_cast<int>(std::floor(t.ymax - 0.5f)));
+            if (x0 > x1 || y0 > y1) continue;
+            const float area = (t.x[1] - t.x[0]) * (t.y[2] - t.y[0]) - (t.y[1] - t.y[0]) * (t.x[2] - t.x[0]);
+            if (area == 0.0f) continue;
+            const float inv = 1.0f / area;
+            // b0 and b1 are linear across the screen: value at a pixel centre and the step per pixel in x.
+            const float b0dx = -(t.y[2] - t.y[1]) * inv, b1dx = -(t.y[0] - t.y[2]) * inv;
+            const float sx = static_cast<float>(x0) + 0.5f;
+            for (int y = y0; y <= y1; ++y) {
+                const float py = static_cast<float>(y) + 0.5f;
+                float b0 = ((t.x[2] - t.x[1]) * (py - t.y[1]) - (t.y[2] - t.y[1]) * (sx - t.x[1])) * inv;
+                float b1 = ((t.x[0] - t.x[2]) * (py - t.y[2]) - (t.y[0] - t.y[2]) * (sx - t.x[2])) * inv;
+                float* depth_row = &target.depth[static_cast<size_t>(y) * w];
+                uint32_t* vis_row = &visibility[static_cast<size_t>(y) * w];
+                for (int x = x0; x <= x1; ++x, b0 += b0dx, b1 += b1dx) {
+                    const float b2 = 1.0f - b0 - b1;
+                    if (b0 < 0.0f || b1 < 0.0f || b2 < 0.0f) continue;
+                    const float iz = b0 * t.iz[0] + b1 * t.iz[1] + b2 * t.iz[2];
+                    if (iz <= depth_row[x]) continue;
+                    if (t.crosses_water) {
+                        // The reflection only shows what stands above the water.
+                        const float wz = (b0 * t.iz[0] * t.wz[0] + b1 * t.iz[1] * t.wz[1] + b2 * t.iz[2] * t.wz[2]) / iz;
+                        if (wz < city.water_z) continue;
+                    }
+                    depth_row[x] = iz;
+                    vis_row[x] = static_cast<uint32_t>(i + 1);
+                }
+            }
+        }
+    });
+
+    timer.mark(pass.mirror ? "mirror: depth" : "main: depth");
+    // 3. One shade per pixel.
+    parallel_rows(h, [&](int row0, int row1) {
+        for (int y = row0; y < row1; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const size_t pix = static_cast<size_t>(y) * w + x;
+                const uint32_t id = visibility[pix];
+                if (id == 0) continue;
+                const ScreenTri& t = list.tris[id - 1];
+                float b[3], a[kAttrs], c[3];
+                barycentric(t, static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, b);
+                interpolate(pass, list, t, b, a);
+                if (!shade(pass, city.batches[t.batch], a, c)) continue;
+                float* d = &target.rgb[pix * 3];
+                d[0] = c[0];
+                d[1] = c[1];
+                d[2] = c[2];
+            }
+        }
+    });
+
+    timer.mark(pass.mirror ? "mirror: shade" : "main: shade");
+    // 4. The additive water sparkle, against the finished depth.
+    if (pass.mirror) return;
+    parallel_rows(h, [&](int row0, int row1) {
+        for (const ScreenTri& t : list.tris) {
+            const CityBatch& batch = city.batches[t.batch];
+            if (batch.material != CityMaterial::Waves) continue;
+            if (t.ymax < static_cast<float>(row0) || t.ymin > static_cast<float>(row1)) continue;
+            const int x0 = std::max(0, static_cast<int>(std::ceil(std::min({t.x[0], t.x[1], t.x[2]}) - 0.5f)));
+            const int x1 = std::min(w - 1, static_cast<int>(std::floor(std::max({t.x[0], t.x[1], t.x[2]}) - 0.5f)));
+            const int y0 = std::max(row0, static_cast<int>(std::ceil(t.ymin - 0.5f)));
+            const int y1 = std::min(row1 - 1, static_cast<int>(std::floor(t.ymax - 0.5f)));
+            for (int y = y0; y <= y1; ++y) {
+                for (int x = x0; x <= x1; ++x) {
+                    float b[3], a[kAttrs], c[3];
+                    if (!barycentric(t, static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f, b)) continue;
+                    const size_t pix = static_cast<size_t>(y) * w + x;
+                    if (b[0] * t.iz[0] + b[1] * t.iz[1] + b[2] * t.iz[2] < target.depth[pix]) continue;
+                    interpolate(pass, list, t, b, a);
+                    if (!shade(pass, batch, a, c)) continue;
+                    float* d = &target.rgb[pix * 3];
+                    d[0] += c[0];
+                    d[1] += c[1];
+                    d[2] += c[2];
+                }
+            }
+        }
+    });
+    timer.mark("main: sparkle");
+}
+
+// The scene's exposure, measured on the main menu: with the level's bloom, the display gamma and the level's colour
 // curve in place, this is the one number left that puts a retail frame's sky and buildings where
 // they are. It holds within a few percent from mid-grey to white. The level asks for
 // Scene_ExposureManual 0.83 inside an automatic range of 0.79 to 0.95; how the tone mapper gets
@@ -341,12 +469,13 @@ void draw_pass(const Pass& pass) {
 constexpr float kExposure = 0.52f;
 
 // Bloom, exposure, gamma and the level's colour curve: linear scene colour to display values.
-void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom, std::vector<float>& out) {
+void tone_map(const City& city, const Surface& scene, float gamma, std::vector<float>& bloom, std::vector<float>& out) {
     const int w = scene.w, h = scene.h;
     // UE3 bloom: a wide blur of the quarter-resolution scene, scaled by Bloom_Scale and added.
     const int bw = std::max(1, w / 4), bh = std::max(1, h / 4);
     std::vector<float> small(static_cast<size_t>(bw) * bh * 3, 0.0f), tmp(small.size());
-    for (int y = 0; y < bh; ++y) {
+    parallel_rows(bh, [&](int brow0, int brow1) {
+    for (int y = brow0; y < brow1; ++y) {
         for (int x = 0; x < bw; ++x) {
             float sum[3] = {0.0f, 0.0f, 0.0f};
             int n = 0;
@@ -363,6 +492,7 @@ void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom,
             for (int c = 0; c < 3; ++c) small[(static_cast<size_t>(y) * bw + x) * 3 + c] = n ? sum[c] / static_cast<float>(n) : 0.0f;
         }
     }
+    });
     const int radius = std::max(2, bw / 26);  // about 50 pixels of a 1280-wide frame, the level's blur kernel
     std::vector<float> kernel(static_cast<size_t>(radius) * 2 + 1);
     float ksum = 0.0f;
@@ -375,7 +505,8 @@ void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom,
     for (int pass = 0; pass < 2; ++pass) {
         const std::vector<float>& src = pass == 0 ? small : tmp;
         std::vector<float>& dst = pass == 0 ? tmp : small;
-        for (int y = 0; y < bh; ++y) {
+        parallel_rows(bh, [&](int blur0, int blur1) {
+        for (int y = blur0; y < blur1; ++y) {
             for (int x = 0; x < bw; ++x) {
                 float sum[3] = {0.0f, 0.0f, 0.0f};
                 for (int i = -radius; i <= radius; ++i) {
@@ -393,11 +524,25 @@ void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom,
                 d[2] = sum[2];
             }
         }
+        });
     }
     bloom.swap(small);
 
+    // pow(v, 1 / gamma) from a table: three of them a pixel is most of this function otherwise.
+    constexpr int kGammaSteps = 4096;
+    static std::vector<float> gamma_table;
+    static float gamma_table_for = 0.0f;
+    if (gamma_table_for != gamma) {
+        gamma_table.resize(kGammaSteps + 2);
+        for (int i = 0; i <= kGammaSteps + 1; ++i) {
+            gamma_table[static_cast<size_t>(i)] = std::pow(std::min(static_cast<float>(i) / kGammaSteps, 1.0f), 1.0f / gamma);
+        }
+        gamma_table_for = gamma;
+    }
+
     out.resize(static_cast<size_t>(w) * h * 3);
-    for (int y = 0; y < h; ++y) {
+    parallel_rows(h, [&](int row0, int row1) {
+    for (int y = row0; y < row1; ++y) {
         const float fy = (static_cast<float>(y) + 0.5f) / 4.0f - 0.5f;
         const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, bh - 1), y1 = std::min(y0 + 1, bh - 1);
         const float ty = std::clamp(fy - std::floor(fy), 0.0f, 1.0f);
@@ -410,13 +555,16 @@ void tone_map(const City& city, const Surface& scene, std::vector<float>& bloom,
             for (int c = 0; c < 3; ++c) {
                 const float b = (bloom[(static_cast<size_t>(y0) * bw + x0) * 3 + c] * (1.0f - tx) + bloom[(static_cast<size_t>(y0) * bw + x1) * 3 + c] * tx) * (1.0f - ty) +
                                 (bloom[(static_cast<size_t>(y1) * bw + x0) * 3 + c] * (1.0f - tx) + bloom[(static_cast<size_t>(y1) * bw + x1) * 3 + c] * tx) * ty;
-                const float v = std::clamp((s[c] + b * city.bloom_scale) * kExposure, 0.0f, 1.0f);
-                const float g = std::pow(v, 1.0f / kDisplayGamma);
+                const float v = std::clamp((s[c] + b * city.bloom_scale) * kExposure, 0.0f, 1.0f) * kGammaSteps;
+                const int vi = static_cast<int>(v);
+                const float g = gamma_table[static_cast<size_t>(vi)] +
+                                (gamma_table[static_cast<size_t>(vi) + 1] - gamma_table[static_cast<size_t>(vi)]) * (v - static_cast<float>(vi));
                 const int i = std::min(static_cast<int>(g * 15.0f), 15);
                 o[c] = std::clamp(city.curve_m[i][c] * g + city.curve_b[i][c], 0.0f, 1.0f);
             }
         }
     }
+    });
 }
 
 }  // namespace
@@ -427,6 +575,8 @@ struct CityRenderer::Impl {
     Surface scene;
     Surface reflection;
     std::vector<float> bloom;
+    TriList tris;
+    std::vector<uint32_t> visibility;
 };
 
 CityRenderer::CityRenderer(const City& city) : impl_(std::make_unique<Impl>(city)) {}
@@ -439,6 +589,7 @@ void CityRenderer::render(const Frame& frame, int w, int h, std::vector<float>& 
 
     // SceneCaptureReflectActor: the scene from the camera mirrored in the water plane.
     const int rw = std::max(16, w / 2), rh = std::max(16, h / 2);
+    StageTimer reset_timer;
     impl_->reflection.reset(rw, rh);
     Pass mirror;
     mirror.city = &city;
@@ -448,9 +599,10 @@ void CityRenderer::render(const Frame& frame, int w, int h, std::vector<float>& 
     const Vec3 mpos{frame.camera.x, frame.camera.y, 2.0f * city.water_z - frame.camera.z};
     const Vec3 mtarget{frame.target.x, frame.target.y, 2.0f * city.water_z - frame.target.z};
     mirror.cam = make_camera(mpos, mtarget, frame.fov, rw, rh);
-    draw_pass(mirror);
+    draw_pass(mirror, impl_->tris, impl_->visibility);
 
     impl_->scene.reset(w, h);
+    reset_timer.mark("(mirror pass + resets)");
     Pass main;
     main.city = &city;
     main.time = static_cast<float>(frame.time);
@@ -458,9 +610,11 @@ void CityRenderer::render(const Frame& frame, int w, int h, std::vector<float>& 
     main.cam = make_camera(frame.camera, frame.target, frame.fov, w, h);
     main.reflection = &impl_->reflection;
     main.reflection_cam = mirror.cam;
-    draw_pass(main);
+    draw_pass(main, impl_->tris, impl_->visibility);
 
-    tone_map(city, impl_->scene, impl_->bloom, rgb);
+    StageTimer timer;
+    tone_map(city, impl_->scene, frame.display_gamma, impl_->bloom, rgb);
+    timer.mark("tone map");
 }
 
 }  // namespace me::fe

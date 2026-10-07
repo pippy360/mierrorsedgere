@@ -38,7 +38,8 @@ Script (`TdUIScene_Start`):
 * `SceneActivated`: `Opacity = 0`; the label text becomes `Localize("TdStart", IsConsole() ? "PressStartText" : "PressAnyKeyText", "TdGameUI")`, which is **"Press Any Key"** on PC; the label is hidden.
 * `HandleInputKey`: reacts to `IE_Released` only. If the attract movie is playing, the key stops it. Otherwise, once `TimeElapsedInScene >= TimeTillStartButton`, it hides and disables `SafeRegionPanel` and calls `CheckProfile()` → `InitSavefileSystem()` → `StartGame()` → `OpenScene(TdMainMenu)`.
 * The copyright line is `TdStart.CopyrightText`: "© 2009 EA Digital Illusions CE AB. All rights reserved."
-* The tick that advances `TimeElapsedInScene`, fades `Opacity` in, shows the label and starts the attract movie is native (`MirrorsEdge.exe`), so its timing is measured in section 8.
+* The tick that advances `TimeElapsedInScene`, fades `Opacity` in, shows the label and starts the attract movie is native (`MirrorsEdge.exe`). Measured (section 8): the scene's opacity is 0 for its first second and rises linearly to 1 over the next; "Press Any Key" appears at 4 s and does not pulse.
+* `TitleImage` is `ADJUST_Justified` on both axes: the 1024x256 texture is scaled by 1.0625 to the widget's width and, with no vertical alignment set, sits at the widget's top (y = 54 to 326). The logo's opaque part is then x 176 to 1076, y 93 to 287, which is where retail draws it.
 
 ---
 
@@ -265,16 +266,18 @@ Taken from the retail game's back buffer at 1280x720 with `tools/retail`'s `d3d9
 
 **Canvas colours and the display gamma**
 
-Text and image tiles do go through a gamma step, and it is not the 2.2 of `TdEngine.ini`:
+Text and image tiles go through a gamma step, and on the main menu it is not the 2.2 of `TdEngine.ini`:
 
-| Drawn | Linear colour | On screen |
+| Drawn on the main menu | Linear colour | On screen |
 |---|---|---|
 | focused sub-button text | (0, 0, 0) | (9, 9, 9) |
 | description text | (0, 0.0037, 0.0278) | (9, 33, 69) |
 | sub-button drop shadow, 50% over column red | (0, 0.078, 0.227) | (121, 50, 74) |
 | button bar image `button_full` | texel (232, 0, 0) | (237, 9, 9) |
 
-All four are `pow(max(c, 1e-4), 1 / 2.73)`. The floor is UE3's `KINDA_SMALL_NUMBER`; the 2.73 is the display gamma the game runs with after `TdPlayerController.SetVideoProfileSettings` has applied the profile's `Brightness` (`SetGamma(Brightness / 10)`, native). The scene is encoded with the same gamma (below), so it is one setting for the whole frame.
+All four are `pow(c, 1 / 2.73)` with a floor of 9/255 under it. On the start screen the same canvas gives `pow(c, 1 / 2.2)` with a floor of 2/255: the logo's texel (241, 0, 0) comes out (240, 2, 2) and the labels' (1, 0, 0) comes out (255, 2, 2).
+
+The difference is the profile. Taking a key on the start screen loads it, and `TdPlayerController.SetVideoProfileSettings` then calls the native `SetGamma(Brightness / 10)`; 2.73 is what a default profile gives. The scene is encoded with the same gamma as the canvas in both places, so it is one setting for the whole frame: in a retail capture the sky visibly brightens between the start screen and the menu.
 
 **Text placement**
 
@@ -286,14 +289,29 @@ Retail frames were paired with port frames of the same camera pose (found by edg
 
 Two readings that looked right and were not: weighting the light-map coefficients by `dot(N, basis)` (1/sqrt(3) each) makes the buildings 1.73 times too bright against the sky; and cutting the curve's pieces at sixteenths instead of fifteenths puts a visible band across the sky.
 
+**The start screen**
+
+Recorded from a cold start (`tools/retail/menu_capture.py boot`), time in seconds from the moment the level appears:
+
+| t | What |
+|---|---|
+| 0 to 2 | the scene fades in from white (`SeqAct_TdFadeEffect`, 2 s) |
+| 1 to 2 | the logo and the copyright line fade in (the scene's `Opacity`) |
+| 4 | "Press Any Key" appears, at full strength; it never pulses |
+| key | the logo and both labels vanish at once. The opening shot carries on, with a save-system spinner at the bottom left, for as long as the profile and the main menu's packages take to load (5 s on the test machine), then the four sticks and their captions appear over the opening shot for one frame before STORY opens |
+
+The opening shot plays at its authored speed: retail frames 31.7 s apart match port frames 31.5 s apart.
+
+With gamma 2.2 the port's start screen then differs from a retail frame of the same moment by 3.7 levels of 255 on average over the whole frame, logo and labels included.
+
 **Timing**
 
-* On the test machine one pass of the STORY camera loop takes 66 s of wall clock, not the Matinee's 60: retail's menu clock runs at about 0.9 of real time there. The port plays the Matinee at its authored length.
+* On the test machine one pass of the STORY camera loop took 66 s of wall clock, not the Matinee's 60. The opening shot kept exact time, so this is not a slow clock; it is not explained. The port plays every Matinee at its authored length.
 
 **Not established**
 
-* The start scene's native tick: the fade-in rate, and whether "Press Any Key" pulses.
-* The RACE column's camera. STORY, OPTIONS and EXTRAS frames match the port's Matinee evaluation (edge correlation 0.84 to 0.91); a RACE frame matches none of the level's 51 Matinees and its camera barely moves over five seconds, where `InterpData_23` moves 16 units a second.
+* The RACE column's camera. STORY, OPTIONS, EXTRAS and start-screen frames match the port's Matinee evaluation (edge correlation 0.84 to 0.91); a RACE frame matches none of the level's 51 Matinees, nor any pairing of one's camera with another's target, and its camera barely moves over five seconds, where `InterpData_23` moves 16 units a second.
+* How the tone mapper gets from `Scene_ExposureManual` 0.83 to the measured 0.52.
 
 ---
 
@@ -308,6 +326,8 @@ Two readings that looked right and were not: weighting the light-map coefficient
 
 It is plain C++ with no window, GPU or audio, so it builds wherever the asset loader does, including the Windows machine that has retail installed.
 
+The reference renderer is a visibility-buffer rasteriser on a small thread pool. At 1280x720 on a 16-thread desktop it takes about 33 ms for a main-menu frame and 49 ms for the start screen, whose shot looks across the whole city.
+
 ```bash
 cmake --build build --target me_menu
 ./build/me_menu --out shots --script "wait 6; shot start.png; key any; wait 46; shot story.png; key right; wait 6; shot race.png"
@@ -317,6 +337,7 @@ python -m tools.retail.side_by_side retail.png shots/story.png out.png --title S
 
 Retail on the left, the port on the right, same camera pose:
 
+![Press Any Key](../screenshots/menu/press_any_key.png)
 ![STORY](../screenshots/menu/main_menu_story.png)
 ![OPTIONS](../screenshots/menu/main_menu_options.png)
 ![EXTRAS](../screenshots/menu/main_menu_extras.png)

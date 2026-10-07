@@ -35,21 +35,21 @@ struct Target {
     }
 };
 
-// An sRGB texel as the canvas draws it.
-const float* canvas_lut() {
+// An sRGB texel as the canvas draws it at a display gamma.
+const float* canvas_lut(float gamma) {
     static float lut[256];
-    static bool built = false;
-    if (!built) {
-        for (int i = 0; i < 256; ++i) lut[i] = canvas_encode(srgb_to_linear(static_cast<float>(i) / 255.0f));
-        built = true;
+    static float built_for = 0.0f;
+    if (built_for != gamma) {
+        for (int i = 0; i < 256; ++i) lut[i] = canvas_encode(srgb_to_linear(static_cast<float>(i) / 255.0f), gamma);
+        built_for = gamma;
     }
     return lut;
 }
 
-void draw_quads(const Target& t, const DrawOp& op) {
+void draw_quads(const Target& t, const DrawOp& op, float gamma) {
     if (!op.image || !op.image->valid()) return;
     const bool glyphs = op.kind == DrawOp::Kind::Glyphs;
-    const float* lut = canvas_lut();
+    const float* lut = canvas_lut(gamma);
     for (const Quad& q : op.quads) {
         const float qw = q.x1 - q.x0, qh = q.y1 - q.y0;
         if (qw <= 0.0f || qh <= 0.0f) continue;
@@ -105,7 +105,8 @@ void draw_stick(const Target& t, const Assets& a, const DrawOp& op, double time)
     const int y0 = std::max(0, static_cast<int>(std::ceil(r.t - 0.5f)));
     const int x1 = std::min(t.w, static_cast<int>(std::ceil(r.r - 0.5f)));
     const int y1 = std::min(t.h, static_cast<int>(std::ceil(r.b - 0.5f)));
-    for (int y = y0; y < y1; ++y) {
+    parallel_rows(y1 - y0, [&](int band0, int band1) {
+    for (int y = y0 + band0; y < y0 + band1; ++y) {
         const float v = (static_cast<float>(y) + 0.5f - r.t) / r.h();
         // "Selection field"
         const float field = saturate(saturate(p.select_top * kSelectTiling - v * kSelectTiling) +
@@ -128,6 +129,7 @@ void draw_stick(const Target& t, const Assets& a, const DrawOp& op, double time)
             t.blend(x, y, c, opacity);
         }
     }
+    });
 }
 
 uint32_t be32(uint32_t v) { return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); }
@@ -181,17 +183,19 @@ void SoftRenderer::render(const Frame& frame, std::vector<uint8_t>& rgba) {
         const Target target{w, h, &color};
         for (const DrawOp& op : frame.ui) {
             if (op.kind == DrawOp::Kind::Stick) draw_stick(target, assets_, op, frame.time);
-            else draw_quads(target, op);
+            else draw_quads(target, op, frame.display_gamma);
         }
     }
 
     rgba.resize(static_cast<size_t>(w) * h * 4);
-    for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-        for (int k = 0; k < 3; ++k) {
-            rgba[i * 4 + k] = static_cast<uint8_t>(std::clamp(color[i * 3 + k], 0.0f, 1.0f) * 255.0f + 0.5f);
+    parallel_rows(h, [&](int row0, int row1) {
+        for (size_t i = static_cast<size_t>(row0) * w; i < static_cast<size_t>(row1) * w; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                rgba[i * 4 + k] = static_cast<uint8_t>(std::clamp(color[i * 3 + k], 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+            rgba[i * 4 + 3] = 255;
         }
-        rgba[i * 4 + 3] = 255;
-    }
+    });
 }
 
 bool write_png(const std::string& path, int width, int height, const uint8_t* rgba) {

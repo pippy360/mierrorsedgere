@@ -20,17 +20,23 @@
 
 namespace me::fe {
 
-// The display gamma the game encodes with. TdEngine.ini says 2.2, but
-// TdPlayerController.SetVideoProfileSettings replaces it with the profile's Brightness, and what a
-// default profile gives, measured on retail frames, is 2.73. Both the canvas and the scene use it.
-constexpr float kDisplayGamma = 2.73f;
+// The display gamma the game encodes the frame with, measured on retail frames. The start screen
+// is drawn with the DisplayGamma of TdEngine.ini, 2.2. Taking a key there loads the profile, and
+// TdPlayerController.SetVideoProfileSettings then calls SetGamma(Brightness / 10): from the main
+// menu on, a default profile gives 2.73.
+constexpr float kStartGamma = 2.2f;
+constexpr float kProfileGamma = 2.73f;
 
-// What the canvas does to a linear colour on its way to the back buffer:
-// pow(max(c, KINDA_SMALL_NUMBER), 1 / DisplayGamma). The floor is why "black" UI text is
-// (9, 9, 9). Materials drawn in the UI (the columns) do not go through it.
-inline float canvas_encode(float linear) {
-    const float c = linear < 1.0e-4f ? 1.0e-4f : (linear > 1.0f ? 1.0f : linear);
-    return std::pow(c, 1.0f / kDisplayGamma);
+// What the canvas does to a linear colour on its way to the back buffer: pow(c, 1 / gamma), with
+// a floor under it. "Black" canvas pixels are (2, 2, 2) on the start screen and (9, 9, 9) on the
+// main menu; the floor is taken between those two measurements. Materials drawn in the UI (the
+// columns) do not go through this.
+inline float canvas_encode(float linear, float gamma) {
+    const float c = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
+    const float t = (gamma - kStartGamma) / (kProfileGamma - kStartGamma);
+    const float floor_out = (2.0f + (9.0f - 2.0f) * (t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t))) / 255.0f;
+    const float out = std::pow(c, 1.0f / gamma);
+    return out < floor_out ? floor_out : out;
 }
 
 enum class Screen : uint8_t { Start, MainMenu };
@@ -79,6 +85,7 @@ struct Frame {
     Vec3 target{0.0f, 1.0f, 0.0f};
     float fov = 90.0f;   // horizontal, degrees (CameraActor.FOVAngle)
     float white = 0.0f;  // SeqAct_TdFadeEffect: 0 = clear, 1 = white
+    float display_gamma = kStartGamma;  // what the scene and the canvas are encoded with this frame
     std::vector<DrawOp> ui;
 };
 
@@ -151,6 +158,8 @@ private:
     void sound(const char* cue) { sounds_.emplace_back(cue); }
     int button_at(float x, float y) const;
 
+    [[nodiscard]] float gamma() const { return screen_ == Screen::Start ? kStartGamma : kProfileGamma; }
+    void ui_color(float r, float g, float b, float a, float out[4]) const;
     void draw_start(Frame& f) const;
     void draw_menu(Frame& f) const;
     void draw_text(Frame& f, const Font& font, const std::string& text, float x, float y, const float color[4]) const;
