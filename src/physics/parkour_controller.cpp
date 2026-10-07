@@ -190,6 +190,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_stop_timer = 0.0f;
     m_frame_turn_uu = 0.0f;
     m_frame_dt = 1.0f / 60.0f;
+    m_frame_accel = Vec3(0.0f, 0.0f, 0.0f);
+    m_frame_accel_valid = false;
 
     m_prev_jump = false;
     m_prev_crouch = false;
@@ -377,6 +379,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     float effective_dt = dt;
     update_reaction_time(input, dt, effective_dt);
     m_frame_dt = effective_dt;
+    m_frame_accel_valid = false;  // PlayerMove runs again this frame
 
     // 2. Camera, Rotation & Look-At Hint
     update_camera_and_inputs(input, effective_dt, scene);
@@ -1326,8 +1329,21 @@ Vec3 ParkourController::walk_acceleration(const Vec3& dir, const InputFrame& inp
 // (aForward > InputMaxSprintHeightLimit and the stick past InputMaxSprintRaduisLimit) and moving
 // that way, walk acceleration otherwise. Letting go within 0.15 s of starting stops you dead for
 // 0.25 s at 35 uu/s (the tap-stop). There is no sprint button in Mirror's Edge.
-Vec3 ParkourController::controller_acceleration(const InputFrame& input, float dt, float turn_uu, bool falling) {
+//
+// PlayerMove runs once per frame, before the pawn's physics: it hands the pawn one Acceleration
+// (ProcessMove) built from the frame's DeltaTime, aTurn and the velocity the frame starts with,
+// and physWalking / physFalling then sub-iterate the whole frame with it. So the first is
+// evaluated on the first call of a frame and held for the rest of that frame's sub-steps.
+// Re-evaluating it every 1/120 s sub-step made a start from rest take walk acceleration
+// (7 x 400 = 2800 uu/s^2, sprint needs Velocity . wish > 0) for only the first 8 ms: the edge_pt1
+// and escape recordings leave rest at 2800 x the frame's dt (46.7 uu/s at 60 fps) where the
+// port reached 31.6, and 309 uu/s on a 0.11 s hitch frame where it reached 114. It also drained
+// the sprint energy (walk_acceleration, per frame dt) once per sub-step.
+Vec3 ParkourController::controller_acceleration(const InputFrame& input, bool falling) {
+    if (m_frame_accel_valid) return m_frame_accel;
+    m_frame_accel_valid = true;
     const MovementConfig& c = m_config;
+    const float dt = m_frame_dt;
     Vec3& vel = m_telemetry.velocity;
     if (!falling && m_stop_timer > 0.0f) {
         m_stop_timer -= dt;
@@ -1335,18 +1351,31 @@ Vec3 ParkourController::controller_acceleration(const InputFrame& input, float d
         const Vec3 stopped = (d.length_sq() > 1e-6f) ? d.normalized() * 35.0f : Vec3(0.0f, 0.0f, 0.0f);
         vel.x = stopped.x;
         vel.y = stopped.y;
-        return Vec3(0.0f, 0.0f, 0.0f);
+        m_frame_accel = Vec3(0.0f, 0.0f, 0.0f);
+        return m_frame_accel;
     }
-    const Vec3 dir = input_direction(input);
+    // PlayerMove clamps the stick to the unit circle (InputSize > 1: aForward and aStrafe divided by
+    // it), so two keys give 0.707 per axis, not 1 - walk_acceleration's per-axis targets are then
+    // 400 x 0.707. In the 2026-09-26 20:40 run, adding D to a 348 uu/s backpedal turns retail's
+    // velocity onto the diagonal at near-constant speed, (-347.8, 0) -> (-340.0, 48.9) -> (-333.4,
+    // 87.4) in the facing frame: 7 x and 10 x the gap to (-282.8, 282.8) per second. The raw keys
+    // aimed the port at (-397.1, 397.1) and sped it up to 486 uu/s: (-353.3, 67.0) -> (-358.3, 121.0).
+    InputFrame stick = input;
+    const float size = std::sqrt(stick.forward * stick.forward + stick.strafe * stick.strafe);
+    if (size > 1.0f) {
+        stick.forward /= size;
+        stick.strafe /= size;
+    }
+    const Vec3 dir = input_direction(stick);
     if (dir.length_sq() > 0.0f) {
         if (!falling) m_accel_time += dt;
-        const float size = std::sqrt(input.forward * input.forward + input.strafe * input.strafe);
-        const bool sprint = input.forward > c.sprint_input_threshold && size > c.sprint_input_threshold &&
+        const bool sprint = stick.forward > c.sprint_input_threshold && std::min(size, 1.0f) > c.sprint_input_threshold &&
                             horiz(vel).dot(dir) > 0.0f;
-        return sprint ? sprint_acceleration(dir, vel, dt, falling, turn_uu)
-                      : walk_acceleration(dir, input, vel, falling);
+        m_frame_accel = sprint ? sprint_acceleration(dir, vel, dt, falling, m_frame_turn_uu)
+                               : walk_acceleration(dir, stick, vel, falling);
+        return m_frame_accel;
     }
-    const Vec3 a = walk_acceleration(dir, input, vel, falling);
+    m_frame_accel = walk_acceleration(dir, stick, vel, falling);
     if (!falling) {
         if (m_accel_time > 0.0f && m_accel_time < 0.15f) {
             m_stop_timer = 0.25f;
@@ -1357,7 +1386,7 @@ Vec3 ParkourController::controller_acceleration(const InputFrame& input, float d
         }
         m_accel_time = 0.0f;
     }
-    return a;
+    return m_frame_accel;
 }
 
 // ATdPawn::CalcVelocity for walking: `speed_mod` is the move's SpeedModifier (TdMove_Crouch 0.2),
@@ -1665,8 +1694,7 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     if (turning) {
         friction *= c.turn_180_friction;  // TdMove_180Turn.FrictionModifier: coast through the turn
     } else {
-        const float turn_uu = m_frame_turn_uu * (dt / std::max(m_frame_dt, 1e-6f));
-        accel = controller_acceleration(input, dt, turn_uu, false);
+        accel = controller_acceleration(input, false);
     }
     calc_velocity(accel, dt, speed_mod, friction);
 
@@ -1732,8 +1760,7 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     // Air control: the controller keeps asking for its ground acceleration; physFalling clamps it
     // to AccelRate x AirControl (6144 x 0.025 = 153.6 uu/s^2). Dodges, turns, and uncontrolled falls have none.
     if (!m_telemetry.falling_to_death && !dodge && !turning) {
-        const float turn_uu = m_frame_turn_uu * (dt / std::max(m_frame_dt, 1e-6f));
-        Vec3 a = horiz(controller_acceleration(input, dt, turn_uu, true));
+        Vec3 a = horiz(controller_acceleration(input, true));
         const float max_a = c.accel_rate * c.air_control;
         if (a.length_sq() > max_a * max_a) a = a.normalized() * max_a;
         m_telemetry.velocity.x += a.x * dt;
@@ -3490,7 +3517,10 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             m_telemetry.combat_anim_time = 0.0f;
             m_telemetry.combat_anim_duration = dur;
             m_melee_cooldown = dur * 0.90f;
-            m_telemetry.velocity += fwd * ((m_telemetry.melee_variant == 2) ? 220.0f : 140.0f);
+            // No lunge: retail's MOVE_Melee keeps the walking velocity. At all nine melee starts in
+            // the retail recordings the speed carries straight on (697 -> 698 -> 698 uu/s at a
+            // sprint, 530 -> 532 -> 534, and 0 -> 0 -> 0 from rest); the +140 / +220 uu/s push the
+            // port added here put it 40-50 uu ahead within half a second.
         }
 
         // Melee Hit Detection & Target Magnetism (from DefaultAIMeleeAttacks.ini)

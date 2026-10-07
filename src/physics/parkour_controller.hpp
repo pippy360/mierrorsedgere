@@ -184,7 +184,9 @@ private:
     [[nodiscard]] Vec3 facing_right() const;
     Vec3 sprint_acceleration(const Vec3& dir, const Vec3& vel, float dt, bool falling, float turn_uu);
     Vec3 walk_acceleration(const Vec3& dir, const InputFrame& input, const Vec3& vel, bool falling);
-    Vec3 controller_acceleration(const InputFrame& input, float dt, float turn_uu, bool falling);
+    // TdPlayerController.PlayerWalking.PlayerMove: evaluated once per frame (frame dt and turn),
+    // then held for every physics sub-step of that frame.
+    Vec3 controller_acceleration(const InputFrame& input, bool falling);
     void calc_velocity(const Vec3& accel, float dt, float speed_mod, float friction);
     [[nodiscard]] float speed_for_height(float height) const;
 
@@ -231,6 +233,8 @@ private:
     float m_stop_timer = 0.0f;         // TdPlayerController.bIsStopping (tap-stop)
     float m_frame_turn_uu = 0.0f;      // |aTurn| this frame, in rotation units (65536 per turn)
     float m_frame_dt = 1.0f / 60.0f;
+    Vec3 m_frame_accel{0.0f, 0.0f, 0.0f};  // this frame's PlayerMove acceleration (Pawn.Acceleration)
+    bool m_frame_accel_valid = false;
 
     // Input edges and buffers
     bool m_prev_jump = false;

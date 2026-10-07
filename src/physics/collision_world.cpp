@@ -11,6 +11,11 @@ namespace {
 
 constexpr uint32_t kLeafSize = 4;
 constexpr float kParallelEpsilon = 1e-9f;
+// A start-penetrating box that overlaps a triangle by no more than this along some separating axis is
+// only touching it there. World-space vertices are good to about one float ulp of their coordinates
+// (0.008 uu at |x| = 65536), so this leaves a wide margin while staying under the controller's 0.1 uu
+// contact skin.
+constexpr float kTouchDepth = 0.05f;
 
 inline Vec3 vmin(const Vec3& a, const Vec3& b) {
     return Vec3(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
@@ -123,6 +128,12 @@ SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, c
         const float face_r = extent.x * std::abs(tri_normal.x) + extent.y * std::abs(tri_normal.y) +
                              extent.z * std::abs(tri_normal.z);
         const float face_depth = std::max(0.0f, face_r - std::abs(side));
+        // "Pushes further in" must be judged relative to the sweep length. Normals of world-space
+        // triangles carry ~1e-4 of float noise (a vertical duct wall at y = -2809 has n.z = 3.6e-7 and
+        // edge axes with n.z = 1.1e-4), so with an absolute epsilon a box merely grazing such a wall had
+        // its 47 uu downward floor probe "blocked" by the wall at t = 0 and the pawn fell off a solid
+        // floor. Motion within ~0.06 degrees of the contact plane is treated as sliding along it.
+        const float into_eps = std::max(1e-6f, 1e-3f * delta.length());
         Vec3 n = face_n;
         float best_depth = face_depth - 0.25f;  // other axes must be clearly shallower to win
         auto consider_axis = [&](Vec3 axis) {
@@ -142,10 +153,14 @@ SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, c
                 const Vec3 cand_n = (push_pos <= push_neg) ? axis : -axis;
                 // Only let an edge/seam axis override the triangle face normal when either:
                 //  (a) it supports the box from below (cand_n.z >= 0.7f, e.g. standing on a roof/ramp top edge), or
-                //  (b) the sweep is actually moving into that edge (cand_n.dot(delta) < -1e-6f).
+                //  (b) the sweep is actually moving into that edge (cand_n.dot(delta) < -into_eps), or
+                //  (c) the box only touches the triangle along it (depth within float noise of zero). The box
+                //      is then outside the triangle on that axis and can only collide by moving into it; a box
+                //      standing against an air duct whose chamfer face plane slices through its top otherwise
+                //      took a deeper edge axis instead and was "blocked" while sliding away from the duct.
                 // Otherwise an internal seam between two wall/prop triangles perpendicular to delta would
                 // replace face_n and cause n.dot(delta) >= 0 to falsely discard a solid wall!
-                if (cand_n.z >= 0.7f || cand_n.dot(delta) < -1e-6f) {
+                if (cand_n.z >= 0.7f || cand_n.dot(delta) < -into_eps || depth <= kTouchDepth) {
                     best_depth = depth;
                     n = cand_n;
                 }
@@ -157,7 +172,7 @@ SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, c
             consider_axis(a.cross(e1));
             consider_axis(a.cross(e2));
         }
-        if (n.dot(delta) >= -1e-6f) return r;
+        if (n.dot(delta) >= -into_eps) return r;
         r.hit = true;
         r.start_penetrating = true;
         r.time = 0.0f;

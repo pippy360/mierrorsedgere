@@ -70,12 +70,12 @@ UE_PHYS_FALLING = 2
 # (PlayerWallWalking), the uncontrolled fall (PlayerDying) - leaves both as
 # they were.
 WALKING_MOVES = {"MOVE_Walking", "MOVE_Jump", "MOVE_Falling", "MOVE_Landing",
-                 "MOVE_Crouch", "MOVE_Slide", "MOVE_VaultOver", "MOVE_SpeedVault",
+                 "MOVE_Crouch", "MOVE_Slide", "MOVE_VaultOver", "MOVE_SpeedVaulting",
                  "MOVE_StepUp", "MOVE_AutoStepUp", "MOVE_SpringBoarding",
                  "MOVE_SoftLanding",
                  # TdMove_Barge has no ControllerState: PlayerWalking, keys live
                  "MOVE_Barge"}
-VAULT_MOVES = {"MOVE_VaultOver", "MOVE_SpeedVault", "MOVE_StepUp", "MOVE_AutoStepUp"}
+VAULT_MOVES = {"MOVE_VaultOver", "MOVE_SpeedVaulting", "MOVE_StepUp", "MOVE_AutoStepUp"}
 # ...of which these ignore the keys for the whole move (DisableMovementTime -1
 # on Default__TdMove_*: TdPawn.SetIgnoreMoveInput zeroes aForward/aStrafe in
 # PlayerInput), so their frames take PlayerMove's no-key path. So does a
@@ -95,9 +95,28 @@ STOP_VEL_UU = 35.0      # StoppingVelocity (@967)
 # ---------------------------------------------------------------------------
 # The trace
 
+MAX_PHYSICS = 13            # the highest EPhysics value a live pawn records (PHYS_None 0 .. 13)
+GARBAGE_ORIGIN_UU = 20.0    # a Location this close to the world origin is not a live pawn
+
+
 def pawn_sample(d):
-    """A sample record that is the pawn: live, read, and not the free camera."""
-    return d.get("px") is not None and d.get("valid", True) and not d.get("freecam")
+    """A sample record that is the pawn: live, read, and not the free camera.
+
+    Once the level is left the recorder can go on reading the released pawn: the
+    2026-09-25 15:46 session's last 305 s (18278 samples) sit at (1, 0, -3..-11)
+    with a physics byte of 61, 77, 168, ... - memory, not a pawn. Replayed, they
+    made 77 windows of retail "falling" at the origin that no port could follow.
+    No live sample in any recording comes within 20 uu of the origin or records
+    a physics value above 13."""
+    if d.get("px") is None or not d.get("valid", True) or d.get("freecam"):
+        return False
+    phys = d.get("physics")
+    if phys is not None and not 0 <= phys <= MAX_PHYSICS:
+        return False
+    if (abs(d["px"]) < GARBAGE_ORIGIN_UU and abs(d.get("py") or 0.0) < GARBAGE_ORIGIN_UU
+            and abs(d.get("pz") or 0.0) < GARBAGE_ORIGIN_UU):
+        return False
+    return True
 
 
 def open_trace(path):
