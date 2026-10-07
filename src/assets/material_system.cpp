@@ -22,6 +22,7 @@
 #include "texture_loader.hpp"
 #include "ue3_props.hpp"
 #include "upk_loader.hpp"
+#include "../renderer/sun_shadow.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1188,7 +1189,7 @@ void GraphCompiler::run() {
     if (out_.uses_scene_color) src << ", texture2d<float> scene_color [[texture(" << matbind::kSceneColorTexture << ")]]";
     if (out_.uses_scene_depth) src << ", depth2d<float> scene_depth [[texture(" << matbind::kSceneDepthTexture << ")]]";
     if (out_.uses_scene_color || out_.uses_scene_depth) src << ", sampler scene_smp [[sampler(" << matbind::kSceneSampler << ")]]";
-    src << ", depth2d<float> shadow_map [[texture(" << matbind::kShadowMapTexture << ")]]";
+    src << ", depth2d_array<float> shadow_map [[texture(" << matbind::kShadowMapTexture << ")]]";
     src << ") {\n";
     src << "    MatParams P = mat_setup(in, F);\n";
     for (const auto& s : normal_stmts) src << s << "\n";
@@ -1644,7 +1645,9 @@ void MaterialBuilder::finalize() {
 // Shared MSL prelude
 // =============================================================================
 const char* material_common_msl() {
-    return R"msl(
+    // The sun shadow lookup (renderer/sun_shadow.hpp) goes first: mat_shadow calls it, and the
+    // renderer's built-in world shader uses the same code.
+    static const std::string source = sun_shadow_msl() + R"msl(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -1684,6 +1687,7 @@ struct FrameUniforms {
     float4x4 sun_view_proj;
     packed_float3 mod_shadow_color;
     float shadow_enabled;
+    float4x4 sun_view_proj_far;
 };
 
 struct MatVSOut {
@@ -1821,43 +1825,17 @@ struct MatLightMap {
 };
 inline float3 mat_lm(MatLightMap m, int j) { return j == 0 ? m.c0 : (j == 1 ? m.c1 : m.c2); }
 
-// Real-time 12-tap rotated Vogel-disk PCF directional sun shadow map evaluation.
-inline float mat_shadow(MatParams P, constant FrameUniforms& F, depth2d<float> shadow_map) {
+// Real-time directional sun shadow cascades, through the shared world-stable PCF lookup
+// (sun_shadow_visibility, renderer/sun_shadow.hpp, prepended to this prelude).
+inline float mat_shadow(MatParams P, constant FrameUniforms& F, depth2d_array<float> shadow_map) {
     if (F.shadow_enabled < 0.5) return 1.0;
     float bias_scale = (F.shadow_enabled > 1.5) ? 0.06 : 1.0;
     float3 Lw = normalize(float3(F.sun_dir));
     float ndl_geo = saturate(dot(P.N, Lw));
     if (ndl_geo <= 0.001) return 0.0;
     float3 biased_wpos = P.wpos + P.N * (mix(14.0, 4.0, ndl_geo) * bias_scale) + Lw * (5.0 * bias_scale);
-    float4 sc = F.sun_view_proj * float4(biased_wpos, 1.0);
-    float3 ndc = sc.xyz / max(sc.w, 1e-6);
-    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    float edge = max(abs(ndc.x), abs(ndc.y));
-    if (edge >= 0.99 || ndc.z <= 0.001 || ndc.z >= 0.999) return 1.0;
-
-    constexpr sampler sh_smp(coord::normalized, filter::nearest, address::clamp_to_edge);
-    float bias = mix(0.0018, 0.0005, ndl_geo);
-    float ref_z = ndc.z - bias;
-    float2 radius = float2(1.65 / 4096.0);
-
-    // Interleaved gradient noise rotation in screen space for smooth penumbra
-    float ign = fract(52.9829189 * fract(dot(P.screen_uv * float2(1280.0, 720.0), float2(0.06711056, 0.00583715))));
-    float ang = ign * 6.2831853;
-    float ca = cos(ang);
-    float sa = sin(ang);
-
-    float vis = 0.0;
-    for (int i = 0; i < 12; ++i) {
-        float r = sqrt((float(i) + 0.5) * (1.0 / 12.0));
-        float theta = float(i) * 2.3999632 + ang;
-        float2 off = float2(cos(theta), sin(theta)) * r * radius;
-        float d = shadow_map.sample(sh_smp, uv + off);
-        vis += (ref_z <= d) ? 1.0 : 0.0;
-    }
-    vis *= (1.0 / 12.0);
-    (void)ca; (void)sa;
-    float fade = smoothstep(0.98, 0.88, edge);
-    return mix(1.0, vis, fade);
+    return sun_shadow_visibility(shadow_map, F.sun_view_proj, F.sun_view_proj_far, /*use_far=*/F.shadow_enabled < 1.5,
+                                 biased_wpos, P.N, ndl_geo, mix(25.2, 7.0, ndl_geo));
 }
 
 // Directional light-map coefficients modulated by real-time sun shadow visibility.
@@ -1913,7 +1891,7 @@ inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diff
     return mix(up_l, tsl, tslm) * upper_c + mix(lo_l, tsl, tslm) * lower_c;
 }
 
-inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, depth2d<float> shadow_map,
+inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, depth2d_array<float> shadow_map,
                            float3 diffuse, float diffuse_power,
                            float3 specular, float specular_power, float3 tslm, int model) {
     float shadow = mat_shadow(P, F, shadow_map);
@@ -1979,6 +1957,7 @@ inline float4 mat_scene_color(texture2d<float> t, sampler s, float2 uv) {
     return float4(pow(max(c.rgb, float3(0.0)), float3(2.2)), c.a);
 }
 )msl";
+    return source.c_str();
 }
 
 std::shared_ptr<SceneMaterialLibrary> build_scene_materials(PackageManager& pm,

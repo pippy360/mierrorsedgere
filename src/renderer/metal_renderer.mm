@@ -1,4 +1,5 @@
 #include "metal_renderer.hpp"
+#include "sun_shadow.hpp"
 #include "../anim/anim_system.hpp"
 #include "../assets/scene_materials.hpp"
 #include "../cutscene/cutscene_player.hpp"
@@ -171,6 +172,7 @@ struct FrameUniforms {
     float4x4 sun_view_proj;
     packed_float3 mod_shadow_color;
     float shadow_enabled;
+    float4x4 sun_view_proj_far;
 };
 
 struct ShadowVertexOut {
@@ -304,35 +306,20 @@ vertex VertexOut world_vertex(constant VertexIn* vertices [[buffer(0)]],
     return out;
 }
 
-inline float sample_world_shadow(float3 world_pos, float3 N, constant FrameUniforms& uniforms, depth2d<float> shadow_map) {
+// Sun visibility through the shared, world-stable shadow cascade lookup (renderer/sun_shadow.hpp).
+inline float sample_world_shadow(float3 world_pos, float3 N, constant FrameUniforms& uniforms, depth2d_array<float> shadow_map) {
     if (uniforms.shadow_enabled < 0.5) return 1.0;
     float3 Lw = normalize(float3(uniforms.sun_dir));
     float ndl = saturate(dot(N, Lw));
     if (ndl <= 0.001) return 0.0;
     float3 biased_pos = world_pos + N * mix(18.0, 5.0, ndl) + Lw * 6.0;
-    float4 sc = uniforms.sun_view_proj * float4(biased_pos, 1.0);
-    float3 ndc = sc.xyz / max(sc.w, 1e-6);
-    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    float edge = max(abs(ndc.x), abs(ndc.y));
-    if (edge >= 0.99 || ndc.z <= 0.001 || ndc.z >= 0.999) return 1.0;
-
-    constexpr sampler sh_smp(coord::normalized, filter::nearest, address::clamp_to_edge);
-    float ref_z = ndc.z - mix(0.0022, 0.0006, ndl);
-    float2 texel = float2(1.0 / 4096.0);
-    float vis = 0.0;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            float d = shadow_map.sample(sh_smp, uv + float2(dx, dy) * texel * 1.35);
-            vis += (ref_z <= d) ? 1.0 : 0.0;
-        }
-    }
-    vis *= (1.0 / 9.0);
-    return mix(1.0, vis, smoothstep(0.98, 0.88, edge));
+    return sun_shadow_visibility(shadow_map, uniforms.sun_view_proj, uniforms.sun_view_proj_far,
+                                 /*use_far=*/uniforms.shadow_enabled < 1.5, biased_pos, N, ndl, mix(30.8, 8.4, ndl));
 }
 
 fragment float4 world_fragment(VertexOut in [[stage_in]],
                                constant FrameUniforms& uniforms [[buffer(0)]],
-                               depth2d<float> shadow_map [[texture(27)]]) {
+                               depth2d_array<float> shadow_map [[texture(27)]]) {
     // Compute geometric facet normal from screen-space derivatives to guarantee crisp architectural planes
     float3 dpdx = dfdx(in.world_pos);
     float3 dpdy = dfdy(in.world_pos);
@@ -749,6 +736,7 @@ struct FrameUniformsGPU {
     simd_float4x4 sun_view_proj;
     PackedFloat3 mod_shadow_color;
     float shadow_enabled;
+    simd_float4x4 sun_view_proj_far;
 };
 
 struct HUDVertex {
@@ -852,7 +840,13 @@ struct MetalRenderer::Impl {
     id<MTLTexture> offscreen_color_tex = nil;
     id<MTLTexture> offscreen_depth_tex = nil;
     id<MTLTexture> scene_hdr_tex = nil; // Intermediate HDR buffer for tone mapping
-    id<MTLTexture> shadow_depth_tex = nil; // 4096x4096 real-time directional sun shadow depth map
+    id<MTLTexture> shadow_depth_tex = nil; // sun shadow cascades: 2-slice 4096x4096 depth array (renderer/sun_shadow.hpp)
+    // The far cascade slice only holds static level geometry and is redrawn only when its (coarsely
+    // snapped) matrix changes or the scene's vertex buffers are rebuilt.
+    bool shadow_far_valid = false;
+    float shadow_far_vp[16] = {};
+    uint64_t scene_generation = 0;       // bumped whenever cached_mesh_buffers is rebuilt
+    uint64_t shadow_far_generation = 0;  // scene_generation the far slice was rendered from
 
     int width = 1280;
     int height = 720;
@@ -1338,7 +1332,9 @@ struct MetalRenderer::Impl {
 
     bool compile_shaders() {
         NSError* error = nil;
-        NSString* source = [NSString stringWithUTF8String:MSL_SHADERS];
+        // The sun shadow lookup is shared with the generated material shaders (renderer/sun_shadow.hpp).
+        const std::string full_source = sun_shadow_msl() + MSL_SHADERS;
+        NSString* source = [NSString stringWithUTF8String:full_source.c_str()];
         MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
         if (@available(macOS 15.0, *)) {
             options.mathMode = MTLMathModeFast;
@@ -1517,12 +1513,15 @@ struct MetalRenderer::Impl {
 
         if (!shadow_depth_tex) {
             MTLTextureDescriptor* shDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-                                                                                              width:4096
-                                                                                             height:4096
+                                                                                              width:kSunShadowMapSize
+                                                                                             height:kSunShadowMapSize
                                                                                           mipmapped:NO];
+            shDesc.textureType = MTLTextureType2DArray;
+            shDesc.arrayLength = 2;  // kSunShadowNearSlice, kSunShadowFarSlice
             shDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             shDesc.storageMode = MTLStorageModePrivate;
             shadow_depth_tex = [device newTextureWithDescriptor:shDesc];
+            shadow_far_valid = false;
         }
 
         MTLTextureDescriptor* colorDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -2312,23 +2311,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.aspect = aspect;
         uniforms.cam_up = simd_make_float3(up.x, up.y, up.z);
 
-        // Directional Sun Orthographic Shadow Matrix (4096x4096 covering view frustum)
-        {
-            const float kShadowExtent = in_main_menu ? 2400.0f : 3600.0f;
-            const float kTexelWorld = (kShadowExtent * 2.0f) / 4096.0f;
-            Vec3 flat_fwd(fwd.x, fwd.y, 0.0f);
-            if (flat_fwd.length() > 1e-3f) flat_fwd = flat_fwd.normalized();
-            Vec3 sh_center = in_main_menu ? Vec3(0.0f, 0.0f, 120.0f) : (cam_pos + flat_fwd * 1300.0f);
-            sh_center.x = std::floor(sh_center.x / kTexelWorld) * kTexelWorld;
-            sh_center.y = std::floor(sh_center.y / kTexelWorld) * kTexelWorld;
-            sh_center.z = std::floor(sh_center.z / kTexelWorld) * kTexelWorld;
-
-            Vec3 sun_up = (std::abs(sun_d.z) < 0.95f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f);
-            Mat4 sun_view = Mat4::look_at(sh_center + sun_d * 8000.0f, sh_center, sun_up);
-            Mat4 sun_proj = Mat4::ortho(-kShadowExtent, kShadowExtent, -kShadowExtent, kShadowExtent, 1000.0f, 15000.0f);
-            Mat4 sun_vp = sun_proj * sun_view;
-            std::memcpy(&uniforms.sun_view_proj, sun_vp.m, sizeof(float) * 16);
-        }
+        // Directional sun shadow cascades (renderer/sun_shadow.hpp): orthographic squares centred on the
+        // camera and snapped to whole texels in light space, so neither map slides across the world by part
+        // of a texel as the camera moves, and turning the camera changes nothing. The main menu instead
+        // frames TdMainMenu's miniature City of Glass with one fixed square and has no far cascade.
+        const Mat4 sun_near_vp = in_main_menu ? sun_shadow_menu_view_proj(sun_d) : sun_shadow_view_proj(sun_d, cam_pos);
+        const Mat4 sun_far_vp = in_main_menu ? sun_near_vp : sun_shadow_far_view_proj(sun_d, cam_pos);
+        std::memcpy(&uniforms.sun_view_proj, sun_near_vp.m, sizeof(float) * 16);
+        std::memcpy(&uniforms.sun_view_proj_far, sun_far_vp.m, sizeof(float) * 16);
         uniforms.mod_shadow_color = simd_make_float3(active_scene.mod_shadow_color.x,
                                                      active_scene.mod_shadow_color.y,
                                                      active_scene.mod_shadow_color.z);
@@ -2371,6 +2361,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             impl_->cached_map_name = active_scene.map_name;
             impl_->cached_total_verts = total_scene_verts;
             impl_->cached_mesh_buffers.clear();
+            ++impl_->scene_generation;  // the far shadow cascade must be redrawn from the new geometry
             for (const auto& m : active_scene.meshes) {
                 if (m.vertices.empty()) {
                     impl_->cached_mesh_buffers.push_back(nil);
@@ -2411,63 +2402,92 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         };
 
         // ---------------------------------------------------------------------
-        // Pass 0: Real-Time Directional Sun Shadow Map (4096x4096 Depth)
+        // Pass 0: Real-Time Directional Sun Shadow Cascades (2 x 4096x4096 Depth)
         // ---------------------------------------------------------------------
         if (impl_->shadow_depth_tex && impl_->shadow_pipeline) {
-            MTLRenderPassDescriptor* shadowPass = [MTLRenderPassDescriptor renderPassDescriptor];
-            shadowPass.depthAttachment.texture = impl_->shadow_depth_tex;
-            shadowPass.depthAttachment.loadAction = MTLLoadActionClear;
-            shadowPass.depthAttachment.storeAction = MTLStoreActionStore;
-            shadowPass.depthAttachment.clearDepth = 1.0;
+            // Renders one cascade into its slice of the shadow map array. `dynamic_casters` adds the moving
+            // elevator parts, the barge doors and the enemies; without it only static level geometry is drawn.
+            auto encode_shadow_cascade = [&](NSUInteger slice, const Mat4& cascade_vp, float slope_bias_cap_uu,
+                                             float depth_range_uu, bool dynamic_casters) {
+                MTLRenderPassDescriptor* shadowPass = [MTLRenderPassDescriptor renderPassDescriptor];
+                shadowPass.depthAttachment.texture = impl_->shadow_depth_tex;
+                shadowPass.depthAttachment.slice = slice;
+                shadowPass.depthAttachment.loadAction = MTLLoadActionClear;
+                shadowPass.depthAttachment.storeAction = MTLStoreActionStore;
+                shadowPass.depthAttachment.clearDepth = 1.0;
 
-            id<MTLRenderCommandEncoder> shEnc = [cmd_buffer renderCommandEncoderWithDescriptor:shadowPass];
-            [shEnc setViewport:(MTLViewport){0.0, 0.0, 4096.0, 4096.0, 0.0, 1.0}];
-            [shEnc setRenderPipelineState:impl_->shadow_pipeline];
-            [shEnc setDepthStencilState:impl_->depth_write_state];
-            [shEnc setDepthBias:0.0012f slopeScale:1.75f clamp:0.015f];
-            [shEnc setCullMode:MTLCullModeNone];
-            [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                // shadow_vertex projects with uniforms.sun_view_proj.
+                const simd_float4x4 near_vp_saved = uniforms.sun_view_proj;
+                std::memcpy(&uniforms.sun_view_proj, cascade_vp.m, sizeof(float) * 16);
 
-            bool sh_prev_moved = false;
-            for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
-                const auto& mesh = active_scene.meshes[i];
-                if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
-                bool moved = apply_scene_mesh_model(i);
-                if (moved || sh_prev_moved) [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                sh_prev_moved = moved;
-                [shEnc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
-                if (mesh.sections.empty()) {
-                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
-                    continue;
-                }
-                for (const auto& s : mesh.sections) {
-                    if (!section_in_range(mesh, s)) continue;
-                    const MaterialShader* sh = nullptr;
-                    const SceneMaterial* m = nullptr;
-                    impl_->section_pipeline(s, &sh, &m);
-                    if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
-                    if (m && (m->name.find("Skydome") != std::string::npos || m->name.find("skydome") != std::string::npos)) continue;
-                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
-                }
-            }
-            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                id<MTLRenderCommandEncoder> shEnc = [cmd_buffer renderCommandEncoderWithDescriptor:shadowPass];
+                [shEnc setViewport:(MTLViewport){0.0, 0.0, (double)kSunShadowMapSize, (double)kSunShadowMapSize, 0.0, 1.0}];
+                [shEnc setRenderPipelineState:impl_->shadow_pipeline];
+                [shEnc setDepthStencilState:impl_->depth_write_state];
+                // Slope-scaled bias, capped in UU (the cap is in map depth units: depth_range_uu UU each).
+                [shEnc setDepthBias:0.0012f slopeScale:1.75f clamp:slope_bias_cap_uu / depth_range_uu];
+                [shEnc setCullMode:MTLCullModeNone];
+                [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
-            if (impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
-                for (const auto& bot : active_scene.enemies) {
-                    if (!bot.alive) continue;
-                    impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
-                    if (impl_->enemy_guard_mesh.empty()) continue;
-                    bind_vertex_bytes_or_buffer(shEnc, impl_->enemy_guard_mesh.data(),
-                                                impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
-                    Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
-                    std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
-                    [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                    [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
+                bool sh_prev_moved = false;
+                for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                    const auto& mesh = active_scene.meshes[i];
+                    if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                    if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
+                    bool moved = apply_scene_mesh_model(i);
+                    if (moved || sh_prev_moved) [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                    sh_prev_moved = moved;
+                    [shEnc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
+                    if (mesh.sections.empty()) {
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                        continue;
+                    }
+                    for (const auto& s : mesh.sections) {
+                        if (!section_in_range(mesh, s)) continue;
+                        const MaterialShader* sh = nullptr;
+                        const SceneMaterial* m = nullptr;
+                        impl_->section_pipeline(s, &sh, &m);
+                        if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
+                        if (m && (m->name.find("Skydome") != std::string::npos || m->name.find("skydome") != std::string::npos)) continue;
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
+                    }
                 }
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
-            }
 
-            [shEnc endEncoding];
+                if (dynamic_casters && impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
+                    for (const auto& bot : active_scene.enemies) {
+                        if (!bot.alive) continue;
+                        impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
+                        if (impl_->enemy_guard_mesh.empty()) continue;
+                        bind_vertex_bytes_or_buffer(shEnc, impl_->enemy_guard_mesh.data(),
+                                                    impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
+                        Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+                        std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
+                        [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
+                    }
+                    std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                }
+
+                [shEnc endEncoding];
+                uniforms.sun_view_proj = near_vp_saved;
+            };
+
+            // Far cascade: static geometry only, so it stays valid until its coarsely snapped square steps
+            // (the camera moved ~kSunShadowFarStep), the sun direction changes or the scene is rebuilt.
+            // The main menu has no far cascade: one fixed square frames its miniature city.
+            if (!in_main_menu &&
+                (!impl_->shadow_far_valid || impl_->shadow_far_generation != impl_->scene_generation ||
+                 std::memcmp(impl_->shadow_far_vp, sun_far_vp.m, sizeof(impl_->shadow_far_vp)) != 0)) {
+                encode_shadow_cascade(kSunShadowFarSlice, sun_far_vp, kSunShadowFarSlopeBiasCap, kSunShadowFarDepthRange,
+                                      /*dynamic_casters=*/false);
+                std::memcpy(impl_->shadow_far_vp, sun_far_vp.m, sizeof(impl_->shadow_far_vp));
+                impl_->shadow_far_generation = impl_->scene_generation;
+                impl_->shadow_far_valid = true;
+            }
+            // Near cascade (or the menu's fixed square): every caster, every frame.
+            encode_shadow_cascade(kSunShadowNearSlice, sun_near_vp, kSunShadowSlopeBiasCap, kSunShadowDepthRange,
+                                  /*dynamic_casters=*/true);
         }
 
         // ---------------------------------------------------------------------
