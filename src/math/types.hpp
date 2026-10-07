@@ -389,6 +389,7 @@ enum class EMovement : uint8_t {
     MOVE_ZipLine = 28,
     MOVE_Balance = 29,
     MOVE_LedgeWalk = 30,
+    MOVE_GrabTransfer = 31,
     MOVE_MeleeAir = 32,
     MOVE_DodgeJump = 33,
     MOVE_StepUp = 37,
@@ -433,6 +434,7 @@ inline const char* move_state_name(EMovement m) {
         case EMovement::MOVE_ZipLine: return "MOVE_ZipLine";
         case EMovement::MOVE_Balance: return "MOVE_Balance";
         case EMovement::MOVE_LedgeWalk: return "MOVE_LedgeWalk";
+        case EMovement::MOVE_GrabTransfer: return "MOVE_GrabTransfer";
         case EMovement::MOVE_MeleeAir: return "MOVE_MeleeAir";
         case EMovement::MOVE_DodgeJump: return "MOVE_DodgeJump";
         case EMovement::MOVE_StepUp: return "MOVE_StepUp";

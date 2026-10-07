@@ -41,6 +41,14 @@ constexpr float kGrabMaxRise = 215.0f;
 constexpr float kMantleMaxRise = 125.0f;
 // Camera roll while wallrunning (TdMove_WallRun camera modifier).
 constexpr float kWallrunCameraRoll = 15.0f;
+// TdMove_Barge defaults: BargeAddOnSpeed, BargeMaxSpeed, BargeKickThresholdSpeed. The move lengths
+// are measured from the recordings: the running barge (2026-09-26 20:40, t=121.64) lasts 1.15 s, the
+// standing kick (edge_pt1, t=215.87) 0.85 s.
+constexpr float kBargeAddOnSpeed = 200.0f;
+constexpr float kBargeMaxSpeed = 500.0f;
+constexpr float kBargeKickThresholdSpeed = 250.0f;
+constexpr float kBargeTime = 1.15f;
+constexpr float kBargeKickTime = 0.85f;
 
 // TdPawn.SpeedCurve_LightWeapon: seconds of sprinting -> speed (uu/s), CIM_Linear keys.
 const std::vector<std::pair<float, float>> kSpeedCurveLightWeapon = {
@@ -503,6 +511,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 update_ledge_grab(input, step_dt, scene);
                 break;
 
+            case EMovement::MOVE_GrabTransfer:
+                update_grab_transfer(step_dt);
+                break;
+
             case EMovement::MOVE_ZipLine:
                 update_zipline(input, step_dt, scene);
                 break;
@@ -543,7 +555,8 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                                   state == EMovement::MOVE_MeleeSlide || state == EMovement::MOVE_SkillRoll ||
                                   state == EMovement::MOVE_Coil);
         const bool attached = (state == EMovement::MOVE_Grabbing || state == EMovement::MOVE_GrabPullUp ||
-                               state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_ZipLine ||
+                               state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_GrabTransfer ||
+                               state == EMovement::MOVE_ZipLine ||
                                state == EMovement::MOVE_Swing || state == EMovement::MOVE_Climb ||
                                state == EMovement::MOVE_WallClimbing || state == EMovement::MOVE_SpeedVaulting ||
                                state == EMovement::MOVE_VaultOver || state == EMovement::MOVE_SpringBoarding);
@@ -1045,6 +1058,104 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             return out;
         }
     }
+    return out;
+}
+
+// TdMove_GrabTransfer (Allowed2DTransferDistance 260, AllowedZTransferDistance 140) and its
+// CheckReachableVaultOver. When the pawn hangs from a lip with no room on top, the thing in the way
+// can be a rail standing on the lip. Then a jump moves the hands up onto the rail's top and vaults
+// over it. Retail does this at a railed slab on the escape roof, recorded twice with identical
+// paths (20260920_185901 t=144.19 and 20260926_204019 t=116.45). The slab's top is at 10624, and
+// an 8 uu rail stands 16 back from the slab's face, rising 96 above it.
+ParkourController::RailTransfer ParkourController::find_rail_transfer(const Vec3& wall_normal, float ledge_z,
+                                                                      const LevelScene& scene) const {
+    RailTransfer out;
+    Vec3 into(-wall_normal.x, -wall_normal.y, 0.0f);
+    if (into.length_sq() < 1e-6f) return out;
+    into = into.normalized();
+    const Vec3& feet = m_telemetry.position;
+    constexpr float kAllowedZTransferDistance = 140.0f;
+    constexpr float kReach = 120.0f;        // pawn centre -> rail face
+    constexpr float kRailMaxWidth = 64.0f;  // anything wider is a top to stand on, not a rail
+
+    // The rail's near face, just above the lip.
+    float face_d = -1.0f;
+    for (float h : {8.0f, 32.0f, 64.0f}) {
+        const Vec3 s(feet.x, feet.y, ledge_z + h);
+        const TraceHit w = trace_ray(s, s + into * kReach, scene);
+        if (!w.hit || w.start_penetrating || std::abs(w.normal.z) > 0.3f) continue;
+        const Vec3 n = horiz(w.normal);
+        if (n.length_sq() < 1e-6f || n.normalized().dot(into) > -0.7f) continue;
+        const float d = (w.point - s).dot(into);
+        if (face_d < 0.0f || d < face_d) face_d = d;
+    }
+    if (face_d < 0.0f) return out;
+
+    // Its top: within AllowedZTransferDistance of the lip, at least a step above it, and with room
+    // for the hands (the same 10 x 10 x 80 box as find_ledge).
+    const Vec3 column = feet + into * (face_d + 2.0f);
+    constexpr Vec3 kTopProbeExtent(2.5f, 2.5f, 0.5f);
+    const float z_start = ledge_z + kAllowedZTransferDistance + 10.0f;
+    const float z_end = ledge_z + 1.0f;
+    float rail_top = 0.0f;
+    bool got_top = false;
+    const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start), Vec3(column.x, column.y, z_end), scene);
+    if (top.hit && !top.start_penetrating && top.normal.z >= kWalkableFloorZ) {
+        rail_top = top.point.z;
+        got_top = true;
+    } else {
+        const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start), kTopProbeExtent,
+                                           Vec3(0.0f, 0.0f, z_end - z_start), scene);
+        if (box_top.hit && !box_top.start_penetrating && box_top.normal.z >= kWalkableFloorZ) {
+            rail_top = box_top.point.z - kTopProbeExtent.z;
+            got_top = true;
+        }
+    }
+    if (!got_top) return out;
+    const float rise = rail_top - ledge_z;
+    if (rise < kMaxStepHeight || rise > kAllowedZTransferDistance) return out;
+    if (!box_free(Vec3(column.x, column.y, rail_top + 41.0f), Vec3(10.0f, 10.0f, 40.0f), scene)) return out;
+
+    // Thin enough to vault: the top has to end within kRailMaxWidth. The far face is then found
+    // by tracing back from beyond it.
+    float far_d = -1.0f;
+    for (float d = face_d + 4.0f; d <= face_d + kRailMaxWidth + 0.5f; d += 4.0f) {
+        const Vec3 p = feet + into * d;
+        if (!trace_ray(Vec3(p.x, p.y, rail_top + 8.0f), Vec3(p.x, p.y, rail_top - 24.0f), scene).hit) {
+            far_d = d;
+            break;
+        }
+    }
+    if (far_d < 0.0f) return out;
+    {
+        Vec3 s = feet + into * far_d;
+        s.z = rail_top - 4.0f;
+        const TraceHit back = trace_ray(s, s - into * (far_d - face_d), scene);
+        if (back.hit && !back.start_penetrating) far_d = (back.point - feet).dot(into);
+    }
+
+    // Retail's path, measured against the rail. The transfer ends hanging under the rail's top,
+    // with the centre 32 out from its face. The vault rises to an apex with the centre 2 short of
+    // the face and the feet 64 under the top. It then carries over to 38 past the far face (the
+    // body clear of it), with the feet 95 under the top, or on the floor there if that is higher.
+    const Vec3 hang_xy = feet + into * (face_d - kPawnRadius - 2.0f);
+    const Vec3 apex_xy = feet + into * (face_d - 2.0f);
+    const Vec3 end_xy = feet + into * (far_d + kPawnRadius + 8.0f);
+    float end_z = rail_top - 95.0f;
+    bool on_floor = false;
+    const TraceHit floor = trace_ray(Vec3(end_xy.x, end_xy.y, rail_top),
+                                     Vec3(end_xy.x, end_xy.y, rail_top - 240.0f), scene);
+    if (floor.hit && floor.normal.z >= kWalkableFloorZ) {
+        end_z = std::max(end_z, floor.point.z);
+        on_floor = floor.point.z >= end_z - (kMaxStepHeight + kMaxFloorDist);
+    }
+    if (!has_room_at(Vec3(end_xy.x, end_xy.y, end_z + 1.0f), kPawnHeight, scene)) return out;
+
+    out.found = true;
+    out.hang = Vec3(hang_xy.x, hang_xy.y, rail_top - m_config.grab_hang_depth);
+    out.apex = Vec3(apex_xy.x, apex_xy.y, rail_top - 64.0f);
+    out.end = Vec3(end_xy.x, end_xy.y, end_z);
+    out.end_on_floor = on_floor;
     return out;
 }
 
@@ -1689,10 +1800,19 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     // What the controller asks for, and how the pawn turns it into velocity.
     float speed_mod = crouched ? c.crouch_speed_modifier : 1.0f;
     if (m_telemetry.weapon.equipped) speed_mod *= m_telemetry.weapon.mobility_scale;
+    // TdMove_Barge keeps the pawn at BargeMaxSpeed or below for the whole move: retail holds
+    // exactly 500.0 uu/s with W held until the door stops it, then accelerates normally again.
+    const bool barging = (st == EMovement::MOVE_Barge);
+    if (barging) speed_mod = std::min(speed_mod, kBargeMaxSpeed / c.ground_speed);
     float friction = c.ground_friction;
     Vec3 accel(0.0f, 0.0f, 0.0f);
     if (turning) {
         friction *= c.turn_180_friction;  // TdMove_180Turn.FrictionModifier: coast through the turn
+    } else if (barging && m_barge_kick) {
+        // The standing kick roots the pawn until it ends (retail: 0 uu/s throughout, W held).
+        m_telemetry.velocity.x = 0.0f;
+        m_telemetry.velocity.y = 0.0f;
+        m_sprint_energy = 0.0f;
     } else {
         accel = controller_acceleration(input, false);
     }
@@ -1759,12 +1879,19 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
 
     // Air control: the controller keeps asking for its ground acceleration; physFalling clamps it
     // to AccelRate x AirControl (6144 x 0.025 = 153.6 uu/s^2). Dodges, turns, and uncontrolled falls have none.
+    // The pawn then gains that acceleration twice per tick - the same doubling as the gravity above
+    // (1600 = 2 x the world's 800). Every retail recording shows it: holding W in the air from 50
+    // to 520 uu/s gains 306-307 uu/s^2 (Jump, Falling, SpringBoarding, GrabJump, WallClimb180TurnJump
+    // alike, and strafing gains 307 sideways); above that the speed curve takes over at twice its
+    // value - median 102 at 550-600, 92 at 600-650, 43-53 at 650-700, 14-16 at 700-750, where the
+    // curve gives ~52, ~47, ~28, ~6. With one application the port's springboard arc gained 50 uu/s^2
+    // where retail's gained 99 and landed ~60 uu/s slower.
     if (!m_telemetry.falling_to_death && !dodge && !turning) {
         Vec3 a = horiz(controller_acceleration(input, true));
         const float max_a = c.accel_rate * c.air_control;
         if (a.length_sq() > max_a * max_a) a = a.normalized() * max_a;
-        m_telemetry.velocity.x += a.x * dt;
-        m_telemetry.velocity.y += a.y * dt;
+        m_telemetry.velocity.x += 2.0f * a.x * dt;
+        m_telemetry.velocity.y += 2.0f * a.y * dt;
     }
 
     // Swept displacement with slide-along-surface; the coil lifts the bottom of the box.
@@ -2317,13 +2444,16 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     if (m_climb_cooldown > 0.12f && ledge.normal.dot(m_climb_normal) > 0.9f) {
         return false;
     }
-    // Room for the body on top (standing, or crouched under a low ceiling).
+    // Room for the body on top (standing, or crouched under a low ceiling). With none, a rail
+    // standing on the lip is still a grab: retail hangs there and a jump takes it up onto the rail
+    // and over (TdMove_IntoGrab.bCheckForVaultOver, TdMove_GrabTransfer).
     const Vec3 on_top = ledge.top_point + into * (kPawnRadius + 2.0f) + Vec3(0.0f, 0.0f, 0.5f);
     const bool stand_room = has_room_at(on_top, kPawnHeight, scene);
-    if (!stand_room && !has_room_at(on_top, kCrouchHeight, scene)) return false;
+    const bool room = stand_room || has_room_at(on_top, kCrouchHeight, scene);
+    if (!room && !find_rail_transfer(ledge.normal, ledge.top_z, scene).found) return false;
 
     const float rise = ledge.top_z - m_telemetry.position.z;
-    if (rise <= kMantleMaxRise && m_telemetry.velocity.z > -50.0f) {
+    if (room && rise <= kMantleMaxRise && m_telemetry.velocity.z > -50.0f) {
         // Already up to the hands: mantle straight over (the top of a wallclimb / a high jump).
         if (climb_onto_ledge(ledge.normal, ledge.top_z, scene)) {
             const float speed = std::max(200.0f, std::min(m_telemetry.velocity.length_xy(), c.speed_max_base_velocity));
@@ -2340,9 +2470,19 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     }
 
     // Hang: hands on the lip, the top GrabHangDepth above the feet, the body against the wall.
+    // The body has to fit there. A lip set back behind a wall below it would put the body inside
+    // that wall: retail falling past the railed slab catches the slab's own lip, not the rail.
+    // The test box is inscribed in the pawn's circle, so it clears a wall face at any angle.
     const float target_z = ledge.top_z - c.grab_hang_depth;
-    move_swept(Vec3(0.0f, 0.0f, target_z - m_telemetry.position.z), kPawnHeight, 0.0f, scene);
     const float gap = ledge.wall_distance - kPawnRadius - 1.0f;
+    {
+        const float r = kPawnRadius * 0.7f;
+        const Vec3 hang = m_telemetry.position + into * std::max(gap, 0.0f);
+        if (!box_free(Vec3(hang.x, hang.y, target_z + 0.5f * kPawnHeight), Vec3(r, r, 0.5f * kPawnHeight - 2.0f), scene)) {
+            return false;
+        }
+    }
+    move_swept(Vec3(0.0f, 0.0f, target_z - m_telemetry.position.z), kPawnHeight, 0.0f, scene);
     if (gap > 0.0f) move_swept(into * gap, kPawnHeight, 0.0f, scene);
 
     m_telemetry.move_state = EMovement::MOVE_Grabbing;
@@ -2351,6 +2491,7 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     m_telemetry.grounded = false;
     m_telemetry.camera_roll_deg = 0.0f;
     m_ledge_z = ledge.top_z;
+    m_grab_rail = !room;
     m_hang_time = 0.0f;
     m_state_timer = 0.0f;
     m_base_actor = -1;
@@ -2393,10 +2534,25 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
 
     // TdMove_Grab: facing within 45° of the wall a jump (or pushing forward) pulls up; looking
     // away from it a jump is a GrabJump; crouch (or pulling back) lets go; A / D shimmy along.
+    // Under a rail there is nothing to pull up onto. A jump transfers the hands up onto the rail
+    // and vaults over it, and pushing forward does nothing. Retail held W through a 3.3 s hang
+    // there (20260920_185901), and the GrabTransfer started in the frame of the space press.
     const bool facing_wall = fwd.dot(into) >= std::cos(45.0f * DEG2RAD);
     if (jump_pressed()) {
         consume_jump();
         if (facing_wall) {
+            if (m_grab_rail) {
+                // TdMove_GrabTransfer goes where the view points: within 60 degrees of the move up
+                // to the rail. Retail ignored a jump looking 12 deg up (69 deg off that line) and
+                // transferred looking 26 and 60 deg up (55 and 21 deg off). Its sideways pipe
+                // transfer (edge_pt1 t=201.93) started 22 deg off.
+                const RailTransfer rail = find_rail_transfer(n, m_ledge_z, scene);
+                const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+                if (rail.found && view.dot((rail.hang - m_telemetry.position).normalized()) >= 0.5f) {
+                    start_grab_transfer(rail);
+                }
+                return;
+            }
             st = EMovement::MOVE_GrabPullUp;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_duration = c.grab_pull_up_time;
@@ -2413,7 +2569,7 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         leave_ground(EMovement::MOVE_GrabJump);
         return;
     }
-    if (input.forward > 0.8f && facing_wall && m_hang_time > 0.1f) {
+    if (input.forward > 0.8f && facing_wall && m_hang_time > 0.1f && !m_grab_rail) {
         st = EMovement::MOVE_GrabPullUp;
         m_state_timer = 0.0f;
         m_telemetry.combat_anim_duration = c.grab_pull_up_time;
@@ -2436,8 +2592,63 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
                                        Vec3(column.x, column.y, m_ledge_z - 10.0f), scene);
         if (top.hit && top.normal.z >= kWalkableFloorZ && std::abs(top.point.z - m_ledge_z) < 4.0f) {
             move_swept(along * (c.grab_shimmy_speed * dt), kPawnHeight, 0.0f, scene);
+            // A rail need not run the whole length of the lip: re-test what the grab tested, at the
+            // same spot on top (the body hangs kPawnRadius + 1 off the face; the grab tested
+            // kPawnRadius + 2 beyond a column 2 past it).
+            const Vec3 ahead = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+            const Vec3 on_top(ahead.x, ahead.y, m_ledge_z + 0.5f);
+            const bool room = has_room_at(on_top, kPawnHeight, scene) || has_room_at(on_top, kCrouchHeight, scene);
+            m_grab_rail = !room && find_rail_transfer(n, m_ledge_z, scene).found;
         }
     }
+}
+
+// TdMove_GrabTransfer is PHYS_Flying with collision off. It moves in a straight line from the
+// hang to the hang under the rail's top at TransferSpeed (retail: a constant (-30.8, 0, 197.1),
+// 199.5 uu/s, for 0.487 s), then goes straight into VaultOver. That uses the script's "vaultOver"
+// VaultType timings (VaultTimeOver 0.35, VaultTimeDown 0.3). Retail's path, the same to 0.1 uu
+// in both recordings:
+//   - 0.35 s up to the apex: constant horizontal speed, with the vertical speed falling linearly
+//     from 671 to 0.
+//   - 0.31 s over the rail and down beyond it: a constant 160 uu/s horizontally, the drop
+//     speeding up.
+//   - A walk out at 160 uu/s.
+void ParkourController::start_grab_transfer(const RailTransfer& rail) {
+    constexpr float kTransferSpeed = 200.0f;
+    m_transfer_from = m_telemetry.position;
+    m_transfer_time = std::max(0.05f, (rail.hang - m_transfer_from).length() / kTransferSpeed);
+    m_path_p0 = rail.hang;
+    m_path_p1 = rail.apex;
+    m_path_p2 = rail.end;
+    m_path_t1 = 0.35f;
+    m_path_t2 = 0.30f;
+    m_path_exit_velocity = horiz(rail.end - rail.hang).normalized() * 160.0f;
+    m_path_end_move = rail.end_on_floor ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
+    m_path_hang_vault = true;
+    m_telemetry.move_state = EMovement::MOVE_GrabTransfer;
+    m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+    m_state_timer = 0.0f;
+    m_telemetry.combat_anim_duration = m_transfer_time;
+}
+
+void ParkourController::update_grab_transfer(float dt) {
+    const float t = m_state_timer;
+    if (t < m_transfer_time) {
+        const Vec3 target = m_transfer_from + (m_path_p0 - m_transfer_from) * (t / m_transfer_time);
+        m_telemetry.velocity = (target - m_telemetry.position) / std::max(dt, 1e-5f);
+        m_telemetry.position = target;
+        return;
+    }
+    // Under the rail's top: straight into the vault over it, with no hang in between.
+    m_telemetry.position = m_path_p0;
+    m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+    m_telemetry.move_state = EMovement::MOVE_VaultOver;
+    m_takeoff_move = EMovement::MOVE_VaultOver;
+    m_state_timer = 0.0f;
+    m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
+    m_fall_peak_z = m_path_p1.z;
+    m_air_fall_start_z = m_fall_peak_z;
+    m_coil_timer = 0.0f;
 }
 
 // -----------------------------------------------------------------------------
@@ -2494,6 +2705,7 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
     exit.z = c.springboard_jump_z;
     m_path_exit_velocity = exit;
     m_path_end_move = EMovement::MOVE_Jump;
+    m_path_hang_vault = false;
 
     m_pre_jump_momentum = speed;
     m_telemetry.move_state = EMovement::MOVE_SpringBoarding;
@@ -2626,10 +2838,13 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     const float leg_speed = std::max(exit_speed * 0.5f, last_leg.length() / m_path_t2);
     m_path_exit_velocity = dir * std::min(leg_speed, c.ground_speed);
     if (over) m_path_exit_velocity = dir * exit_speed;
+    m_path_hang_vault = false;
 
     m_pre_jump_momentum = speed;
-    m_telemetry.move_state = (speed >= 350.0f) ? EMovement::MOVE_SpeedVaulting : EMovement::MOVE_VaultOver;
-    m_takeoff_move = EMovement::MOVE_SpeedVaulting;
+    // Retail records every vault - onto or over, walking pace or full sprint - as MOVE_VaultOver
+    // (3,454 samples in 61 runs across the recordings); MOVE_SpeedVaulting never appears.
+    m_telemetry.move_state = EMovement::MOVE_VaultOver;
+    m_takeoff_move = EMovement::MOVE_VaultOver;
     m_state_timer = 0.0f;
     m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
     m_telemetry.grounded = false;
@@ -2646,13 +2861,20 @@ void ParkourController::update_vault(const InputFrame& input, float dt, const Le
     const float t = m_state_timer;
     Vec3 target;
     if (t < m_path_t1) {
-        target = m_path_p0 + (m_path_p1 - m_path_p0) * (t / std::max(m_path_t1, 1e-4f));
+        const float s = t / std::max(m_path_t1, 1e-4f);
+        target = m_path_p0 + (m_path_p1 - m_path_p0) * s;
+        // Out of a GrabTransfer the rise eases out: retail's vertical speed falls linearly to 0.
+        if (m_path_hang_vault) target.z = m_path_p0.z + (m_path_p1.z - m_path_p0.z) * s * (2.0f - s);
     } else if (t < m_path_t1 + m_path_t2) {
-        target = m_path_p1 + (m_path_p2 - m_path_p1) * ((t - m_path_t1) / std::max(m_path_t2, 1e-4f));
+        const float s = (t - m_path_t1) / std::max(m_path_t2, 1e-4f);
+        target = m_path_p1 + (m_path_p2 - m_path_p1) * s;
+        // ... and the drop beyond the rail eases in from the apex.
+        if (m_path_hang_vault) target.z = m_path_p1.z + (m_path_p2.z - m_path_p1.z) * s * s;
     } else {
         // End of the animation: the pawn carries on with the move's exit velocity.
         m_telemetry.position = m_path_p2;
         m_telemetry.velocity = m_path_exit_velocity;
+        m_path_hang_vault = false;
         const EMovement end = m_path_end_move;
         if (end == EMovement::MOVE_Jump) {
             // Springboard launch.
@@ -2667,7 +2889,7 @@ void ParkourController::update_vault(const InputFrame& input, float dt, const Le
             // Over: a normal landing on the floor beyond (or a fall if there was none).
             m_telemetry.grounded = false;
             m_telemetry.move_state = EMovement::MOVE_Falling;
-            m_takeoff_move = EMovement::MOVE_SpeedVaulting;
+            m_takeoff_move = EMovement::MOVE_VaultOver;
             m_telemetry.velocity.z = -50.0f;
         }
         m_state_timer = 0.0f;
@@ -4066,12 +4288,19 @@ void ParkourController::update_barge_doors(const InputFrame& input, float dt, Le
 
                     if (is_barge) {
                         door.open_speed = 12.0f; // High-impact shoulder/kick slam
+                        // TdMove_Barge: BargeAddOnSpeed on top of the run, capped at BargeMaxSpeed;
+                        // slower than BargeKickThresholdSpeed it is a standing kick that leaves the
+                        // pawn where it is. Retail goes 619.8 -> exactly 500.0 uu/s (2026-09-26 20:40,
+                        // t=121.64) and stays at 0 through a kick from rest with W held (edge_pt1,
+                        // t=215.87).
+                        const float speed = m_telemetry.speed_2d;
+                        m_barge_kick = speed < kBargeKickThresholdSpeed;
+                        const float boosted = m_barge_kick ? 0.0f : std::min(speed + kBargeAddOnSpeed, kBargeMaxSpeed);
                         m_telemetry.move_state = EMovement::MOVE_Barge;
                         m_state_timer = 0.0f;
                         m_telemetry.combat_anim_time = 0.0f;
-                        m_telemetry.combat_anim_duration = 0.45f;
+                        m_telemetry.combat_anim_duration = m_barge_kick ? kBargeKickTime : kBargeTime;
                         m_melee_cooldown = 0.45f;
-                        const float boosted = std::clamp(m_telemetry.speed_2d + 200.0f, 380.0f, 540.0f);
                         m_telemetry.velocity.x = push_dir.x * boosted;
                         m_telemetry.velocity.y = push_dir.y * boosted;
                         m_telemetry.speed_2d = boosted;

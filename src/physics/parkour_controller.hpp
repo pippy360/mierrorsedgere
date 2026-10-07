@@ -143,6 +143,16 @@ private:
         Vec3 top_point{0.0f, 0.0f, 0.0f};
     };
 
+    // TdMove_GrabTransfer: an obstacle standing on a grabbed lip (a rail) that leaves no room to
+    // pull up, but can itself be hung from and vaulted over. All points are feet positions.
+    struct RailTransfer {
+        bool found = false;
+        Vec3 hang{0.0f, 0.0f, 0.0f};  // hanging under the rail's top (end of the transfer)
+        Vec3 apex{0.0f, 0.0f, 0.0f};  // top of the vault, hands on the rail
+        Vec3 end{0.0f, 0.0f, 0.0f};   // beyond the rail
+        bool end_on_floor = false;    // a floor the walk picks up under `end`
+    };
+
     // Pawn box swept against the level collision and the moving elevator parts (BlockNonZeroExtent).
     TraceHit sweep_capsule(const Capsule& capsule, const Vec3& delta, const LevelScene& scene) const;
     // Zero-extent probe. Movement probes test what blocks pawn movement (BlockNonZeroExtent);
@@ -166,6 +176,9 @@ private:
     WallFace probe_wall(const Vec3& dir, float reach, float height, const LevelScene& scene) const;
     // Walkable top of the obstacle whose face is `wall`, between min_rise and max_rise above the feet.
     Ledge find_ledge(const Vec3& dir, float reach, float min_rise, float max_rise, const LevelScene& scene) const;
+    // TdMove_GrabTransfer.CheckReachableVaultOver: from the current position, under a lip at
+    // `ledge_z` on the wall facing `wall_normal`, the rail standing on the lip and the vault over it.
+    RailTransfer find_rail_transfer(const Vec3& wall_normal, float ledge_z, const LevelScene& scene) const;
 
     // Swept movement helpers: the pawn position only ever changes through collision sweeps.
     TraceHit move_swept(const Vec3& delta, float height, float bottom_offset, const LevelScene& scene);
@@ -197,6 +210,8 @@ private:
     void update_wallclimb(const InputFrame& input, float dt, const LevelScene& scene);
     void update_slide(const InputFrame& input, float dt, LevelScene& scene);
     void update_ledge_grab(const InputFrame& input, float dt, const LevelScene& scene);
+    void start_grab_transfer(const RailTransfer& rail);
+    void update_grab_transfer(float dt);
     void update_vault(const InputFrame& input, float dt, const LevelScene& scene);
     void update_zipline(const InputFrame& input, float dt, const LevelScene& scene);
     void update_swing_bar(const InputFrame& input, float dt, const LevelScene& scene);
@@ -263,6 +278,7 @@ private:
     float m_melee_combo_reset_timer = 0.0f;
     int m_weapon_cycle_index = 0;
     bool m_jump_consumed = false;
+    bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
 
     // Jump / fall bookkeeping (TdMove_Jump / TdMove_Landing)
     Vec3 m_last_jump_location{0.0f, 0.0f, 0.0f};  // TdPawn.LastJumpLocation
@@ -293,6 +309,9 @@ private:
     float m_swing_angular_vel = 0.0f;
     float m_ledge_z = 0.0f;  // top of the grabbed ledge (MOVE_Grabbing / MOVE_GrabPullUp)
     float m_hang_time = 0.0f;
+    bool m_grab_rail = false;  // hanging under a lip a rail blocks: no pull-up, jump transfers to the rail
+    Vec3 m_transfer_from{0.0f, 0.0f, 0.0f};  // MOVE_GrabTransfer: from the hang to m_path_p0
+    float m_transfer_time = 0.0f;
 
     // Timed root-motion paths (TdMove_SpeedVault / TdMove_SpringBoard)
     Vec3 m_path_p0{0.0f, 0.0f, 0.0f};
@@ -302,6 +321,7 @@ private:
     float m_path_t2 = 0.0f;
     Vec3 m_path_exit_velocity{0.0f, 0.0f, 0.0f};
     EMovement m_path_end_move = EMovement::MOVE_Walking;
+    bool m_path_hang_vault = false;  // VaultOver out of a GrabTransfer: eased rise, eased drop
 
     // UE3 Pawn.Base: the actor the pawn stands on (moving elevator parts carry the pawn).
     int32_t m_base_actor = -1;
