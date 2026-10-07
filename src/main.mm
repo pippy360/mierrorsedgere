@@ -623,6 +623,37 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", LevelIntro=" << sp01_scene.level_intro.seq_name
               << ", Subtitle=\"" << cs_sub_text << "\")" << std::endl;
 
+    // Stage 12: Interactive Door Barging (`TdMove_Barge` & Hinge Rotation on SP00 Rooftop Doorway)
+    std::cout << "[Oracle Stage 12] Testing Interactive Door Barging (TdMove_Barge & Hinge Swing)..." << std::endl;
+    bool s12_pass = false;
+    bool saw_move_barge = false;
+    float final_door_deg = 0.0f;
+    float final_door_x = 0.0f;
+    if (!sp00_scene.barge_doors.empty()) {
+        BargeDoorInstance& door = sp00_scene.barge_doors[0];
+        door.state = DoorState::Closed;
+        door.open_angle_rad = 0.0f;
+        door.model_matrix = Mat4::identity();
+        controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
+        InputFrame barge_in{};
+        barge_in.forward = 1.0f;
+        barge_in.sprint = true;
+        for (int step = 0; step < 72; ++step) {
+            controller.step(barge_in, kDt, sp00_scene);
+            if (controller.get_telemetry().move_state == EMovement::MOVE_Barge) {
+                saw_move_barge = true;
+            }
+        }
+        final_door_deg = door.open_angle_rad * (180.0f / 3.14159265f);
+        final_door_x = controller.get_telemetry().position.x;
+        s12_pass = saw_move_barge && (std::abs(door.open_angle_rad) > 1.5f) && (final_door_x < -4300.0f);
+    }
+    std::cout << "  -> Stage 12 Result: " << (s12_pass ? "PASS" : "FAIL")
+              << " (Doors=" << sp00_scene.barge_doors.size()
+              << ", MoveBarge=" << (saw_move_barge ? "OK" : "NO")
+              << ", Swing=" << final_door_deg << " deg"
+              << ", EndX=" << final_door_x << ")" << std::endl;
+
     // Write complete telemetry log
     std::ofstream tel_file("/tmp/me_oracle_telemetry.json");
     if (tel_file.is_open()) {
@@ -635,9 +666,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cout << "[Oracle] Telemetry written to /tmp/me_oracle_telemetry.json" << std::endl;
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8 and the cutscene stage 11
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, and door barging stage 12
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
