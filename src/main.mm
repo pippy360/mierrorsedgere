@@ -239,7 +239,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     controller.reset(Vec3(-1655.2f, -6505.2f, 4224.0f), 180.0f);
     step_until(in_run, 240, sim_scene, [&] { return controller.get_position().x <= -2513.0f; });
     controller.step(in_run_jump, kDt, sim_scene);
-    bool s2_vault = (controller.get_move_state() == EMovement::MOVE_SpeedVaulting);
+    bool s2_vault = (controller.get_move_state() == EMovement::MOVE_VaultOver);
     log_telemetry("Stage2_Vault");
     step_until(in_run, 180, sim_scene, [&] { return controller.is_grounded(); });
     // Back on the roof (floor 4224) beyond the duct rather than on top of it (4369)

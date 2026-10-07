@@ -1531,13 +1531,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
             vm_offset = base_armed_offset;
         } else if (state == EMovement::MOVE_GrabPullUp || state == EMovement::MOVE_Grabbing ||
-                   state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_Climb ||
+                   state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_GrabTransfer ||
+                   state == EMovement::MOVE_Climb ||
                    state == EMovement::MOVE_SpeedVaulting || state == EMovement::MOVE_VaultOver ||
                    state == EMovement::MOVE_SpringBoarding || state == EMovement::MOVE_Swing ||
                    state == EMovement::MOVE_WallClimbing || state == EMovement::MOVE_SkillRoll) {
             // Two-handed parkour climb / vault / hang / swing maneuvers holster viewmodel to unarmed anim set
             active_set = &faith_unarmed_set_;
-            if (state == EMovement::MOVE_GrabPullUp) {
+            if (state == EMovement::MOVE_GrabPullUp || state == EMovement::MOVE_GrabTransfer) {
                 seq_a = active_set->find_sequence("HangHeaveUp");
                 float dur = (telemetry.combat_anim_duration > 0.1f)
                                 ? telemetry.combat_anim_duration
@@ -1646,7 +1647,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 show_lower_body = true;
                 break;
             }
-            case EMovement::MOVE_GrabPullUp: {
+            case EMovement::MOVE_GrabPullUp:
+            case EMovement::MOVE_GrabTransfer: {
                 seq_a = active_set->find_sequence("HangHeaveUp");
                 seq_b = active_set->find_sequence("HangHeaveOver");
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.65f;
