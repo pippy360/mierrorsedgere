@@ -342,4 +342,19 @@ Retail on the left, the port on the right, same camera pose:
 ![OPTIONS](../screenshots/menu/main_menu_options.png)
 ![EXTRAS](../screenshots/menu/main_menu_extras.png)
 
-Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the screens the sub-buttons open, and the attract movie.
+### In the macOS app
+
+`mirrorsedge_macos` boots into the front end (`run_interactive_app` in `src/main.mm`). While it is up it owns the frame: keyboard (arrows, Enter or Space, Escape), mouse and D-pad go to `Frontend`; its cue names become the skin's sounds from `Audio/A_HUD.upk` (`Tab_Change`, `D-Pad`, `A_Pos`) and the menu music; `SoftRenderer` draws the frame at 1280x720 and `MetalRenderer::set_frontend_frame` shows it full screen, aspect-fitted, the way a Bink frame is shown.
+
+| Chosen | Does |
+|---|---|
+| CONTINUE GAME | starts the chapter loaded at start-up |
+| NEW GAME | loads the Prologue with its opening |
+| PLAY CHAPTER, and every RACE / OPTIONS / EXTRAS item | opens the older chapter-select overlay on the matching tab (those screens are not reverse engineered yet) |
+| QUIT GAME (Escape) | quits |
+
+`--chapter` and `--level` start in the level and skip the front end, as they skipped the old menu.
+
+This part was written on the Windows machine that has retail installed. It compiles and links on a macOS 15 Apple Silicon runner; it has not been run on a Mac, so the first launch there is its first test. The pictures above are the same `Frontend` and `SoftRenderer` the app uses, so what can differ on a Mac is the hand-off (input, sound, the texture upload), not the menu.
+
+Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the screens the sub-buttons open, the save-system spinner between the start screen and the menu, and the attract movie. The front end is drawn at 720 lines whatever the window's size; on a Retina display that is upscaled.
