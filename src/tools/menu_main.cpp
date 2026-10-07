@@ -18,6 +18,7 @@
 #include "../ui/frontend/frontend.hpp"
 #include "../ui/frontend/soft_render.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -94,7 +95,21 @@ void dump_assets(const std::string& dir, const me::fe::Assets& a) {
                   << m->target.keys.size() << ", fov keys " << m->fov.keys.size() << ", events " << m->events.size() << "\n";
     }
     size_t tris = 0;
-    for (const auto& b : a.city.batches) tris += b.tris.size() / 3;
+    static const char* const kMaterial[] = {"buildings", "base", "water", "waves", "sky"};
+    for (const auto& b : a.city.batches) {
+        tris += b.tris.size() / 3;
+        float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+        for (const auto& v : b.tris) {
+            const float p[3] = {v.pos.x, v.pos.y, v.pos.z};
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = std::min(lo[k], p[k]);
+                hi[k] = std::max(hi[k], p[k]);
+            }
+        }
+        std::cout << "  " << b.mesh << " (" << kMaterial[static_cast<int>(b.material)] << "): " << b.tris.size() / 3 << " triangles, x "
+                  << lo[0] << ".." << hi[0] << ", y " << lo[1] << ".." << hi[1] << ", z " << lo[2] << ".." << hi[2]
+                  << (b.lightmap >= 0 ? ", light map" : "") << "\n";
+    }
     std::cout << "city: " << a.city.batches.size() << " batches, " << tris << " triangles\n";
 }
 
