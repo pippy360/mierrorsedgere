@@ -2197,7 +2197,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             const MenuChapterEntry& cam_ch = impl_->main_menu.get_chapter(impl_->selected_chapter);
             cam_pos = cam_ch.camera_location;
             rot = cam_ch.camera_rotation;
-            fov_deg = 70.0f;
+            fov_deg = 90.0f;
             near_plane = 10.0f;
             far_plane = 400000.0f;
         }
@@ -2209,13 +2209,15 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         Mat4 view = Mat4::look_at(cam_pos, target, up);
         float aspect = float(impl_->width) / float(impl_->height);
-        float fov_rad = fov_deg * DEG2RAD;
-        Mat4 proj = Mat4::perspective(fov_rad, aspect, near_plane, far_plane);
+        float fov_h_rad = fov_deg * DEG2RAD;
+        float fov_y_rad = 2.0f * std::atan(std::tan(fov_h_rad * 0.5f) / aspect);
+        Mat4 proj = Mat4::perspective(fov_y_rad, aspect, near_plane, far_plane);
         Mat4 vp = proj * view;
 
-        // Viewmodel camera matrix
+        // Viewmodel camera matrix (DefaultGame.ini Model1pFOV = 100 horizontal)
         Mat4 vm_view = Mat4::look_at(Vec3(0, 0, 0), Vec3(0, 100.0f, 0), Vec3(0, 0, 1));
-        Mat4 vm_proj = Mat4::perspective(80.0f * DEG2RAD, aspect, 1.0f, 500.0f);
+        float vm_fov_y_rad = 2.0f * std::atan(std::tan(100.0f * DEG2RAD * 0.5f) / aspect);
+        Mat4 vm_proj = Mat4::perspective(vm_fov_y_rad, aspect, 1.0f, 500.0f);
         Mat4 vm_vp = vm_proj * vm_view;
 
         // Pack frame uniforms
@@ -2241,7 +2243,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         uniforms.is_runner_vision = 0.0f;
 
         uniforms.cam_forward = simd_make_float3(fwd.x, fwd.y, fwd.z);
-        uniforms.fov_tan = std::tan(fov_rad * 0.5f);
+        uniforms.fov_tan = std::tan(fov_y_rad * 0.5f);
         uniforms.cam_right = simd_make_float3(right.x, right.y, right.z);
         uniforms.aspect = aspect;
         uniforms.cam_up = simd_make_float3(up.x, up.y, up.z);

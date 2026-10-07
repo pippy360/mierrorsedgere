@@ -227,7 +227,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     const float s1_speed = controller.get_telemetry().speed_2d;
     const float s1_fov = controller.get_telemetry().fov_deg;
     const float s1_z = controller.get_position().z;
-    bool s1_pass = (s1_speed >= 400.0f) && (s1_fov > 100.0f) && controller.is_grounded() &&
+    bool s1_pass = (s1_speed >= 400.0f) && (s1_fov > 90.0f) && controller.is_grounded() &&
                    std::abs(s1_z - sp00_scene.player_spawn_pos.z) < 1.0f;
     std::cout << "  -> Stage 1 Result: " << (s1_pass ? "PASS" : "FAIL")
               << " (Speed=" << s1_speed << " u/s, FOV=" << s1_fov << "°, Roof Z=" << s1_z << ")" << std::endl;

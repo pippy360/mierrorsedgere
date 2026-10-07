@@ -942,7 +942,7 @@ struct PlayerTelemetry {
     float yaw_deg = 0.0f;
     float pitch_deg = 0.0f;
     float camera_roll_deg = 0.0f;
-    float fov_deg = 100.0f;
+    float fov_deg = 90.0f;
     float eye_height = 166.0f;  // TdPawn: centre 90 + BaseEyeHeight 76 above the feet
     float health = 100.0f;
     float reaction_energy = 100.0f;
