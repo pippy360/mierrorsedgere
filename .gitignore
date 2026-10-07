@@ -52,3 +52,4 @@ ghidra/
 ida/
 scratch/
 *.log
+build-*/

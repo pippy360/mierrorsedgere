@@ -145,6 +145,18 @@ Options:
 
 ---
 
+## Replaying Retail Runs
+
+`tools/retail/` records a person playing the retail game on Windows: a `d3d9.dll` proxy reads the pawn's position, velocity, move and view every frame, plus every key. `me_replay` then replays that run, frame for frame, through the `ParkourController` against the same level's collision, and reports where the two paths part. `me_replay` is a headless CMake target that builds on macOS and Windows. See [`tools/retail/README.md`](tools/retail/README.md).
+
+```bash
+python -m tools.retail.record_session --name myrun --map escape_p     # Windows, retail installed
+cmake --build build --target me_replay
+python -m tools.retail.replay --trace build/retail/trials/<stamp>_myrun.jsonl
+```
+
+---
+
 ## License & Compliance
 
 Clean-room reimplementation written from first principles for macOS Apple Silicon. Contains no proprietary game binaries, decompiled bytecodes, or extracted copyrighted assets. All game assets remain the property of Electronic Arts and DICE and are read directly from the user's legal game installation.

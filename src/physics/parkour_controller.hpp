@@ -32,6 +32,24 @@ public:
     // Reset player position and orientation
     void reset(const Vec3& spawn_pos, float spawn_yaw = 0.0f);
 
+    // Retail replay harness (tools/retail/replay.py, src/tools/replay_main.cpp): reset the pawn to a
+    // recorded retail frame - feet, velocity, view - and hand it the state retail's PlayerMove carries
+    // into that frame, which no recording holds and the harness rebuilds by retail's own rules:
+    // TdPawn.SpeedSprintEnergy, TdPlayerController.AccelerationTime, the walk-stop still to run
+    // (seconds, 0 = none), the jump chain (0 none, 1 Falling after a jump, 2 in MOVE_Jump) with its
+    // PreJumpMomentum, and which of jump / crouch the frame before held (so a held key is no press).
+    struct AnchorState {
+        float sprint_energy = 0.0f;
+        float accel_time = 0.0f;
+        float stop_left = 0.0f;
+        int jump = 0;
+        float pre_jump_momentum = 0.0f;
+        bool held_jump = false;
+        bool held_crouch = false;
+    };
+    void anchor(const Vec3& feet, const Vec3& velocity, float yaw, float pitch, bool grounded,
+                const AnchorState& state);
+
     // Primary simulation step: fixed 120Hz/60Hz substepped physics
     void step(const InputFrame& input, float dt, LevelScene& scene);
 

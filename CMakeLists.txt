@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(mirrorsedge_macos LANGUAGES CXX OBJCXX)
+project(mirrorsedge_macos LANGUAGES CXX)
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,7 +10,9 @@ set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 
 # Optimization & Objective-C ARC flags
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wextra -Wno-unused-parameter")
+if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wextra -Wno-unused-parameter")
+endif()
 set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -O2 -fobjc-arc -Wall -Wextra -Wno-unused-parameter")
 
 # Include directories
@@ -22,9 +27,8 @@ link_directories(
     /opt/homebrew/lib
 )
 
-# Source files
-set(SOURCES
-    src/main.mm
+# The asset loader and the parkour controller: plain C++, no window, GPU or audio.
+set(CORE_SOURCES
     src/anim/anim_system.cpp
     src/assets/upk_loader.cpp
     src/assets/ue3_props.cpp
@@ -32,10 +36,28 @@ set(SOURCES
     src/assets/texture_loader.cpp
     src/assets/material_system.cpp
     src/assets/ini_config.cpp
-    src/audio/audio_engine.cpp
-    src/cutscene/cutscene_player.cpp
     src/physics/collision_world.cpp
     src/physics/parkour_controller.cpp
+)
+
+# me_replay: replays a recorded retail run through the controller, headless (tools/retail/README.md).
+# Builds on any platform, so it runs on the Windows machine that records the retail game.
+find_package(ZLIB REQUIRED)
+add_executable(me_replay src/tools/replay_main.cpp ${CORE_SOURCES})
+target_link_libraries(me_replay PRIVATE ZLIB::ZLIB)
+if(MINGW)
+    # no libstdc++ / libgcc DLLs to ship next to it
+    target_link_options(me_replay PRIVATE -static)
+endif()
+
+if(APPLE)
+
+# Source files
+set(SOURCES
+    src/main.mm
+    ${CORE_SOURCES}
+    src/audio/audio_engine.cpp
+    src/cutscene/cutscene_player.cpp
     src/ui/main_menu.cpp
     src/renderer/metal_renderer.mm
 )
@@ -63,3 +85,5 @@ target_link_libraries(mirrorsedge_macos PRIVATE
     "-framework ImageIO"
     "-framework OpenAL"
 )
+
+endif()
