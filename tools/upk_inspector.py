@@ -22,6 +22,9 @@ import zlib
 import argparse
 from typing import List, Dict, Any, Optional, Tuple
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lzo1x as _lzo1x_py  # noqa: E402
+
 # Optional ctypes acceleration for LZO1X
 _C_LZO_FUNC = None
 try:
@@ -59,143 +62,9 @@ def lzo1x_decompress(src: bytes, expected_len: int) -> bytes:
         if res == 0:
             return out_buf.raw[:out_len.value]
 
-    # Pure-Python fallback
-    dst = bytearray()
-    ip = 0
-    src_len = len(src)
-    if src_len == 0:
-        return bytes(dst)
-
-    state = 0
-    b = src[ip]
-    ip += 1
-
-    if b > 17:
-        t = b - 17
-        dst.extend(src[ip:ip + t])
-        ip += t
-        if ip >= src_len:
-            return bytes(dst)
-        b = src[ip]
-        ip += 1
-        state = 0
-
-    while ip <= src_len:
-        if b < 16:
-            if state == 0:
-                # Literal run
-                t = b
-                if t == 0:
-                    while ip < src_len and src[ip] == 0:
-                        t += 255
-                        ip += 1
-                    t += 15 + src[ip]
-                    ip += 1
-                t += 3
-                dst.extend(src[ip:ip + t])
-                ip += t
-                if ip >= src_len:
-                    break
-                b = src[ip]
-                ip += 1
-                if b < 16:
-                    # Short match (M1)
-                    m_dist = 1 + (b >> 2) + (src[ip] << 2)
-                    ip += 1
-                    m_pos = len(dst) - m_dist
-                    dst.append(dst[m_pos])
-                    dst.append(dst[m_pos + 1])
-                    t = b & 3
-                    if t > 0:
-                        dst.extend(src[ip:ip + t])
-                        ip += t
-                    state = t
-                    if ip >= src_len:
-                        break
-                    b = src[ip]
-                    ip += 1
-                    continue
-                else:
-                    state = 0
-            else:
-                # Short match (M1) when state != 0
-                m_dist = 1 + (b >> 2) + (src[ip] << 2)
-                ip += 1
-                m_pos = len(dst) - m_dist
-                dst.append(dst[m_pos])
-                dst.append(dst[m_pos + 1])
-                t = b & 3
-                if t > 0:
-                    dst.extend(src[ip:ip + t])
-                    ip += t
-                state = t
-                if ip >= src_len:
-                    break
-                b = src[ip]
-                ip += 1
-                continue
-
-        # Match instructions (M2, M3, M4)
-        if b >= 64:
-            # M2 match
-            m_len = ((b >> 5) - 1) + 2
-            m_dist = 1 + ((b >> 2) & 7) + (src[ip] << 3)
-            ip += 1
-            trailing = b & 3
-        elif b >= 32:
-            # M3 match
-            m_len = b & 31
-            if m_len == 0:
-                while ip < src_len and src[ip] == 0:
-                    m_len += 255
-                    ip += 1
-                m_len += 31 + src[ip]
-                ip += 1
-            m_len += 2
-            lo = src[ip]
-            hi = src[ip + 1]
-            ip += 2
-            m_dist = 1 + (lo >> 2) + (hi << 6)
-            trailing = lo & 3
-        elif b >= 16:
-            # M4 match
-            m_len = b & 7
-            if m_len == 0:
-                while ip < src_len and src[ip] == 0:
-                    m_len += 255
-                    ip += 1
-                m_len += 7 + src[ip]
-                ip += 1
-            m_len += 2
-            dist_high = (b & 8) << 11
-            lo = src[ip]
-            hi = src[ip + 1]
-            ip += 2
-            m_off = (lo >> 2) | (hi << 6)
-            if m_off == 0:
-                # End of stream marker
-                break
-            m_dist = 0x4000 + dist_high + m_off
-            trailing = lo & 3
-        else:
-            raise ValueError(f"Invalid LZO opcode 0x{b:02x} at input offset {ip - 1}")
-
-        m_pos = len(dst) - m_dist
-        for _ in range(m_len):
-            dst.append(dst[m_pos])
-            m_pos += 1
-
-        if trailing > 0:
-            dst.extend(src[ip:ip + trailing])
-            ip += trailing
-
-        state = trailing
-        if ip >= src_len:
-            break
-        b = src[ip]
-        ip += 1
-
-    return bytes(dst)
+    # No liblzo2 (Windows): the pure-Python decoder. It raises rather than hand back a block of the
+    # wrong length, because a short block shifts every export after it.
+    return _lzo1x_py.decompress(src, expected_len)
 
 
 class PackageHeader:
@@ -258,7 +127,7 @@ class UPKPackage:
 
     def _load_and_decompress(self):
         with open(self.file_path, 'rb') as fp:
-            raw_hdr = fp.read(4096)
+            raw_hdr = fp.read(1 << 20)
 
         hdr = self.header
         hdr.tag, ver_lic = struct.unpack_from('<II', raw_hdr, 0)
@@ -306,7 +175,21 @@ class UPKPackage:
                 pkg_name, off = self._read_fstring(raw_hdr, off)
                 hdr.additional_packages_to_cook.append(pkg_name)
 
-        # Decompress / buffer package
+        # Decompress / buffer package. ME_UPK_CACHE=<dir> keeps the decompressed image of each
+        # compressed package there, keyed on its path, size and mtime: without liblzo2 a level
+        # takes minutes to decompress in Python, and a tool is usually run on it many times.
+        cache_file = None
+        cache_dir = os.environ.get('ME_UPK_CACHE')
+        if cache_dir and chunk_cnt > 0:
+            st = os.stat(self.file_path)
+            key = '%s|%d|%d' % (os.path.abspath(self.file_path), st.st_size, int(st.st_mtime))
+            import hashlib
+            cache_file = os.path.join(cache_dir, hashlib.sha1(key.encode('utf-8')).hexdigest() + '.bin')
+            if os.path.isfile(cache_file):
+                with open(cache_file, 'rb') as cf:
+                    self.data = bytearray(cf.read())
+                return
+
         with open(self.file_path, 'rb') as fp:
             if chunk_cnt == 0:
                 fp.seek(0)
@@ -341,7 +224,14 @@ class UPKPackage:
                             decomp = comp_data
                         chunk_out.extend(decomp)
 
+                    if len(chunk_out) != u_sz:
+                        raise ValueError(f"chunk at {u_off} decompressed to {len(chunk_out)} bytes, expected {u_sz}")
                     self.data[u_off:u_off + u_sz] = chunk_out
+
+        if cache_file:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            with open(cache_file, 'wb') as cf:
+                cf.write(self.data)
 
     def _parse_tables(self):
         hdr = self.header
