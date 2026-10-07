@@ -2552,6 +2552,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         const bool uv_layout_ok = num_uv >= 1 && num_uv <= 8 && uv_off_signed >= 8;
         const size_t uv_off = uv_layout_ok ? static_cast<size_t>(uv_off_signed) : 0;
         const bool has_color = uv_layout_ok && uv_off >= 12;
+        asset.num_uv_channels = uv_layout_ok ? num_uv : 0;
 
         auto read_uv = [&](const uint8_t* sv, int32_t channel, float& u, float& v) {
             u = 0.0f;
@@ -2615,12 +2616,13 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
                 v.tangent = (tx.length_sq() > 0.25f) ? tx.normalized() : Vec3(1.0f, 0.0f, 0.0f);
                 v.tangent_sign = (sv[7] >= 128) ? 1.0f : -1.0f;
                 read_uv(sv, 0, v.u, v.v);
-                read_uv(sv, 1, v.u2, v.v2);
+                // A set the mesh lacks repeats its last one (FLocalVertexFactory::InitRHI).
+                read_uv(sv, std::min<int32_t>(1, num_uv - 1), v.u2, v.v2);
                 if (num_uv >= 3 && uv_layout_ok) {
-                    float u3 = 0.0f, v3 = 0.0f;
-                    read_uv(sv, 2, u3, v3);
-                    asset.uv_channel2.push_back(u3);
-                    asset.uv_channel2.push_back(v3);
+                    float e[4];
+                    read_uv(sv, 2, e[0], e[1]);
+                    read_uv(sv, std::min<int32_t>(3, num_uv - 1), e[2], e[3]);
+                    asset.uv_extra.insert(asset.uv_extra.end(), e, e + 4);
                 }
                 v.color = has_color ? (static_cast<uint32_t>(sv[10]) | (static_cast<uint32_t>(sv[9]) << 8) |
                                        (static_cast<uint32_t>(sv[8]) << 16) | (static_cast<uint32_t>(sv[11]) << 24))
@@ -2936,6 +2938,11 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, 
                         std::memcpy(&v.v2, fv + 12, 4);
                     }
                 }
+                // A model's vertex factory gives materials one texture coordinate set, TexCoord
+                // (UModelComponent binds ShadowTexCoord as the light-map coordinate only), so
+                // every TextureCoordinate index reads it, as the last set does on any mesh.
+                v.u2 = v.u;
+                v.v2 = v.v;
                 inout_bounds.expand(v.position);
                 poly_v[count++] = v;
             }
@@ -3036,7 +3043,8 @@ AABB transformed_mesh_bounds(const LevelActor& a, const StaticMeshAsset& sm) {
 // Emits StaticMeshActor LOD0 triangles in world space, binned per scene material.
 class MeshEmitter {
 public:
-    explicit MeshEmitter(std::vector<std::string>* material_paths) : material_paths_(material_paths) {
+    explicit MeshEmitter(std::vector<std::string>* material_paths, MaterialUVResolver* material_uvs = nullptr)
+        : material_paths_(material_paths), material_uvs_(material_uvs) {
         if (material_paths_) {
             for (size_t i = 0; i < material_paths_->size(); ++i) {
                 ids_.emplace(to_lower((*material_paths_)[i]), static_cast<int32_t>(i));
@@ -3077,13 +3085,20 @@ public:
         const uint32_t color = legacy_palette_color(a, to_lower(a.mesh_name));
         AABB box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
 
-        auto emit_vertex = [&](std::vector<Vertex>& dst, const Vertex& lv, bool keep_vertex_color) {
+        // The section's material decides which two of the mesh's UV sets the vertex carries.
+        MaterialUVSlots slots;
+        auto emit_vertex = [&](std::vector<Vertex>& dst, uint32_t index, bool keep_vertex_color) {
+            const Vertex& lv = sm.triangles[index];
             const Vec3 wp = xf.apply(lv.position);
             const Vec3 wn = xf.axis_x * (lv.normal.x * inv_scale.x) + xf.axis_y * (lv.normal.y * inv_scale.y) +
                             xf.axis_z * (lv.normal.z * inv_scale.z);
             const Vec3 wt = xf.axis_x * (lv.tangent.x * xf.scale.x) + xf.axis_y * (lv.tangent.y * xf.scale.y) +
                             xf.axis_z * (lv.tangent.z * xf.scale.z);
             Vertex wv = lv;
+            if (!slots.is_default()) {
+                sm.uv(index, slots.index[0], wv.u, wv.v);
+                sm.uv(index, slots.index[1], wv.u2, wv.v2);
+            }
             wv.position = wp;
             wv.normal = (wn.length_sq() > 1e-20f) ? wn.normalized() : Vec3(0.0f, 0.0f, 1.0f);
             wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
@@ -3097,13 +3112,13 @@ public:
         auto emit_range = [&](std::vector<Vertex>& dst, uint32_t first, uint32_t count, bool keep_vertex_color) {
             const uint32_t end = std::min<uint32_t>(first + count, static_cast<uint32_t>(sm.triangles.size()));
             for (uint32_t i = first; i + 2 < end; i += 3) {
-                emit_vertex(dst, sm.triangles[i], keep_vertex_color);
+                emit_vertex(dst, i, keep_vertex_color);
                 if (det_sign < 0.0f) {
-                    emit_vertex(dst, sm.triangles[i + 2], keep_vertex_color);
-                    emit_vertex(dst, sm.triangles[i + 1], keep_vertex_color);
+                    emit_vertex(dst, i + 2, keep_vertex_color);
+                    emit_vertex(dst, i + 1, keep_vertex_color);
                 } else {
-                    emit_vertex(dst, sm.triangles[i + 1], keep_vertex_color);
-                    emit_vertex(dst, sm.triangles[i + 2], keep_vertex_color);
+                    emit_vertex(dst, i + 1, keep_vertex_color);
+                    emit_vertex(dst, i + 2, keep_vertex_color);
                 }
             }
         };
@@ -3115,7 +3130,9 @@ public:
                 const auto& el = sm.elements[e];
                 if (el.vertex_count == 0) continue;
                 const bool overridden = e < a.material_overrides.size() && !a.material_overrides[e].empty();
-                const int32_t mat = material_id(overridden ? a.material_overrides[e] : el.material);
+                const std::string& mat_path = overridden ? a.material_overrides[e] : el.material;
+                const int32_t mat = material_id(mat_path);
+                slots = uv_slots(mat, mat_path);
                 emit_range(bins[mat], el.first_vertex, el.vertex_count, true);
             }
         } else {
@@ -3152,8 +3169,19 @@ private:
         return id;
     }
 
+    MaterialUVSlots uv_slots(int32_t material, const std::string& path) {
+        if (!material_uvs_) return {};
+        auto it = uv_slots_.find(material);
+        if (it != uv_slots_.end()) return it->second;
+        const MaterialUVSlots s = material_uvs_->slots(path);
+        uv_slots_.emplace(material, s);
+        return s;
+    }
+
     std::vector<std::string>* material_paths_;
+    MaterialUVResolver* material_uvs_;
     std::unordered_map<std::string, int32_t> ids_;
+    std::unordered_map<int32_t, MaterialUVSlots> uv_slots_;
 };
 
 bool valid_box(const AABB& b) { return b.min_pt.x <= b.max_pt.x && b.min_pt.y <= b.max_pt.y && b.min_pt.z <= b.max_pt.z; }
@@ -3206,7 +3234,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                           std::vector<std::string>* out_material_paths,
                           const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins,
-                          const AABB* bsp_bounds) {
+                          const AABB* bsp_bounds,
+                          MaterialUVResolver* material_uvs) {
     out_meshes.clear();
 
     // Batched world buffers for single-draw-call-per-material rendering
@@ -3216,7 +3245,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
     rv_batch.name = "UE3_Level_RunnerVision_Geometry";
     rv_batch.is_runner_vision = true;
 
-    MeshEmitter emitter(out_material_paths);
+    MeshEmitter emitter(out_material_paths, material_uvs);
     std::map<int32_t, std::vector<Vertex>> world_bins;
     std::map<int32_t, std::vector<Vertex>> rv_bins;
 
@@ -3400,8 +3429,8 @@ void assign_elevator_parts(LevelScene& scene, const std::vector<InterpDoorInfo>&
 
 // Builds the per-part render buffer (appended to scene.meshes) and collision of every elevator part.
 void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-                                  std::vector<std::string>* material_paths) {
-    MeshEmitter emitter(material_paths);
+                                  std::vector<std::string>* material_paths, MaterialUVResolver* material_uvs = nullptr) {
+    MeshEmitter emitter(material_paths, material_uvs);
     for (size_t e = 0; e < scene.elevators.size(); ++e) {
         auto& el = scene.elevators[e];
         for (size_t p = 0; p < el.parts.size(); ++p) {
@@ -3547,8 +3576,8 @@ void assign_barge_doors(LevelScene& scene) {
 }
 
 void build_barge_door_geometry(LevelScene& scene, const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
-                               std::vector<std::string>* material_paths) {
-    MeshEmitter emitter(material_paths);
+                               std::vector<std::string>* material_paths, MaterialUVResolver* material_uvs = nullptr) {
+    MeshEmitter emitter(material_paths, material_uvs);
     for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
         BargeDoorInstance& door = scene.barge_doors[d];
         AABB leaf_bounds(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
@@ -4395,11 +4424,16 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             collision->add_triangle(bsp[i], bsp[i + 1], bsp[i + 2], -1, COLL_BlockAll);
         }
     }
+    // Each section's vertices carry the two UV sets its material reads, which have to be known
+    // while the geometry is emitted: this translates the graphs once, without their textures.
+    std::unique_ptr<MaterialUVResolver> material_uvs;
+    if (pm) material_uvs = std::make_unique<MaterialUVResolver>(*pm);
     build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr,
-                         &bsp_render_bins, &bsp_bounds);
+                         &bsp_render_bins, &bsp_bounds, material_uvs.get());
     collision->build();
-    build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
-    build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
+    build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
+    build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
+    material_uvs.reset();
 
     // WorldInfo.KillZ when the level sets it (otherwise lethal falls are handled by fall height).
     for (size_t i = 0; i < master_pkg->get_exports().size(); ++i) {

@@ -39,6 +39,24 @@ std::shared_ptr<SceneMaterialLibrary> build_scene_materials(PackageManager& pm,
                                                            const std::vector<std::string>& material_paths,
                                                            const MaterialBuildOptions& opts = {});
 
+// Answers "which UV sets does this material read?" while the level geometry is being built,
+// before build_scene_materials runs: it resolves and translates the material's graph but loads
+// no textures. Results are cached per path.
+class MaterialUVResolver {
+public:
+    explicit MaterialUVResolver(PackageManager& pm);
+    ~MaterialUVResolver();
+    MaterialUVResolver(const MaterialUVResolver&) = delete;
+    MaterialUVResolver& operator=(const MaterialUVResolver&) = delete;
+
+    // `material_path` as in build_scene_materials; "" (the engine default material) reads set 0.
+    MaterialUVSlots slots(const std::string& material_path);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // Shared MSL prelude (vertex function, FMaterialParameters equivalent, lighting).
 const char* material_common_msl();
 

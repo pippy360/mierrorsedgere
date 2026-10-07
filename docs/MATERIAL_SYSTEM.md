@@ -95,6 +95,34 @@ When the placement scale has a negative determinant, the emitter swaps vertices 
 every triangle. This mirrors UE3's `ReverseCulling` for mirrored primitives, so back-face
 culling stays correct.
 
+### 2.4 Which UV sets a section's vertices carry
+A mesh has up to four UV sets and a material's `TextureCoordinate` nodes name the one they read
+(`CoordinateIndex`). The engine `Vertex` carries two (`u,v` and `u2,v2`, `P.uv0` and `P.uv1` in the
+generated shaders), so the two are chosen per section from what its material reads:
+
+- The translator records the indices a graph reads (`CompiledMaterial::texcoord_mask`; a texture
+  sample, `Panner`, `Rotator` or `BumpOffset` with no coordinate input reads index 0).
+  `material_uv_slots` gives index 0 the first slot and index 1 the second, and an index above 1
+  takes whichever of the two the graph leaves free. `M_Crane_Top` reads 1 (normal map) and 2
+  (diffuse, mask), so its vertices carry mesh sets 2 and 1 and its shader samples the diffuse with
+  `P.uv0`. A graph that reads three or more sets gets a warning; no material in the Tutorial or
+  Escape levels does.
+- The mesh emitter asks a `MaterialUVResolver` (the translator run without loading textures, cached
+  per material path) for those slots and fills the two sets with `StaticMeshAsset::uv`.
+- An index the mesh does not have reads the mesh's last set, as `FLocalVertexFactory::InitRHI`
+  binds it. A mesh with one UV set therefore gives index 1 the same coordinates as index 0.
+- BSP surfaces give every index their one `TexCoord`. Their `ShadowTexCoord` is the light-map
+  coordinate only.
+
+Before this, every index above 1 read mesh set 1. On the Tutorial crane (`VH_Stationary.S_Crane_01`,
+three UV sets) the normal map reads set 1 and the diffuse and its colour mask read set 2, so the
+diffuse was drawn with the wrong set and repeated along the arm:
+
+![The crane's diffuse texture mapped with UV set 1 and with UV set 2](../screenshots/tutorial_crane_uv_sets.png)
+
+The picture is an offline flat render of `T_Crane_Top_D` over the `M_Crane_Top_ColourA` sections as
+the level loader emits them, not a frame from the app.
+
 ---
 
 ## 3. Finding objects across packages: canonical paths
@@ -386,8 +414,10 @@ The "missing" actors use level skeletal meshes (`SK_Flag_02`, `SK_Pigeon`, `SK_C
 `CH_TKY_Cop_SWAT`, the `PX_SK_*` cloth, ...) or the editor-only `MatineeCam_SM`, which is not cooked.
 They are not drawn yet, and no procedural stand-in geometry is generated for them.
 
-The only remaining material warnings are the crane materials (`VH_Stationary.S_Crane_01.*`).
-They sample TexCoord index 2, which is mapped to UV1.
+The log lines above were recorded before §2.4: the three Tutorial warnings were the crane materials
+(`VH_Stationary.S_Crane_01.*`) sampling TexCoord index 2, and that warning no longer exists. The
+portable loader (`me_replay`) now reports 0 materials with warnings for the Tutorial and Escape
+levels; the counts on a Mac have not been re-recorded.
 
 ---
 
@@ -402,7 +432,8 @@ They sample TexCoord index 2, which is mapped to UV1.
    (550 components in Tutorial_p).
 3. **BSP.** Render the `ModelComponent`s (Tutorial_p has 151 Models).
 4. **Skeletal meshes** placed in levels.
-5. **TexCoord ≥ 2.** It currently maps to UV1, because the vertex format carries two UV sets.
+5. **More than two UV sets in one material.** A vertex carries two (§2.4). A material that reads
+   three gets a warning and its third index shares a slot.
 6. **Translucency sorting.** Translucent sections are drawn unsorted.
 7. **`TextureRenderTarget2D`.** Planar reflections are not rendered, so these targets fall back
    to their default texture.

@@ -257,7 +257,7 @@ bool load_city(PackageManager& pm, const std::shared_ptr<UPKPackage>& menu_map, 
         }
 
         const UProperty* overrides = find_prop(comp, "Materials");
-        const bool has_uv2 = mesh.uv_channel2.size() == mesh.triangles.size() * 2;
+        const bool has_uv2 = mesh.uv_extra.size() == mesh.triangles.size() * 4;
         for (size_t e = 0; e < mesh.elements.size(); ++e) {
             const StaticMeshElement& el = mesh.elements[e];
             std::string material = el.material;
@@ -283,8 +283,8 @@ bool load_city(PackageManager& pm, const std::shared_ptr<UPKPackage>& menu_map, 
                 dst.uv[1][0] = src.u2;
                 dst.uv[1][1] = src.v2;
                 if (has_uv2) {
-                    dst.uv[2][0] = mesh.uv_channel2[static_cast<size_t>(v) * 2];
-                    dst.uv[2][1] = mesh.uv_channel2[static_cast<size_t>(v) * 2 + 1];
+                    dst.uv[2][0] = mesh.uv_extra[static_cast<size_t>(v) * 4];
+                    dst.uv[2][1] = mesh.uv_extra[static_cast<size_t>(v) * 4 + 1];
                 }
                 dst.color[0] = static_cast<float>(src.color & 0xFF) / 255.0f;
                 dst.color[1] = static_cast<float>((src.color >> 8) & 0xFF) / 255.0f;

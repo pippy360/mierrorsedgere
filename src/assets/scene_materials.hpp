@@ -83,6 +83,38 @@ struct MaterialShader {
     std::string base_material;  // for diagnostics
 };
 
+// A vertex carries two UV sets (uv0, uv1). A UE3 material may read any of a mesh's sets through
+// TextureCoordinate's CoordinateIndex, but almost none reads more than two, so each compiled
+// material says which two indices its slots stand for and the level builder fills each mesh
+// section's vertices to match. Indices 0 and 1 keep their own slot whenever they are read.
+struct MaterialUVSlots {
+    int8_t index[2] = {0, 1};  // the TextureCoordinate index slot 0 / slot 1 carries
+    [[nodiscard]] bool is_default() const { return index[0] == 0 && index[1] == 1; }
+};
+
+// `texcoord_mask`: bit i set when the graph reads TextureCoordinate index i.
+inline MaterialUVSlots material_uv_slots(uint32_t texcoord_mask) {
+    int a = (texcoord_mask & 1u) ? 0 : -1;
+    int b = (texcoord_mask & 2u) ? 1 : -1;
+    for (int i = 2; i < 8; ++i) {
+        if (!(texcoord_mask & (1u << i))) continue;
+        if (b < 0) b = i;
+        else if (a < 0) a = i;
+    }
+    MaterialUVSlots s;
+    s.index[0] = static_cast<int8_t>(a < 0 ? 0 : a);
+    s.index[1] = static_cast<int8_t>(b < 0 ? 1 : b);
+    return s;
+}
+
+// The slot that serves TextureCoordinate `index`. A third set has no slot of its own: the slot
+// holding the higher index stands in for it.
+inline int material_uv_slot(const MaterialUVSlots& s, int index) {
+    if (index == s.index[0]) return 0;
+    if (index == s.index[1]) return 1;
+    return s.index[1] >= s.index[0] ? 1 : 0;
+}
+
 // A resolved material instance (Material or MaterialInstanceConstant chain leaf).
 struct SceneMaterial {
     std::string name;            // full path of the leaf material object
@@ -92,6 +124,8 @@ struct SceneMaterial {
     MatBlendMode blend = MatBlendMode::Opaque;
     MatLightingModel lighting = MatLightingModel::Phong;
     bool two_sided = false;
+    uint32_t texcoord_mask = 0;                // bit i: the graph reads TextureCoordinate index i
+    MaterialUVSlots uv_slots;                  // which of those the vertex's two UV sets carry
     std::vector<int> tex2d;                    // scene texture index per 2D slot (-1 => default)
     std::vector<TexDefault> tex2d_default;     // default per 2D slot
     std::vector<int> texcube;                  // scene texture index per cube slot (-1 => default)
