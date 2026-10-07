@@ -96,27 +96,59 @@ struct ActorTransform {
     Vec3 axis_x{1.0f, 0.0f, 0.0f};
     Vec3 axis_y{0.0f, 1.0f, 0.0f};
     Vec3 axis_z{0.0f, 0.0f, 1.0f};
+    Vec3 comp_axis_x{1.0f, 0.0f, 0.0f};
+    Vec3 comp_axis_y{0.0f, 1.0f, 0.0f};
+    Vec3 comp_axis_z{0.0f, 0.0f, 1.0f};
     Vec3 scale{1.0f, 1.0f, 1.0f};
+    Vec3 comp_scale{1.0f, 1.0f, 1.0f};
+    Vec3 comp_translation{0.0f, 0.0f, 0.0f};
     Vec3 location{0.0f, 0.0f, 0.0f};
     Vec3 pre_pivot{0.0f, 0.0f, 0.0f};
+    bool has_comp_xform = false;
 
-    ActorTransform(const Vec3& loc, const Rotator& rot, const Vec3& scale3, const Vec3& prepivot = Vec3(0.0f, 0.0f, 0.0f))
-        : scale(scale3), location(loc), pre_pivot(prepivot) {
+    static void compute_axes(const Rotator& rot, Vec3& out_x, Vec3& out_y, Vec3& out_z) {
         const Vec3 rad = rot.to_radians();
         const float sp = std::sin(rad.x), cp = std::cos(rad.x);
         const float sy = std::sin(rad.y), cy = std::cos(rad.y);
         const float sr = std::sin(rad.z), cr = std::cos(rad.z);
-        axis_x = Vec3(cp * cy, cp * sy, sp);
-        axis_y = Vec3(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp);
-        axis_z = Vec3(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp);
+        out_x = Vec3(cp * cy, cp * sy, sp);
+        out_y = Vec3(sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp);
+        out_z = Vec3(-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp);
     }
+
+    ActorTransform(const Vec3& loc, const Rotator& rot, const Vec3& scale3,
+                   const Vec3& prepivot = Vec3(0.0f, 0.0f, 0.0f))
+        : scale(scale3), location(loc), pre_pivot(prepivot) {
+        compute_axes(rot, axis_x, axis_y, axis_z);
+    }
+
     static ActorTransform of(const LevelActor& a) {
-        return ActorTransform(a.location, a.rotation,
-                              Vec3(a.draw_scale * a.draw_scale_3d.x, a.draw_scale * a.draw_scale_3d.y,
-                                   a.draw_scale * a.draw_scale_3d.z));
+        ActorTransform xf(a.location, a.rotation,
+                          Vec3(a.draw_scale * a.draw_scale_3d.x,
+                               a.draw_scale * a.draw_scale_3d.y,
+                               a.draw_scale * a.draw_scale_3d.z),
+                          a.pre_pivot);
+        const Vec3 cs(a.comp_scale * a.comp_scale_3d.x,
+                      a.comp_scale * a.comp_scale_3d.y,
+                      a.comp_scale * a.comp_scale_3d.z);
+        if (std::abs(a.comp_rotation.pitch) > 1e-3f || std::abs(a.comp_rotation.yaw) > 1e-3f ||
+            std::abs(a.comp_rotation.roll) > 1e-3f || a.comp_translation.length_sq() > 1e-6f ||
+            std::abs(cs.x - 1.0f) > 1e-4f || std::abs(cs.y - 1.0f) > 1e-4f || std::abs(cs.z - 1.0f) > 1e-4f) {
+            xf.has_comp_xform = true;
+            xf.comp_scale = cs;
+            xf.comp_translation = a.comp_translation;
+            compute_axes(a.comp_rotation, xf.comp_axis_x, xf.comp_axis_y, xf.comp_axis_z);
+        }
+        return xf;
     }
+
     [[nodiscard]] Vec3 apply(const Vec3& local) const {
-        const Vec3 l = local - pre_pivot;
+        Vec3 p = local;
+        if (has_comp_xform) {
+            p = comp_translation + comp_axis_x * (local.x * comp_scale.x) +
+                comp_axis_y * (local.y * comp_scale.y) + comp_axis_z * (local.z * comp_scale.z);
+        }
+        const Vec3 l = p - pre_pivot;
         return location + axis_x * (l.x * scale.x) + axis_y * (l.y * scale.y) + axis_z * (l.z * scale.z);
     }
 };
@@ -1109,6 +1141,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
         if (const auto* p = get_prop("Location")) a.location = p->vec_val;
         if (const auto* p = get_prop("Rotation")) a.rotation = p->rot_val;
+        if (const auto* p = get_prop("PrePivot")) a.pre_pivot = p->vec_val;
         if (const auto* p = get_prop("DrawScale")) a.draw_scale = p->float_val;
         if (const auto* p = get_prop("DrawScale3D")) a.draw_scale_3d = p->vec_val;
         if (const auto* p = get_prop("Tag")) a.tag = p->str_val;
@@ -1124,6 +1157,9 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         if (const auto* rm = get_prop("ReplicatedMesh")) {
             if (!rm->obj_ref_name.empty() && rm->obj_ref_name != "None") {
                 a.mesh_name = rm->obj_ref_name;
+                if (rm->obj_ref_index != 0) {
+                    a.mesh_path = object_canonical_path(*this, rm->obj_ref_index);
+                }
             }
         }
 
@@ -1143,44 +1179,58 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
         if (comp_idx > 0 && static_cast<size_t>(comp_idx) <= exports_.size()) {
             const auto& comp_exp = exports_[comp_idx - 1];
-            size_t cp_start = find_property_start(comp_exp);
-            size_t cexp_end = static_cast<size_t>(comp_exp.serial_offset) + static_cast<size_t>(comp_exp.serial_size);
-            if (cp_start < data_.size() && cp_start < cexp_end) {
-                auto comp_props = parse_properties(cp_start, std::min<size_t>(cexp_end - cp_start, data_.size() - cp_start));
-                if (comp_props.find("StaticMesh") != comp_props.end() && !comp_props["StaticMesh"].obj_ref_name.empty() &&
-                    comp_props["StaticMesh"].obj_ref_name != "None") {
-                    a.mesh_name = comp_props["StaticMesh"].obj_ref_name;
-                }
-                if (comp_props.find("HiddenGame") != comp_props.end() && comp_props["HiddenGame"].bool_val) {
-                    b_hidden = true;
-                }
-                if (comp_props.find("Scale") != comp_props.end() && comp_props["Scale"].float_val > 0.0f) {
-                    a.draw_scale *= comp_props["Scale"].float_val;
-                }
-                if (comp_props.find("Scale3D") != comp_props.end()) {
-                    a.draw_scale_3d.x *= comp_props["Scale3D"].vec_val.x;
-                    a.draw_scale_3d.y *= comp_props["Scale3D"].vec_val.y;
-                    a.draw_scale_3d.z *= comp_props["Scale3D"].vec_val.z;
-                }
-            }
-            int32_t c_arch = comp_exp.archetype;
+            bool seen_mesh = false;
+            bool seen_scale = false;
+            bool seen_scale3d = false;
+            bool seen_trans = false;
+            bool seen_rot = false;
+            int32_t cur_comp = comp_idx;
             int c_guard = 0;
-            while (a.mesh_name.empty() && c_arch > 0 && static_cast<size_t>(c_arch) <= exports_.size() && c_guard++ < 8) {
-                const auto& acomp_exp = exports_[c_arch - 1];
-                size_t acp_start = find_property_start(acomp_exp);
-                size_t acexp_end = static_cast<size_t>(acomp_exp.serial_offset) + static_cast<size_t>(acomp_exp.serial_size);
-                if (acp_start < data_.size() && acp_start < acexp_end) {
-                    auto acomp_props = parse_properties(acp_start, std::min<size_t>(acexp_end - acp_start, data_.size() - acp_start));
-                    if (acomp_props.find("StaticMesh") != acomp_props.end() &&
-                        !acomp_props["StaticMesh"].obj_ref_name.empty() &&
-                        acomp_props["StaticMesh"].obj_ref_name != "None") {
-                        a.mesh_name = acomp_props["StaticMesh"].obj_ref_name;
+            while (cur_comp > 0 && static_cast<size_t>(cur_comp) <= exports_.size() && c_guard++ < 8) {
+                const auto& cexp = exports_[cur_comp - 1];
+                size_t cp_start = find_property_start(cexp);
+                size_t cexp_end = static_cast<size_t>(cexp.serial_offset) + static_cast<size_t>(cexp.serial_size);
+                if (cp_start < data_.size() && cp_start < cexp_end) {
+                    auto cprops = parse_properties(cp_start, std::min<size_t>(cexp_end - cp_start, data_.size() - cp_start));
+                    if (!seen_mesh) {
+                        if (auto it = cprops.find("StaticMesh");
+                            it != cprops.end() && !it->second.obj_ref_name.empty() && it->second.obj_ref_name != "None") {
+                            a.mesh_name = it->second.obj_ref_name;
+                            if (it->second.obj_ref_index != 0) {
+                                a.mesh_path = object_canonical_path(*this, it->second.obj_ref_index);
+                            }
+                            seen_mesh = true;
+                        }
                     }
-                    if (acomp_props.find("HiddenGame") != acomp_props.end() && acomp_props["HiddenGame"].bool_val) {
+                    if (auto it = cprops.find("HiddenGame"); it != cprops.end() && it->second.bool_val) {
                         b_hidden = true;
                     }
+                    if (!seen_scale) {
+                        if (auto it = cprops.find("Scale"); it != cprops.end() && it->second.float_val > 0.0f) {
+                            a.comp_scale = it->second.float_val;
+                            seen_scale = true;
+                        }
+                    }
+                    if (!seen_scale3d) {
+                        if (auto it = cprops.find("Scale3D"); it != cprops.end()) {
+                            a.comp_scale_3d = it->second.vec_val;
+                            seen_scale3d = true;
+                        }
+                    }
+                    if (!seen_trans) {
+                        if (auto it = cprops.find("Translation"); it != cprops.end()) {
+                            a.comp_translation = it->second.vec_val;
+                            seen_trans = true;
+                        }
+                    }
+                    if (!seen_rot) {
+                        if (auto it = cprops.find("Rotation"); it != cprops.end()) {
+                            a.comp_rotation = it->second.rot_val;
+                            seen_rot = true;
+                        }
+                    }
                 }
-                c_arch = acomp_exp.archetype;
+                cur_comp = cexp.archetype;
             }
 
             // StaticMeshComponent.Materials[] overrides the mesh's per-element materials
@@ -2121,11 +2171,10 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         }
         std::string key = full_obj_name;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (auto it = out_meshes.find(key); it != out_meshes.end()) {
-            const bool existing_has_coll = it->second.use_simple_box_collision
-                                               ? !it->second.simple_collision.empty()
-                                               : !it->second.complex_collision.empty();
-            if (existing_has_coll) continue;
+        const int32_t exp_index = static_cast<int32_t>(&exp - exports_.data()) + 1;
+        const std::string canon_key = to_lower(object_canonical_path(*this, exp_index));
+        if (!canon_key.empty() && out_meshes.find(canon_key) != out_meshes.end()) {
+            continue;
         }
 
         size_t prop_start = find_property_start(exp);
@@ -2406,14 +2455,26 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         }
 
         if (!asset.triangles.empty() || !asset.simple_collision.empty() || !asset.complex_collision.empty()) {
+            const bool asset_has_coll = asset.use_simple_box_collision
+                                            ? !asset.simple_collision.empty()
+                                            : !asset.complex_collision.empty();
+            if (!canon_key.empty()) {
+                out_meshes[canon_key] = asset;
+            }
             if (exp.object_number > 0) {
                 std::string base_key = exp.object_name;
                 std::transform(base_key.begin(), base_key.end(), base_key.begin(), ::tolower);
-                if (out_meshes.find(base_key) == out_meshes.end()) {
+                auto bit = out_meshes.find(base_key);
+                if (bit == out_meshes.end() ||
+                    (asset_has_coll && bit->second.simple_collision.empty() && bit->second.complex_collision.empty())) {
                     out_meshes[base_key] = asset;
                 }
             }
-            out_meshes[key] = std::move(asset);
+            auto sit = out_meshes.find(key);
+            if (sit == out_meshes.end() || asset_has_coll ||
+                (sit->second.simple_collision.empty() && sit->second.complex_collision.empty())) {
+                out_meshes[key] = std::move(asset);
+            }
         }
     }
 }
@@ -2751,6 +2812,15 @@ const StaticMeshAsset* find_mesh(const std::unordered_map<std::string, StaticMes
     return it != lib.end() ? &it->second : nullptr;
 }
 
+const StaticMeshAsset* find_mesh(const std::unordered_map<std::string, StaticMeshAsset>& lib, const LevelActor& a) {
+    if (!a.mesh_path.empty()) {
+        if (auto it = lib.find(to_lower(a.mesh_path)); it != lib.end()) {
+            return &it->second;
+        }
+    }
+    return find_mesh(lib, a.mesh_name);
+}
+
 // World AABB of a mesh actor from the transformed corners of the mesh bounds box.
 AABB transformed_mesh_bounds(const LevelActor& a, const StaticMeshAsset& sm) {
     const ActorTransform xf = ActorTransform::of(a);
@@ -2963,7 +3033,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         if (std::abs(a.location.x) > 150000.0f || std::abs(a.location.y) > 150000.0f) continue;
         if (a.elevator >= 0 || a.barge_door >= 0) continue;  // moving InterpActor / door: built dynamically
 
-        const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+        const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
         if (!a.mesh_name.empty() && !sm) {
             ++missing_meshes;
             missing_names[to_lower(a.mesh_name)]++;
@@ -3098,7 +3168,7 @@ void assign_elevator_parts(LevelScene& scene, const std::vector<InterpDoorInfo>&
         const LevelActor& cab = actors[cab_it->second];
         float floor_offset = 0.0f;
         float cab_height = 262.0f;
-        if (const StaticMeshAsset* sm = find_mesh(mesh_lib, cab.mesh_name)) {
+        if (const StaticMeshAsset* sm = find_mesh(mesh_lib, cab)) {
             floor_offset = sm->bounds_origin.z - sm->bounds_extent.z;
             cab_height = 2.0f * sm->bounds_extent.z;
         }
@@ -3149,7 +3219,7 @@ void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<st
             }
             part.prev_offset = part.offset;
             LevelActor& a = scene.actors[part.actor_index];
-            const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+            const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
             auto cw = std::make_shared<CollisionWorld>();
             append_actor_collision(a, part.actor_index, sm, *cw);
             cw->build();
@@ -3182,23 +3252,23 @@ void assign_barge_doors(LevelScene& scene) {
         const std::string low_mesh = to_lower(a.mesh_name);
         const std::string low_obj = to_lower(a.object_name);
         const std::string low_cls = to_lower(a.class_name);
-        // Exclude sliding elevator doors, locked decorative doors, door frames, and doorway closer mechanisms
+        // Only interactive InterpActor doors can swing open in Mirror's Edge; StaticMeshActor doors
+        // and all door frames / combined wall-doors are static blocking world geometry.
+        if (low_cls != "interpactor") return false;
         if (low_mesh.find("elevatordoor") != std::string::npos ||
             low_mesh.find("doorlocked") != std::string::npos ||
             low_mesh.find("doorstorefront") != std::string::npos ||
             low_mesh.find("doorrollup") != std::string::npos ||
-            low_mesh.find("outerframe") != std::string::npos ||
+            low_mesh.find("frame") != std::string::npos ||
+            low_mesh.find("combined") != std::string::npos ||
             low_mesh.find("policecar") != std::string::npos ||
             low_mesh.find("doorclosingmech") != std::string::npos) {
             return false;
         }
         if (low_mesh.find("barge") != std::string::npos || low_obj.find("barge") != std::string::npos) return true;
-        if (low_mesh.find("maintenancedoor") != std::string::npos) return true;
-        if (low_mesh.find("sp01_door") != std::string::npos) return true;
-        if (low_mesh.find("stormdraindoor") != std::string::npos) return true;
         if (low_mesh.find("officedoorglass") != std::string::npos || low_obj.find("officedoorglass") != std::string::npos) return true;
         if (low_mesh.find("onewaydoor") != std::string::npos || low_obj.find("onewaydoor") != std::string::npos) return true;
-        if (low_cls == "interpactor" && low_mesh.find("door") != std::string::npos) return true;
+        if (a.is_runner_vision && low_mesh.find("door") != std::string::npos) return true;
         return false;
     };
 
@@ -3288,7 +3358,7 @@ void build_barge_door_geometry(LevelScene& scene, const std::unordered_map<std::
         for (size_t p = 0; p < door.parts.size(); ++p) {
             DoorPart& part = door.parts[p];
             LevelActor& a = scene.actors[part.actor_index];
-            const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+            const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
             auto cw = std::make_shared<CollisionWorld>();
             append_actor_collision(a, part.actor_index, sm, *cw);
             cw->build();
@@ -3741,12 +3811,13 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         if (require_prefix && low.rfind(low_prefix, 0) != 0) {
             return false;
         }
-        // Skip localization, music, audio, lightmap-only, and time-trial sub-packages.
-        // Note: *_spt, *_slc, and *_cs MUST be loaded because Mirror's Edge places all interactive
-        // elevator cabs, level intro Matinee sequences (e.g. Edge_Pt1_CS), and floating title credits there!
+        // Skip localization, music, audio, lookat, and time-trial sub-packages.
+        // Note: *_spt, *_slc, *_cs, and *_lgts MUST be loaded because Mirror's Edge places interactive
+        // elevator cabs, Matinee sequences, and 2,100+ collidable StaticMeshActors (flowerbeds, billboards,
+        // roof props) inside those sub-packages.
         if (low.find("_loc_") != std::string::npos || low.find("_mus") != std::string::npos ||
             low.find("_aud") != std::string::npos || low.find("_peds") != std::string::npos ||
-            low.find("_lookat") != std::string::npos || low.find("_lgts") != std::string::npos ||
+            low.find("_lookat") != std::string::npos ||
             low.rfind("tt_", 0) == 0) {
             return false;
         }
@@ -3784,10 +3855,10 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
     }
 
-    // Load geometry, art, slice (*_Slc), and script/elevator (*_Spt) sub-packages
+    // Load geometry, art, slice (*_Slc), lighting/props (*_Lgts), and script/elevator (*_Spt) sub-packages
     size_t loaded_sub = 0;
     for (const auto& sub_path : sub_packages) {
-        if (loaded_sub++ >= 96) break;
+        if (loaded_sub++ >= 160) break;
         auto sub_pkg = std::make_shared<UPKPackage>(sub_path);
         if (!sub_pkg->is_valid()) continue;
 

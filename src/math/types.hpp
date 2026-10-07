@@ -535,11 +535,17 @@ struct LevelActor {
     std::string unique_name;   // export name including the FName number suffix (e.g. "InterpActor_3")
     std::string base_name;     // unique_name of the Actor.Base this actor is attached to ("" = none)
     std::string mesh_name;
+    std::string mesh_path;       // canonical UE3 object path (e.g. "VH_NYC_PoliceVehicles.PoliceCar_01.S_Policecar_01")
     std::string tag;
     Vec3 location{0.0f, 0.0f, 0.0f};
     Rotator rotation{0.0f, 0.0f, 0.0f};
+    Vec3 pre_pivot{0.0f, 0.0f, 0.0f};
     Vec3 draw_scale_3d{1.0f, 1.0f, 1.0f};
     float draw_scale = 1.0f;
+    Vec3 comp_translation{0.0f, 0.0f, 0.0f};
+    Rotator comp_rotation{0.0f, 0.0f, 0.0f};
+    Vec3 comp_scale_3d{1.0f, 1.0f, 1.0f};
+    float comp_scale = 1.0f;
     AABB world_bounds;
     // UE3 collision: bCollideActors && bBlockActors && CollisionComponent.CollideActors &&
     // BlockActors && BlockNonZeroExtent (pawn movement) / BlockZeroExtent (traces).
