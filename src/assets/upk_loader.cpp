@@ -2551,6 +2551,12 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
                 v.tangent_sign = (sv[7] >= 128) ? 1.0f : -1.0f;
                 read_uv(sv, 0, v.u, v.v);
                 read_uv(sv, 1, v.u2, v.v2);
+                if (num_uv >= 3 && uv_layout_ok) {
+                    float u3 = 0.0f, v3 = 0.0f;
+                    read_uv(sv, 2, u3, v3);
+                    asset.uv_channel2.push_back(u3);
+                    asset.uv_channel2.push_back(v3);
+                }
                 v.color = has_color ? (static_cast<uint32_t>(sv[10]) | (static_cast<uint32_t>(sv[9]) << 8) |
                                        (static_cast<uint32_t>(sv[8]) << 16) | (static_cast<uint32_t>(sv[11]) << 24))
                                     : 0xFFFFFFFFu;

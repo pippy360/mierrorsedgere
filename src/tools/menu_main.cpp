@@ -10,11 +10,13 @@
 //   move <x> <y> | click <x> <y>    the mouse, in viewport pixels
 //   shot <file.png>                 render the current frame into --out
 //   state                           print the screen, column and focused button
+//   linear <file.f32>               the 3D scene before tone mapping, raw float32 RGB
 //   menu                            go straight to the main menu
 
 #include "../ui/frontend/frontend.hpp"
 #include "../ui/frontend/soft_render.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -194,6 +196,16 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::cout << "wrote " << path << "\n";
+        } else if (verb == "linear") {
+            // The 3D scene before tone mapping, as raw float32 RGB: for fitting the tone curve.
+            std::string name;
+            cs >> name;
+            renderer.render(fe.frame(), rgba);
+            const std::vector<float>& lin = renderer.linear_scene();
+            if (std::FILE* f = std::fopen((out_dir + "/" + name).c_str(), "wb")) {
+                std::fwrite(lin.data(), sizeof(float), lin.size(), f);
+                std::fclose(f);
+            }
         } else {
             std::cerr << "me_menu: unknown script command '" << verb << "'\n";
             return 2;

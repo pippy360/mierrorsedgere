@@ -30,6 +30,9 @@ public:
     void set_background(bool on) { background_ = on; }
     void set_ui(bool on) { ui_ = on; }
 
+    // The last frame's 3D scene before tone mapping (linear, three floats per pixel): for calibration.
+    [[nodiscard]] const std::vector<float>& linear_scene() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

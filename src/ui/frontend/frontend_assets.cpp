@@ -1,5 +1,7 @@
 #include "frontend_assets.hpp"
 
+#include "frontend_internal.hpp"
+
 #include "../../assets/ini_config.hpp"
 #include "../../assets/package_manager.hpp"
 #include "../../assets/texture_loader.hpp"
@@ -66,61 +68,6 @@ void dxt5_alpha_block(const uint8_t* b, uint8_t out[16]) {
     for (int i = 0; i < 16; ++i) out[i] = a[(bits >> (3 * i)) & 7];
 }
 
-bool decode_mip(const TextureMip& mip, TexFormat fmt, Image& out) {
-    const int w = mip.width, h = mip.height;
-    if (w <= 0 || h <= 0 || mip.data.size() < texture_mip_bytes(fmt, w, h)) return false;
-    out.w = w;
-    out.h = h;
-    out.px.assign(static_cast<size_t>(w) * h * 4, 255);
-    const uint8_t* src = mip.data.data();
-    if (fmt == TexFormat::BGRA8) {
-        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-            out.px[i * 4 + 0] = src[i * 4 + 2];
-            out.px[i * 4 + 1] = src[i * 4 + 1];
-            out.px[i * 4 + 2] = src[i * 4 + 0];
-            out.px[i * 4 + 3] = src[i * 4 + 3];
-        }
-        return true;
-    }
-    if (fmt == TexFormat::G8) {
-        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
-            out.px[i * 4 + 0] = out.px[i * 4 + 1] = out.px[i * 4 + 2] = src[i];
-        }
-        return true;
-    }
-    if (fmt != TexFormat::DXT1 && fmt != TexFormat::DXT3 && fmt != TexFormat::DXT5) return false;
-    const size_t block = fmt == TexFormat::DXT1 ? 8 : 16;
-    const int bw = (w + 3) / 4, bh = (h + 3) / 4;
-    for (int by = 0; by < bh; ++by) {
-        for (int bx = 0; bx < bw; ++bx) {
-            const uint8_t* b = src + (static_cast<size_t>(by) * bw + bx) * block;
-            uint8_t rgba[16][4];
-            uint8_t alpha[16];
-            if (fmt == TexFormat::DXT1) {
-                dxt_color_block(b, true, rgba);
-                for (int i = 0; i < 16; ++i) alpha[i] = rgba[i][3];
-            } else {
-                dxt_color_block(b + 8, false, rgba);
-                if (fmt == TexFormat::DXT5) {
-                    dxt5_alpha_block(b, alpha);
-                } else {
-                    for (int i = 0; i < 16; ++i) alpha[i] = static_cast<uint8_t>(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
-                }
-            }
-            for (int i = 0; i < 16; ++i) {
-                const int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
-                if (x >= w || y >= h) continue;
-                uint8_t* d = &out.px[(static_cast<size_t>(y) * w + x) * 4];
-                d[0] = rgba[i][0];
-                d[1] = rgba[i][1];
-                d[2] = rgba[i][2];
-                d[3] = alpha[i];
-            }
-        }
-    }
-    return true;
-}
-
 int32_t find_export(const UPKPackage& pkg, const std::string& name, const char* cls_a, const char* cls_b = nullptr) {
     const std::string want = to_lower(name);
     const auto& exports = pkg.get_exports();
@@ -136,7 +83,7 @@ bool load_image_export(PackageManager& pm, const UPKPackage& pkg, int32_t index,
     if (index <= 0) return false;
     SceneTexture tex;
     if (!load_texture2d(pm, pkg, index, 4096, tex, nullptr) || tex.mips.empty()) return false;
-    if (!decode_mip(tex.mips.front(), tex.format, out)) return false;
+    if (!decode_texture_mip(tex.mips.front(), tex.format, out)) return false;
     out.wrap_x = tex.address_x != TexAddress::Clamp;
     out.wrap_y = tex.address_y != TexAddress::Clamp;
     out.srgb = tex.srgb;
@@ -383,8 +330,60 @@ std::string to_latin1(const std::string& s) {
 
 }  // namespace
 
-// Defined in frontend_city.cpp.
-bool load_city(PackageManager& pm, const std::shared_ptr<UPKPackage>& menu_map, City& out, std::vector<std::string>& warnings);
+bool decode_texture_mip(const TextureMip& mip, TexFormat fmt, Image& out) {
+    const int w = mip.width, h = mip.height;
+    if (w <= 0 || h <= 0 || mip.data.size() < texture_mip_bytes(fmt, w, h)) return false;
+    out.w = w;
+    out.h = h;
+    out.px.assign(static_cast<size_t>(w) * h * 4, 255);
+    const uint8_t* src = mip.data.data();
+    if (fmt == TexFormat::BGRA8) {
+        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+            out.px[i * 4 + 0] = src[i * 4 + 2];
+            out.px[i * 4 + 1] = src[i * 4 + 1];
+            out.px[i * 4 + 2] = src[i * 4 + 0];
+            out.px[i * 4 + 3] = src[i * 4 + 3];
+        }
+        return true;
+    }
+    if (fmt == TexFormat::G8) {
+        for (size_t i = 0; i < static_cast<size_t>(w) * h; ++i) {
+            out.px[i * 4 + 0] = out.px[i * 4 + 1] = out.px[i * 4 + 2] = src[i];
+        }
+        return true;
+    }
+    if (fmt != TexFormat::DXT1 && fmt != TexFormat::DXT3 && fmt != TexFormat::DXT5) return false;
+    const size_t block = fmt == TexFormat::DXT1 ? 8 : 16;
+    const int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; ++by) {
+        for (int bx = 0; bx < bw; ++bx) {
+            const uint8_t* b = src + (static_cast<size_t>(by) * bw + bx) * block;
+            uint8_t rgba[16][4];
+            uint8_t alpha[16];
+            if (fmt == TexFormat::DXT1) {
+                dxt_color_block(b, true, rgba);
+                for (int i = 0; i < 16; ++i) alpha[i] = rgba[i][3];
+            } else {
+                dxt_color_block(b + 8, false, rgba);
+                if (fmt == TexFormat::DXT5) {
+                    dxt5_alpha_block(b, alpha);
+                } else {
+                    for (int i = 0; i < 16; ++i) alpha[i] = static_cast<uint8_t>(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+                }
+            }
+            for (int i = 0; i < 16; ++i) {
+                const int x = bx * 4 + (i & 3), y = by * 4 + (i >> 2);
+                if (x >= w || y >= h) continue;
+                uint8_t* d = &out.px[(static_cast<size_t>(y) * w + x) * 4];
+                d[0] = rgba[i][0];
+                d[1] = rgba[i][1];
+                d[2] = rgba[i][2];
+                d[3] = alpha[i];
+            }
+        }
+    }
+    return true;
+}
 
 float Font::advance(unsigned char c, unsigned char next) const {
     float a = static_cast<float>(glyphs[c].w + spacing);

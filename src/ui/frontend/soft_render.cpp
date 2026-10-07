@@ -154,6 +154,8 @@ struct SoftRenderer::Impl {
 SoftRenderer::SoftRenderer(const Assets& assets) : impl_(std::make_unique<Impl>(assets.city)), assets_(assets) {}
 SoftRenderer::~SoftRenderer() = default;
 
+const std::vector<float>& SoftRenderer::linear_scene() const { return impl_->city.linear(); }
+
 void SoftRenderer::render(const Frame& frame, std::vector<uint8_t>& rgba) {
     const int w = frame.width, h = frame.height;
     std::vector<float>& color = impl_->color;

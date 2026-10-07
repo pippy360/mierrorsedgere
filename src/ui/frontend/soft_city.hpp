@@ -19,6 +19,9 @@ public:
     // Fills `rgb` (w x h, three floats per pixel, display space) with the view from the frame's camera.
     void render(const Frame& frame, int w, int h, std::vector<float>& rgb);
 
+    // The last frame's scene colour before tone mapping: linear, three floats per pixel.
+    [[nodiscard]] const std::vector<float>& linear() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

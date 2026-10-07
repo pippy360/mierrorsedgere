@@ -96,20 +96,46 @@ struct CityVertex {
     float color[3] = {1.0f, 1.0f, 1.0f};  // vertex colour, 0..1
 };
 
+// One StaticMeshComponent's baked lighting: its three directional light-map textures already
+// summed for a surface whose normal is the vertex normal (which is all the menu's materials use).
+struct LightMap {
+    int w = 0;
+    int h = 0;
+    std::vector<float> rgb;  // linear radiance, three per texel
+    float scale[2] = {1.0f, 1.0f};  // FLightMap2D CoordinateScale
+    float bias[2] = {0.0f, 0.0f};   // FLightMap2D CoordinateBias
+    [[nodiscard]] bool valid() const { return w > 0 && h > 0 && rgb.size() == static_cast<size_t>(w) * h * 3; }
+};
+
 // The triangles of one mesh element, in world space.
 struct CityBatch {
     std::string mesh;
     CityMaterial material = CityMaterial::Buildings;
+    int lightmap = -1;             // index into City::lightmaps, sampled with uv[1]
     std::vector<CityVertex> tris;  // three per triangle
 };
 
 struct City {
     std::vector<CityBatch> batches;
+    std::vector<LightMap> lightmaps;
     Image fade;   // UI_City.T_CityFade_01_A
     Image sky;    // UI_City.T_Skydome_Menu
     Image waves;  // UI_City.T_Waves_01_A
     Vec3 sun_dir{0.0f, 0.0f, 1.0f};  // towards the sun
     float water_z = 0.0f;            // the reflection plane (SceneCaptureReflectActor)
+    // WorldInfo.DefaultPostProcessSettings: Bloom_Scale, and Curves, the colour curve as sixteen
+    // linear pieces per channel (out = m * in + b over in = [i/16, (i+1)/16)).
+    float bloom_scale = 0.0f;
+    float curve_m[16][3];
+    float curve_b[16][3];
+    City() {
+        for (int i = 0; i < 16; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                curve_m[i][c] = 1.0f;
+                curve_b[i][c] = 0.0f;
+            }
+        }
+    }
     [[nodiscard]] bool valid() const { return !batches.empty(); }
 };
 
