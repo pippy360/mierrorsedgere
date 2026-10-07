@@ -133,8 +133,8 @@ struct Rotator {
         float y = rad.y;
         float r = rad.z;
         return Vec3(
-             std::sin(r) * std::sin(y) + std::cos(r) * std::sin(p) * std::cos(y),
-            -std::sin(r) * std::cos(y) + std::cos(r) * std::sin(p) * std::sin(y),
+            -std::sin(r) * std::sin(y) - std::cos(r) * std::sin(p) * std::cos(y),
+             std::sin(r) * std::cos(y) - std::cos(r) * std::sin(p) * std::sin(y),
              std::cos(r) * std::cos(p)
         );
     }
