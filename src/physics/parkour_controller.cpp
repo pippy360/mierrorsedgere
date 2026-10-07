@@ -314,7 +314,16 @@ void ParkourController::equip_weapon(const std::string& weapon_name) {
     ws.is_heavy = matched->is_heavy;
     ws.is_two_handed = matched->is_two_handed;
     ws.mobility_scale = matched->mobility_scale;
-    ws.equip_timer = 0.35f; // trigger 1P unholster animation
+    if (matched->fire_mode == EWeaponFireMode::BoltAction) {
+        ws.fire_anim_duration = 1.45f;
+    } else if (matched->fire_mode == EWeaponFireMode::PumpAction) {
+        ws.fire_anim_duration = (std::string(matched->id) == "Remington870") ? 1.05f : 0.88f;
+    } else if (matched->fire_mode == EWeaponFireMode::SemiAuto) {
+        ws.fire_anim_duration = 0.52f;
+    } else {
+        ws.fire_anim_duration = 0.48f;
+    }
+    ws.equip_timer = matched->is_heavy ? 0.65f : 0.45f; // trigger 1P unholster animation
     m_telemetry.weapon = ws;
 }
 
@@ -2725,7 +2734,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         dw.grounded = false;
         scene.dropped_weapons.push_back(dw);
 
-        ws.drop_timer = 0.25f; // plays 1P `throwaway` animation before clearing `ws.equipped`
+        ws.drop_timer = 0.35f; // plays 1P `throwaway` animation before clearing `ws.equipped`
         ws.is_heavy = false;
         ws.mobility_scale = 1.0f;
         m_telemetry.active_subtitle = reason;
@@ -2826,7 +2835,16 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         if (ws.ammo <= 0) return;
         ws.ammo--;
         ws.fired_this_tick = true;
-        ws.fire_anim_timer = std::min(0.32f, std::max(0.14f, ws.fire_interval));
+        if (ws.fire_mode == EWeaponFireMode::BoltAction) {
+            ws.fire_anim_duration = 1.45f;
+        } else if (ws.fire_mode == EWeaponFireMode::PumpAction) {
+            ws.fire_anim_duration = (ws.name == "Remington870") ? 1.05f : 0.88f;
+        } else if (ws.fire_mode == EWeaponFireMode::SemiAuto) {
+            ws.fire_anim_duration = 0.52f;
+        } else {
+            ws.fire_anim_duration = 0.48f;
+        }
+        ws.fire_anim_timer = ws.fire_anim_duration;
         ws.muzzle_flash_timer = 0.065f;
 
         Rotator view_rot = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f);
