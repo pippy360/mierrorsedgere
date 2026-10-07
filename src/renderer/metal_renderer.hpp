@@ -65,6 +65,8 @@ public:
     [[nodiscard]] bool is_menu_open() const;
     void set_selected_chapter(int idx);
     [[nodiscard]] int selected_chapter() const;
+    void set_selected_menu_tab(int tab);
+    [[nodiscard]] int selected_menu_tab() const;
     void set_cutscene_player(const class CutscenePlayer* player);
 
     // Raw Metal device handles (for external toolchain probes)

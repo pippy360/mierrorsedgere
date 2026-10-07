@@ -2810,7 +2810,7 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
         // Check whether a walkable roof/ledge exists behind the pipe top; if so, mantle onto it.
         // If no walkable roof exists (dead-end pipe below upper wall), hold at the top step.
         if (m_telemetry.position.z >= m_climb_top.z - 25.0f) {
-            for (float dist_in : {45.0f, 80.0f, 120.0f, 165.0f, 205.0f}) {
+            for (float dist_in : {45.0f, 80.0f, 120.0f}) {
                 const Vec3 probe_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + into * dist_in;
                 const TraceHit roof = trace_ray(
                     Vec3(probe_xy.x, probe_xy.y, m_climb_top.z + 150.0f),

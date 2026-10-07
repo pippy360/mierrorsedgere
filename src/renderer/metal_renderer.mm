@@ -1064,6 +1064,7 @@ struct MetalRenderer::Impl {
     // Menu state & Frontend UI System (TdMainMenu.me1 + UI/TdUI_FrontEnd.upk)
     bool menu_open = false;
     int selected_chapter = 1;
+    int selected_menu_tab = 0;
     MainMenuSystem main_menu;
     bool main_menu_gpu_ready = false;
     id<MTLTexture> ui_logo_tex = nil;
@@ -2208,7 +2209,7 @@ struct MetalRenderer::Impl {
 
         for (int c = 0; c < 4; ++c) {
             const float cx = (96.0f + float(c) * 272.0f) * sx;
-            const bool active = (c == 0);
+            const bool active = (c == selected_menu_tab);
             draw_ui_skew_quad(bg_verts, cx, nav_y, col_w - 6.0f * sx, nav_h, 14.0f * sx,
                               active ? runner_red : col_veil);
             draw_ui_skew_quad(fg_verts, cx, nav_y, 3.0f * sx, nav_h, 14.0f * sx,
@@ -3324,6 +3325,8 @@ void MetalRenderer::set_menu_open(bool open) { impl_->menu_open = open; }
 bool MetalRenderer::is_menu_open() const { return impl_->menu_open; }
 void MetalRenderer::set_selected_chapter(int idx) { impl_->selected_chapter = std::clamp(idx, 0, 9); }
 int MetalRenderer::selected_chapter() const { return impl_->selected_chapter; }
+void MetalRenderer::set_selected_menu_tab(int tab) { impl_->selected_menu_tab = std::clamp(tab, 0, 3); }
+int MetalRenderer::selected_menu_tab() const { return impl_->selected_menu_tab; }
 void MetalRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
 
 void* MetalRenderer::raw_device() const { return (__bridge void*)impl_->device; }
