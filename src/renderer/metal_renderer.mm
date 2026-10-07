@@ -1065,6 +1065,10 @@ struct MetalRenderer::Impl {
     bool menu_open = false;
     int selected_chapter = 1;
     int selected_menu_tab = 0;
+    int selected_menu_row = 0;
+    int opt_sens_pct = 100;
+    int opt_fov_deg = 90;
+    bool opt_fullscreen = false;
     MainMenuSystem main_menu;
     bool main_menu_gpu_ready = false;
     id<MTLTexture> ui_logo_tex = nil;
@@ -2091,39 +2095,77 @@ struct MetalRenderer::Impl {
         }
 
         // =====================================================================
-        // 2. LEFT SAFE-REGION: TdLoadLevel CHAPTER SELECTOR (Minimalist DICE Style)
+        // 2. LEFT SAFE-REGION: TAB-SPECIFIC MENU ROWS (STORY / RACE / OPTIONS / EXTRAS)
         // =====================================================================
         const float lx = 96.0f * sx;
         const float ly = 104.0f * sy;
-        const float lw = 336.0f * sx;
+        const float lw = 380.0f * sx;
 
-        // Section Title ("PLAY CHAPTER") + thin scarlet architectural rule
+        const std::string left_heading =
+            (selected_menu_tab == 1) ? "SPEED RUN COURSES" :
+            (selected_menu_tab == 2) ? "GAME & VIDEO OPTIONS" :
+            (selected_menu_tab == 3) ? "EXTRAS & ARCHIVE" :
+            config_title_or("LOAD CHAPTER");
+
         draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
-                            config_title_or("LOAD CHAPTER"), lx, ly, 23.0f * sy, dark_ink, false);
+                            left_heading, lx, ly, 23.0f * sy, dark_ink, false);
         draw_ui_skew_quad(fg_verts, lx - 4.0f * sx, ly + 28.0f * sy, lw, 2.5f * sy, 3.0f * sx, runner_red);
 
         const float list_top = ly + 38.0f * sy;
         const float row_step = 35.5f * sy;
         const float row_h    = 31.0f * sy;
 
-        for (int i = 0; i < 10; ++i) {
-            const MenuChapterEntry& ch = main_menu.get_chapter(i);
-            const float ry = list_top + float(i) * row_step;
-            const bool is_sel = (i == sel);
-
-            std::string ch_upper = ch.map_name;
-            for (char& c : ch_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-
+        auto draw_menu_row = [&](int idx, const std::string& label, bool is_sel) {
+            const float ry = list_top + float(idx) * row_step;
             if (is_sel) {
-                // Active chapter: iconic forward-slanted Scarlet Red bar + pure white thick italic text
                 draw_ui_skew_quad(bg_verts, lx - 8.0f * sx, ry, lw + 18.0f * sx, row_h, 9.0f * sx, runner_red);
                 draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
-                                    ch_upper, lx + 8.0f * sx, ry + 5.5f * sy, 18.5f * sy, pure_white, true);
+                                    label, lx + 8.0f * sx, ry + 5.5f * sy, 18.0f * sy, pure_white, true);
             } else {
-                // Unselected chapter: subtle translucent glass veil + dark medium italic text
                 draw_ui_skew_quad(bg_verts, lx, ry + 1.5f * sy, lw, row_h - 3.0f * sy, 7.5f * sx, row_strip);
                 draw_multifont_text(tex_batches, fg_verts, f_med_italic, ui_font_medium_italic_tex,
-                                    ch_upper, lx + 8.0f * sx, ry + 6.5f * sy, 16.0f * sy, dark_ink, false);
+                                    label, lx + 8.0f * sx, ry + 6.5f * sy, 15.8f * sy, dark_ink, false);
+            }
+        };
+
+        if (selected_menu_tab == 0 || selected_menu_tab == 1) {
+            // STORY & RACE: 10 Campaign / Speed Run Chapters
+            for (int i = 0; i < 10; ++i) {
+                const MenuChapterEntry& ch = main_menu.get_chapter(i);
+                std::string ch_upper = ch.map_name;
+                for (char& c : ch_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (selected_menu_tab == 1) {
+                    ch_upper += "   [" + ch.speedrun_target_time + "]";
+                }
+                draw_menu_row(i, ch_upper, i == sel);
+            }
+        } else if (selected_menu_tab == 2) {
+            // OPTIONS: 6 Interactive Game, Input & Display Settings
+            const int rsel = std::clamp(selected_menu_row, 0, 5);
+            const std::string opt_rows[6] = {
+                "MOUSE SENSITIVITY:   " + std::to_string(opt_sens_pct) + "%",
+                "FIELD OF VIEW (FOV): " + std::to_string(opt_fov_deg) + " DEG",
+                std::string("DISPLAY MODE:        ") + (opt_fullscreen ? "FULLSCREEN" : "WINDOWED"),
+                std::string("REACTION TIME:       ") + (telemetry.reaction_active ? "ACTIVE" : "READY"),
+                "RESET TO ACTIVE CHECKPOINT",
+                "QUIT TO DESKTOP"
+            };
+            for (int i = 0; i < 6; ++i) {
+                draw_menu_row(i, opt_rows[i], i == rsel);
+            }
+        } else {
+            // EXTRAS: 6 Interactive Cutscene, Weapon & Sandbox Actions
+            const int rsel = std::clamp(selected_menu_row, 0, 5);
+            static const char* kExtraRows[6] = {
+                "PLAY CHAPTER OPENING MOVIE",
+                "CYCLE ALL 17 BINK CUTSCENES",
+                "PLAY 3D ROOFTOP INTRO FLY-IN",
+                "EQUIP RUNNER SIDEARM (M1911)",
+                "DEPLOY KRUGERSEC SQUAD AHEAD",
+                "ALL 10 CHAPTERS: UNLOCKED"
+            };
+            for (int i = 0; i < 6; ++i) {
+                draw_menu_row(i, kExtraRows[i], i == rsel);
             }
         }
 
@@ -2136,17 +2178,28 @@ struct MetalRenderer::Impl {
 
         std::string cur_upper = cur_ch.map_name;
         for (char& c : cur_upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        const std::string right_heading =
+            (selected_menu_tab == 1) ? ("COURSE: " + cur_upper) :
+            (selected_menu_tab == 2) ? "SYSTEM & GRAPHICS" :
+            (selected_menu_tab == 3) ? "RUNNER ARCHIVE" :
+            cur_upper;
+
         draw_multifont_text(tex_batches, fg_verts, f_head_thick, ui_font_headline_thick_tex,
-                            cur_upper, rx, ry, 23.0f * sy, runner_red, false);
+                            right_heading, rx, ry, 23.0f * sy, runner_red, false);
         draw_ui_skew_quad(fg_verts, rx - 4.0f * sx, ry + 28.0f * sy, rw, 2.5f * sy, 3.0f * sx, dark_ink);
 
-        // Localized district timestamp (e.g. "West Arlington 5.21am")
         std::string supers_flat = cur_ch.district_timestamp;
         for (char& c : supers_flat) {
             if (c == '\n') c = ' ';
         }
+        const std::string right_sub =
+            (selected_menu_tab == 1) ? "INSTANT START (NO CUTSCENES)" :
+            (selected_menu_tab == 2) ? ("APPLE METAL 3.0  •  " + std::to_string(width) + "x" + std::to_string(height)) :
+            (selected_menu_tab == 3) ? "17 BINK MOVIES  •  199 SUBTITLES" :
+            supers_flat;
+
         draw_multifont_text(tex_batches, fg_verts, f_head_light, ui_font_headline_light_tex,
-                            supers_flat, rx + 2.0f * sx, ry + 35.0f * sy, 19.0f * sy, dark_ink, false);
+                            right_sub, rx + 2.0f * sx, ry + 35.0f * sy, 18.0f * sy, dark_ink, false);
 
         // Halftone Chapter Preview Photograph (UI/TdUIResources_CheckpointImages.upk)
         const float img_x = rx;
@@ -2238,8 +2291,14 @@ struct MetalRenderer::Impl {
         draw_ui_skew_quad(bg_verts, 628.0f * sx, btn_y, 556.0f * sx, btn_h, 7.0f * sx, dark_bar);
         draw_ui_skew_quad(fg_verts, 628.0f * sx, btn_y, 4.0f * sx, btn_h, 7.0f * sx, runner_red);
 
+        const char* bar_text =
+            (selected_menu_tab == 1) ? "[CLICK / ENTER] START SPEED RUN      [ESC] RESUME" :
+            (selected_menu_tab == 2) ? "[CLICK / ENTER] CHANGE OPTION        [ESC] RESUME" :
+            (selected_menu_tab == 3) ? "[CLICK / ENTER] ACTIVATE EXTRA       [ESC] RESUME" :
+                                       "[CLICK / ENTER] PLAY CHAPTER         [ESC] RESUME";
+
         draw_multifont_text(tex_batches, fg_verts, f_med_italic, ui_font_medium_italic_tex,
-                            "[ENTER] PLAY CHAPTER      [UP / DOWN] SELECT      [ESC] RESUME",
+                            bar_text,
                             646.0f * sx, btn_y + 6.5f * sy, 15.0f * sy, pure_white, true);
     }
 
@@ -3327,6 +3386,13 @@ void MetalRenderer::set_selected_chapter(int idx) { impl_->selected_chapter = st
 int MetalRenderer::selected_chapter() const { return impl_->selected_chapter; }
 void MetalRenderer::set_selected_menu_tab(int tab) { impl_->selected_menu_tab = std::clamp(tab, 0, 3); }
 int MetalRenderer::selected_menu_tab() const { return impl_->selected_menu_tab; }
+void MetalRenderer::set_selected_menu_row(int row) { impl_->selected_menu_row = std::clamp(row, 0, 9); }
+int MetalRenderer::selected_menu_row() const { return impl_->selected_menu_row; }
+void MetalRenderer::set_menu_options_state(int sens_pct, int fov_deg, bool fullscreen) {
+    impl_->opt_sens_pct = sens_pct;
+    impl_->opt_fov_deg = fov_deg;
+    impl_->opt_fullscreen = fullscreen;
+}
 void MetalRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
 
 void* MetalRenderer::raw_device() const { return (__bridge void*)impl_->device; }
