@@ -310,7 +310,10 @@ With gamma 2.2 the port's start screen then differs from a retail frame of the s
 
 **Not established**
 
-* The RACE column's camera. STORY, OPTIONS, EXTRAS and start-screen frames match the port's Matinee evaluation (edge correlation 0.84 to 0.91); a RACE frame matches none of the level's 51 Matinees, nor any pairing of one's camera with another's target, and its camera barely moves over five seconds, where `InterpData_23` moves 16 units a second.
+* The RACE column's camera. STORY, OPTIONS, EXTRAS and start-screen frames match the port's Matinee evaluation (edge correlation 0.84 to 0.91). A RACE frame matches nothing tried: not `InterpData_23` at any second of its 60 or any field of view from 25 to 120 degrees, not its 0.35 s intro, not any other of the level's 51 Matinees, not one Matinee's camera with another's target. Retail's RACE camera sits among the buildings and barely moves over five seconds; the Kismet, read as in section 6.2, puts it above the south-west district looking across the water and moves it 16 units a second. All five city meshes are loaded and that district is under the port's camera, so the difference is the camera, not missing geometry. The port follows the Kismet as read:
+
+  ![RACE](../screenshots/menu/main_menu_race.png)
+
 * How the tone mapper gets from `Scene_ExposureManual` 0.83 to the measured 0.52.
 
 ---
