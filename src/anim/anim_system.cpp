@@ -225,9 +225,20 @@ bool DXT1Texture::decode_rgba8(std::vector<uint8_t>& out_rgba) const {
         uint32_t r5 = (c >> 11) & 31u;
         uint32_t g6 = (c >> 5) & 63u;
         uint32_t b5 = c & 31u;
-        out[0] = static_cast<uint8_t>((r5 * 255u + 15u) / 31u);
-        out[1] = static_cast<uint8_t>((g6 * 255u + 31u) / 63u);
-        out[2] = static_cast<uint8_t>((b5 * 255u + 15u) / 31u);
+        int r8 = static_cast<int>((r5 * 255u + 15u) / 31u);
+        int g8 = static_cast<int>((g6 * 255u + 31u) / 63u);
+        int b8 = static_cast<int>((b5 * 255u + 15u) / 31u);
+        // Eliminate DXT1 RGB565 (5-bit R/B vs 6-bit G) green/magenta quantization banding on neutral gunmetal texels
+        if (std::abs(r8 - b8) <= 9 && std::abs(g8 - ((r8 + b8) >> 1)) <= 10) {
+            uint8_t lum = static_cast<uint8_t>((r8 + 2 * g8 + b8 + 2) >> 2);
+            out[0] = lum;
+            out[1] = lum;
+            out[2] = lum;
+        } else {
+            out[0] = static_cast<uint8_t>(r8);
+            out[1] = static_cast<uint8_t>(g8);
+            out[2] = static_cast<uint8_t>(b8);
+        }
         out[3] = 255;
     };
 
@@ -550,7 +561,7 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
         // Skip NumRigidVertices, NumSoftVertices, MaxBoneInfluences (12B)
         ptr += 12;
 
-        // Decode RigidVertices (49B each)
+        // Decode RigidVertices (49B each: Pos[12], TangentBasis[12], UVs[3*8=24], Bone[1])
         for (int32_t v = 0; v < rigid_cnt; ++v) {
             const uint8_t* vp = rigid_ptr + static_cast<size_t>(v) * 49;
             SkinnedVertex sv{};
@@ -559,8 +570,20 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             std::memcpy(&sv.bind_pos.z, vp + 8, 4);
             sv.bind_tangent = unpack_normal(vp + 12);
             sv.bind_norm = unpack_normal(vp + 20);
-            std::memcpy(&sv.u, vp + 24, 4);
-            std::memcpy(&sv.v, vp + 28, 4);
+            float u0 = 0.0f, v0 = 0.0f, u2 = 0.0f, v2 = 0.0f;
+            std::memcpy(&u0, vp + 24, 4);
+            std::memcpy(&v0, vp + 28, 4);
+            std::memcpy(&u2, vp + 40, 4);
+            std::memcpy(&v2, vp + 44, 4);
+            // All UE3 weapon & ammo materials in Mirror's Edge bind CoordinateIndex=2 (UVs[2] at vp+40/44),
+            // whereas character meshes (Faith/SWAT) have UVs[2]=(0,0) and bind CoordinateIndex=0 (UVs[0]).
+            if (std::abs(u2) > 1e-6f || std::abs(v2) > 1e-6f) {
+                sv.u = u2;
+                sv.v = v2;
+            } else {
+                sv.u = u0;
+                sv.v = v0;
+            }
             uint8_t local_b = vp[48];
             uint8_t real_b = (local_b < bone_map.size() && bone_map[local_b] < bone_count)
                                  ? static_cast<uint8_t>(bone_map[local_b])
@@ -580,8 +603,18 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             std::memcpy(&sv.bind_pos.z, vp + 8, 4);
             sv.bind_tangent = unpack_normal(vp + 12);
             sv.bind_norm = unpack_normal(vp + 20);
-            std::memcpy(&sv.u, vp + 24, 4);
-            std::memcpy(&sv.v, vp + 28, 4);
+            float u0 = 0.0f, v0 = 0.0f, u2 = 0.0f, v2 = 0.0f;
+            std::memcpy(&u0, vp + 24, 4);
+            std::memcpy(&v0, vp + 28, 4);
+            std::memcpy(&u2, vp + 40, 4);
+            std::memcpy(&v2, vp + 44, 4);
+            if (std::abs(u2) > 1e-6f || std::abs(v2) > 1e-6f) {
+                sv.u = u2;
+                sv.v = v2;
+            } else {
+                sv.u = u0;
+                sv.v = v0;
+            }
             for (int k = 0; k < 4; ++k) {
                 uint8_t local_b = vp[48 + k];
                 uint8_t real_b = (local_b < bone_map.size() && bone_map[local_b] < bone_count)
