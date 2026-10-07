@@ -597,6 +597,21 @@ void AudioEngine::update(float dt,
             target_music_gain = 0.60f;
             target_breath_gain = 0.10f;
             break;
+        case ESoundGroupEffectMode::FallingToDeath:
+            // Mode 6: Wind & Faith scream at full gain, music attenuated
+            target_sfx_gain = 1.15f;
+            target_music_gain = 0.12f;
+            target_breath_gain = 1.25f;
+            target_slomo_pitch = 1.0f;
+            break;
+        case ESoundGroupEffectMode::DeathByFall:
+        case ESoundGroupEffectMode::DeathGeneric:
+            // Mode 8/9: Music & ambient ducked out while death impact resonates
+            target_sfx_gain = 0.90f;
+            target_music_gain = 0.02f;
+            target_breath_gain = 0.0f;
+            target_slomo_pitch = 0.88f;
+            break;
         default:
             break;
     }
@@ -902,7 +917,13 @@ bool AudioEngine::load_sound_bank(const std::string& game_root, const std::strin
     fs::path base(game_root);
     fs::path bank_path = base / "TdGame" / "CookedPC" / "Audio" / bank_name;
     if (!fs::exists(bank_path)) {
+        bank_path = base / "TdGame" / "CookedPC" / "Audio" / (bank_name + ".upk");
+    }
+    if (!fs::exists(bank_path)) {
         bank_path = base / "Audio" / bank_name;
+    }
+    if (!fs::exists(bank_path)) {
+        bank_path = base / "Audio" / (bank_name + ".upk");
     }
     bool ok = load_package_audio_and_cues(bank_path.string());
     if (ok) {
@@ -917,6 +938,7 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
         "A_M_Menu.upk",
         "A_Material_Footstep.upk",
         "A_Material_Handstep.upk",
+        "A_Bodyfalls.upk",
         "A_Character_Female_01.upk",
         "A_Character_Effects.upk",
         "A_Character_Oral.upk",
@@ -1285,13 +1307,39 @@ void AudioEngine::play_effect(EAudioEffect effect, float volume, float pitch) {
             if (resolve_cue_or_clip("Fire1P", v, p)) { play_sound("Fire1P", volume, pitch); return; }
             break;
         }
+        case EAudioEffect::FallDeathScream: {
+            set_sound_group_mode(ESoundGroupEffectMode::FallingToDeath);
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Death_Fall", v, p)) {
+                play_sound("Death_Fall", volume * 1.15f, pitch);
+                if (resolve_cue_or_clip("Oral_Death", v, p)) play_sound("Oral_Death", volume * 0.95f, pitch);
+                return;
+            }
+            if (resolve_cue_or_clip("Oral_Death", v, p)) { play_sound("Oral_Death", volume * 1.1f, pitch); return; }
+            if (resolve_cue_or_clip("Death", v, p)) { play_sound("Death", volume * 1.1f, pitch); return; }
+            break;
+        }
+        case EAudioEffect::FallDeathImpact: {
+            set_sound_group_mode(ESoundGroupEffectMode::DeathByFall);
+            float v = volume, p = pitch;
+            if (resolve_cue_or_clip("Death_Impact", v, p)) {
+                play_sound("Death_Impact", volume * 1.25f, pitch);
+                if (resolve_cue_or_clip("ArmCrack", v, p)) play_sound("ArmCrack", volume * 0.85f, pitch);
+                return;
+            }
+            if (resolve_cue_or_clip("BodyFall", v, p)) { play_sound("BodyFall", volume * 1.2f, pitch); return; }
+            if (resolve_cue_or_clip("Body_Fall", v, p)) { play_sound("Body_Fall", volume * 1.2f, pitch); return; }
+            if (resolve_cue_or_clip("Impact_Hard", v, p)) { play_sound("Impact_Hard", volume * 1.2f, pitch); return; }
+            break;
+        }
         default:
             break;
     }
 
     static const char* kFallbackEffectNames[] = {
         "FX_Footstep", "FX_Jump", "FX_Wallrun", "FX_Vault", "FX_Slide",
-        "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot"
+        "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot",
+        "FX_FallDeathScream", "FX_FallDeathImpact"
     };
     size_t idx = static_cast<size_t>(effect);
     if (idx < static_cast<size_t>(EAudioEffect::Count)) {
@@ -1330,7 +1378,8 @@ void AudioEngine::play_effect_3d(EAudioEffect effect, const Vec3& world_pos, flo
 
     static const char* kFallbackEffectNames[] = {
         "FX_Footstep", "FX_Jump", "FX_Wallrun", "FX_Vault", "FX_Slide",
-        "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot"
+        "FX_SkillRoll", "FX_Zipline", "FX_CheckpointChime", "FX_Disarm", "FX_Gunshot",
+        "FX_FallDeathScream", "FX_FallDeathImpact"
     };
     size_t idx = static_cast<size_t>(effect);
     if (idx < static_cast<size_t>(EAudioEffect::Count)) {
@@ -1565,6 +1614,28 @@ void AudioEngine::synthesize_fallback_clips() {
         float slow_pad = std::sin(2.0f * kPi * 110.0f * t) * 0.3f + std::sin(2.0f * kPi * 130.81f * t) * 0.2f;
         float flutter = std::sin(2.0f * kPi * 6.0f * t) * 0.05f;
         float s = (slow_pad + flutter) * 0.45f;
+        return {s, s};
+    });
+
+    // 13. FX_FallDeathScream (1.1s high-speed terminal wind shriek + panicked vocal pitch drop)
+    make_clip("FX_FallDeathScream", 1.10f, [](float t, size_t, size_t) -> std::pair<float, float> {
+        float u = t / 1.10f;
+        float env = std::sin(kPi * std::pow(u, 0.55f));
+        float f0 = 760.0f - 290.0f * u + 12.0f * std::sin(2.0f * kPi * 7.5f * t);
+        float vocal = (std::sin(2.0f * kPi * f0 * t) * 0.45f +
+                       std::sin(2.0f * kPi * f0 * 2.0f * t) * 0.28f +
+                       std::sin(2.0f * kPi * f0 * 3.0f * t) * 0.14f) * env;
+        float wind = (rand_normalized() * 2.0f - 1.0f) * (0.25f + 0.45f * u) * env;
+        float s = (vocal + wind) * 0.72f;
+        return {s * 0.96f, s * 1.04f};
+    });
+
+    // 14. FX_FallDeathImpact (1.25s lethal ground impact thud + bone crunch + ear tinnitus)
+    make_clip("FX_FallDeathImpact", 1.25f, [](float t, size_t, size_t) -> std::pair<float, float> {
+        float sub_thud = std::sin(2.0f * kPi * (58.0f * std::exp(-4.0f * t)) * t) * std::exp(-7.5f * t) * 0.95f;
+        float crunch = (rand_normalized() * 2.0f - 1.0f) * std::exp(-22.0f * t) * 0.85f;
+        float ring = std::sin(2.0f * kPi * 3840.0f * t) * std::exp(-2.2f * t) * 0.14f;
+        float s = std::clamp(sub_thud + crunch + ring, -1.0f, 1.0f);
         return {s, s};
     });
 }

@@ -180,6 +180,9 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.disarm_prompt_visible = false;
     m_telemetry.hit_marker_timer = 0.0f;
     m_telemetry.damage_flash_timer = 0.0f;
+    m_telemetry.falling_to_death = false;
+    m_telemetry.fall_death_impact = false;
+    m_telemetry.death_anim_progress = 0.0f;
     m_telemetry.active_subtitle = "";
 
     m_sprint_energy = 0.0f;
@@ -232,6 +235,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
+    m_death_timer = 0.0f;
+    m_death_total_duration = 1.35f;
 }
 
 void ParkourController::equip_weapon(const std::string& weapon_name) {
@@ -671,9 +676,11 @@ void ParkourController::update_camera_and_inputs(const InputFrame& input, float 
         }
     }
 
-    // Camera roll interpolation: smoothly relax roll unless in wallrun
+    // Camera roll interpolation: smoothly relax roll unless in wallrun or lethal fall/death
     if (m_telemetry.move_state != EMovement::MOVE_WallRunningLeft &&
-        m_telemetry.move_state != EMovement::MOVE_WallRunningRight) {
+        m_telemetry.move_state != EMovement::MOVE_WallRunningRight &&
+        !m_telemetry.falling_to_death &&
+        !m_telemetry.fall_death_impact) {
         m_telemetry.camera_roll_deg += (0.0f - m_telemetry.camera_roll_deg) * std::min(1.0f, 10.0f * dt);
     }
 }
@@ -1339,11 +1346,21 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
     m_telemetry.grounded = true;
 
     if (fall >= c.uncontrolled_fall) {
-        // TdPawn.UncontrolledFall: lethal (respawn at the last checkpoint).
+        // TdPawn.UncontrolledFall: lethal fall impact -> play FallingLandDie animation + impact SFX -> fade to black -> respawn.
         m_telemetry.health = 0.0f;
+        m_telemetry.falling_to_death = true;
+        m_telemetry.fall_death_impact = true;
         m_telemetry.move_state = EMovement::MOVE_Landing;
         m_landing_timer = c.hard_landing_time;
+        m_state_timer = 0.0f;
+        m_death_total_duration = 1.35f;
+        m_death_timer = m_death_total_duration;
+        m_telemetry.death_anim_progress = 0.0f;
+        m_telemetry.damage_flash_timer = 0.55f;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        m_sprint_energy = 0.0f;
+        set_stance(28.0f);
+        m_telemetry.camera_roll_deg = 38.0f;
         return;
     }
 
@@ -1514,6 +1531,17 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     EMovement& st = m_telemetry.move_state;
     if (m_telemetry.position.z > m_fall_peak_z) m_fall_peak_z = m_telemetry.position.z;
 
+    const float fall_dist = std::max(0.0f, m_fall_peak_z - m_telemetry.position.z);
+    if (fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
+        if (!m_telemetry.falling_to_death) {
+            m_telemetry.falling_to_death = true;
+            st = EMovement::MOVE_Falling;
+        }
+        // TdMove_Falling (FallingUncontrolled): wind buffeting roll & disoriented pitch while plummeting
+        float wind_roll = std::sin(m_telemetry.sim_time * 9.5f) * 14.0f + 8.0f;
+        m_telemetry.camera_roll_deg += (wind_roll - m_telemetry.camera_roll_deg) * std::min(1.0f, 6.0f * dt);
+    }
+
     if (st == EMovement::MOVE_180TurnInAir && m_turn_timer <= 0.0f) {
         st = EMovement::MOVE_Falling;  // the turn is done; the landing still knows (m_turned_in_air)
     }
@@ -1524,7 +1552,7 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     // TdMove_Coil.CanDoMove: a crouch press out of a jump (never a plain fall or a dodge), moving
     // the way you face, without a heavy weapon. The legs lift TotalHeightBoost over
     // HeightBoostDuration and stay tucked until the landing.
-    if (m_crouch_pressed && !m_telemetry.weapon.is_heavy && coil_allowed_from(st) &&
+    if (!m_telemetry.falling_to_death && m_crouch_pressed && !m_telemetry.weapon.is_heavy && coil_allowed_from(st) &&
         facing_forward().dot(m_telemetry.velocity) >= 100.0f) {
         m_crouch_pressed = false;
         st = EMovement::MOVE_Coil;
@@ -1532,8 +1560,8 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     }
     if (st == EMovement::MOVE_Coil) m_coil_timer += dt;
 
-    // Context moves (TdPlayerMoveManager auto moves while airborne).
-    if (!dodge && !turning && !kicking) {
+    // Context moves (TdPlayerMoveManager auto moves while airborne — disabled once in uncontrolled lethal fall).
+    if (!m_telemetry.falling_to_death && !dodge && !turning && !kicking) {
         if (try_initiate_zipline(scene)) return;
         if (try_initiate_ledge_grab(input, scene)) return;
         if (try_initiate_vault(input, scene)) return;
@@ -1548,8 +1576,8 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     m_telemetry.velocity.z -= c.gravity * dt;
 
     // Air control: the controller keeps asking for its ground acceleration; physFalling clamps it
-    // to AccelRate x AirControl (6144 x 0.025 = 153.6 uu/s^2). Dodges and turns have none.
-    if (!dodge && !turning) {
+    // to AccelRate x AirControl (6144 x 0.025 = 153.6 uu/s^2). Dodges, turns, and uncontrolled falls have none.
+    if (!m_telemetry.falling_to_death && !dodge && !turning) {
         const float turn_uu = m_frame_turn_uu * (dt / std::max(m_frame_dt, 1e-6f));
         Vec3 a = horiz(controller_acceleration(input, dt, turn_uu, true));
         const float max_a = c.accel_rate * c.air_control;
@@ -2556,6 +2584,14 @@ void ParkourController::update_landing_moves(const InputFrame& input, float dt, 
         return;
     }
 
+    // Lethal fall impact (FallingLandDie): keep collapsed posture and roll until blackout respawn
+    if (m_telemetry.fall_death_impact) {
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        set_stance(28.0f);
+        m_telemetry.camera_roll_deg = 38.0f + 6.0f * m_telemetry.death_anim_progress;
+        return;
+    }
+
     // LandHard / LayOnGround: dead stop, input ignored until the animation ends (a jump press gets
     // you up off the ground early once the fall has played out).
     m_telemetry.velocity.x = 0.0f;
@@ -3231,12 +3267,28 @@ void ParkourController::update_health_and_regen(float dt) {
 // Checkpoints, Kill Volumes & Collectibles Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
-    // 1. Fall Death (WorldInfo.KillZ, or a lethal drop below the last checkpoint) -> Respawn
+    // 1. Fall Death (WorldInfo.KillZ, lethal drop below checkpoint, or health <= 0) -> Play Death Sequence -> Respawn
     if (m_telemetry.position.z < scene.kill_z ||
         m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f ||
         m_telemetry.health <= 0.0f) {
-        reset(m_last_checkpoint_pos, m_last_checkpoint_yaw);
-        m_telemetry.active_subtitle = "Respawned at Checkpoint";
+        if (!m_telemetry.fall_death_impact) {
+            m_telemetry.falling_to_death = true;
+            m_telemetry.fall_death_impact = true;
+            m_telemetry.health = 0.0f;
+            m_death_total_duration = m_telemetry.grounded ? 1.35f : 0.90f;
+            m_death_timer = m_death_total_duration;
+            m_telemetry.death_anim_progress = 0.0f;
+            m_telemetry.damage_flash_timer = 0.45f;
+            m_telemetry.active_subtitle = "Lethal Fall";
+        } else {
+            m_death_timer -= m_frame_dt;
+            m_telemetry.death_anim_progress = std::clamp(
+                1.0f - (m_death_timer / std::max(0.10f, m_death_total_duration)), 0.0f, 1.0f);
+            if (m_death_timer <= 0.0f) {
+                reset(m_last_checkpoint_pos, m_last_checkpoint_yaw);
+                m_telemetry.active_subtitle = "Respawned at Checkpoint";
+            }
+        }
         return;
     }
 

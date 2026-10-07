@@ -20,6 +20,8 @@ enum class EAudioEffect : uint8_t {
     CheckpointChime,
     Disarm,
     Gunshot,
+    FallDeathScream,
+    FallDeathImpact,
     Count
 };
 
