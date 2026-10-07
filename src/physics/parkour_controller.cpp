@@ -157,7 +157,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.yaw_deg = spawn_yaw;
     m_telemetry.pitch_deg = 0.0f;
     m_telemetry.camera_roll_deg = 0.0f;
-    m_telemetry.fov_deg = 100.0f;
+    m_telemetry.fov_deg = 90.0f;
     m_telemetry.eye_height = kEyeHeightStand;
     m_telemetry.health = 100.0f;
     m_telemetry.reaction_energy = 100.0f;
@@ -556,9 +556,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
 
-    // Dynamic FOV scaling: 100° at base, up to 108° at full sprint
+    // Dynamic FOV scaling: 90° horizontal at base (BaseEngine.ini FOVAngle=90), up to 98° at full sprint
     float speed_ratio = std::clamp((m_telemetry.speed_2d - m_config.run_speed) / (m_config.sprint_speed - m_config.run_speed), 0.0f, 1.0f);
-    m_telemetry.fov_deg = 100.0f + 8.0f * speed_ratio;
+    m_telemetry.fov_deg = 90.0f + 8.0f * speed_ratio;
 }
 
 // -----------------------------------------------------------------------------
