@@ -149,9 +149,11 @@ private:
     float current_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
     float target_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
-    // Dedicated continuous TdSoundNodeVelocity source for 1P RunWind
+    // Dedicated continuous TdSoundNodeVelocity source for 1P RunWind + max-speed wind surge
     uint32_t run_wind_source_ = 0;
     float current_wind_vol_ = 0.0f;
+    float wind_surge_env_ = 0.0f;
+    bool max_speed_wind_active_ = false;
 
     // 4 Dedicated looping 3D sources for level *_Aud.me1 AmbientSound emitters
     static constexpr size_t kAmbientPoolSize = 4;

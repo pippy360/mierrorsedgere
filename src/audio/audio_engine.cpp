@@ -174,9 +174,8 @@ bool AudioEngine::init_openal() {
         alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
         alSourcef(src, AL_GAIN, (i == 0) ? 1.0f : 0.0f);
     }
-    rebind_music_stem_buffers();
 
-    // Create dedicated continuous TdSoundNodeVelocity (RunWind) loop source
+    // Create dedicated continuous TdSoundNodeVelocity (RunWind) loop source before rebind
     {
         ALuint wsrc = 0;
         alGenSources(1, &wsrc);
@@ -186,6 +185,8 @@ bool AudioEngine::init_openal() {
         alSource3f(wsrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
         alSourcef(wsrc, AL_GAIN, 0.0f);
     }
+
+    rebind_music_stem_buffers();
 
     // Create 4 dedicated 3D ambient emitter sources (*_Aud.me1 AmbientSound pool)
     for (size_t i = 0; i < kAmbientPoolSize; ++i) {
@@ -397,17 +398,21 @@ void AudioEngine::rebind_music_stem_buffers() {
         alSourcePlay(music_stem_sources_[i]);
     }
 
-    // Bind RunWind (TdSoundNodeVelocity) if CharacterRunWind is loaded
+    // Bind RunWind (TdSoundNodeVelocity) preferring CharacterRunWind or dedicated FX_RunWind fallback
     if (run_wind_source_) {
-        const SoundClip* wind_clip = pick_first_available_clip({"RAW.CharacterRunWind", "CharacterRunWind", "FX_Wallrun"});
+        const SoundClip* wind_clip = pick_first_available_clip({"RAW.CharacterRunWind", "CharacterRunWind", "FX_RunWind", "FX_Wallrun"});
         if (wind_clip) {
             uint32_t wbuf = get_or_create_buffer(*wind_clip, false);
             if (wbuf) {
                 ALint cur_buf = 0;
+                ALint cur_state = 0;
                 alGetSourcei(run_wind_source_, AL_BUFFER, &cur_buf);
+                alGetSourcei(run_wind_source_, AL_SOURCE_STATE, &cur_state);
                 if (static_cast<uint32_t>(cur_buf) != wbuf) {
                     alSourceStop(run_wind_source_);
                     alSourcei(run_wind_source_, AL_BUFFER, static_cast<ALint>(wbuf));
+                    alSourcePlay(run_wind_source_);
+                } else if (cur_state != AL_PLAYING) {
                     alSourcePlay(run_wind_source_);
                 }
             }
@@ -552,12 +557,30 @@ void AudioEngine::update(float dt,
         }
     }
 
-    // 3. Update TdSoundNodeVelocity (1P RunWind: INTERPOLATION_Square between 450..850 UU/s)
+    // 3. Update TdSoundNodeVelocity (1P RunWind peaking at max sprint speed 720 UU/s + max-speed wind rush)
     if (run_wind_source_) {
-        float norm_spd = std::clamp((player_speed - 450.0f) / 400.0f, 0.0f, 1.0f);
-        float sq_env = norm_spd * norm_spd; // INTERPOLATION_Square
-        current_wind_vol_ += (sq_env * 0.55f - current_wind_vol_) * lerp_factor;
-        float wind_pitch = (1.0f + 0.20f * sq_env) * slomo_pitch_scale_;
+        // Trigger a distinct aerodynamic wind rush surge upon crossing max sprint speed (~695-720 UU/s)
+        if (!max_speed_wind_active_ && player_speed >= 695.0f) {
+            max_speed_wind_active_ = true;
+            wind_surge_env_ = 1.0f;
+            play_sound("FX_WindGust", 0.55f, 1.04f);
+        } else if (max_speed_wind_active_ && player_speed < 660.0f) {
+            max_speed_wind_active_ = false;
+        }
+        wind_surge_env_ = std::max(0.0f, wind_surge_env_ - dt * 1.6f);
+
+        float norm_spd = std::clamp((player_speed - 480.0f) / 240.0f, 0.0f, 1.0f);
+        float sq_env = norm_spd * norm_spd; // INTERPOLATION_Square ramping cleanly to 1.0 at 720 UU/s
+        float overdrive = std::clamp((player_speed - 720.0f) / 130.0f, 0.0f, 1.0f);
+        float target_wind_vol = std::min(1.0f, sq_env * 0.85f + overdrive * 0.15f + wind_surge_env_ * 0.25f);
+        current_wind_vol_ += (target_wind_vol - current_wind_vol_) * lerp_factor;
+        float wind_pitch = (0.96f + 0.24f * sq_env + 0.08f * overdrive + 0.08f * wind_surge_env_) * slomo_pitch_scale_;
+
+        ALint cur_state = 0;
+        alGetSourcei(run_wind_source_, AL_SOURCE_STATE, &cur_state);
+        if (cur_state != AL_PLAYING) {
+            rebind_music_stem_buffers();
+        }
         alSourcef(run_wind_source_, AL_GAIN, current_wind_vol_ * sfx_bus_gain_);
         alSourcef(run_wind_source_, AL_PITCH, wind_pitch);
     }
@@ -1120,6 +1143,66 @@ void AudioEngine::synthesize_fallback_clips() {
         float s = (thump * 0.6f + noise * 0.8f);
         return {s, s};
     });
+
+    // 11. FX_RunWind (2.0s seamless stereo aerodynamic wind rush + cloth flutter loop)
+    {
+        constexpr float kWindDur = 2.0f;
+        size_t samples = static_cast<size_t>(kWindDur * kSampleRate);
+        std::vector<float> left(samples), right(samples);
+        float lp_l1 = 0.0f, lp_l2 = 0.0f, lp_r1 = 0.0f, lp_r2 = 0.0f;
+        for (size_t i = 0; i < samples; ++i) {
+            float t = static_cast<float>(i) / kSampleRate;
+            float n_l = rand_normalized() * 2.0f - 1.0f;
+            float n_r = rand_normalized() * 2.0f - 1.0f;
+            float sweep = 0.085f + 0.025f * std::sin(2.0f * kPi * 1.0f * t);
+            lp_l1 += sweep * (n_l - lp_l1);
+            lp_l2 += sweep * (lp_l1 - lp_l2);
+            lp_r1 += sweep * (n_r - lp_r1);
+            lp_r2 += sweep * (lp_r1 - lp_r2);
+            float flutter = 0.06f * std::sin(2.0f * kPi * 14.0f * t) * (n_l + n_r) * 0.5f;
+            // Crossfade loop ends for click-free seamless looping
+            float edge = std::min(std::min(t / 0.05f, (kWindDur - t) / 0.05f), 1.0f);
+            left[i]  = (lp_l2 * 1.45f + flutter) * edge;
+            right[i] = (lp_r2 * 1.45f - flutter) * edge;
+        }
+        SoundClip clip;
+        clip.name = "FX_RunWind";
+        clip.full_path = "FX_RunWind";
+        clip.sample_rate = kSampleRate;
+        clip.channels = 2;
+        clip.duration = kWindDur;
+        clip.pcm_data = float_stereo_to_pcm16(left, right);
+        sound_clips_["FX_RunWind"] = clip;
+    }
+
+    // 12. FX_WindGust (450ms high-speed aerodynamic wind surge when reaching max speed)
+    {
+        constexpr float kGustDur = 0.45f;
+        size_t samples = static_cast<size_t>(kGustDur * kSampleRate);
+        std::vector<float> left(samples), right(samples);
+        float lp_l = 0.0f, lp_r = 0.0f;
+        for (size_t i = 0; i < samples; ++i) {
+            float t = static_cast<float>(i) / kSampleRate;
+            float u = t / kGustDur;
+            float env = std::sin(kPi * std::pow(u, 0.65f));
+            float cutoff = 0.06f + 0.14f * std::sin(kPi * u);
+            float n_l = rand_normalized() * 2.0f - 1.0f;
+            float n_r = rand_normalized() * 2.0f - 1.0f;
+            lp_l += cutoff * (n_l - lp_l);
+            lp_r += cutoff * (n_r - lp_r);
+            float whistle = 0.08f * std::sin(2.0f * kPi * (520.0f + 180.0f * u) * t) * env;
+            left[i]  = (lp_l * 1.35f + whistle) * env * 0.75f;
+            right[i] = (lp_r * 1.35f + whistle) * env * 0.75f;
+        }
+        SoundClip clip;
+        clip.name = "FX_WindGust";
+        clip.full_path = "FX_WindGust";
+        clip.sample_rate = kSampleRate;
+        clip.channels = 2;
+        clip.duration = kGustDur;
+        clip.pcm_data = float_stereo_to_pcm16(left, right);
+        sound_clips_["FX_WindGust"] = clip;
+    }
 
     // -------------------------------------------------------------------------
     // 4 Dynamic Solar Fields Music Stems (Seamless 5.0-second fallback loops)
