@@ -193,6 +193,23 @@ public:
     // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
     void evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const;
 
+    // Indexed form of evaluate_enemy_swat() (used by the renderer): writes the posed officer's unique vertices
+    // (skinned body, then the attached weapon, then the muzzle-flash corners) to out_vertices, which must have
+    // room for enemy_swat_max_vertices() entries. Gathering them through the first index_count entries of
+    // enemy_swat_index_lists()[index_list] gives exactly the triangle list evaluate_enemy_swat() returns, but
+    // each shared vertex is posed only once, and the caller can bound the mesh before building the list.
+    struct EnemySwatDraw {
+        size_t vertex_count = 0;  // vertices written to out_vertices
+        size_t index_list = 0;    // enemy_swat_index_lists() entry to draw
+        size_t index_count = 0;   // leading indices of that list to draw (0 = nothing to draw)
+    };
+    EnemySwatDraw evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
+                                              Vertex* out_vertices) const;
+    [[nodiscard]] size_t enemy_swat_max_vertices() const { return enemy_swat_max_vertices_; }
+    // Static triangle-list indices for evaluate_enemy_swat_indexed(): entry 0 is the body alone, every other
+    // entry the body, one weapon mesh and the muzzle flash. Rebuilt by init_from_game_root().
+    [[nodiscard]] const std::vector<std::vector<uint32_t>>& enemy_swat_index_lists() const { return enemy_swat_index_lists_; }
+
     // Evaluate 3D dropped weapons on the ground and active ballistic tracers / impact sparks
     void evaluate_combat_world_fx(const LevelScene& scene, float sim_time,
                                   std::vector<Vertex>& out_world_tris,
@@ -258,6 +275,12 @@ private:
     AnimSetAsset swat_2h_set_;
 
     std::vector<AnimBlendConfig> blend_configs_;
+
+    // evaluate_enemy_swat_indexed() support, built by build_enemy_swat_index_lists() once the meshes are loaded.
+    void build_enemy_swat_index_lists();
+    std::vector<std::vector<uint32_t>> enemy_swat_index_lists_;
+    std::unordered_map<const SkeletalMeshAsset*, size_t> enemy_swat_weapon_index_list_;  // weapon mesh -> list
+    size_t enemy_swat_max_vertices_ = 0;
 };
 
 } // namespace me

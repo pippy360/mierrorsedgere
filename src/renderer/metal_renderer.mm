@@ -1017,6 +1017,43 @@ static bool mat_blend_is_translucent(MatBlendMode b) {
     return b == MatBlendMode::Translucent || b == MatBlendMode::Additive || b == MatBlendMode::Modulate;
 }
 
+// World-space side and near planes of a view-projection matrix's clip volume (Metal clips to -w <= x <= w,
+// -w <= y <= w and 0 <= z <= w; no pipeline here changes the depth clip mode). A sphere wholly outside one of
+// these planes rasterizes nothing in that pass: every triangle inside it is clipped away completely, so not
+// drawing it leaves the render target unchanged. The far plane is left out because its float test is poorly
+// conditioned (w - z cancels), so the GPU's rounding there cannot be bounded tightly.
+struct ClipVolume {
+    explicit ClipVolume(const Mat4& view_proj) {
+        // Row r of the column-major matrix: clip[r] = sum over c of m[c * 4 + r] * (x, y, z, 1)[c].
+        auto m = [&](int r, int c) { return static_cast<double>(view_proj.m[c * 4 + r]); };
+        for (int c = 0; c < 4; ++c) {
+            planes[0][c] = m(3, c) + m(0, c);  // -w <= x
+            planes[1][c] = m(3, c) - m(0, c);  //  x <= w
+            planes[2][c] = m(3, c) + m(1, c);  // -w <= y
+            planes[3][c] = m(3, c) - m(1, c);  //  y <= w
+            planes[4][c] = m(2, c);            //  0 <= z
+        }
+        for (auto& p : planes) {
+            const double len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            if (len > 0.0) {
+                for (double& v : p) v /= len;
+            }
+        }
+    }
+
+    // False only if the sphere lies outside some plane by more than `margin` UU (so a NaN centre or radius is
+    // never rejected).
+    [[nodiscard]] bool may_cover(const Vec3& center, float radius, double margin) const {
+        for (const auto& p : planes) {
+            const double dist = p[0] * center.x + p[1] * center.y + p[2] * center.z + p[3];
+            if (dist < -(static_cast<double>(radius) + margin)) return false;
+        }
+        return true;
+    }
+
+    double planes[5][4];
+};
+
 // -----------------------------------------------------------------------------
 // PIMPL Implementation
 // -----------------------------------------------------------------------------
@@ -1090,7 +1127,14 @@ struct MetalRenderer::Impl {
     // First-Person Faith Viewmodel Mesh & 3D Enemy Guard Mesh
     std::vector<Vertex> faith_viewmodel_mesh;
     std::vector<Vertex> enemy_guard_mesh;
-    std::vector<std::vector<Vertex>> frame_enemy_meshes;
+    // This frame's posed enemies (index = enemy index). Each one's triangle list (exactly evaluate_enemy_swat()'s)
+    // is written to enemy_vertex_buffers[slot][i] only when the enemy can reach a pass's render target.
+    struct EnemyFrameDraw {
+        size_t corner_count = 0;  // triangle-list vertices (0 = nothing to draw)
+        bool in_view = false;     // may cover pixels of the camera view (world pass)
+        bool in_shadow = false;   // may cover texels of the near shadow cascade (shadow pass)
+    };
+    std::vector<EnemyFrameDraw> frame_enemy_draws;
     AnimSystem anim_system;
 
     // Triple-buffered CPU/GPU frame synchronization & reusable dynamic vertex buffers
@@ -1099,6 +1143,16 @@ struct MetalRenderer::Impl {
     id<MTLCommandBuffer> last_cmd_buffer = nil;
     std::vector<id<MTLBuffer>> dyn_vertex_buffers[kMaxFramesInFlight];
     size_t dyn_vertex_cursor[kMaxFramesInFlight] = {0, 0, 0};
+    // Per-frame-slot GPU vertex buffers for the posed enemies (index = enemy index): each worker writes its enemy's
+    // triangle list straight into this memory, and the shadow and world passes draw from the same buffer.
+    std::vector<id<MTLBuffer>> enemy_vertex_buffers[kMaxFramesInFlight];
+
+    // Vertex data up to this size is passed inline with setVertexBytes instead of through a buffer.
+    static constexpr size_t kMaxInlineVertexBytes = 4096;
+
+    static size_t dynamic_buffer_capacity(size_t length) {
+        return std::max<size_t>((length + 4095u) & ~size_t(4095u), 65536u);
+    }
 
     id<MTLBuffer> acquire_dynamic_vertex_buffer(int slot, const void* data, size_t length) {
         auto& pool = dyn_vertex_buffers[slot];
@@ -1108,8 +1162,7 @@ struct MetalRenderer::Impl {
         }
         id<MTLBuffer> buf = pool[idx];
         if (!buf || buf.length < length) {
-            size_t cap = std::max<size_t>((length + 4095u) & ~size_t(4095u), 65536u);
-            buf = [device newBufferWithLength:cap options:MTLResourceStorageModeShared];
+            buf = [device newBufferWithLength:dynamic_buffer_capacity(length) options:MTLResourceStorageModeShared];
             pool[idx] = buf;
         }
         std::memcpy(buf.contents, data, length);
@@ -2717,7 +2770,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         impl_->sync_material_library(active_scene.materials);
 
         auto bind_vertex_bytes_or_buffer = [&](id<MTLRenderCommandEncoder> encoder, const void* data, size_t length, NSUInteger index) {
-            if (length <= 4096) {
+            if (length <= MetalRenderer::Impl::kMaxInlineVertexBytes) {
                 [encoder setVertexBytes:data length:length atIndex:index];
             } else {
                 id<MTLBuffer> buf = impl_->acquire_dynamic_vertex_buffer(frame_slot, data, length);
@@ -2786,23 +2839,101 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         const bool has_translucent = impl_->cached_has_translucent;
         const bool needs_scene_copies = impl_->cached_needs_scene_copies;
 
-        // Pre-skin active SWAT/CPF enemies once per frame and share between Pass 0 (Shadow) and Pass 1 (World)
+        // Pose active SWAT/CPF enemies once per frame and share between Pass 0 (Shadow) and Pass 1 (World).
+        // Enemies are independent (evaluate_enemy_swat_indexed is const and keeps its scratch buffers thread_local),
+        // so they are posed in parallel. An enemy's triangle list (exactly evaluate_enemy_swat()'s) is assembled,
+        // straight into this frame slot's GPU buffer for it, only if its posed bounds can reach the camera view or
+        // the near shadow cascade. The GPU would clip an enemy outside both away completely, so skipping it leaves
+        // both passes' output unchanged.
         const bool need_enemies = impl_->anim_system.is_loaded() && !active_scene.enemies.empty() &&
                                   (!impl_->menu_open || (impl_->shadow_depth_tex && impl_->shadow_pipeline));
         if (need_enemies) {
-            if (impl_->frame_enemy_meshes.size() < active_scene.enemies.size()) {
-                impl_->frame_enemy_meshes.resize(active_scene.enemies.size());
+            const size_t enemy_count = active_scene.enemies.size();
+            if (impl_->frame_enemy_draws.size() < enemy_count) {
+                impl_->frame_enemy_draws.resize(enemy_count);
             }
-            for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
-                const auto& bot = active_scene.enemies[ei];
-                if (!bot.alive && impl_->menu_open) {
-                    impl_->frame_enemy_meshes[ei].clear();
-                    continue;
+            auto& slot_enemy_buffers = impl_->enemy_vertex_buffers[frame_slot];
+            if (slot_enemy_buffers.size() < enemy_count) {
+                slot_enemy_buffers.resize(enemy_count);
+            }
+            MetalRenderer::Impl* const impl = impl_.get();
+            const std::vector<EnemyBot>* const bots = &active_scene.enemies;
+            std::vector<id<MTLBuffer>>* const gpu_meshes = &slot_enemy_buffers;
+            const ClipVolume view_volume(vp);
+            const ClipVolume shadow_volume(sun_near_vp);
+            const bool shadow_pass = impl_->shadow_depth_tex && impl_->shadow_pipeline;
+            const float sim_time = telemetry.sim_time;
+            const bool reaction_active = telemetry.reaction_active;
+            const bool menu_open = impl_->menu_open;
+            // Each worker touches only element ei of frame_enemy_draws / slot_enemy_buffers (both sized above).
+            auto pose_enemy = [impl, bots, gpu_meshes, &view_volume, &shadow_volume, cam_pos, shadow_pass, sim_time,
+                               reaction_active, menu_open](size_t ei) {
+                const auto& bot = (*bots)[ei];
+                auto& draw = impl->frame_enemy_draws[ei];
+                draw = MetalRenderer::Impl::EnemyFrameDraw{};
+                if (!bot.alive && menu_open) return;
+
+                thread_local std::vector<Vertex> posed;
+                posed.resize(impl->anim_system.enemy_swat_max_vertices());
+                const AnimSystem::EnemySwatDraw mesh =
+                    impl->anim_system.evaluate_enemy_swat_indexed(bot, sim_time, reaction_active, posed.data());
+                if (mesh.index_count == 0) return;
+
+                // World-space bounding sphere of the posed vertices (the triangle list is built from them alone).
+                // fmin/fmax skip NaN operands, so a NaN coordinate instead makes the bounds NaN explicitly, and
+                // ClipVolume never rejects a NaN sphere.
+                float lox = posed[0].position.x, loy = posed[0].position.y, loz = posed[0].position.z;
+                float hix = lox, hiy = loy, hiz = loz;
+                bool has_nan = false;
+                for (size_t v = 0; v < mesh.vertex_count; ++v) {
+                    const Vec3& p = posed[v].position;
+                    lox = std::fmin(lox, p.x);
+                    loy = std::fmin(loy, p.y);
+                    loz = std::fmin(loz, p.z);
+                    hix = std::fmax(hix, p.x);
+                    hiy = std::fmax(hiy, p.y);
+                    hiz = std::fmax(hiz, p.z);
+                    has_nan |= (p.x != p.x) | (p.y != p.y) | (p.z != p.z);
                 }
-                impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active,
-                                                       impl_->frame_enemy_meshes[ei]);
-            }
+                if (has_nan) lox = NAN;
+                const Vec3 lo(lox, loy, loz);
+                const Vec3 hi(hix, hiy, hiz);
+                const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+                const Vec3 center = bot_model.transform_point((lo + hi) * 0.5f);
+                const float radius = (hi - lo).length() * 0.5f;
+                // Far beyond the rounding of the GPU's float transforms, which stays well under 1e-5 of the
+                // coordinates' magnitudes.
+                const double margin = 16.0 + 1e-4 * (static_cast<double>(center.length()) + cam_pos.length());
+                draw.in_view = !menu_open && view_volume.may_cover(center, radius, margin);  // world pass: gameplay only
+                draw.in_shadow = shadow_pass && bot.alive && shadow_volume.may_cover(center, radius, margin);
+                if (!draw.in_view && !draw.in_shadow) return;
+
+                const std::vector<uint32_t>& corners = impl->anim_system.enemy_swat_index_lists()[mesh.index_list];
+                const size_t bytes = mesh.index_count * sizeof(Vertex);
+                @autoreleasepool {
+                    id<MTLBuffer> buf = (*gpu_meshes)[ei];
+                    if (!buf || buf.length < bytes) {
+                        buf = [impl->device newBufferWithLength:MetalRenderer::Impl::dynamic_buffer_capacity(bytes)
+                                                        options:MTLResourceStorageModeShared];
+                        (*gpu_meshes)[ei] = buf;
+                    }
+                    Vertex* out = static_cast<Vertex*>(buf.contents);
+                    for (size_t k = 0; k < mesh.index_count; ++k) out[k] = posed[corners[k]];
+                }
+                draw.corner_count = mesh.index_count;
+            };
+            const auto* const pose_enemy_fn = &pose_enemy;
+            dispatch_apply(enemy_count, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t ei) {
+                (*pose_enemy_fn)(ei);
+            });
         }
+        // Draws enemy ei's triangle list from this frame slot's buffer; it must be in_view or in_shadow.
+        auto draw_enemy_mesh = [&](id<MTLRenderCommandEncoder> encoder, size_t ei) {
+            [encoder setVertexBuffer:impl_->enemy_vertex_buffers[frame_slot][ei] offset:0 atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:impl_->frame_enemy_draws[ei].corner_count];
+        };
 
         auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
             return s.vertex_count > 0 &&
@@ -2883,16 +3014,15 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
 
                 if (dynamic_casters && need_enemies) {
+                    // Only the near cascade has dynamic casters; in_shadow was tested against its matrix (and
+                    // implies a live, posed enemy).
                     for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
+                        if (!impl_->frame_enemy_draws[ei].in_shadow) continue;
                         const auto& bot = active_scene.enemies[ei];
-                        if (!bot.alive) continue;
-                        const auto& emesh = impl_->frame_enemy_meshes[ei];
-                        if (emesh.empty()) continue;
-                        bind_vertex_bytes_or_buffer(shEnc, emesh.data(), emesh.size() * sizeof(Vertex), 0);
                         Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                         std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                         [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:emesh.size()];
+                        draw_enemy_mesh(shEnc, ei);
                     }
                     std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
                 }
@@ -3043,18 +3173,16 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         bind_world_char_wep_textures("Colt1911");
         if (!impl_->menu_open && need_enemies) {
             for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
+                if (!impl_->frame_enemy_draws[ei].in_view) continue;
                 const auto& bot = active_scene.enemies[ei];
-                const auto& emesh = impl_->frame_enemy_meshes[ei];
-                if (emesh.empty()) continue;
                 bind_world_char_wep_textures(bot.weapon_name);
-                bind_vertex_bytes_or_buffer(enc, emesh.data(), emesh.size() * sizeof(Vertex), 0);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:emesh.size()];
+                draw_enemy_mesh(enc, ei);
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
