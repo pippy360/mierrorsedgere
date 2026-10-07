@@ -1232,6 +1232,7 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                   << "  - DefaultAnimation.ini CustomAnimNodes: " << blend_configs_.size() << std::endl;
     }
 
+    build_enemy_swat_index_lists();
     return loaded_;
 }
 
@@ -1266,6 +1267,9 @@ const SkeletalMeshAsset* AnimSystem::get_weapon_mesh(const std::string& weapon_n
 }
 
 namespace {
+
+// append_muzzle_flash_mesh() always emits 4 fins x 2 double-sided triangles = 48 corners.
+constexpr size_t kMuzzleFlashVertexCount = 48;
 
 // Helper to append a 3D 4-fin muzzle flash star cone at `tip_pos` pointing along `forward_dir`
 void append_muzzle_flash_mesh(std::vector<Vertex>& out_tris, const Vec3& tip_pos,
@@ -2199,11 +2203,66 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
 }
 
 // -----------------------------------------------------------------------------
+// Static draw-order index lists for evaluate_enemy_swat_indexed()
+// -----------------------------------------------------------------------------
+void AnimSystem::build_enemy_swat_index_lists() {
+    enemy_swat_index_lists_.clear();
+    enemy_swat_weapon_index_list_.clear();
+    enemy_swat_max_vertices_ = 0;
+    if (!swat_mesh_.is_valid()) return;
+
+    // Exactly the corners the triangle-list output has, in its order: each index of each whole triangle, except
+    // out-of-range indices, which are skipped. The weapon's vertices follow the body's, the flash follows the weapon.
+    auto append_corners = [](const SkeletalMeshAsset& mesh, uint32_t base, std::vector<uint32_t>& out) {
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+            for (int k = 0; k < 3; ++k) {
+                uint16_t vi = mesh.indices[i + k];
+                if (vi >= mesh.vertices.size()) continue;
+                out.push_back(base + vi);
+            }
+        }
+    };
+    const size_t body_vertices = swat_mesh_.vertices.size();
+    std::vector<uint32_t> body;
+    append_corners(swat_mesh_, 0, body);
+    enemy_swat_index_lists_.push_back(std::move(body));
+    enemy_swat_max_vertices_ = body_vertices;
+
+    auto add_weapon = [&](const SkeletalMeshAsset& wmesh) {
+        if (!wmesh.is_valid() || enemy_swat_weapon_index_list_.count(&wmesh)) return;
+        std::vector<uint32_t> list = enemy_swat_index_lists_[0];
+        append_corners(wmesh, static_cast<uint32_t>(body_vertices), list);
+        const size_t flash_base = body_vertices + wmesh.vertices.size();
+        for (size_t f = 0; f < kMuzzleFlashVertexCount; ++f) list.push_back(static_cast<uint32_t>(flash_base + f));
+        enemy_swat_weapon_index_list_[&wmesh] = enemy_swat_index_lists_.size();
+        enemy_swat_index_lists_.push_back(std::move(list));
+        enemy_swat_max_vertices_ = std::max(enemy_swat_max_vertices_, flash_base + kMuzzleFlashVertexCount);
+    };
+    // Every mesh get_weapon_mesh() can return.
+    add_weapon(colt1911_mesh_);
+    for (const auto& [wname, wmesh] : weapon_meshes_) add_weapon(wmesh);
+}
+
+// -----------------------------------------------------------------------------
 // Evaluate KrugerSec / CPF SWAT Officer Skeletal Mesh (AT_Cop + LBS)
 // -----------------------------------------------------------------------------
 void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const {
     out_triangles.clear();
-    if (!loaded_ || !swat_mesh_.is_valid()) return;
+    thread_local std::vector<Vertex> unique_vertices;
+    unique_vertices.resize(enemy_swat_max_vertices_);
+    const EnemySwatDraw draw = evaluate_enemy_swat_indexed(bot, sim_time, reaction_disarm, unique_vertices.data());
+    if (draw.index_count == 0) return;
+    const std::vector<uint32_t>& indices = enemy_swat_index_lists_[draw.index_list];
+    out_triangles.reserve(draw.index_count);
+    for (size_t k = 0; k < draw.index_count; ++k) {
+        out_triangles.push_back(unique_vertices[indices[k]]);
+    }
+}
+
+AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
+                                                                  Vertex* out_vertices) const {
+    EnemySwatDraw draw;
+    if (!loaded_ || !swat_mesh_.is_valid() || enemy_swat_index_lists_.empty()) return draw;
 
     bool two_handed = is_heavy_weapon_name(bot.weapon_name);
     const AnimSetAsset* active_set = (two_handed && !swat_2h_set_.sequences.empty()) ? &swat_2h_set_ : &swat_set_;
@@ -2300,28 +2359,31 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
     const SkeletalMeshAsset* bot_wmesh = (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
                                              ? get_weapon_mesh(bot.weapon_name)
                                              : nullptr;
-    size_t bot_w_indices = bot_wmesh ? bot_wmesh->indices.size() : 0;
-    out_triangles.reserve(swat_mesh_.indices.size() + bot_w_indices + 48);
 
-    for (size_t i = 0; i + 2 < swat_mesh_.indices.size(); i += 3) {
-        for (int k = 0; k < 3; ++k) {
-            uint16_t vi = swat_mesh_.indices[i + k];
-            if (vi >= swat_mesh_.vertices.size()) continue;
-            const SkinnedVertex& sv = swat_mesh_.vertices[vi];
-            Vertex out_v{};
-            out_v.position = skinned_pos[vi];
-            out_v.normal = skinned_norm[vi];
-            out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
-            out_v.u = sv.u;
-            out_v.v = sv.v;
-            out_v.u2 = (sv.chunk_index == 1) ? 1.25f : 1.0f;
-            out_v.color = 0xFFFFFFFF;
-            out_triangles.push_back(out_v);
-        }
+    // Body: one output vertex per skinned vertex; index list 0 references them in triangle order.
+    const size_t body_vertices = swat_mesh_.vertices.size();
+    for (size_t vi = 0; vi < body_vertices; ++vi) {
+        const SkinnedVertex& sv = swat_mesh_.vertices[vi];
+        Vertex out_v{};
+        out_v.position = skinned_pos[vi];
+        out_v.normal = skinned_norm[vi];
+        out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
+        out_v.u = sv.u;
+        out_v.v = sv.v;
+        out_v.u2 = (sv.chunk_index == 1) ? 1.25f : 1.0f;
+        out_v.color = 0xFFFFFFFF;
+        out_vertices[vi] = out_v;
     }
+    draw.vertex_count = body_vertices;
+    draw.index_list = 0;
+    draw.index_count = enemy_swat_index_lists_[0].size();
 
     // Attach weapon to officer's RightWeapon bone in component space (1:1 scale + animated RightWeapon rotation)
     if (bot_wmesh && bot_wmesh->is_valid()) {
+        // build_enemy_swat_index_lists() covers every mesh get_weapon_mesh() returns.
+        const auto it_list = enemy_swat_weapon_index_list_.find(bot_wmesh);
+        if (it_list == enemy_swat_weapon_index_list_.end()) return draw;
+
         int32_t rw_idx = 0;
         auto it_rw = swat_mesh_.bone_name_to_index.find("rightweapon");
         if (it_rw == swat_mesh_.bone_name_to_index.end()) {
@@ -2333,39 +2395,46 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         const Quat4 rw_quat = comp_quat[rw_idx];
         uint32_t disarm_red = pack_rgba8(0.95f, 0.08f, 0.08f);
 
-        for (size_t i = 0; i + 2 < bot_wmesh->indices.size(); i += 3) {
-            for (int k = 0; k < 3; ++k) {
-                uint16_t vi = bot_wmesh->indices[i + k];
-                if (vi >= bot_wmesh->vertices.size()) continue;
-                const SkinnedVertex& sv = bot_wmesh->vertices[vi];
-                Vec3 p_comp = rw_pos + rw_quat.rotate(sv.bind_pos);
-                Vec3 n_comp = rw_quat.rotate(sv.bind_norm);
-                Vertex out_v{};
-                out_v.position = Vec3(p_comp.z, -p_comp.x, -p_comp.y);
-                out_v.normal = Vec3(n_comp.z, -n_comp.x, -n_comp.y).normalized();
-                out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
-                out_v.u = sv.u;
-                out_v.v = sv.v;
-                out_v.u2 = (sv.mat_type == 1) ? 3.0f : 2.0f;
-                out_v.color = bot.disarm_window ? disarm_red : 0xFFFFFFFF;
-                out_triangles.push_back(out_v);
-            }
+        Vertex* weapon_out = out_vertices + body_vertices;
+        for (size_t vi = 0; vi < bot_wmesh->vertices.size(); ++vi) {
+            const SkinnedVertex& sv = bot_wmesh->vertices[vi];
+            Vec3 p_comp = rw_pos + rw_quat.rotate(sv.bind_pos);
+            Vec3 n_comp = rw_quat.rotate(sv.bind_norm);
+            Vertex out_v{};
+            out_v.position = Vec3(p_comp.z, -p_comp.x, -p_comp.y);
+            out_v.normal = Vec3(n_comp.z, -n_comp.x, -n_comp.y).normalized();
+            out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
+            out_v.u = sv.u;
+            out_v.v = sv.v;
+            out_v.u2 = (sv.mat_type == 1) ? 3.0f : 2.0f;
+            out_v.color = bot.disarm_window ? disarm_red : 0xFFFFFFFF;
+            weapon_out[vi] = out_v;
         }
+        draw.vertex_count += bot_wmesh->vertices.size();
+        draw.index_list = it_list->second;
+        draw.index_count = enemy_swat_index_lists_[draw.index_list].size() - kMuzzleFlashVertexCount;
 
-        // Emit 3D Muzzle Flash at enemy weapon barrel tip when firing
+        // Emit 3D Muzzle Flash at enemy weapon barrel tip when firing (its corners are the list's last indices)
         if (bot.muzzle_flash_timer > 0.0f && bot_wmesh->bones.size() > 3) {
             Vec3 flash_comp = rw_pos + rw_quat.rotate(bot_wmesh->bones[3].bind_pos);
             Vec3 flash_local(flash_comp.z, -flash_comp.x, -flash_comp.y);
             Vec3 fwd_comp = rw_quat.rotate(Vec3(0.0f, 0.0f, 1.0f));
             Vec3 right_comp = rw_quat.rotate(Vec3(-1.0f, 0.0f, 0.0f));
             Vec3 up_comp = rw_quat.rotate(Vec3(0.0f, -1.0f, 0.0f));
-            append_muzzle_flash_mesh(out_triangles, flash_local,
+            thread_local std::vector<Vertex> flash;
+            flash.clear();
+            append_muzzle_flash_mesh(flash, flash_local,
                                      Vec3(fwd_comp.z, -fwd_comp.x, -fwd_comp.y).normalized(),
                                      Vec3(right_comp.z, -right_comp.x, -right_comp.y).normalized(),
                                      Vec3(up_comp.z, -up_comp.x, -up_comp.y).normalized(),
                                      9.0f, 16.0f);
+            const size_t flash_vertices = std::min(flash.size(), kMuzzleFlashVertexCount);
+            std::copy_n(flash.begin(), flash_vertices, out_vertices + draw.vertex_count);
+            draw.vertex_count += flash_vertices;
+            draw.index_count += flash_vertices;
         }
     }
+    return draw;
 }
 
 // -----------------------------------------------------------------------------
