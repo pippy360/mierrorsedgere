@@ -508,7 +508,7 @@ void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
     k2.fov_deg = telemetry.fov_deg;
 
     matinee_keys_ = {k0, k1, k2};
-    active_subtitle_ = "CELESTE: Looking good today, Faith. Ready for a run across the rooftops?";
+    active_subtitle_.clear();
 }
 
 void CutscenePlayer::stop() {

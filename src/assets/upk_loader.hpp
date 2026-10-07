@@ -134,6 +134,7 @@ public:
     std::vector<SoundClip> extract_audio() const;
     void extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_cues,
                                          std::vector<AmbientEmitterInfo>& out_ambients) const;
+    void extract_level_loaded_sound_cues(std::vector<std::string>& out_cue_names) const;
     bool extract_static_mesh_bounds(int32_t export_index, Vec3& out_origin, Vec3& out_extent, float& out_radius) const;
     void extract_static_meshes(std::unordered_map<std::string, StaticMeshAsset>& out_meshes) const;
     void extract_level_streaming_and_checkpoints(std::vector<LevelCheckpointInfo>& out_checkpoints,

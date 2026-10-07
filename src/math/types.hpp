@@ -486,6 +486,11 @@ struct MeshBuffer {
     int32_t barge_door = -1;
 };
 
+struct SoundSubtitleLine {
+    float time = 0.0f;
+    std::string text;
+};
+
 struct SoundClip {
     std::string name;
     std::string full_path;
@@ -493,6 +498,7 @@ struct SoundClip {
     int sample_rate = 44100;
     int channels = 2;
     float duration = 0.0f;
+    std::vector<SoundSubtitleLine> subtitles;
 };
 
 struct SoundCueDef {
@@ -504,6 +510,8 @@ struct SoundCueDef {
     float min_radius = 200.0f;
     float max_radius = 3000.0f;
     bool looping = false;
+    bool is_concatenator = false;
+    bool has_modulator = false;
     std::vector<std::string> wave_names;
     std::vector<float> wave_weights;
 };
