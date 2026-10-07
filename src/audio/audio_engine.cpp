@@ -11,8 +11,13 @@
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 #ifndef ME_NO_OPENAL
+#if defined(__APPLE__)
 #include <OpenAL/al.h>
 #include <OpenAL/alc.h>
+#else  // OpenAL Soft
+#include <AL/al.h>
+#include <AL/alc.h>
+#endif
 #endif
 
 #if defined(__has_include)

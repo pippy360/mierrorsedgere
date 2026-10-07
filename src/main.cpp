@@ -1,9 +1,8 @@
 #define SDL_MAIN_HANDLED
-#import <Cocoa/Cocoa.h>
-#import <QuartzCore/CAMetalLayer.h>
-#import <Metal/Metal.h>
 #include <SDL2/SDL.h>
+#if defined(__APPLE__)
 #include <SDL2/SDL_metal.h>
+#endif
 
 #include "math/types.hpp"
 #include "assets/upk_loader.hpp"
@@ -12,10 +11,13 @@
 #include "cutscene/cutscene_player.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
-#include "renderer/metal_renderer.hpp"
+#include "platform/platform.hpp"
+#include "renderer/renderer.hpp"
 #include "ui/frontend/frontend.hpp"
 #include "ui/frontend/soft_render.hpp"
 
+#include <algorithm>
+#include <array>
 #include <iostream>
 #include <memory>
 #include <fstream>
@@ -27,6 +29,18 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <unordered_map>
+
+#if defined(_WIN32)
+// The window's HWND for the Direct3D swap chain. Last, because <windows.h> defines macros
+// (near, far, min, max) that are ordinary names in the headers above.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <SDL2/SDL_syswm.h>
+#undef near
+#undef far
+#endif
 
 namespace fs = std::filesystem;
 
@@ -44,6 +58,13 @@ static void copy_artifact(const std::string& src, const std::string& dst) {
     fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
 }
 
+// "MACOS" / "WINDOWS", for the banners
+static std::string platform_upper() {
+    std::string name = platform_name();
+    for (char& c : name) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return name;
+}
+
 } // namespace me
 
 // -----------------------------------------------------------------------------
@@ -52,22 +73,28 @@ static void copy_artifact(const std::string& src, const std::string& dst) {
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
-    std::cout << "  MIRROR'S EDGE NATIVE MACOS ENGINE - ORACLE VERIFICATION" << std::endl;
+    std::cout << "  MIRROR'S EDGE NATIVE " << platform_upper() << " ENGINE - ORACLE VERIFICATION" << std::endl;
     std::cout << "============================================================" << std::endl;
     std::cout << "[Oracle] Game Root: " << game_root << std::endl;
 
     ensure_dir("screenshots");
-    ensure_dir("/tmp/me_oracle_screenshots");
-    const std::string brain_dir = "/Users/tomnom/.gemini/jetski/brain/722392a1-bc28-473f-af94-1a09e569935f";
+    const std::string tmp_dir = temp_dir();
+    ensure_dir(tmp_dir + "/me_oracle_screenshots");
+    // The macOS development machine keeps a third copy of the screenshots here.
+    std::string brain_dir;
+#if defined(__APPLE__)
+    brain_dir = "/Users/tomnom/.gemini/jetski/brain/722392a1-bc28-473f-af94-1a09e569935f";
     ensure_dir(brain_dir);
+#endif
 
-    // 1. Initialize Headless Metal Renderer & Audio Engine
-    MetalRenderer renderer;
+    // 1. Initialize Headless Renderer & Audio Engine
+    Renderer renderer;
+    renderer.set_game_root(game_root);
     if (!renderer.init_headless(1280, 720)) {
-        std::cerr << "[Oracle ERROR] MetalRenderer::init_headless failed!" << std::endl;
+        std::cerr << "[Oracle ERROR] Renderer::init_headless failed!" << std::endl;
         return 1;
     }
-    std::cout << "[Oracle] MetalRenderer initialized in headless mode (1280x720)." << std::endl;
+    std::cout << "[Oracle] Renderer initialized in headless mode (1280x720)." << std::endl;
 
     AudioEngine audio;
     if (!audio.init(true)) {
@@ -194,11 +221,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
 
     auto save_and_publish_png = [&](const std::string& name) {
         std::string local_path = "screenshots/" + name;
-        std::string tmp_path = "/tmp/me_oracle_screenshots/" + name;
-        std::string brain_path = brain_dir + "/" + name;
+        std::string tmp_path = tmp_dir + "/me_oracle_screenshots/" + name;
         renderer.save_screenshot_png(local_path);
         copy_artifact(local_path, tmp_path);
-        copy_artifact(local_path, brain_path);
+        if (!brain_dir.empty()) copy_artifact(local_path, brain_dir + "/" + name);
     };
 
     // Steps `in` until done() holds (checked after every step) or max_frames elapse.
@@ -720,7 +746,8 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", EndX=" << final_door_x << ")" << std::endl;
 
     // Write complete telemetry log
-    std::ofstream tel_file("/tmp/me_oracle_telemetry.json");
+    const std::string tel_path = tmp_dir + "/me_oracle_telemetry.json";
+    std::ofstream tel_file(tel_path);
     if (tel_file.is_open()) {
         tel_file << "[\n";
         for (size_t i = 0; i < telemetry_log.size(); ++i) {
@@ -728,7 +755,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         }
         tel_file << "]\n";
         tel_file.close();
-        std::cout << "[Oracle] Telemetry written to /tmp/me_oracle_telemetry.json" << std::endl;
+        std::cout << "[Oracle] Telemetry written to " << tel_path << std::endl;
     }
 
     // Stage 13: Pipe Balance Beam Walking (TdBalanceWalkVolume) & Vertical Drainpipe Climbing (TdLadderVolume)
@@ -1095,17 +1122,21 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
 }
 
 // -----------------------------------------------------------------------------
-// Interactive SDL2 + Metal Window Gameplay Loop
+// Interactive SDL2 Window Gameplay Loop (Metal on macOS, Direct3D 11 on Windows)
 // -----------------------------------------------------------------------------
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
                               const std::string& custom_level, int max_frames,
                               bool start_in_main_menu) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
-    std::cout << "  MIRROR'S EDGE NATIVE MACOS - INTERACTIVE LAUNCH" << std::endl;
+    std::cout << "  MIRROR'S EDGE NATIVE " << platform_upper() << " - INTERACTIVE LAUNCH" << std::endl;
     std::cout << "============================================================" << std::endl;
 
     SDL_SetMainReady();
+#if defined(_WIN32)
+    // Window sizes in points and the drawable in pixels, as on a Retina display.
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         std::cerr << "[SDL ERROR] Initialization failed: " << SDL_GetError() << std::endl;
         return 1;
@@ -1113,11 +1144,18 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     int win_w = 1280;
     int win_h = 720;
+#if defined(__APPLE__)
+    const char* window_title = "Mirror's Edge (Native macOS Apple Silicon)";
+    const Uint32 window_flags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#else
+    const char* window_title = "Mirror's Edge (Native Windows Direct3D 11)";
+    const Uint32 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
     SDL_Window* window = SDL_CreateWindow(
-        "Mirror's Edge (Native macOS Apple Silicon)",
+        window_title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         win_w, win_h,
-        SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+        window_flags
     );
 
     if (!window) {
@@ -1126,6 +1164,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return 1;
     }
 
+    // What the renderer draws into: a CAMetalLayer on macOS, the window itself (HWND) on Windows.
+#if defined(__APPLE__)
     SDL_MetalView metal_view = SDL_Metal_CreateView(window);
     if (!metal_view) {
         std::cerr << "[SDL ERROR] Failed to create Metal view: " << SDL_GetError() << std::endl;
@@ -1133,16 +1173,30 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         SDL_Quit();
         return 1;
     }
+    auto get_drawable_size = [&](int* w, int* h) { SDL_Metal_GetDrawableSize(window, w, h); };
+    auto destroy_surface = [&]() { SDL_Metal_DestroyView(metal_view); };
+#else
+    auto get_drawable_size = [&](int* w, int* h) { SDL_GetWindowSizeInPixels(window, w, h); };
+    auto destroy_surface = []() {};
+#endif
 
-    void* metal_layer = SDL_Metal_GetLayer(metal_view);
     int drawable_w = win_w;
     int drawable_h = win_h;
-    SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+    get_drawable_size(&drawable_w, &drawable_h);
 
-    MetalRenderer renderer;
-    if (!renderer.init_with_metal_layer(metal_layer, drawable_w, drawable_h)) {
-        std::cerr << "[Metal ERROR] init_with_metal_layer failed!" << std::endl;
-        SDL_Metal_DestroyView(metal_view);
+    Renderer renderer;
+    renderer.set_game_root(game_root);
+#if defined(__APPLE__)
+    const bool renderer_ok = renderer.init_with_metal_layer(SDL_Metal_GetLayer(metal_view), drawable_w, drawable_h);
+#else
+    SDL_SysWMinfo wm_info;
+    SDL_VERSION(&wm_info.version);
+    const bool renderer_ok = SDL_GetWindowWMInfo(window, &wm_info) == SDL_TRUE &&
+                             renderer.init_with_window(wm_info.info.win.window, drawable_w, drawable_h);
+#endif
+    if (!renderer_ok) {
+        std::cerr << "[Renderer ERROR] Could not initialize the renderer for the window!" << std::endl;
+        destroy_surface();
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -1238,7 +1292,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     if (!load_chapter_or_level(current_chapter_idx, custom_level, /*play_intro=*/!start_in_main_menu)) {
         std::cerr << "[Game ERROR] No playable level (check --game-root / --level)." << std::endl;
         if (game_controller) SDL_GameControllerClose(game_controller);
-        SDL_Metal_DestroyView(metal_view);
+        destroy_surface();
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
@@ -1343,7 +1397,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     running = false;
                 } else if (fev.type == SDL_WINDOWEVENT) {
                     if (fev.window.event == SDL_WINDOWEVENT_RESIZED || fev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                        SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+                        get_drawable_size(&drawable_w, &drawable_h);
                         renderer.resize(drawable_w, drawable_h);
                     }
                 } else if ((fev.type == SDL_KEYDOWN && fev.key.repeat == 0) || fev.type == SDL_KEYUP) {
@@ -1468,7 +1522,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (row == 2) {
                     is_fullscreen = !is_fullscreen;
                     SDL_SetWindowFullscreen(window, is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-                    SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+                    get_drawable_size(&drawable_w, &drawable_h);
                     renderer.resize(drawable_w, drawable_h);
                     renderer.set_menu_options_state(kSensPresets[sens_preset_idx], kFovPresets[fov_preset_idx], is_fullscreen);
                 } else if (row == 3) {
@@ -1530,7 +1584,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 running = false;
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_RESIZED || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+                    get_drawable_size(&drawable_w, &drawable_h);
                     renderer.resize(drawable_w, drawable_h);
                 }
             } else if (ev.type == SDL_MOUSEMOTION) {
@@ -1824,7 +1878,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         const auto& tel = controller.get_telemetry();
 
         // Live movement telemetry logging for run diagnostics
-        static std::ofstream live_trace("/tmp/me_live_run_telemetry.jsonl", std::ios::out | std::ios::trunc);
+        static std::ofstream live_trace(temp_dir() + "/me_live_run_telemetry.jsonl", std::ios::out | std::ios::trunc);
         bool state_changed = (tel.move_state != prev_state);
         bool cp_changed = (tel.active_checkpoint != prev_checkpoint);
         bool speed_drop = (pre_vel.length_xy() - tel.speed_2d > 120.0f);
@@ -1938,7 +1992,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     if (game_controller) SDL_GameControllerClose(game_controller);
     audio.shutdown();
-    SDL_Metal_DestroyView(metal_view);
+    destroy_surface();
     SDL_DestroyWindow(window);
     SDL_Quit();
 
@@ -1950,7 +2004,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 // Main Entrypoint & CLI Parsing
 // -----------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
-    std::string game_root = "/Users/tomnom/mirrorsedge";
+    std::string game_root = me::default_game_root();
     bool verify_all = false;
     std::string script_json = "";
     int initial_chapter = 0;
@@ -1985,9 +2039,9 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--game-root") {
             if (i + 1 < argc) game_root = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Mirror's Edge Native macOS Engine\n\n"
+            std::cout << "Mirror's Edge Native " << me::platform_name() << " Engine\n\n"
                       << "Usage:\n"
-                      << "  mirrorsedge_macos [options]\n\n"
+                      << "  " << fs::path(argv[0]).filename().string() << " [options]\n\n"
                       << "Options:\n"
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
@@ -1996,10 +2050,16 @@ int main(int argc, char* argv[]) {
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
                       << "  --level <path>           Load custom level package\n"
                       << "  --max-frames <N>         Exit after rendering N frames\n"
-                      << "  --game-root <dir>        Set retail game assets directory (default: /Users/tomnom/mirrorsedge)\n"
+                      << "  --game-root <dir>        Set retail game assets directory (default: " << me::default_game_root() << ")\n"
                       << "  --help, -h               Show this help message\n";
             return 0;
         }
+    }
+
+    if (!me::is_game_root(game_root)) {
+        std::cerr << "[Game ERROR] No Mirror's Edge install at '" << game_root << "' (expected TdGame/CookedPC inside it).\n"
+                  << "             Pass --game-root <dir> or set MEDGE_ME_INSTALL." << std::endl;
+        return 1;
     }
 
     if (verify_all) {
