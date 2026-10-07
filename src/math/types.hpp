@@ -567,6 +567,9 @@ struct LevelActor {
     bool is_springboard = false;
     bool is_balance_beam = false;
     bool is_swing_bar = false;
+    bool is_soft_landing = false;
+    bool is_fall_height_volume = false;
+    float fall_height_target_z = 0.0f;
     bool is_enemy = false;
     bool is_bag = false;
     bool is_elevator_part = false;
