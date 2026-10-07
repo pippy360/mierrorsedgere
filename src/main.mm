@@ -464,9 +464,21 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         renderer.render_frame(sim_scene, controller.get_telemetry());
     }
 
-    bool s7_pass = s7_disarm && s7_reaction && (weapons_verified == 11);
+    // Verify unarmed MOVE_Melee completes and exits cleanly back to MOVE_Walking without sticking
+    controller.reset(Vec3(751.8f, -1591.7f, 4992.0f), 90.0f);
+    InputFrame in_melee{};
+    in_melee.melee = true;
+    controller.step(in_melee, 1.0f / 60.0f, sim_scene);
+    const bool melee_started = (controller.get_move_state() == EMovement::MOVE_Melee);
+    for (int f = 0; f < 45; ++f) {
+        controller.step(in_idle, 1.0f / 60.0f, sim_scene);
+    }
+    const bool melee_recovered = melee_started && (controller.get_move_state() == EMovement::MOVE_Walking);
+
+    bool s7_pass = s7_disarm && s7_reaction && (weapons_verified == 11) && melee_recovered;
     std::cout << "  -> Stage 7 Result: " << (s7_pass ? "PASS" : "FAIL")
               << " (Disarm=" << (s7_disarm ? "OK" : "NO")
+              << ", MeleeRecovery=" << (melee_recovered ? "OK" : "STUCK")
               << ", WeaponsVerified=" << weapons_verified << "/11"
               << ", Reaction=" << (s7_reaction ? "ACTIVE" : "OFF") << ")" << std::endl;
 
