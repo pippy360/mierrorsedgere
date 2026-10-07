@@ -1544,33 +1544,34 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                                 ? telemetry.combat_anim_duration
                                 : ((seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.65f);
                 norm_time = std::clamp(telemetry.combat_anim_time / dur, 0.0f, 0.98f);
-                vm_offset = Vec3(0.0f, 14.0f, 8.0f);
+                vm_offset = Vec3(0.0f, 8.0f, 6.0f);
             } else if (state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_Grabbing) {
                 seq_a = (telemetry.combat_anim_time < 0.35f) ? active_set->find_sequence("HangHardStart")
                                                              : active_set->find_sequence("Hang");
                 norm_time = std::fmod(telemetry.combat_anim_time * 0.8f, 1.0f);
-                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+                vm_offset = Vec3(0.0f, 8.0f, 3.0f);
             } else if (state == EMovement::MOVE_Climb) {
                 const bool alternate_hand = (static_cast<int>(telemetry.combat_anim_time * 3.0f) & 1) != 0;
                 seq_a = active_set->find_sequence(alternate_hand ? "LadderClimbUpLeftHand" : "LadderClimbUpRightHand");
                 norm_time = std::fmod(telemetry.combat_anim_time * 3.0f, 1.0f);
-                vm_offset = Vec3(0.0f, 16.0f, 12.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 28.0f);
             } else if (state == EMovement::MOVE_WallClimbing) {
                 seq_a = active_set->find_sequence("WallRunVertical");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.467f;
                 norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
-                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 18.0f);
             } else if (state == EMovement::MOVE_SpringBoarding) {
                 seq_a = active_set->find_sequence("SpringBoardRightLeg");
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.72f;
                 norm_time = std::clamp(0.18f + 0.72f * (telemetry.combat_anim_time / dur), 0.12f, 0.94f);
-                vm_offset = Vec3(0.0f, 8.0f, -6.0f);
+                vm_offset = Vec3(2.0f, 14.0f, 10.0f);
                 show_lower_body = true;
             } else if (state == EMovement::MOVE_Swing) {
-                seq_a = active_set->find_sequence("swingposefronttop");
+                seq_a = active_set->find_sequence("swingposebacktop");
+                if (!seq_a) seq_a = active_set->find_sequence("swinghardstart");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.667f;
                 norm_time = std::fmod(telemetry.combat_anim_time / dur, 1.0f);
-                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
+                vm_offset = Vec3(0.0f, 6.0f, -2.0f);
                 show_lower_body = true;
             } else if (state == EMovement::MOVE_SkillRoll) {
                 seq_a = active_set->find_sequence("fallinglandroll");
@@ -1582,7 +1583,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 seq_a = active_set->find_sequence("VaultOver");
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.50f;
                 norm_time = std::clamp(0.10f + 0.82f * (telemetry.combat_anim_time / dur), 0.08f, 0.94f);
-                vm_offset = Vec3(0.0f, 10.0f, -4.0f);
+                vm_offset = Vec3(2.0f, 14.0f, 12.0f);
                 show_lower_body = true;
             }
         } else if (speed > 55.0f) {
@@ -1624,7 +1625,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.72f;
                 norm_time = std::clamp(0.18f + 0.72f * (st / dur), 0.12f, 0.94f);
                 blend_alpha = 0.22f;
-                vm_offset = Vec3(0.0f, 8.0f, -6.0f);
+                vm_offset = Vec3(2.0f, 14.0f, 10.0f);
                 show_lower_body = true;
                 break;
             }
@@ -1633,7 +1634,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 seq_a = active_set->find_sequence("VaultOver");
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.50f;
                 norm_time = std::clamp(0.10f + 0.82f * (st / dur), 0.08f, 0.94f);
-                vm_offset = Vec3(0.0f, 10.0f, -4.0f);
+                vm_offset = Vec3(2.0f, 14.0f, 12.0f);
                 show_lower_body = true;
                 break;
             }
@@ -1643,7 +1644,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 if (!seq_a) seq_a = active_set->find_sequence("stepuprightleg48");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.36f;
                 norm_time = std::clamp(st / dur, 0.05f, 0.95f);
-                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
+                vm_offset = Vec3(0.0f, 14.0f, 12.0f);
                 show_lower_body = true;
                 break;
             }
@@ -1654,14 +1655,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 float dur = (telemetry.combat_anim_duration > 0.1f) ? telemetry.combat_anim_duration : 0.65f;
                 norm_time = std::clamp(st / dur, 0.0f, 0.98f);
                 blend_alpha = 0.25f;
-                vm_offset = Vec3(0.0f, 14.0f, 8.0f);
+                vm_offset = Vec3(0.0f, 8.0f, 6.0f);
                 break;
             }
             case EMovement::MOVE_IntoGrab: {
                 seq_a = active_set->find_sequence("HangHardStart");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.55f;
                 norm_time = std::clamp(st / dur, 0.0f, 0.96f);
-                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+                vm_offset = Vec3(0.0f, 8.0f, 3.0f);
                 break;
             }
             case EMovement::MOVE_Grabbing: {
@@ -1681,14 +1682,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 2.0f;
                     norm_time = std::fmod((st - 0.32f) / dur, 1.0f);
                 }
-                vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+                vm_offset = Vec3(0.0f, 8.0f, 3.0f);
                 break;
             }
             case EMovement::MOVE_GrabJump: {
                 seq_a = active_set->find_sequence("hangturnjump");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.85f;
                 norm_time = std::clamp(st / dur, 0.0f, 0.95f);
-                vm_offset = Vec3(0.0f, 14.0f, 12.0f);
+                vm_offset = Vec3(0.0f, 10.0f, 6.0f);
                 break;
             }
             case EMovement::MOVE_Climb: {
@@ -1697,17 +1698,19 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                     seq_a = active_set->find_sequence("LadderClimbDownFast");
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.5f;
                     norm_time = std::fmod(st / dur, 1.0f);
+                    vm_offset = Vec3(0.0f, 12.0f, 4.0f);
                 } else if (std::abs(climb_vz) > 10.0f || speed > 10.0f) {
                     const float rung_cycle = st * 2.8f;
                     const bool left_hand = (static_cast<int>(rung_cycle) & 1) != 0;
                     seq_a = active_set->find_sequence(left_hand ? "LadderClimbUpLeftHand" : "LadderClimbUpRightHand");
                     norm_time = std::fmod(rung_cycle, 1.0f);
+                    vm_offset = Vec3(0.0f, 16.0f, 28.0f);
                 } else {
                     seq_a = active_set->find_sequence("LadderClimbUpRightHandStill");
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 2.0f;
                     norm_time = std::fmod(st / dur, 1.0f);
+                    vm_offset = Vec3(0.0f, 16.0f, 24.0f);
                 }
-                vm_offset = Vec3(0.0f, 16.0f, 12.0f);
                 break;
             }
             case EMovement::MOVE_WallRunningRight: {
@@ -1716,7 +1719,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.533f;
                 norm_time = std::fmod(st / dur, 1.0f);
                 blend_alpha = 0.25f;
-                vm_offset = Vec3(4.0f, 14.0f, 14.0f);
+                vm_offset = Vec3(4.0f, 14.0f, 10.0f);
                 break;
             }
             case EMovement::MOVE_WallRunningLeft: {
@@ -1725,7 +1728,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.533f;
                 norm_time = std::fmod(st / dur, 1.0f);
                 blend_alpha = 0.25f;
-                vm_offset = Vec3(-4.0f, 14.0f, 14.0f);
+                vm_offset = Vec3(-4.0f, 14.0f, 10.0f);
                 break;
             }
             case EMovement::MOVE_WallRunJump: {
@@ -1746,14 +1749,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.467f;
                     norm_time = std::fmod(st / dur, 1.0f);
                 }
-                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 18.0f);
                 break;
             }
             case EMovement::MOVE_WallClimb180TurnJump: {
                 seq_a = active_set->find_sequence("wallrunvertical180turn");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.633f;
                 norm_time = std::clamp(st / dur, 0.0f, 0.96f);
-                vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                vm_offset = Vec3(0.0f, 16.0f, 16.0f);
                 break;
             }
             case EMovement::MOVE_180Turn: {
@@ -1781,12 +1784,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 if (st < 0.22f && active_set->find_sequence("swinghardstart")) {
                     seq_a = active_set->find_sequence("swinghardstart");
                     norm_time = std::clamp(st / 0.22f, 0.0f, 1.0f);
+                    vm_offset = Vec3(0.0f, 6.0f, -1.0f);
                 } else {
-                    seq_a = active_set->find_sequence("swingposefronttop");
+                    seq_a = active_set->find_sequence("swingposebacktop");
+                    if (!seq_a) seq_a = active_set->find_sequence("swingposefronttop");
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.667f;
                     norm_time = std::fmod(st / dur, 1.0f);
+                    vm_offset = Vec3(0.0f, 6.0f, -2.0f);
                 }
-                vm_offset = Vec3(0.0f, 12.0f, 8.0f);
                 show_lower_body = true;
                 break;
             }
@@ -1794,7 +1799,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 seq_a = active_set->find_sequence("ZipLine");
                 float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.0f;
                 norm_time = std::fmod(st / dur, 1.0f);
-                vm_offset = Vec3(2.0f, 62.0f, -4.0f);
+                vm_offset = Vec3(1.5f, 38.0f, -30.5f);
                 break;
             }
             case EMovement::MOVE_Coil: {
@@ -1943,6 +1948,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     const Vec3 eye_pos = comp_pos[eye_idx];
     const Quat4 eye_inv_quat = comp_quat[eye_idx].conjugate();
 
+    // Rigid pitch rotation for overhead 1P maneuvers authored with pitched camera view (e.g. ZipLine cable pulley)
+    float upper_pitch_rad = 0.0f;
+    if (state == EMovement::MOVE_ZipLine) {
+        upper_pitch_rad = 55.0f * DEG2RAD;
+    }
+    const float cos_up = std::cos(upper_pitch_rad);
+    const float sin_up = std::sin(upper_pitch_rad);
+
     // Note: vm_view = look_at((0,0,0), (0,100,0), (0,0,1)) has s = (-1,0,0),
     // so +rel.x maps to Screen Left (LeftHand) and -rel.x maps to Screen Right (RightHand Red Glove).
     // (rel.x, rel.z, -rel.y) is a proper right-handed 90-deg rotation (det = +1).
@@ -1950,7 +1963,11 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     auto raw_to_vm_pos = [&](const Vec3& raw_p, bool is_lower) -> Vec3 {
         Vec3 rel = eye_inv_quat.rotate(raw_p - eye_pos);
         if (!is_lower) {
-            return Vec3(rel.x + vm_offset.x, rel.z + vm_offset.y, -rel.y + vm_offset.z);
+            float vy = rel.z;
+            float vz = -rel.y;
+            float ry = vy * cos_up + vz * sin_up;
+            float rz = -vy * sin_up + vz * cos_up;
+            return Vec3(rel.x + vm_offset.x, ry + vm_offset.y, rz + vm_offset.z);
         }
         if (lower_body_high_kick) {
             // For flying jump kick / high kick / wallrun kick: pitch legs higher into foreground view
@@ -1972,7 +1989,9 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     };
     auto raw_to_vm_dir = [&](const Vec3& raw_d) -> Vec3 {
         Vec3 rel = eye_inv_quat.rotate(raw_d);
-        return Vec3(rel.x, rel.z, -rel.y).normalized();
+        float vy = rel.z;
+        float vz = -rel.y;
+        return Vec3(rel.x, vy * cos_up + vz * sin_up, -vy * sin_up + vz * cos_up).normalized();
     };
 
     thread_local std::vector<Vec3> skinned_pos;
@@ -1989,16 +2008,17 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             uint8_t dom_bone = sv.bones[0];
             if (!is_lower) {
                 if (sv.chunk_index == 1) {
-                    // Chunk 1 (Faith_Glove): keep only RightHand & finger bones (48..70),
-                    // culling the rolled-up elbow shirt cuff (17,18,41,46,47,71)
-                    if (dom_bone < 48 || dom_bone > 70) {
+                    // Chunk 1 (Faith_Glove): keep RightForeArm wrap, RightHand, fingers, and RightForeArmRoll strap (47..71),
+                    // culling only the shoulder cuff on 46.
+                    if (dom_bone < 47 || dom_bone > 71) {
                         vert_valid[i] = 0;
                         continue;
                     }
                 } else {
-                    // Chunk 0 (Skin): keep forearms, wrists, hands, and fingers (18..41, 47..71)
-                    bool is_forearm_or_hand = (dom_bone >= 18 && dom_bone <= 41) || (dom_bone >= 47 && dom_bone <= 71);
-                    if (!is_forearm_or_hand) {
+                    // Chunk 0 (Skin): keep full arms (LeftArm 17..41, RightArm 46..71) so raised elbows in
+                    // ZipLine, Hang, Swing, Climb, Vault, and WallRun connect smoothly to shoulders.
+                    bool is_arm_or_hand = (dom_bone >= 17 && dom_bone <= 41) || (dom_bone >= 46 && dom_bone <= 71);
+                    if (!is_arm_or_hand) {
                         vert_valid[i] = 0;
                         continue;
                     }
