@@ -105,7 +105,19 @@ struct SkinnedVertex {
     uint8_t bones[4] = {0, 0, 0, 0};
     uint8_t weights[4] = {255, 0, 0, 0};
     uint8_t chunk_index = 0;
+    uint8_t mat_type = 0; // 0 = main material, 1 = M_Ammo, 2 = M_M95_Sight
     uint32_t color = 0xFFFFFFFF;
+};
+
+struct DXT1Texture {
+    std::string name;
+    int32_t width = 0;
+    int32_t height = 0;
+    std::vector<uint8_t> dxt1_blocks;
+
+    [[nodiscard]] bool is_valid() const { return width > 0 && height > 0 && !dxt1_blocks.empty(); }
+    [[nodiscard]] Vec3 sample_rgb01(float u, float v) const;
+    [[nodiscard]] bool decode_rgba8(std::vector<uint8_t>& out_rgba) const;
 };
 
 struct SkeletalMeshAsset {
@@ -122,6 +134,9 @@ struct SkeletalMeshAsset {
     std::vector<SkelMeshSection> sections;
     std::vector<SkinnedVertex> vertices;
     std::vector<uint16_t> indices;
+    DXT1Texture tex_diffuse;
+    DXT1Texture tex_specular;
+    DXT1Texture tex_normal;
 
     [[nodiscard]] bool is_valid() const {
         return !bones.empty() && !vertices.empty() && !indices.empty();
@@ -150,16 +165,6 @@ struct AnimSetAsset {
     std::unordered_map<std::string, AnimSequenceAsset> sequences; // lowercase key -> sequence
 
     [[nodiscard]] const AnimSequenceAsset* find_sequence(const std::string& seq_name) const;
-};
-
-struct DXT1Texture {
-    std::string name;
-    int32_t width = 0;
-    int32_t height = 0;
-    std::vector<uint8_t> dxt1_blocks;
-
-    [[nodiscard]] bool is_valid() const { return width > 0 && height > 0 && !dxt1_blocks.empty(); }
-    [[nodiscard]] Vec3 sample_rgb01(float u, float v) const;
 };
 
 struct AnimBlendConfig {
@@ -206,6 +211,12 @@ public:
     [[nodiscard]] const SkeletalMeshAsset& swat_mesh() const { return swat_mesh_; }
     [[nodiscard]] const SkeletalMeshAsset& colt1911_mesh() const { return colt1911_mesh_; }
     [[nodiscard]] const std::unordered_map<std::string, SkeletalMeshAsset>& weapon_meshes() const { return weapon_meshes_; }
+    [[nodiscard]] const DXT1Texture& faith_skin_tex() const { return faith_skin_tex_; }
+    [[nodiscard]] const DXT1Texture& faith_glove_tex() const { return faith_glove_tex_; }
+    [[nodiscard]] const DXT1Texture& faith_lower_tex() const { return faith_lower_tex_; }
+    [[nodiscard]] const DXT1Texture& swat_diffuse_tex() const { return swat_diffuse_tex_; }
+    [[nodiscard]] const DXT1Texture& swat_specular_tex() const { return swat_specular_tex_; }
+    [[nodiscard]] const DXT1Texture& ammo_diffuse_tex() const { return ammo_diffuse_tex_; }
     [[nodiscard]] const AnimSetAsset& faith_unarmed_anims() const { return faith_unarmed_set_; }
     [[nodiscard]] const AnimSetAsset& faith_common_anims() const { return faith_common_set_; }
     [[nodiscard]] const AnimSetAsset& faith_2h_common_anims() const { return faith_2h_common_set_; }
@@ -223,6 +234,13 @@ private:
     SkeletalMeshAsset swat_mesh_;
     SkeletalMeshAsset colt1911_mesh_;
     std::unordered_map<std::string, SkeletalMeshAsset> weapon_meshes_;
+
+    DXT1Texture faith_skin_tex_;
+    DXT1Texture faith_glove_tex_;
+    DXT1Texture faith_lower_tex_;
+    DXT1Texture swat_diffuse_tex_;
+    DXT1Texture swat_specular_tex_;
+    DXT1Texture ammo_diffuse_tex_;
 
     AnimSetAsset faith_unarmed_set_;
     AnimSetAsset faith_common_set_;

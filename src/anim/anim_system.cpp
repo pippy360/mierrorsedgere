@@ -213,6 +213,72 @@ Vec3 DXT1Texture::sample_rgb01(float u, float v) const {
     return pal[code];
 }
 
+bool DXT1Texture::decode_rgba8(std::vector<uint8_t>& out_rgba) const {
+    if (!is_valid()) return false;
+    const int32_t w = width;
+    const int32_t h = height;
+    const int32_t bw = std::max(1, (w + 3) / 4);
+    const int32_t bh = std::max(1, (h + 3) / 4);
+    out_rgba.assign(static_cast<size_t>(w) * static_cast<size_t>(h) * 4, 255);
+
+    auto unpack_565_u8 = [](uint16_t c, uint8_t out[4]) {
+        uint32_t r5 = (c >> 11) & 31u;
+        uint32_t g6 = (c >> 5) & 63u;
+        uint32_t b5 = c & 31u;
+        out[0] = static_cast<uint8_t>((r5 * 255u + 15u) / 31u);
+        out[1] = static_cast<uint8_t>((g6 * 255u + 31u) / 63u);
+        out[2] = static_cast<uint8_t>((b5 * 255u + 15u) / 31u);
+        out[3] = 255;
+    };
+
+    for (int32_t by = 0; by < bh; ++by) {
+        for (int32_t bx = 0; bx < bw; ++bx) {
+            size_t blk_off = static_cast<size_t>(by * bw + bx) * 8;
+            if (blk_off + 8 > dxt1_blocks.size()) break;
+            uint16_t c0 = 0, c1 = 0;
+            uint32_t bits = 0;
+            std::memcpy(&c0, dxt1_blocks.data() + blk_off, 2);
+            std::memcpy(&c1, dxt1_blocks.data() + blk_off + 2, 2);
+            std::memcpy(&bits, dxt1_blocks.data() + blk_off + 4, 4);
+
+            uint8_t pal[4][4];
+            unpack_565_u8(c0, pal[0]);
+            unpack_565_u8(c1, pal[1]);
+            if (c0 > c1) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    pal[2][ch] = static_cast<uint8_t>((2u * pal[0][ch] + pal[1][ch] + 1u) / 3u);
+                    pal[3][ch] = static_cast<uint8_t>((pal[0][ch] + 2u * pal[1][ch] + 1u) / 3u);
+                }
+                pal[2][3] = 255;
+                pal[3][3] = 255;
+            } else {
+                for (int ch = 0; ch < 3; ++ch) {
+                    pal[2][ch] = static_cast<uint8_t>((static_cast<uint32_t>(pal[0][ch]) + pal[1][ch]) >> 1);
+                    pal[3][ch] = 0;
+                }
+                pal[2][3] = 255;
+                pal[3][3] = 0;
+            }
+
+            for (int32_t ly = 0; ly < 4; ++ly) {
+                int32_t py = by * 4 + ly;
+                if (py >= h) break;
+                for (int32_t lx = 0; lx < 4; ++lx) {
+                    int32_t px = bx * 4 + lx;
+                    if (px >= w) break;
+                    uint32_t code = (bits >> (2 * (ly * 4 + lx))) & 3u;
+                    uint8_t* dst = out_rgba.data() + (static_cast<size_t>(py) * w + px) * 4;
+                    dst[0] = pal[code][0];
+                    dst[1] = pal[code][1];
+                    dst[2] = pal[code][2];
+                    dst[3] = pal[code][3];
+                }
+            }
+        }
+    }
+    return true;
+}
+
 const AnimSequenceAsset* AnimSetAsset::find_sequence(const std::string& seq_name) const {
     auto it = sequences.find(to_lower_str(seq_name));
     if (it != sequences.end()) return &it->second;
@@ -526,6 +592,24 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             }
             sv.chunk_index = static_cast<uint8_t>(c);
             out_mesh.vertices.push_back(sv);
+        }
+    }
+
+    for (const auto& sec : out_mesh.sections) {
+        uint8_t mtype = 0;
+        std::string mlow = to_lower_str(sec.material_name);
+        if (mlow.find("ammo") != std::string::npos) {
+            mtype = 1;
+        } else if (mlow.find("sight") != std::string::npos || mlow.find("lens") != std::string::npos) {
+            mtype = 2;
+        }
+        size_t start_i = static_cast<size_t>(std::max(0, sec.base_index));
+        size_t end_i = std::min(out_mesh.indices.size(), start_i + static_cast<size_t>(sec.num_triangles) * 3);
+        for (size_t k = start_i; k < end_i; ++k) {
+            uint16_t vi = out_mesh.indices[k];
+            if (vi < out_mesh.vertices.size()) {
+                out_mesh.vertices[vi].mat_type = mtype;
+            }
         }
     }
 
@@ -881,21 +965,20 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
             }
         }
 
-        DXT1Texture tex_skin{}, tex_glove{};
-        parse_dxt1_texture(pkg_1p, "Female_1p_C", tex_skin);
-        parse_dxt1_texture(pkg_1p, "Faith_Glove_C", tex_glove);
+        parse_dxt1_texture(pkg_1p, "Female_1p_C", faith_skin_tex_);
+        parse_dxt1_texture(pkg_1p, "Faith_Glove_C", faith_glove_tex_);
+        const DXT1Texture& tex_skin = faith_skin_tex_;
+        const DXT1Texture& tex_glove = faith_glove_tex_;
 
         for (auto& v : faith_upper_.vertices) {
             if (v.chunk_index == 0 && tex_skin.is_valid()) {
                 Vec3 c = tex_skin.sample_rgb01(v.u, v.v);
-                // Warm natural skin calibration matching DICE's M_skinJocTest3_SH subsurface shader
                 c.x = std::clamp(std::pow(c.x, 0.85f) * 1.06f, 0.15f, 0.96f);
                 c.y = std::clamp(std::pow(c.y, 0.88f) * 1.02f, 0.12f, 0.88f);
                 c.z = std::clamp(std::pow(c.z, 0.90f) * 0.98f, 0.10f, 0.82f);
                 v.color = pack_rgba8(c.x, c.y, c.z);
             } else if (tex_glove.is_valid()) {
                 Vec3 c = tex_glove.sample_rgb01(v.u, v.v);
-                // Enhance red Runner glove leather vs black leather strap contrast
                 if (c.x > c.y * 1.35f && c.x > 0.12f) {
                     c = Vec3(std::clamp(c.x * 1.65f, 0.55f, 0.94f),
                              std::clamp(c.y * 0.65f, 0.05f, 0.18f),
@@ -912,14 +995,14 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
 
     UPKPackage pkg_cine(cooked + "Characters/CH_Faith_Cinematic.upk");
     if (pkg_cine.is_valid() && faith_lower_.is_valid()) {
-        DXT1Texture tex_lower{}, tex_upper{};
-        parse_dxt1_texture(pkg_cine, "Faith_Cine_Lower_C", tex_lower);
+        DXT1Texture tex_upper{};
+        parse_dxt1_texture(pkg_cine, "Faith_Cine_Lower_C", faith_lower_tex_);
         parse_dxt1_texture(pkg_cine, "Faith_Cine_Upper_C", tex_upper);
+        const DXT1Texture& tex_lower = faith_lower_tex_;
 
         for (auto& v : faith_lower_.vertices) {
             if (v.chunk_index == 1 && tex_lower.is_valid()) {
                 Vec3 c = tex_lower.sample_rgb01(v.u, v.v);
-                // Boost white/grey Runner cargo pants and red/black split-toe Tabi shoes
                 if (c.x > c.y * 1.35f && c.x > 0.15f) {
                     c = Vec3(std::clamp(c.x * 1.55f, 0.50f, 0.92f),
                              std::clamp(c.y * 0.65f, 0.06f, 0.20f),
@@ -949,28 +1032,23 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                 break;
             }
         }
-        DXT1Texture tex_swat_d{}, tex_swat_s{};
-        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_D", tex_swat_d);
-        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_S", tex_swat_s);
+        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_D", swat_diffuse_tex_);
+        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_S", swat_specular_tex_);
+        swat_mesh_.tex_diffuse = swat_diffuse_tex_;
+        swat_mesh_.tex_specular = swat_specular_tex_;
+    }
 
-        for (auto& v : swat_mesh_.vertices) {
-            if (tex_swat_d.is_valid()) {
-                Vec3 d = tex_swat_d.sample_rgb01(v.u, v.v);
-                Vec3 s = tex_swat_s.is_valid() ? tex_swat_s.sample_rgb01(v.u, v.v) : Vec3(0.2f, 0.2f, 0.2f);
-                // Apply M_Generic_CharMaterial_SH sRGB + Spherical Harmonic tactical armor lift
-                float r = std::pow(std::max(d.x, 0.0f), 0.45f) * 0.72f + s.x * 0.35f + 0.12f;
-                float g = std::pow(std::max(d.y, 0.0f), 0.45f) * 0.75f + s.y * 0.38f + 0.14f;
-                float b = std::pow(std::max(d.z, 0.0f), 0.45f) * 0.82f + s.z * 0.44f + 0.18f;
-                // Highlight white CPF chest/shoulder armor plates where diffuse/spec luminance is higher
-                float lum = (d.x + d.y + d.z + s.x + s.y + s.z) * 0.1667f;
-                if (lum > 0.08f && v.bind_pos.y < -95.0f && v.bind_pos.y > -148.0f) {
-                    r = std::clamp(r * 1.45f + 0.16f, 0.25f, 0.92f);
-                    g = std::clamp(g * 1.45f + 0.17f, 0.26f, 0.93f);
-                    b = std::clamp(b * 1.48f + 0.19f, 0.28f, 0.95f);
+    // Load shared brass cartridge texture from Weapons/WP_Ammo.upk (used by M_Ammo sections on Glock18/FNSCARL/FNMinimi)
+    {
+        UPKPackage pkg_ammo(cooked + "Weapons/WP_Ammo.upk");
+        if (pkg_ammo.is_valid()) {
+            for (const auto& exp : pkg_ammo.get_exports()) {
+                if (pkg_ammo.get_export_class(exp) == "Texture2D" &&
+                    (exp.object_name.find("_D") != std::string::npos || exp.object_name.find("Ammo") != std::string::npos)) {
+                    if (parse_dxt1_texture(pkg_ammo, exp.object_name, ammo_diffuse_tex_) && ammo_diffuse_tex_.is_valid()) {
+                        if (exp.object_name.find("_D") != std::string::npos) break;
+                    }
                 }
-                v.color = pack_rgba8(std::clamp(r, 0.12f, 0.94f),
-                                     std::clamp(g, 0.14f, 0.95f),
-                                     std::clamp(b, 0.17f, 0.96f));
             }
         }
     }
@@ -982,19 +1060,20 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         const char* skel_name;
         const char* tex_d;
         const char* tex_s;
+        const char* tex_n;
     };
     static const WeaponPackageSpec kWeaponSpecs[] = {
-        {"Colt1911",     "Weapons/WP_Colt1911.upk",     "SK_Colt1911",     "T_Colt1911_D",     "T_Colt1911_S"},
-        {"Glock18",      "Weapons/WP_Glock18.upk",      "SK_Glock18",      "T_Glock18_D",      "T_Glock18_S"},
-        {"BerettaM93R",  "Weapons/WP_BerettaM93R.upk",  "SK_BerettaM93R",  "T_BerettaM93R_D",  "T_BerettaM93R_S"},
-        {"SteyrTMP",     "Weapons/WP_SteyrTMP.upk",     "SK_SteyrTMP",     "T_SteyrTMP_D",     "T_SteyrTMP_S"},
-        {"MP5K",         "Weapons/WP_MP5K.upk",         "SK_MP5K",         "T_MP5K_D",         "T_MP5K_S"},
-        {"G36C",         "Weapons/WP_G36C.upk",         "SK_G36C",         "T_G36C_D",         "T_G36C_S"},
-        {"FNSCARL",      "Weapons/WP_FNSCARL.upk",      "SK_FNSCARL",      "T_FNSCARL_D",      "T_FNSCARL_S"},
-        {"Remington870", "Weapons/WP_Remington870.upk", "SK_Remington870", "T_Remington870_D", "T_Remington870_S"},
-        {"Neostead",     "Weapons/WP_Neostead.upk",     "SK_Neostead",     "T_Neostead_D",     "T_Neostead_S"},
-        {"FNMinimi",     "Weapons/WP_FNMinimi.upk",     "SK_FNMinimi",     "T_FNMinimi_D",     "T_FNMinimi_S"},
-        {"M95",          "Weapons/WP_M95.upk",          "SK_M95",          "T_M95_D",          "T_M95_S"}
+        {"Colt1911",     "Weapons/WP_Colt1911.upk",     "SK_Colt1911",     "T_Colt1911_D",     "T_Colt1911_S",     "T_Colt1911_N"},
+        {"Glock18",      "Weapons/WP_Glock18.upk",      "SK_Glock18",      "T_Glock18_D",      "T_Glock18_S",      "T_Glock18_N"},
+        {"BerettaM93R",  "Weapons/WP_BerettaM93R.upk",  "SK_BerettaM93R",  "T_BerettaM93R_D",  "T_BerettaM93R_S",  "T_BerettaM93R_N"},
+        {"SteyrTMP",     "Weapons/WP_SteyrTMP.upk",     "SK_SteyrTMP",     "T_SteyrTMP_D",     "T_SteyrTMP_S",     "T_SteyrTMP_N"},
+        {"MP5K",         "Weapons/WP_MP5K.upk",         "SK_MP5K",         "T_MP5K_D",         "T_MP5K_S",         "T_MP5K_N"},
+        {"G36C",         "Weapons/WP_G36C.upk",         "SK_G36C",         "T_G36C_D",         "T_G36C_S",         "T_G36C_N"},
+        {"FNSCARL",      "Weapons/WP_FNSCARL.upk",      "SK_FNSCARL",      "T_FNSCARL_D",      "T_FNSCARL_S",      "T_FNSCARL_N"},
+        {"Remington870", "Weapons/WP_Remington870.upk", "SK_Remington870", "T_Remington870_D", "T_Remington870_S", "T_Remington870_N"},
+        {"Neostead",     "Weapons/WP_Neostead.upk",     "SK_Neostead",     "T_Neostead_D",     "T_Neostead_S",     "T_Neostead_N"},
+        {"FNMinimi",     "Weapons/WP_FNMinimi.upk",     "SK_FNMinimi",     "T_FNMinimi_D",     "T_FNMinimi_S",     "T_FNMinimi_N"},
+        {"M95",          "Weapons/WP_M95.upk",          "SK_M95",          "T_M95_D",          "T_M95_S",          "T_M95_N"}
     };
 
     for (const auto& ws : kWeaponSpecs) {
@@ -1009,18 +1088,12 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         }
         if (!w_mesh.is_valid()) continue;
 
-        DXT1Texture tex_d{}, tex_s{};
-        parse_dxt1_texture(pkg_w, ws.tex_d, tex_d);
-        parse_dxt1_texture(pkg_w, ws.tex_s, tex_s);
+        parse_dxt1_texture(pkg_w, ws.tex_d, w_mesh.tex_diffuse);
+        parse_dxt1_texture(pkg_w, ws.tex_s, w_mesh.tex_specular);
+        parse_dxt1_texture(pkg_w, ws.tex_n, w_mesh.tex_normal);
+
         for (auto& v : w_mesh.vertices) {
-            Vec3 d = tex_d.is_valid() ? tex_d.sample_rgb01(v.u, v.v) : Vec3(0.15f, 0.16f, 0.18f);
-            Vec3 s = tex_s.is_valid() ? tex_s.sample_rgb01(v.u, v.v) : Vec3(0.25f, 0.26f, 0.28f);
-            float r = std::pow(std::max(d.x, 0.0f), 0.45f) * 0.65f + s.x * 0.40f + 0.16f;
-            float g = std::pow(std::max(d.y, 0.0f), 0.45f) * 0.67f + s.y * 0.42f + 0.17f;
-            float b = std::pow(std::max(d.z, 0.0f), 0.45f) * 0.72f + s.z * 0.46f + 0.20f;
-            v.color = pack_rgba8(std::clamp(r, 0.16f, 0.78f),
-                                 std::clamp(g, 0.17f, 0.80f),
-                                 std::clamp(b, 0.19f, 0.84f));
+            v.color = 0xFFFFFFFF;
         }
         if (std::string(ws.key) == "Colt1911") {
             colt1911_mesh_ = w_mesh;
@@ -1678,7 +1751,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
-                out_v.color = sv.color;
+                out_v.u2 = is_lower ? 3.0f : (sv.chunk_index == 0 ? 1.0f : 2.0f);
+                out_v.color = 0xFFFFFFFF;
                 out_triangles.push_back(out_v);
             }
         }
@@ -1813,7 +1887,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
-                out_v.color = sv.color;
+                out_v.u2 = (sv.mat_type == 1) ? 5.0f : (sv.mat_type == 2 ? 6.0f : 4.0f);
+                out_v.color = 0xFFFFFFFF;
                 out_triangles.push_back(out_v);
             }
         }
@@ -1953,7 +2028,8 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
             out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
             out_v.u = sv.u;
             out_v.v = sv.v;
-            out_v.color = sv.color;
+            out_v.u2 = 1.0f;
+            out_v.color = 0xFFFFFFFF;
             out_triangles.push_back(out_v);
         }
     }
@@ -1984,7 +2060,8 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
-                out_v.color = bot.disarm_window ? disarm_red : sv.color;
+                out_v.u2 = (sv.mat_type == 1) ? 3.0f : 2.0f;
+                out_v.color = bot.disarm_window ? disarm_red : 0xFFFFFFFF;
                 out_triangles.push_back(out_v);
             }
         }
@@ -2049,7 +2126,8 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float /*sim_t
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
-                out_v.color = sv.color;
+                out_v.u2 = (sv.mat_type == 1) ? 3.0f : 2.0f;
+                out_v.color = 0xFFFFFFFF;
                 out_world_tris.push_back(out_v);
             }
         }

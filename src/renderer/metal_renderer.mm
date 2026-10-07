@@ -193,6 +193,7 @@ struct VertexOut {
     float3 world_pos;
     float3 world_norm;
     float2 uv;
+    float2 uv2;
     float4 color;
 };
 
@@ -295,6 +296,7 @@ vertex VertexOut world_vertex(constant VertexIn* vertices [[buffer(0)]],
     out.world_norm = normalize((uniforms.model * float4(norm, 0.0)).xyz);
     out.clip_pos = uniforms.view_proj * world_pos4;
     out.uv = float2(v.u, v.v);
+    out.uv2 = float2(v.u2, v.v2);
 
     // Unpack vertex color (ABGR / RGBA)
     float r = float((v.color >> 0) & 0xFF) / 255.0;
@@ -319,7 +321,12 @@ inline float sample_world_shadow(float3 world_pos, float3 N, constant FrameUnifo
 
 fragment float4 world_fragment(VertexOut in [[stage_in]],
                                constant FrameUniforms& uniforms [[buffer(0)]],
-                               depth2d_array<float> shadow_map [[texture(27)]]) {
+                               texture2d<float> swat_d_tex [[texture(0)]],
+                               texture2d<float> wep_d_tex  [[texture(1)]],
+                               texture2d<float> wep_s_tex  [[texture(2)]],
+                               texture2d<float> ammo_d_tex [[texture(3)]],
+                               depth2d_array<float> shadow_map [[texture(27)]],
+                               sampler world_tex_sampler   [[sampler(0)]]) {
     // Compute geometric facet normal from screen-space derivatives to guarantee crisp architectural planes
     float3 dpdx = dfdx(in.world_pos);
     float3 dpdy = dfdy(in.world_pos);
@@ -336,18 +343,16 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
 
     // Blend smooth vertex normal with crisp geometric face normal
-    float3 N = normalize(mix(geo_N, vtx_N, 0.55));
+    float3 N = normalize(mix(geo_N, vtx_N, (in.uv2.x > 0.5) ? 0.75 : 0.55));
     float3 L = normalize(float3(uniforms.sun_dir));
     float shadow = sample_world_shadow(in.world_pos, N, uniforms, shadow_map);
 
     // 1. Directional Sun + UE3 BasePass GetMaterialHemisphereLightTransferFull (MaterialTemplate.usf)
     float NdotL = max(dot(N, L), 0.0) * shadow;
-    // Secondary directional fill so X-facing and Y-facing shadow walls have distinct tonal separation
     float side_contrast = 0.5 + 0.5 * N.x - 0.25 * N.y;
 
     float3 sun_light = float3(0.56, 0.53, 0.48) * NdotL;
     float sky_hemi = saturate(N.z * 0.5 + 0.5);
-    // Quadratic hemisphere transfer: w = (0.5, 0.5) + (0.5, -0.5) * N.z; w *= w
     float2 hemi_w = float2(0.5, 0.5) + float2(0.5, -0.5) * N.z;
     hemi_w *= hemi_w;
     float3 mod_azure = max(float3(uniforms.mod_shadow_color), float3(0.42, 0.65, 0.92)) * float3(0.65, 0.88, 1.18);
@@ -356,12 +361,38 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float3 sky_bounce = (upper_sky * hemi_w.x + lower_sky * hemi_w.y + float3(0.06, 0.10, 0.16)) * (0.78 + 0.22 * side_contrast);
     float3 lighting = sun_light + sky_bounce;
 
-    // 2. Base Albedo & Procedural Architectural Material Detailing
+    // 2. Base Albedo & High-Res GPU Character/Weapon Textures vs Architectural Detailing
     float3 base_albedo = in.color.rgb * float3(uniforms.actor_tint);
+    float3 spec_add = float3(0.0);
     float dist = length(float3(uniforms.camera_pos) - in.world_pos);
-
     float rv_factor = saturate(max(uniforms.is_runner_vision, uniforms.runner_vision_strength));
-    if (rv_factor < 0.5) {
+
+    if (in.uv2.x > 0.5) {
+        if (in.uv2.x < 1.5) {
+            // KrugerSec / CPF SWAT Officer high-resolution 1024x1024 GPU texture
+            float3 d_swat = swat_d_tex.sample(world_tex_sampler, in.uv).rgb;
+            base_albedo = pow(max(d_swat, float3(0.0)), float3(0.72)) * float3(1.18, 1.20, 1.26) + float3(0.05, 0.06, 0.08);
+            float3 H = normalize(L + V);
+            spec_add = float3(0.22, 0.25, 0.30) * pow(max(dot(N, H), 0.0), 20.0);
+        } else if (in.uv2.x < 2.5) {
+            // 3D Enemy Weapon / Dropped Weapon main high-res GPU texture
+            if (in.color.r > 0.85 && in.color.g < 0.20) {
+                base_albedo = in.color.rgb;
+            } else {
+                float3 d_wep = wep_d_tex.sample(world_tex_sampler, in.uv).rgb;
+                float3 s_wep = wep_s_tex.sample(world_tex_sampler, in.uv).rgb;
+                base_albedo = pow(max(d_wep, float3(0.0)), float3(0.78)) * 1.15 + s_wep * 0.22 + float3(0.04, 0.05, 0.06);
+                float3 H = normalize(L + V);
+                spec_add = s_wep * (pow(max(dot(N, H), 0.0), 18.0) * 0.45 + pow(max(dot(N, H), 0.0), 48.0) * 0.35);
+            }
+        } else {
+            // 3D Weapon M_Ammo brass cartridge / belt section
+            float3 d_ammo = ammo_d_tex.sample(world_tex_sampler, in.uv).rgb;
+            base_albedo = pow(max(d_ammo, float3(0.0)), float3(0.75)) * float3(1.25, 1.05, 0.72) + float3(0.14, 0.10, 0.04);
+            float3 H = normalize(L + V);
+            spec_add = float3(0.85, 0.68, 0.36) * pow(max(dot(N, H), 0.0), 32.0) * 0.55;
+        }
+    } else if (rv_factor < 0.5) {
         if (abs(N.z) > 0.72) {
             // Horizontal Rooftop / Walkway Concrete Tile Seams (200cm expansion joints + 50cm sub-tiles)
             float2 major_grid = abs(fract(in.world_pos.xy * 0.005) - 0.5);
@@ -401,7 +432,7 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
         }
     }
 
-    float3 lit_color = base_albedo * lighting;
+    float3 lit_color = base_albedo * lighting + spec_add;
 
     // 3. Runner Vision (LOI) Saturated Red Highlight (#E61414)
     if (rv_factor > 0.001) {
@@ -430,7 +461,7 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
 }
 
 // -----------------------------------------------------------------------------
-// 3. First-Person Faith Viewmodel (CH_Faith_1P)
+// 3. First-Person Faith Viewmodel (CH_Faith_1P + High-Res 1P Weapons)
 // -----------------------------------------------------------------------------
 vertex VertexOut viewmodel_vertex(constant VertexIn* vertices [[buffer(0)]],
                                   constant FrameUniforms& uniforms [[buffer(1)]],
@@ -446,6 +477,7 @@ vertex VertexOut viewmodel_vertex(constant VertexIn* vertices [[buffer(0)]],
     out.world_norm = normalize((uniforms.model * float4(norm, 0.0)).xyz);
     out.clip_pos = uniforms.view_proj * world_pos4;
     out.uv = float2(v.u, v.v);
+    out.uv2 = float2(v.u2, v.v2);
 
     float r = float((v.color >> 0) & 0xFF) / 255.0;
     float g = float((v.color >> 8) & 0xFF) / 255.0;
@@ -457,20 +489,130 @@ vertex VertexOut viewmodel_vertex(constant VertexIn* vertices [[buffer(0)]],
 }
 
 fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
-                                   constant FrameUniforms& uniforms [[buffer(0)]]) {
+                                   constant FrameUniforms& uniforms [[buffer(0)]],
+                                   texture2d<float> vm_skin_tex  [[texture(0)]],
+                                   texture2d<float> vm_glove_tex [[texture(1)]],
+                                   texture2d<float> vm_lower_tex [[texture(2)]],
+                                   texture2d<float> vm_wep_d_tex [[texture(3)]],
+                                   texture2d<float> vm_wep_s_tex [[texture(4)]],
+                                   texture2d<float> vm_wep_n_tex [[texture(5)]],
+                                   texture2d<float> vm_ammo_tex  [[texture(6)]],
+                                   sampler vm_sampler            [[sampler(0)]]) {
+    int slot = int(round(in.uv2.x));
+    if (slot == 0) {
+        // Emissive muzzle flash star
+        return float4(in.color.rgb * 1.35, 1.0);
+    }
+
     float3 dpdx = dfdx(in.world_pos);
     float3 dpdy = dfdy(in.world_pos);
-    float3 geo_N = normalize(cross(dpdx, dpdy));
-    float3 N = normalize(mix(in.world_norm, geo_N, 0.4));
-    float3 L = normalize(float3(0.35, -0.45, 0.82));
+    float3 geo_N = cross(dpdx, dpdy);
+    float geo_len = length(geo_N);
+    geo_N = (geo_len > 1e-6) ? (geo_N / geo_len) : float3(0.0, -1.0, 0.0);
+
     float3 V = normalize(-in.world_pos);
+    if (dot(geo_N, V) < 0.0) geo_N = -geo_N;
+
+    float3 vtx_N = in.world_norm;
+    float vtx_len = length(vtx_N);
+    vtx_N = (vtx_len > 1e-4) ? (vtx_N / vtx_len) : geo_N;
+    if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
+
+    float3 N = normalize(mix(geo_N, vtx_N, 0.72));
+    float3 L = normalize(float3(0.35, -0.45, 0.82));
+    float3 H = normalize(L + V);
+
+    if (slot == 1) {
+        // Faith 1P Arms, Hands, Fingers & Tattoo (Female_1p_C, 2048x2048)
+        float3 c = vm_skin_tex.sample(vm_sampler, in.uv).rgb;
+        float3 albedo = pow(max(c, float3(0.0)), float3(0.85, 0.88, 0.90)) * float3(1.06, 1.01, 0.96);
+        float wrap = saturate((dot(N, L) + 0.35) / 1.35);
+        float spec = pow(max(dot(N, H), 0.0), 20.0) * 0.14;
+        float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.10;
+        float3 col = albedo * (0.44 + 0.56 * wrap) + float3(spec + rim) * float3(1.0, 0.95, 0.90);
+        return float4(col, 1.0);
+    }
+
+    if (slot == 2) {
+        // Faith 1P Red/Black Leather Runner Glove (Faith_Glove_C, 1024x1024)
+        float3 c = vm_glove_tex.sample(vm_sampler, in.uv).rgb;
+        float3 albedo;
+        if (c.x > c.y * 1.32 && c.x > 0.11) {
+            albedo = clamp(float3(c.x * 1.62, c.y * 0.65, c.z * 0.65), float3(0.05), float3(0.95));
+        } else {
+            albedo = pow(max(c, float3(0.0)), float3(0.82)) * 1.16 + float3(0.03, 0.03, 0.04);
+        }
+        float NdotL = max(dot(N, L), 0.0);
+        float spec = pow(max(dot(N, H), 0.0), 26.0) * 0.24;
+        float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.12;
+        float3 col = albedo * (0.44 + 0.56 * NdotL) + float3(spec + rim);
+        return float4(col, 1.0);
+    }
+
+    if (slot == 3) {
+        // Faith 1P Cargo Pants & Split-Toe Tabi Boots (Faith_Cine_Lower_C, 1024x1024)
+        float3 c = vm_lower_tex.sample(vm_sampler, in.uv).rgb;
+        float3 albedo;
+        if (c.x > c.y * 1.32 && c.x > 0.14) {
+            albedo = clamp(float3(c.x * 1.55, c.y * 0.65, c.z * 0.65), float3(0.06), float3(0.94));
+        } else {
+            albedo = pow(max(c, float3(0.0)), float3(0.78)) * 1.15;
+        }
+        float NdotL = max(dot(N, L), 0.0);
+        float spec = pow(max(dot(N, H), 0.0), 22.0) * 0.15;
+        return float4(albedo * (0.46 + 0.54 * NdotL) + float3(spec), 1.0);
+    }
+
+    if (slot == 5) {
+        // Weapon M_Ammo Brass Cartridges & Belt (T_Ammo_D)
+        float3 a_raw = vm_ammo_tex.sample(vm_sampler, in.uv).rgb;
+        float3 albedo = pow(max(a_raw, float3(0.0)), float3(0.78)) * float3(1.26, 1.05, 0.72) + float3(0.12, 0.09, 0.04);
+        float NdotL = max(dot(N, L), 0.0);
+        float spec_brass = pow(max(dot(N, H), 0.0), 36.0) * 0.65 + pow(max(dot(N, H), 0.0), 12.0) * 0.25;
+        float3 col = albedo * (0.42 + 0.58 * NdotL) + float3(0.92, 0.76, 0.42) * spec_brass;
+        return float4(col, 1.0);
+    }
+
+    if (slot == 6) {
+        // Barrett M95 Scope Optical Glass Lens (M_M95_Sight)
+        float fresnel = pow(1.0 - max(dot(N, V), 0.0), 2.5);
+        float glint = pow(max(dot(N, H), 0.0), 96.0);
+        float2 centered = abs(fract(in.uv) - 0.5);
+        float crosshair = (min(centered.x, centered.y) < 0.006 && max(centered.x, centered.y) < 0.35) ? 0.18 : 0.0;
+        float3 glass_col = float3(0.05, 0.11, 0.17) + float3(0.32, 0.58, 0.88) * fresnel * 0.65 + float3(glint * 0.9) + float3(crosshair * 0.12);
+        return float4(glass_col, 1.0);
+    }
+
+    // Slot 4: Equipped Weapon High-Resolution Main Material (T_<Weapon>_D + T_<Weapon>_S + T_<Weapon>_N)
+    float3 d_raw = vm_wep_d_tex.sample(vm_sampler, in.uv).rgb;
+    float3 s_raw = vm_wep_s_tex.sample(vm_sampler, in.uv).rgb;
+    float3 n_ts  = vm_wep_n_tex.sample(vm_sampler, in.uv).rgb * 2.0 - 1.0;
+
+    // Screen-space cotangent normal map perturbation for crisp picatinny rails, grip checkering, screws & markings
+    float2 duv1 = dfdx(in.uv);
+    float2 duv2 = dfdy(in.uv);
+    float3 dp2perp = cross(dpdy, N);
+    float3 dp1perp = cross(N, dpdx);
+    float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+    float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-8);
+    N = normalize(N + (T * n_ts.x + B * n_ts.y) * (invmax * 0.65));
 
     float NdotL = max(dot(N, L), 0.0);
-    float3 H = normalize(L + V);
-    float spec = pow(max(dot(N, H), 0.0), 24.0) * 0.18;
-    float rim = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.12;
+    float sky_hemi = saturate(N.z * 0.5 + 0.5);
+    float side_fill = saturate(-N.x * 0.5 + 0.5);
 
-    float3 col = in.color.rgb * (0.48 + 0.52 * NdotL) + float3(spec + rim);
+    // Authentic UE3 M_Weapon_Master gunmetal + polymer shading with City of Glass sky reflection
+    float3 albedo = pow(max(d_raw, float3(0.0)), float3(0.82)) * 1.15 + s_raw * 0.18;
+    float3 hemi_light = float3(0.34, 0.37, 0.42) + float3(0.24, 0.32, 0.44) * sky_hemi + float3(0.10, 0.11, 0.13) * side_fill;
+    float3 sun_diff   = float3(0.68, 0.65, 0.60) * NdotL;
+
+    float spec_broad = pow(max(dot(N, H), 0.0), 16.0) * 0.45;
+    float spec_tight = pow(max(dot(N, H), 0.0), 64.0) * 0.60;
+    float fresnel    = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.26;
+    float3 spec_col  = s_raw * (spec_broad + spec_tight) + float3(0.68, 0.84, 1.0) * fresnel * (0.18 + s_raw * 0.85);
+
+    float3 col = albedo * (hemi_light + sun_diff) + spec_col;
     return float4(col, 1.0);
 }
 
@@ -1551,10 +1693,63 @@ struct MetalRenderer::Impl {
         scene_depth_copy = [device newTextureWithDescriptor:copyDepthDesc];
     }
 
+    struct WeaponGPUTextures {
+        id<MTLTexture> diffuse = nil;
+        id<MTLTexture> specular = nil;
+        id<MTLTexture> normal = nil;
+    };
+    id<MTLTexture> vm_skin_gpu_tex = nil;
+    id<MTLTexture> vm_glove_gpu_tex = nil;
+    id<MTLTexture> vm_lower_gpu_tex = nil;
+    id<MTLTexture> swat_d_gpu_tex = nil;
+    id<MTLTexture> ammo_d_gpu_tex = nil;
+    std::unordered_map<std::string, WeaponGPUTextures> weapon_gpu_textures;
+
+    id<MTLTexture> upload_dxt1_texture(const DXT1Texture& dxt) {
+        if (!dxt.is_valid()) return nil;
+        std::vector<uint8_t> rgba;
+        if (!dxt.decode_rgba8(rgba) || rgba.empty()) return nil;
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                        width:static_cast<NSUInteger>(dxt.width)
+                                                                                       height:static_cast<NSUInteger>(dxt.height)
+                                                                                    mipmapped:YES];
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModeShared;
+        id<MTLTexture> tex = [device newTextureWithDescriptor:desc];
+        if (!tex) return nil;
+        [tex replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(dxt.width), static_cast<NSUInteger>(dxt.height))
+               mipmapLevel:0
+                 withBytes:rgba.data()
+               bytesPerRow:static_cast<NSUInteger>(dxt.width) * 4];
+        if (dxt.width >= 4 && dxt.height >= 4) {
+            id<MTLCommandBuffer> cb = [command_queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit generateMipmapsForTexture:tex];
+            [blit endEncoding];
+            [cb commit];
+        }
+        return tex;
+    }
+
     // Real UE3 USkeletalMesh & TdAnimSet assets (CH_Faith_1P, KrugerSec/CPF SWAT, weapons) used for
     // the first-person viewmodel, enemies and dropped weapons.
     void load_character_assets() {
         anim_system.init_from_game_root("/Users/tomnom/mirrorsedge");
+        if (!anim_system.is_loaded()) return;
+
+        vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex());
+        vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex());
+        vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex());
+        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex());
+        ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex());
+
+        for (const auto& [wname, wmesh] : anim_system.weapon_meshes()) {
+            WeaponGPUTextures wtex{};
+            wtex.diffuse  = upload_dxt1_texture(wmesh.tex_diffuse);
+            wtex.specular = upload_dxt1_texture(wmesh.tex_specular);
+            wtex.normal   = upload_dxt1_texture(wmesh.tex_normal);
+            weapon_gpu_textures[wname] = wtex;
+        }
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
@@ -2519,6 +2714,27 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
 
+        auto bind_world_char_wep_textures = [&](const std::string& wname) {
+            id<MTLTexture> t_swat = impl_->swat_d_gpu_tex ? impl_->swat_d_gpu_tex : impl_->tex_default_white;
+            id<MTLTexture> t_wep_d = impl_->tex_default_white;
+            id<MTLTexture> t_wep_s = impl_->tex_default_black;
+            auto it_w = impl_->weapon_gpu_textures.find(wname);
+            if (it_w == impl_->weapon_gpu_textures.end() && !impl_->weapon_gpu_textures.empty()) {
+                it_w = impl_->weapon_gpu_textures.find("Colt1911");
+            }
+            if (it_w != impl_->weapon_gpu_textures.end()) {
+                if (it_w->second.diffuse)  t_wep_d = it_w->second.diffuse;
+                if (it_w->second.specular) t_wep_s = it_w->second.specular;
+            }
+            id<MTLTexture> t_ammo = impl_->ammo_d_gpu_tex ? impl_->ammo_d_gpu_tex : impl_->tex_default_white;
+            [enc setFragmentTexture:t_swat  atIndex:0];
+            [enc setFragmentTexture:t_wep_d atIndex:1];
+            [enc setFragmentTexture:t_wep_s atIndex:2];
+            [enc setFragmentTexture:t_ammo  atIndex:3];
+            [enc setFragmentSamplerState:impl_->mat_samplers[0][0] atIndex:0];
+        };
+        bind_world_char_wep_textures("Colt1911");
+
         // Binds mesh i's vertex buffer + frame uniforms (incl. its model matrix) on the current encoder.
         auto bind_scene_mesh = [&](size_t i) {
             uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
@@ -2542,6 +2758,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 if (mesh.sections.empty()) {
                     [enc setRenderPipelineState:impl_->world_pipeline];
                     [enc setCullMode:MTLCullModeNone];
+                    bind_world_char_wep_textures("Colt1911");
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
                     continue;
                 }
@@ -2571,6 +2788,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     } else {
                         [enc setRenderPipelineState:impl_->world_pipeline];
                         [enc setCullMode:MTLCullModeNone];
+                        bind_world_char_wep_textures("Colt1911");
                     }
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
                 }
@@ -2585,10 +2803,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
         [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+        bind_world_char_wep_textures("Colt1911");
         if (!impl_->menu_open && impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
             for (const auto& bot : active_scene.enemies) {
                 impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
                 if (impl_->enemy_guard_mesh.empty()) continue;
+                bind_world_char_wep_textures(bot.weapon_name);
                 bind_vertex_bytes_or_buffer(enc, impl_->enemy_guard_mesh.data(),
                                             impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
@@ -2605,6 +2825,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // B2a. Render 3D Dropped Weapons on Ground & 3D Bullet Tracers / Impact Sparks
         if (!impl_->menu_open && impl_->anim_system.is_loaded() &&
             (!active_scene.dropped_weapons.empty() || !active_scene.active_tracers.empty())) {
+            std::string pickup_wname = !active_scene.dropped_weapons.empty()
+                                           ? active_scene.dropped_weapons.front().weapon_name
+                                           : "Colt1911";
+            bind_world_char_wep_textures(pickup_wname);
             std::vector<Vertex> combat_fx_verts;
             std::vector<Vertex> combat_rv_verts;
             impl_->anim_system.evaluate_combat_world_fx(active_scene, telemetry.sim_time, combat_fx_verts, combat_rv_verts);
@@ -2693,6 +2917,32 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 uniforms.camera_pos = simd_make_float3(0.0f, 0.0f, 0.0f);
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
+
+                id<MTLTexture> t_skin  = impl_->vm_skin_gpu_tex  ? impl_->vm_skin_gpu_tex  : impl_->tex_default_white;
+                id<MTLTexture> t_glove = impl_->vm_glove_gpu_tex ? impl_->vm_glove_gpu_tex : impl_->tex_default_white;
+                id<MTLTexture> t_lower = impl_->vm_lower_gpu_tex ? impl_->vm_lower_gpu_tex : impl_->tex_default_white;
+                id<MTLTexture> t_wep_d = impl_->tex_default_white;
+                id<MTLTexture> t_wep_s = impl_->tex_default_black;
+                id<MTLTexture> t_wep_n = impl_->tex_default_flat_normal;
+                auto it_w = impl_->weapon_gpu_textures.find(telemetry.weapon.name);
+                if (it_w == impl_->weapon_gpu_textures.end() && !impl_->weapon_gpu_textures.empty()) {
+                    it_w = impl_->weapon_gpu_textures.find("Colt1911");
+                }
+                if (it_w != impl_->weapon_gpu_textures.end()) {
+                    if (it_w->second.diffuse)  t_wep_d = it_w->second.diffuse;
+                    if (it_w->second.specular) t_wep_s = it_w->second.specular;
+                    if (it_w->second.normal)   t_wep_n = it_w->second.normal;
+                }
+                id<MTLTexture> t_ammo = impl_->ammo_d_gpu_tex ? impl_->ammo_d_gpu_tex : impl_->tex_default_white;
+
+                [enc setFragmentTexture:t_skin  atIndex:0];
+                [enc setFragmentTexture:t_glove atIndex:1];
+                [enc setFragmentTexture:t_lower atIndex:2];
+                [enc setFragmentTexture:t_wep_d atIndex:3];
+                [enc setFragmentTexture:t_wep_s atIndex:4];
+                [enc setFragmentTexture:t_wep_n atIndex:5];
+                [enc setFragmentTexture:t_ammo  atIndex:6];
+                [enc setFragmentSamplerState:impl_->mat_samplers[0][0] atIndex:0];
 
                 bind_vertex_bytes_or_buffer(enc, impl_->faith_viewmodel_mesh.data(),
                                             impl_->faith_viewmodel_mesh.size() * sizeof(Vertex), 0);
