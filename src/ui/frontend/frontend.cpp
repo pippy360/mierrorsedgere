@@ -23,14 +23,6 @@ constexpr float kSceneHeight = 720.0f;
 
 constexpr float kPi = 3.14159265358979f;
 
-// A UI colour as the canvas writes it (see frontend.hpp, canvas_encode).
-void ui_color(float r, float g, float b, float a, float out[4]) {
-    out[0] = canvas_encode(r);
-    out[1] = canvas_encode(g);
-    out[2] = canvas_encode(b);
-    out[3] = a;
-}
-
 // "<StringAliasMap:Conditional1>QUIT GAME" -> "QUIT GAME": the alias is a gamepad glyph, empty on PC.
 std::string strip_markup(const std::string& s) {
     std::string out;
@@ -90,6 +82,14 @@ constexpr float kShadowRGB[3] = {0.0f, 0.07806f, 0.22714f};  // every drop-shado
 constexpr float kNavyRGB[3] = {0.0f, 0.00369724f, 0.0277553f};  // TdLabelText_CommonText
 
 }  // namespace
+
+// A UI colour as the canvas writes it (see frontend.hpp, canvas_encode).
+void Frontend::ui_color(float r, float g, float b, float a, float out[4]) const {
+    out[0] = canvas_encode(r, gamma());
+    out[1] = canvas_encode(g, gamma());
+    out[2] = canvas_encode(b, gamma());
+    out[3] = a;
+}
 
 bool Frontend::init(const std::string& game_root, int width, int height, std::string& error) {
     width_ = std::max(width, 16);
@@ -452,8 +452,9 @@ void Frontend::draw_start(Frame& f) const {
     assets_.start_rect("ContentPanel", panel);
     (void)panel;
 
-    // The scene opens at Opacity 0 and comes up with the level's own fade from white.
-    const float opacity = std::clamp(1.0f - white_, 0.0f, 1.0f);
+    // SceneActivated sets Opacity to 0 and the scene's native tick brings it up. Measured on
+    // retail: nothing for the first second, then a linear second to full.
+    const float opacity = std::clamp(time_in_scene_ - 1.0f, 0.0f, 1.0f);
     if (opacity <= 0.0f) return;
 
     // TitleImage: ADJUST_Justified on both axes scales the texture to fit the widget, keeping its
@@ -617,6 +618,7 @@ const Frame& Frontend::frame() {
     f.height = height_;
     f.time = time_;
     f.white = white_;
+    f.display_gamma = gamma();
     f.ui.clear();
     if (matinee_) {
         f.camera = matinee_->camera.eval(matinee_time_);

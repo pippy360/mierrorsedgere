@@ -1181,6 +1181,12 @@ struct MetalRenderer::Impl {
     id<MTLTexture> bink_video_tex = nil;
     uint64_t bink_uploaded_serial = 0;
 
+    // The CPU-rendered front end frame (set_frontend_frame), uploaded every frame it is set.
+    const uint8_t* frontend_rgba = nullptr;
+    int frontend_w = 0;
+    int frontend_h = 0;
+    id<MTLTexture> frontend_tex = nil;
+
     // Cached GPU Vertex Buffers & Per-Section Material/Shadow Metadata for Scene Meshes
     std::string cached_map_name;
     size_t cached_total_verts = 0;
@@ -3344,7 +3350,65 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // Pass 3: 2D HUD, Cutscene Video/Letterbox Overlay & Frontend UI
         // ---------------------------------------------------------------------
         simd_float2 screen_size = simd_make_float2(float(impl_->width), float(impl_->height));
-        if (impl_->menu_open) {
+        if (impl_->frontend_rgba != nullptr && impl_->frontend_w > 0 && impl_->frontend_h > 0 && impl_->ui_tex_pipeline) {
+            // The front end: one CPU-rendered frame over everything, the same way a Bink frame is shown.
+            const int fw = impl_->frontend_w;
+            const int fh = impl_->frontend_h;
+            if (!impl_->frontend_tex ||
+                (int)impl_->frontend_tex.width != fw ||
+                (int)impl_->frontend_tex.height != fh) {
+                // Not an sRGB texture: the frame is display values already, and this pass writes
+                // straight to an RGBA8Unorm target, as the other UI textures do.
+                MTLTextureDescriptor* td = [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                 width:fw
+                                                height:fh
+                                             mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                td.storageMode = MTLStorageModeShared;
+                impl_->frontend_tex = [impl_->device newTextureWithDescriptor:td];
+            }
+            if (impl_->frontend_tex) {
+                [impl_->frontend_tex replaceRegion:MTLRegionMake2D(0, 0, fw, fh)
+                                       mipmapLevel:0
+                                         withBytes:impl_->frontend_rgba
+                                       bytesPerRow:fw * 4];
+
+                float w = float(impl_->width);
+                float h = float(impl_->height);
+                std::vector<HUDVertex> black_bg;
+                impl_->draw_ui_quad(black_bg, 0.0f, 0.0f, w, h, simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+                [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                bind_vertex_bytes_or_buffer(postEnc, black_bg.data(), black_bg.size() * sizeof(HUDVertex), 0);
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:black_bg.size()];
+
+                float src_aspect = float(fw) / float(fh);
+                float scr_aspect = w / h;
+                float draw_w = w, draw_h = h, draw_x = 0.0f, draw_y = 0.0f;
+                if (scr_aspect > src_aspect) {
+                    draw_w = h * src_aspect;
+                    draw_x = (w - draw_w) * 0.5f;
+                } else {
+                    draw_h = w / src_aspect;
+                    draw_y = (h - draw_h) * 0.5f;
+                }
+
+                simd_float4 white = simd_make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+                UITexVertex v0{{draw_x, draw_y}, {0.0f, 0.0f}, white};
+                UITexVertex v1{{draw_x + draw_w, draw_y}, {1.0f, 0.0f}, white};
+                UITexVertex v2{{draw_x + draw_w, draw_y + draw_h}, {1.0f, 1.0f}, white};
+                UITexVertex v3{{draw_x, draw_y + draw_h}, {0.0f, 1.0f}, white};
+                std::vector<UITexVertex> qv = {v0, v1, v2, v0, v2, v3};
+
+                [postEnc setRenderPipelineState:impl_->ui_tex_pipeline];
+                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+                [postEnc setFragmentTexture:impl_->frontend_tex atIndex:0];
+                bind_vertex_bytes_or_buffer(postEnc, qv.data(), qv.size() * sizeof(UITexVertex), 0);
+                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:qv.size()];
+            }
+        } else if (impl_->menu_open) {
             std::vector<HUDVertex> bg_verts;
             std::vector<MetalRenderer::Impl::UITextureBatch> tex_batches;
             std::vector<HUDVertex> fg_verts;
@@ -3638,6 +3702,12 @@ void MetalRenderer::set_menu_options_state(int sens_pct, int fov_deg, bool fulls
     impl_->opt_fullscreen = fullscreen;
 }
 void MetalRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
+
+void MetalRenderer::set_frontend_frame(const uint8_t* rgba, int width, int height) {
+    impl_->frontend_rgba = rgba;
+    impl_->frontend_w = rgba ? width : 0;
+    impl_->frontend_h = rgba ? height : 0;
+}
 
 void* MetalRenderer::raw_device() const { return (__bridge void*)impl_->device; }
 void* MetalRenderer::raw_command_queue() const { return (__bridge void*)impl_->command_queue; }

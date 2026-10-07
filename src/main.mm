@@ -13,8 +13,11 @@
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
 #include "renderer/metal_renderer.hpp"
+#include "ui/frontend/frontend.hpp"
+#include "ui/frontend/soft_render.hpp"
 
 #include <iostream>
+#include <memory>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -1205,6 +1208,37 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     set_menu_active(start_in_main_menu);
     ensure_dir("screenshots");
 
+    // The front end: "Press Any Key", then the main menu, as retail has them
+    // (docs/MAIN_MENU_SYSTEM_RE.md). me::fe::Frontend is the state machine and
+    // me::fe::SoftRenderer draws its frames on the CPU, at the 1280x720 the scenes were authored
+    // for; the Metal renderer shows the result full screen. The chapter-select overlay above stays
+    // as the screen PLAY CHAPTER and the not-yet-built sub-menus open.
+    constexpr int kFrontendW = 1280;
+    constexpr int kFrontendH = 720;
+    std::unique_ptr<fe::Frontend> frontend;
+    std::unique_ptr<fe::SoftRenderer> frontend_renderer;
+    std::vector<uint8_t> frontend_rgba;
+    bool frontend_active = false;
+    if (start_in_main_menu) {
+        frontend = std::make_unique<fe::Frontend>();
+        std::string frontend_error;
+        if (frontend->init(game_root, kFrontendW, kFrontendH, frontend_error)) {
+            frontend_renderer = std::make_unique<fe::SoftRenderer>(frontend->assets());
+            frontend_active = true;
+            renderer.set_menu_open(false);
+            audio.set_menu_music(true);
+            SDL_SetRelativeMouseMode(SDL_FALSE);
+            SDL_ShowCursor(SDL_ENABLE);
+        } else {
+            std::cerr << "[Frontend] " << frontend_error << " - falling back to the chapter-select overlay." << std::endl;
+            frontend.reset();
+        }
+    }
+    auto leave_frontend = [&]() {
+        frontend_active = false;
+        renderer.set_frontend_frame(nullptr, 0, 0);
+    };
+
     // Interactive Loop
     bool running = true;
     int frame_counter = 0;
@@ -1248,6 +1282,112 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         float dt = std::chrono::duration<float>(now - last_time).count();
         last_time = now;
         if (dt > 0.1f) dt = 0.1f; // clamp hitch spikes
+
+        // While the front end is up it owns the frame: its own events, update and picture.
+        if (frontend_active) {
+            SDL_Event fev;
+            while (SDL_PollEvent(&fev)) {
+                if (fev.type == SDL_QUIT) {
+                    running = false;
+                } else if (fev.type == SDL_WINDOWEVENT) {
+                    if (fev.window.event == SDL_WINDOWEVENT_RESIZED || fev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                        SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+                        renderer.resize(drawable_w, drawable_h);
+                    }
+                } else if ((fev.type == SDL_KEYDOWN && fev.key.repeat == 0) || fev.type == SDL_KEYUP) {
+                    fe::Key key = fe::Key::Other;
+                    switch (fev.key.keysym.sym) {
+                        case SDLK_LEFT:     key = fe::Key::Left; break;
+                        case SDLK_RIGHT:    key = fe::Key::Right; break;
+                        case SDLK_UP:       key = fe::Key::Up; break;
+                        case SDLK_DOWN:     key = fe::Key::Down; break;
+                        case SDLK_RETURN:
+                        case SDLK_KP_ENTER:
+                        case SDLK_SPACE:    key = fe::Key::Accept; break;
+                        case SDLK_ESCAPE:   key = fe::Key::Escape; break;
+                        default: break;
+                    }
+                    if (fev.type == SDL_KEYDOWN) frontend->key_down(key);
+                    else frontend->key_up(key);
+                } else if (fev.type == SDL_CONTROLLERBUTTONDOWN || fev.type == SDL_CONTROLLERBUTTONUP) {
+                    fe::Key key = fe::Key::Other;
+                    switch (fev.cbutton.button) {
+                        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  key = fe::Key::Left; break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: key = fe::Key::Right; break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_UP:    key = fe::Key::Up; break;
+                        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  key = fe::Key::Down; break;
+                        case SDL_CONTROLLER_BUTTON_A:
+                        case SDL_CONTROLLER_BUTTON_START:      key = fe::Key::Accept; break;
+                        default: break;
+                    }
+                    if (fev.type == SDL_CONTROLLERBUTTONDOWN) frontend->key_down(key);
+                    else frontend->key_up(key);
+                } else if (fev.type == SDL_MOUSEMOTION ||
+                           (fev.type == SDL_MOUSEBUTTONDOWN && fev.button.button == SDL_BUTTON_LEFT)) {
+                    // Window points to the front end's frame, which is aspect-fitted in the window.
+                    SDL_GetWindowSize(window, &win_w, &win_h);
+                    const float fit = std::min(static_cast<float>(std::max(1, win_w)) / static_cast<float>(kFrontendW),
+                                               static_cast<float>(std::max(1, win_h)) / static_cast<float>(kFrontendH));
+                    const float off_x = (static_cast<float>(win_w) - static_cast<float>(kFrontendW) * fit) * 0.5f;
+                    const float off_y = (static_cast<float>(win_h) - static_cast<float>(kFrontendH) * fit) * 0.5f;
+                    const bool motion = fev.type == SDL_MOUSEMOTION;
+                    const float fx = (static_cast<float>(motion ? fev.motion.x : fev.button.x) - off_x) / fit;
+                    const float fy = (static_cast<float>(motion ? fev.motion.y : fev.button.y) - off_y) / fit;
+                    if (motion) frontend->mouse_move(fx, fy);
+                    else frontend->mouse_click(fx, fy);
+                }
+            }
+
+            frontend->update(dt);
+            for (const std::string& cue : frontend->take_sounds()) {
+                // The skin's UI sound cues, all in Audio/A_HUD.upk.
+                if (cue == "Music") audio.set_menu_music(true);
+                else if (cue == "TabChangeRight" || cue == "TabChangeLeft") audio.play_sound("Tab_Change");
+                else if (cue == "NavigateUp" || cue == "NavigateDown") audio.play_sound("D-Pad");
+                else if (cue == "Accept") audio.play_sound("A_Pos");
+            }
+
+            const std::string action = frontend->take_action();
+            if (action == "Quit") {
+                running = false;
+            } else if (action == "LoadGameButton") {
+                // CONTINUE GAME: the chapter loaded at start-up.
+                leave_frontend();
+                set_menu_active(false);
+            } else if (action == "NewGameButton") {
+                // NEW GAME: the Prologue, with its opening.
+                leave_frontend();
+                set_menu_active(false);
+                current_chapter_idx = 1;
+                renderer.set_selected_chapter(current_chapter_idx);
+                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+            } else if (!action.empty() && action != "Friends") {
+                // PLAY CHAPTER, and the sub-menus that are not built yet: the chapter-select overlay,
+                // on the tab that matches the column.
+                int tab = 0;
+                if (action == "LevelRaceButton" || action == "TimeTrialOnlineButton" || action == "LeaderboardsButton") tab = 1;
+                else if (action == "GamepadButton" || action == "VideoButton" || action == "AudioButton" ||
+                         action == "ControlsButton" || action == "GameSettingsButton") tab = 2;
+                else if (action == "UnlocksButton" || action == "CreditsButton") tab = 3;
+                leave_frontend();
+                renderer.set_selected_menu_tab(tab);
+                set_menu_active(true);
+            }
+
+            if (frontend_active) {
+                frontend_renderer->render(frontend->frame(), frontend_rgba);
+                renderer.set_frontend_frame(frontend_rgba.data(), kFrontendW, kFrontendH);
+            }
+            audio.update(dt, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), 0.0f, false);
+            renderer.render_frame(active_scene, controller.get_telemetry());
+
+            ++frame_counter;
+            if (max_frames > 0 && frame_counter >= max_frames) {
+                std::cout << "[Game] Reached max-frames limit (" << max_frames << "). Exiting cleanly." << std::endl;
+                running = false;
+            }
+            continue;
+        }
 
         InputFrame input{};
         // By default sprint is active for momentum acceleration matching retail Mirror's Edge

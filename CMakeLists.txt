@@ -77,6 +77,7 @@ set(SOURCES
     src/audio/audio_engine.cpp
     src/cutscene/cutscene_player.cpp
     src/ui/main_menu.cpp
+    ${FRONTEND_SOURCES}
     src/renderer/metal_renderer.mm
 )
 

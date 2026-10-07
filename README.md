@@ -159,7 +159,7 @@ python -m tools.retail.replay --trace build/retail/trials/<stamp>_myrun.jsonl
 
 ## The Front End, Headless
 
-`src/ui/frontend/` is the "Press Any Key" screen and the main menu, reverse engineered from the retail scenes, scripts, materials and menu level ([`docs/MAIN_MENU_SYSTEM_RE.md`](docs/MAIN_MENU_SYSTEM_RE.md)): a state machine that produces a camera and a 2D draw list, and a CPU reference renderer for it. `me_menu` runs it from a script and writes PNGs, on macOS or Windows, so its frames can be put next to retail's:
+`src/ui/frontend/` is the "Press Any Key" screen and the main menu, reverse engineered from the retail scenes, scripts, materials and menu level ([`docs/MAIN_MENU_SYSTEM_RE.md`](docs/MAIN_MENU_SYSTEM_RE.md)): a state machine that produces a camera and a 2D draw list, and a CPU reference renderer for it. The app boots into it. `me_menu` runs the same code from a script and writes PNGs, on macOS or Windows, so its frames can be put next to retail's:
 
 ```bash
 cmake --build build --target me_menu
@@ -167,6 +167,7 @@ cmake --build build --target me_menu
 python -m tools.retail.side_by_side retail.png shots/story.png side_by_side.png
 ```
 
+![Press Any Key, retail and port](screenshots/menu/press_any_key.png)
 ![Main menu, retail and port](screenshots/menu/main_menu_story.png)
 
 ---
