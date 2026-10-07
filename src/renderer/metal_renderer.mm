@@ -2335,6 +2335,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     return true;
                 }
             }
+            if (mb.barge_door >= 0 && static_cast<size_t>(mb.barge_door) < active_scene.barge_doors.size()) {
+                const Mat4& door_model = active_scene.barge_doors[static_cast<size_t>(mb.barge_door)].model_matrix;
+                std::memcpy(&uniforms.model, door_model.m, sizeof(float) * 16);
+                return true;
+            }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
             return false;
         };

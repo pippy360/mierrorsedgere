@@ -72,6 +72,7 @@ private:
     void update_health_and_regen(float dt);
     void update_checkpoints_and_volumes(LevelScene& scene);
     void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
+    void update_barge_doors(const InputFrame& input, float dt, LevelScene& scene);
 
     // Collision Detection and Swept Physics. TdPawn's cylinder is Radius=30, CollisionHeight=90
     // (a half-height: the pawn is 180 tall, 122 when crouched / sliding / coiled). UE3 PHYS_Walking

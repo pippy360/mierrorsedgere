@@ -356,6 +356,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             if (m_illegal_wall_timer <= 0.0f) m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
         }
 
+        // Step hinged bargeable doors (TdMove_Barge + InterpActor hinge rotation)
+        update_barge_doors(input, step_dt, scene);
+
         // Step interactive elevators (InterpActor + InterpTrackMove) and carry player with cab_delta
         update_elevators(input, step_dt, scene);
 
@@ -709,6 +712,13 @@ ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& caps
             consider(part.collision->sweep_box(centre - part.offset, delta, extent, COLL_BlockNonZeroExtent), part.offset);
         }
     }
+    for (const auto& door : scene.barge_doors) {
+        if (door.state != DoorState::Closed) continue;
+        for (const auto& part : door.parts) {
+            if (!part.collision) continue;
+            consider(part.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
+        }
+    }
     return best;
 }
 
@@ -733,6 +743,13 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
         for (const auto& part : elev.parts) {
             if (!part.collision) continue;
             consider(part.collision->line_check(start - part.offset, end - part.offset, channels), part.offset);
+        }
+    }
+    for (const auto& door : scene.barge_doors) {
+        if (door.state != DoorState::Closed) continue;
+        for (const auto& part : door.parts) {
+            if (!part.collision) continue;
+            consider(part.collision->line_check(start, end, channels), Vec3(0.0f, 0.0f, 0.0f));
         }
     }
     return best;
@@ -774,6 +791,14 @@ bool ParkourController::box_free(const Vec3& centre, const Vec3& extent, const L
             }
         }
     }
+    for (const auto& door : scene.barge_doors) {
+        if (door.state != DoorState::Closed) continue;
+        for (const auto& part : door.parts) {
+            if (part.collision && part.collision->overlap_box(centre, extent, COLL_BlockNonZeroExtent)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -796,6 +821,13 @@ ParkourController::TraceHit ParkourController::sweep_box(const Vec3& centre, con
         for (const auto& part : elev.parts) {
             if (!part.collision) continue;
             consider(part.collision->sweep_box(centre - part.offset, delta, extent, COLL_BlockNonZeroExtent), part.offset);
+        }
+    }
+    for (const auto& door : scene.barge_doors) {
+        if (door.state != DoorState::Closed) continue;
+        for (const auto& part : door.parts) {
+            if (!part.collision) continue;
+            consider(part.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
         }
     }
     return best;
@@ -3442,6 +3474,124 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
     }
 
     m_telemetry.streamed_sublevel_count = static_cast<int>(scene.loaded_sublevel_packages.size());
+}
+
+void ParkourController::update_barge_doors(const InputFrame& input, float dt, LevelScene& scene) {
+    if (scene.barge_doors.empty()) return;
+
+    const Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
+    const Vec3 vel_2d(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f);
+    const Vec3 vel_dir = (vel_2d.length_sq() > 1e-4f) ? vel_2d.normalized() : fwd;
+
+    for (size_t i = 0; i < scene.barge_doors.size(); ++i) {
+        BargeDoorInstance& door = scene.barge_doors[i];
+
+        if (door.state == DoorState::Closed) {
+            const float pz = m_telemetry.position.z;
+            const bool z_overlap = (pz + 180.0f >= door.closed_bounds.min_pt.z - 20.0f) &&
+                                   (pz <= door.closed_bounds.max_pt.z + 20.0f);
+            if (z_overlap) {
+                const float cx = std::clamp(m_telemetry.position.x, door.closed_bounds.min_pt.x, door.closed_bounds.max_pt.x);
+                const float cy = std::clamp(m_telemetry.position.y, door.closed_bounds.min_pt.y, door.closed_bounds.max_pt.y);
+                const float dx = cx - m_telemetry.position.x;
+                const float dy = cy - m_telemetry.position.y;
+                const float horiz_dist = std::sqrt(dx * dx + dy * dy);
+
+                Vec3 to_door(door.center_pos.x - m_telemetry.position.x,
+                             door.center_pos.y - m_telemetry.position.y, 0.0f);
+                if (to_door.length_sq() > 1e-4f) to_door = to_door.normalized();
+                else to_door = fwd;
+
+                const float auto_barge_range = std::max(105.0f, m_telemetry.speed_2d * 0.35f);
+                const float melee_barge_range = std::max(150.0f, m_telemetry.speed_2d * 0.50f);
+
+                const bool trigger_auto_barge =
+                    (m_telemetry.speed_2d >= 200.0f && horiz_dist <= auto_barge_range &&
+                     (vel_dir.dot(to_door) > 0.20f || fwd.dot(to_door) > 0.25f));
+                const bool trigger_melee_barge =
+                    (input.melee && horiz_dist <= melee_barge_range && fwd.dot(to_door) > 0.05f);
+                const bool trigger_interact =
+                    (input.use && horiz_dist <= 165.0f && fwd.dot(to_door) >= 0.0f);
+
+                if (trigger_auto_barge || trigger_melee_barge || trigger_interact) {
+                    const bool is_barge = (trigger_auto_barge || trigger_melee_barge);
+                    Vec3 arm(door.center_pos.x - door.hinge_pos.x, door.center_pos.y - door.hinge_pos.y, 0.0f);
+                    if (arm.length_sq() < 1e-3f) arm = Vec3(1.0f, 0.0f, 0.0f);
+                    const Vec3 tangent_pos(-arm.y, arm.x, 0.0f); // Direction leaf moves when +dtheta > 0
+                    const Vec3 push_dir = (m_telemetry.speed_2d > 80.0f) ? vel_dir : fwd;
+                    const float sign = (push_dir.dot(tangent_pos) >= 0.0f) ? 1.0f : -1.0f;
+
+                    door.target_angle_rad = sign * 1.66f; // ~95 deg wide open away from player
+                    door.state = DoorState::Opening;
+                    door.hold_timer = 8.0f;
+                    door.barged = is_barge;
+
+                    if (is_barge) {
+                        door.open_speed = 12.0f; // High-impact shoulder/kick slam
+                        m_telemetry.move_state = EMovement::MOVE_Barge;
+                        m_state_timer = 0.0f;
+                        m_telemetry.combat_anim_time = 0.0f;
+                        m_telemetry.combat_anim_duration = 0.45f;
+                        m_melee_cooldown = 0.45f;
+                        const float boosted = std::clamp(m_telemetry.speed_2d + 200.0f, 380.0f, 540.0f);
+                        m_telemetry.velocity.x = push_dir.x * boosted;
+                        m_telemetry.velocity.y = push_dir.y * boosted;
+                        m_telemetry.speed_2d = boosted;
+                    } else {
+                        door.open_speed = 4.2f; // Smooth manual open
+                    }
+                }
+            }
+        }
+
+        if (door.state == DoorState::Opening) {
+            const float diff = door.target_angle_rad - door.open_angle_rad;
+            const float step = door.open_speed * dt;
+            if (std::abs(diff) <= step) {
+                door.open_angle_rad = door.target_angle_rad;
+                door.state = DoorState::Open;
+            } else {
+                door.open_angle_rad += (diff >= 0.0f ? step : -step);
+            }
+        } else if (door.state == DoorState::Open) {
+            door.hold_timer -= dt;
+            if (door.hold_timer <= 0.0f) {
+                const float dx = m_telemetry.position.x - door.center_pos.x;
+                const float dy = m_telemetry.position.y - door.center_pos.y;
+                if (dx * dx + dy * dy > 220.0f * 220.0f) {
+                    door.state = DoorState::Closing;
+                } else {
+                    door.hold_timer = 2.0f;
+                }
+            }
+        } else if (door.state == DoorState::Closing) {
+            const float step = 2.2f * dt;
+            if (std::abs(door.open_angle_rad) <= step) {
+                door.open_angle_rad = 0.0f;
+                door.state = DoorState::Closed;
+            } else {
+                door.open_angle_rad += (door.open_angle_rad >= 0.0f ? -step : step);
+            }
+        }
+
+        // Update world-space hinge rotation matrix: M = T(hinge) * Rz(open_angle_rad) * T(-hinge)
+        if (std::abs(door.open_angle_rad) > 1e-5f) {
+            const float c = std::cos(door.open_angle_rad);
+            const float s = std::sin(door.open_angle_rad);
+            const float hx = door.hinge_pos.x;
+            const float hy = door.hinge_pos.y;
+            Mat4 m = Mat4::identity();
+            m.m[0]  = c;
+            m.m[1]  = s;
+            m.m[4]  = -s;
+            m.m[5]  = c;
+            m.m[12] = hx - c * hx + s * hy;
+            m.m[13] = hy - s * hx - c * hy;
+            door.model_matrix = m;
+        } else {
+            door.model_matrix = Mat4::identity();
+        }
+    }
 }
 
 } // namespace me

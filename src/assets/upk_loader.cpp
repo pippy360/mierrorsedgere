@@ -2877,7 +2877,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
     for (size_t i = 0; i < actors.size(); ++i) {
         LevelActor& a = actors[i];
         if (std::abs(a.location.x) > 150000.0f || std::abs(a.location.y) > 150000.0f) continue;
-        if (a.elevator >= 0) continue;  // moving InterpActor: see build_elevator_part_geometry()
+        if (a.elevator >= 0 || a.barge_door >= 0) continue;  // moving InterpActor / door: built dynamically
 
         const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
         if (!a.mesh_name.empty() && !sm) {
@@ -3087,6 +3087,163 @@ void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<st
             a.world_bounds = box;
             part.mesh_index = static_cast<int32_t>(scene.meshes.size());
             scene.meshes.push_back(std::move(mb));
+        }
+    }
+}
+
+void assign_barge_doors(LevelScene& scene) {
+    auto& actors = scene.actors;
+    auto is_hinged_door_leaf = [](const LevelActor& a) -> bool {
+        if (a.elevator >= 0 || a.is_elevator_part) return false;
+        const std::string low_mesh = to_lower(a.mesh_name);
+        const std::string low_obj = to_lower(a.object_name);
+        const std::string low_cls = to_lower(a.class_name);
+        // Exclude sliding elevator doors, locked decorative doors, door frames, and doorway closer mechanisms
+        if (low_mesh.find("elevatordoor") != std::string::npos ||
+            low_mesh.find("doorlocked") != std::string::npos ||
+            low_mesh.find("doorstorefront") != std::string::npos ||
+            low_mesh.find("doorrollup") != std::string::npos ||
+            low_mesh.find("outerframe") != std::string::npos ||
+            low_mesh.find("policecar") != std::string::npos ||
+            low_mesh.find("doorclosingmech") != std::string::npos) {
+            return false;
+        }
+        if (low_mesh.find("barge") != std::string::npos || low_obj.find("barge") != std::string::npos) return true;
+        if (low_mesh.find("maintenancedoor") != std::string::npos) return true;
+        if (low_mesh.find("sp01_door") != std::string::npos) return true;
+        if (low_mesh.find("stormdraindoor") != std::string::npos) return true;
+        if (low_mesh.find("officedoorglass") != std::string::npos || low_obj.find("officedoorglass") != std::string::npos) return true;
+        if (low_mesh.find("onewaydoor") != std::string::npos || low_obj.find("onewaydoor") != std::string::npos) return true;
+        if (low_cls == "interpactor" && low_mesh.find("door") != std::string::npos) return true;
+        return false;
+    };
+
+    for (size_t i = 0; i < actors.size(); ++i) {
+        LevelActor& a = actors[i];
+        if (!is_hinged_door_leaf(a) || a.barge_door >= 0) continue;
+
+        // Deduplicate identical hinged doors across streaming packages
+        int32_t d_idx = -1;
+        for (size_t k = 0; k < scene.barge_doors.size(); ++k) {
+            if ((scene.barge_doors[k].hinge_pos - a.location).length() < 8.0f) {
+                d_idx = static_cast<int32_t>(k);
+                break;
+            }
+        }
+        if (d_idx < 0) {
+            BargeDoorInstance d;
+            d.name = a.source_package + ":" + a.unique_name;
+            d.source_package = a.source_package;
+            d.hinge_pos = a.location;
+            d.center_pos = a.location;
+            d_idx = static_cast<int32_t>(scene.barge_doors.size());
+            scene.barge_doors.push_back(std::move(d));
+        }
+
+        if (to_lower(a.mesh_name).find("barge") != std::string::npos) {
+            a.is_runner_vision = true;
+        }
+        a.barge_door = d_idx;
+        DoorPart part;
+        part.actor_name = a.unique_name;
+        part.actor_index = static_cast<int32_t>(i);
+        part.is_blocker_only = false;
+        scene.barge_doors[d_idx].parts.push_back(std::move(part));
+    }
+
+    // Attach hard-attached closer hardware (S_DoorClosingMech_01) and hidden doorway trigger slabs (S_DoorClosingMech_02)
+    for (size_t i = 0; i < actors.size(); ++i) {
+        LevelActor& a = actors[i];
+        if (a.elevator >= 0 || a.barge_door >= 0) continue;
+        const std::string low_mesh = to_lower(a.mesh_name);
+        const bool is_closer_bar = (low_mesh.find("doorclosingmech_01") != std::string::npos);
+        const bool is_blocker_slab = (low_mesh.find("doorclosingmech_02") != std::string::npos);
+        if (!is_closer_bar && !is_blocker_slab && a.base_name.empty()) continue;
+
+        for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
+            BargeDoorInstance& door = scene.barge_doors[d];
+            bool match = false;
+            if (!a.base_name.empty()) {
+                for (const auto& p : door.parts) {
+                    if (!p.is_blocker_only && p.actor_name == a.base_name &&
+                        scene.actors[p.actor_index].source_package == a.source_package) {
+                        match = true;
+                        break;
+                    }
+                }
+            }
+            if (!match && (is_closer_bar || is_blocker_slab)) {
+                const float dx = a.location.x - door.hinge_pos.x;
+                const float dy = a.location.y - door.hinge_pos.y;
+                const float dz = std::abs(a.location.z - door.hinge_pos.z);
+                if (std::sqrt(dx * dx + dy * dy) < 200.0f && dz < 320.0f) {
+                    match = true;
+                }
+            }
+            if (match) {
+                a.barge_door = static_cast<int32_t>(d);
+                DoorPart part;
+                part.actor_name = a.unique_name;
+                part.actor_index = static_cast<int32_t>(i);
+                part.is_blocker_only = is_blocker_slab || a.is_hidden;
+                door.parts.push_back(std::move(part));
+                break;
+            }
+        }
+    }
+}
+
+void build_barge_door_geometry(LevelScene& scene, const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
+                               std::vector<std::string>* material_paths) {
+    MeshEmitter emitter(material_paths);
+    for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
+        BargeDoorInstance& door = scene.barge_doors[d];
+        AABB leaf_bounds(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+        bool has_leaf_bounds = false;
+
+        for (size_t p = 0; p < door.parts.size(); ++p) {
+            DoorPart& part = door.parts[p];
+            LevelActor& a = scene.actors[part.actor_index];
+            const StaticMeshAsset* sm = find_mesh(mesh_lib, a.mesh_name);
+            auto cw = std::make_shared<CollisionWorld>();
+            append_actor_collision(a, part.actor_index, sm, *cw);
+            cw->build();
+            if (!cw->empty()) part.collision = std::move(cw);
+            if (!sm) continue;
+
+            AABB box = transformed_mesh_bounds(a, *sm);
+            a.world_bounds = box;
+            if (!part.is_blocker_only && valid_box(box)) {
+                leaf_bounds.expand(box.min_pt);
+                leaf_bounds.expand(box.max_pt);
+                has_leaf_bounds = true;
+            }
+
+            if (a.is_hidden || sm->triangles.empty()) continue;
+
+            MeshBuffer mb;
+            mb.name = "UE3_Door_" + a.source_package + "_" + a.unique_name;
+            mb.is_runner_vision = a.is_runner_vision;
+            mb.barge_door = static_cast<int32_t>(d);
+            std::map<int32_t, std::vector<Vertex>> bins;
+            const AABB emitted_box = emitter.emit(a, *sm, bins, mb.vertices);
+            if (emitter.use_materials()) MeshEmitter::flush(mb, bins);
+            if (mb.vertices.empty()) continue;
+            mb.bounds = emitted_box;
+            a.world_bounds = emitted_box;
+            part.mesh_index = static_cast<int32_t>(scene.meshes.size());
+            scene.meshes.push_back(std::move(mb));
+        }
+
+        if (has_leaf_bounds) {
+            door.center_pos = leaf_bounds.center();
+            leaf_bounds.min_pt -= Vec3(24.0f, 24.0f, 16.0f);
+            leaf_bounds.max_pt += Vec3(24.0f, 24.0f, 16.0f);
+            door.closed_bounds = leaf_bounds;
+        } else {
+            door.center_pos = door.hinge_pos + Vec3(0.0f, 0.0f, 100.0f);
+            door.closed_bounds = AABB(door.hinge_pos - Vec3(90.0f, 90.0f, 20.0f),
+                                      door.hinge_pos + Vec3(90.0f, 90.0f, 240.0f));
         }
     }
 }
@@ -3574,6 +3731,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
     // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
     assign_elevator_parts(out_scene, door_infos, mesh_library);
+    assign_barge_doors(out_scene);
 
     // Extract the chapter's cooked Matinee opening intro sequence (SeqAct_Interp -> SeqVar_TdLocalPawn +
     // SkeletalMeshActorMAT -> 82-bone Faith 1P UAnimSequence: sp01_intro..sp09_intro).
@@ -3881,6 +4039,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
                          &bsp_render_bins, &bsp_bounds);
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
+    build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr);
 
     // WorldInfo.KillZ when the level sets it (otherwise lethal falls are handled by fall height).
     for (size_t i = 0; i < master_pkg->get_exports().size(); ++i) {

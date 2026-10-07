@@ -483,6 +483,7 @@ struct MeshBuffer {
     // with a translation model matrix of LevelScene::elevators[elevator].parts[elevator_part].offset.
     int32_t elevator = -1;
     int32_t elevator_part = -1;
+    int32_t barge_door = -1;
 };
 
 struct SoundClip {
@@ -540,6 +541,7 @@ struct LevelActor {
     bool collide_complex = false; // Actor.bCollideComplex: ignore simple collision, collide per poly
     bool is_blocking_volume = false;
     int32_t elevator = -1;       // >= 0: moving part of LevelScene::elevators[elevator]
+    int32_t barge_door = -1;     // >= 0: hinged door part of LevelScene::barge_doors[barge_door]
     bool is_runner_vision = false;
     bool is_checkpoint = false;
     bool is_trigger = false;
@@ -907,6 +909,40 @@ struct ElevatorInstance {
 };
 
 // -----------------------------------------------------------------------------
+// Interactive Hinged / Bargeable Door System (`TdMove_Barge` + `InterpActor` Doors)
+// -----------------------------------------------------------------------------
+enum class DoorState : uint8_t {
+    Closed = 0,
+    Opening = 1,
+    Open = 2,
+    Closing = 3
+};
+
+struct DoorPart {
+    std::string actor_name;
+    int32_t actor_index = -1;
+    int32_t mesh_index = -1;       // LevelScene::meshes index (-1 if hidden blocker like S_DoorClosingMech_02)
+    bool is_blocker_only = false;  // true for hidden doorway trigger/blocker slab
+    std::shared_ptr<const CollisionWorld> collision;
+};
+
+struct BargeDoorInstance {
+    std::string name;
+    std::string source_package;
+    Vec3 hinge_pos{0.0f, 0.0f, 0.0f};      // World-space vertical hinge pin position
+    Vec3 center_pos{0.0f, 0.0f, 0.0f};     // World-space center of closed door slab
+    AABB closed_bounds;                    // World-space AABB of doorway (for barge traces & triggers)
+    DoorState state = DoorState::Closed;
+    float open_angle_rad = 0.0f;           // Current signed Z-rotation around hinge_pos (radians)
+    float target_angle_rad = 0.0f;         // Target open angle (+/- ~1.66 rad = ~95 deg away from player)
+    float open_speed = 11.5f;              // Angular velocity (rad/s): fast slam on Barge, smooth on Interact
+    float hold_timer = 0.0f;               // Time remaining while held open before optional slow return
+    bool barged = false;                   // True when slammed open via MOVE_Barge
+    std::vector<DoorPart> parts;           // Door leaf mesh, attached closer bar, and hidden doorway slab
+    Mat4 model_matrix = Mat4::identity();  // T(hinge_pos) * Rz(open_angle_rad) * T(-hinge_pos)
+};
+
+// -----------------------------------------------------------------------------
 // Input Frame (Mapped from Keyboard, Mouse, or Gamepad)
 // -----------------------------------------------------------------------------
 struct InputFrame {
@@ -1057,6 +1093,7 @@ struct LevelScene {
     std::vector<std::string> all_streaming_packages;
     std::vector<std::string> loaded_sublevel_packages;
     std::vector<ElevatorInstance> elevators;
+    std::vector<BargeDoorInstance> barge_doors;
     std::vector<SceneCaptureReflectInfo> reflection_captures;
     std::vector<ReflectionVolumeInfo> reflection_volumes;
     std::vector<SoundClip> sounds;
