@@ -100,6 +100,10 @@ public:
     // Dynamic 4-track Solar Fields stem volume control (0.0 to 1.0)
     void set_music_stems(float ambient_vol, float tension_vol, float chase_vol, float reaction_vol);
 
+    // Switch between Main Menu theme (A_M_Menu.upk) and active chapter Solar Fields stems
+    void set_menu_music(bool active);
+    [[nodiscard]] const std::string& get_active_music_bank() const { return active_music_bank_; }
+
     // Stop all playing sound sources
     void stop_all();
 
@@ -118,9 +122,10 @@ private:
     uint32_t acquire_source();
     uint32_t get_or_create_buffer(const SoundClip& clip, bool force_mono_for_3d = false);
     void invalidate_cached_buffer(const std::string& key);
+    void clear_chapter_music_clips();
     void rebind_music_stem_buffers();
 
-    bool load_package_audio_and_cues(const std::string& pkg_path);
+    bool load_package_audio_and_cues(const std::string& pkg_path, std::vector<std::string>* out_clip_keys = nullptr);
     const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const;
     const SoundClip* pick_first_available_clip(std::initializer_list<const char*> candidates) const;
 
@@ -130,6 +135,8 @@ private:
     bool initialized_ = false;
     bool headless_ = false;
     bool is_menu_music_ = false;
+    std::string active_music_bank_;
+    std::vector<std::string> active_music_clip_keys_;
 
     // OpenAL context handles (opaque pointers)
     void* alc_device_ = nullptr;

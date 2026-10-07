@@ -363,20 +363,56 @@ uint32_t AudioEngine::get_or_create_buffer(const SoundClip& clip, bool force_mon
 #endif
 }
 
+void AudioEngine::clear_chapter_music_clips() {
+#ifndef ME_NO_OPENAL
+    if (alc_context_) {
+        for (int i = 0; i < 4; ++i) {
+            if (music_stem_sources_[i]) {
+                alSourceStop(music_stem_sources_[i]);
+                alSourcei(music_stem_sources_[i], AL_BUFFER, 0);
+            }
+            music_stem_buffers_[i] = 0;
+            music_stem_clip_names_[i].clear();
+        }
+    }
+#endif
+
+    for (const auto& key : active_music_clip_keys_) {
+        if (key == "A_M_Menu" || key == "RAW.A_M_Menu") continue;
+        invalidate_cached_buffer(key);
+        sound_clips_.erase(key);
+    }
+    active_music_clip_keys_.clear();
+}
+
 void AudioEngine::rebind_music_stem_buffers() {
     // Prefer Menu theme on Main Menu, or active chapter's Solar Fields UPK tracks in-game
-    const SoundClip* amb = is_menu_music_
-        ? pick_first_available_clip({"RAW.A_M_Menu", "A_M_Menu", "RAW.ambience_01", "ambience_01", "Stem_0"})
-        : pick_first_available_clip({"RAW.ambience_01", "ambience_01", "RAW.ME_THEME_Ambience", "RAW.A_M_Menu", "A_M_Menu", "Stem_0"});
-    const SoundClip* tension = pick_first_available_clip({
-        "RAW.ambience_011", "ambience_011", "RAW.Puzzle_01", "Puzzle_01", "Stem_1"
-    });
-    const SoundClip* chase = pick_first_available_clip({
-        "RAW.chase_01", "chase_01", "RAW.A_TT_Music", "A_TT_Music", "Stem_2"
-    });
-    const SoundClip* combat = pick_first_available_clip({
-        "RAW.combat_01", "combat_01", "Stem_3"
-    });
+    const SoundClip* amb = nullptr;
+    const SoundClip* tension = nullptr;
+    const SoundClip* chase = nullptr;
+    const SoundClip* combat = nullptr;
+
+    if (is_menu_music_) {
+        amb = pick_first_available_clip({"RAW.A_M_Menu", "A_M_Menu", "Stem_0"});
+    } else {
+        amb = pick_first_available_clip({
+            "RAW.ambience_01", "ambience_01", "RAW.ME_THEME_Ambience", "RAW.A_TT_Music", "A_TT_Music", "Stem_0"
+        });
+        tension = pick_first_available_clip({
+            "RAW.ambience_011", "ambience_011", "RAW.Puzzle_01", "Puzzle_01",
+            "RAW.chase_011", "chase_011", "RAW.ambience_02", "ambience_02",
+            "RAW.A_TT_Music", "A_TT_Music", "Stem_1"
+        });
+        chase = pick_first_available_clip({
+            "RAW.chase_01", "chase_01", "RAW.chase_02", "chase_02",
+            "RAW.ambience_03", "ambience_03", "RAW.A_TT_Music", "A_TT_Music", "Stem_2"
+        });
+        combat = pick_first_available_clip({
+            "RAW.combat_01", "combat_01", "RAW.Combat_New", "Combat_New",
+            "RAW.Combat_011", "Combat_011", "RAW.chase_01", "chase_01",
+            "RAW.A_TT_Music", "A_TT_Music", "Stem_3"
+        });
+    }
 
     const SoundClip* chosen[4] = {amb, tension, chase, combat};
 
@@ -384,7 +420,14 @@ void AudioEngine::rebind_music_stem_buffers() {
     if (headless_ || !alc_context_) return;
 
     for (int i = 0; i < 4; ++i) {
-        if (!chosen[i] || !music_stem_sources_[i]) continue;
+        if (!music_stem_sources_[i]) continue;
+        if (!chosen[i]) {
+            alSourceStop(music_stem_sources_[i]);
+            alSourcei(music_stem_sources_[i], AL_BUFFER, 0);
+            music_stem_buffers_[i] = 0;
+            music_stem_clip_names_[i].clear();
+            continue;
+        }
         std::string new_name = !chosen[i]->full_path.empty() ? chosen[i]->full_path : chosen[i]->name;
         uint32_t buf = get_or_create_buffer(*chosen[i], false);
         if (!buf) continue;
@@ -527,7 +570,12 @@ void AudioEngine::update(float dt,
     alListenerfv(AL_ORIENTATION, ori);
 
     // 2. Evaluate target Solar Fields stem volumes based on gameplay speed & state
-    if (reaction_active) {
+    if (is_menu_music_) {
+        target_stem_vols_[0] = 1.00f; // Pure Solar Fields Main Menu theme (A_M_Menu)
+        target_stem_vols_[1] = 0.00f;
+        target_stem_vols_[2] = 0.00f;
+        target_stem_vols_[3] = 0.00f;
+    } else if (reaction_active) {
         target_stem_vols_[0] = 0.25f; // Ambient attenuated
         target_stem_vols_[1] = 0.25f; // Tension attenuated
         target_stem_vols_[2] = 0.10f; // Chase attenuated
@@ -655,7 +703,7 @@ void AudioEngine::update(float dt,
 #endif
 }
 
-bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path) {
+bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path, std::vector<std::string>* out_clip_keys) {
     namespace fs = std::filesystem;
     if (!fs::exists(pkg_path)) {
         return false;
@@ -684,9 +732,11 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path) {
         }
         invalidate_cached_buffer(clip.name);
         sound_clips_[clip.name] = clip;
+        if (out_clip_keys) out_clip_keys->push_back(clip.name);
         if (!clip.full_path.empty()) {
             invalidate_cached_buffer(clip.full_path);
             sound_clips_[clip.full_path] = clip;
+            if (out_clip_keys) out_clip_keys->push_back(clip.full_path);
         }
     }
 
@@ -724,8 +774,6 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
     bool any_loaded = false;
     static const char* kStockBanks[] = {
         "A_M_Menu.upk",
-        "A_M_SP01A.upk",
-        "A_M_SP01B.upk",
         "A_Material_Footstep.upk",
         "A_Material_Handstep.upk",
         "A_Character_Female_01.upk",
@@ -754,31 +802,65 @@ bool AudioEngine::load_level_audio(const std::string& game_root, const std::stri
         active_ambient_indices_[i] = -1;
     }
 
+    // Purge any previous chapter's Solar Fields music clips so unqualified wave names
+    // (ambience_01, ambience_011, Puzzle_01, chase_01, combat_01, etc.) never bleed across levels
+    clear_chapter_music_clips();
+
     is_menu_music_ = (map_file.find("MainMenu") != std::string::npos);
 
-    // Load chapter-matched Solar Fields interactive music bank if applicable
-    if (is_menu_music_) load_sound_bank(game_root, "A_M_Menu.upk");
-    else if (map_file.find("SP02") != std::string::npos) load_sound_bank(game_root, "A_M_SP02.upk");
-    else if (map_file.find("SP03") != std::string::npos) load_sound_bank(game_root, "A_M_SP03.upk");
-    else if (map_file.find("SP04") != std::string::npos) load_sound_bank(game_root, "A_M_SP04.upk");
-    else if (map_file.find("SP05") != std::string::npos) load_sound_bank(game_root, "A_M_SP05.upk");
-    else if (map_file.find("SP06") != std::string::npos) load_sound_bank(game_root, "A_M_SP06.upk");
-    else if (map_file.find("SP07") != std::string::npos) load_sound_bank(game_root, "A_M_SP07.upk");
-    else if (map_file.find("SP08") != std::string::npos) load_sound_bank(game_root, "A_M_SP08.upk");
-    else if (map_file.find("SP09") != std::string::npos) load_sound_bank(game_root, "A_M_SP09.upk");
-    else if (map_file.find("TT_") != std::string::npos)  load_sound_bank(game_root, "A_M_TimeTrial.upk");
-    else load_sound_bank(game_root, "A_M_SP01A.upk");
+    // Determine exact chapter-matched Solar Fields interactive music bank
+    std::string music_bank = "A_M_SP01A.upk";
+    if (is_menu_music_)                                               music_bank = "A_M_Menu.upk";
+    else if (map_file.find("TT_") != std::string::npos)               music_bank = "A_M_TimeTrial.upk";
+    else if (map_file.find("Escape") != std::string::npos ||
+             map_file.find("SP01B") != std::string::npos ||
+             map_file.find("SP01b") != std::string::npos)             music_bank = "A_M_SP01B.upk";
+    else if (map_file.find("SP02") != std::string::npos ||
+             map_file.find("Stormdrain") != std::string::npos)        music_bank = "A_M_SP02.upk";
+    else if (map_file.find("SP03") != std::string::npos ||
+             map_file.find("Cranes") != std::string::npos)            music_bank = "A_M_SP03.upk";
+    else if (map_file.find("SP04") != std::string::npos ||
+             map_file.find("Subway") != std::string::npos)            music_bank = "A_M_SP04.upk";
+    else if (map_file.find("SP05") != std::string::npos ||
+             map_file.find("Mall") != std::string::npos)              music_bank = "A_M_SP05.upk";
+    else if (map_file.find("SP06") != std::string::npos ||
+             map_file.find("Factory") != std::string::npos)           music_bank = "A_M_SP06.upk";
+    else if (map_file.find("SP07") != std::string::npos ||
+             map_file.find("Boat") != std::string::npos)              music_bank = "A_M_SP07.upk";
+    else if (map_file.find("SP08") != std::string::npos ||
+             map_file.find("Convoy") != std::string::npos)            music_bank = "A_M_SP08.upk";
+    else if (map_file.find("SP09") != std::string::npos ||
+             map_file.find("Scraper") != std::string::npos)           music_bank = "A_M_SP09.upk";
 
-    // Scan map directory for streaming *_Aud.me1 spatial audio sublevels
+    active_music_bank_ = music_bank;
+    {
+        fs::path base(game_root);
+        fs::path bank_path = base / "TdGame" / "CookedPC" / "Audio" / music_bank;
+        if (!fs::exists(bank_path)) {
+            bank_path = base / "Audio" / music_bank;
+        }
+        load_package_audio_and_cues(bank_path.string(), &active_music_clip_keys_);
+    }
+
+    // Scan map directory for streaming *_Aud.me1 spatial audio sublevels matching this level's prefix
     fs::path full_map = fs::path(game_root) / "TdGame" / "CookedPC" / map_file;
     if (!fs::exists(full_map)) {
         full_map = fs::path(map_file);
     }
+
+    std::string map_stem = full_map.stem().string();
+    if (map_stem.size() > 2 &&
+        map_stem.compare(map_stem.size() - 2, 2, "_p") == 0) {
+        map_stem.resize(map_stem.size() - 2);
+    }
+    std::string prefix_underscore = map_stem + "_";
+
     bool loaded_any_aud = false;
     if (fs::exists(full_map.parent_path())) {
         for (const auto& entry : fs::directory_iterator(full_map.parent_path())) {
             if (!entry.is_regular_file()) continue;
             std::string fn = entry.path().filename().string();
+            if (!map_stem.empty() && fn.rfind(prefix_underscore, 0) != 0) continue;
             if (fn.find("_Aud.me1") != std::string::npos || fn.find("_Audio0.me1") != std::string::npos) {
                 if (load_package_audio_and_cues(entry.path().string())) {
                     loaded_any_aud = true;
@@ -1027,6 +1109,13 @@ void AudioEngine::set_music_stems(float ambient_vol, float tension_vol, float ch
     target_stem_vols_[1] = std::clamp(tension_vol, 0.0f, 1.0f);
     target_stem_vols_[2] = std::clamp(chase_vol, 0.0f, 1.0f);
     target_stem_vols_[3] = std::clamp(reaction_vol, 0.0f, 1.0f);
+}
+
+void AudioEngine::set_menu_music(bool active) {
+    if (is_menu_music_ != active) {
+        is_menu_music_ = active;
+        rebind_music_stem_buffers();
+    }
 }
 
 void AudioEngine::stop_all() {
