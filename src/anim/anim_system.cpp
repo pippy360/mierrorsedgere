@@ -1269,6 +1269,20 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 show_lower_body = true;
             }
         }
+    } else if (telemetry.fall_death_impact) {
+        // Lethal fall ground impact / blackout: play UE3 1P death landing sequence (FallingLandDie)
+        seq_a = resolve_seq(w_spec_set, w_comm_set, "FallingLandDie", &active_set);
+        if (!seq_a) seq_a = resolve_seq(nullptr, nullptr, "fallinglandhard", &active_set);
+        norm_time = std::clamp(telemetry.death_anim_progress, 0.0f, 0.98f);
+        vm_offset = Vec3(0.0f, 12.0f, 10.0f);
+        show_lower_body = true;
+    } else if (telemetry.falling_to_death) {
+        // Uncontrolled lethal freefall: play UE3 1P flailing arms/body sequence (fallinguncontrolled)
+        seq_a = resolve_seq(w_spec_set, w_comm_set, "fallinguncontrolled", &active_set);
+        if (!seq_a) seq_a = resolve_seq(nullptr, nullptr, "jumpfast", &active_set);
+        norm_time = std::fmod(sim_t * 2.2f, 1.0f);
+        vm_offset = Vec3(0.0f, 14.0f, 10.0f);
+        show_lower_body = true;
     } else if (state == EMovement::MOVE_Snatch) {
         const char* snatch_seq = telemetry.snatch_from_back ? "SnatchBack" : "SnatchFwd";
         seq_a = resolve_seq(w_spec_set, w_comm_set, snatch_seq, &active_set);
@@ -1454,6 +1468,13 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 seq_a = active_set->find_sequence("fallinglandroll");
                 norm_time = std::fmod(sim_t * 1.5f, 1.0f);
                 vm_offset = Vec3(0.0f, 16.0f, 14.0f);
+                break;
+            case EMovement::MOVE_Landing:
+            case EMovement::MOVE_LayOnGround:
+                seq_a = active_set->find_sequence("fallinglandhard");
+                norm_time = std::clamp(telemetry.combat_anim_time / 1.8f, 0.0f, 0.96f);
+                vm_offset = Vec3(0.0f, 14.0f, 12.0f);
+                show_lower_body = true;
                 break;
             case EMovement::MOVE_LedgeWalk:
             case EMovement::MOVE_Balance:
@@ -2005,6 +2026,19 @@ bool AnimSystem::verify_all() const {
     dummy_tel.speed_2d = 600.0f;
     dummy_tel.sim_time = 0.5f;
     std::vector<Vertex> tris_1p;
+    evaluate_faith_1p(dummy_tel, tris_1p);
+    if (tris_1p.size() < 6000) return false;
+
+    // Verify fall-death sequences (fallinguncontrolled & FallingLandDie)
+    if (!faith_unarmed_set_.find_sequence("fallinguncontrolled") ||
+        !faith_unarmed_set_.find_sequence("FallingLandDie")) {
+        return false;
+    }
+    dummy_tel.falling_to_death = true;
+    evaluate_faith_1p(dummy_tel, tris_1p);
+    if (tris_1p.size() < 6000) return false;
+    dummy_tel.fall_death_impact = true;
+    dummy_tel.death_anim_progress = 0.5f;
     evaluate_faith_1p(dummy_tel, tris_1p);
     if (tris_1p.size() < 6000) return false;
 

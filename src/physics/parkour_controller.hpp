@@ -275,6 +275,8 @@ private:
     // Spawn / Respawn tracking
     Vec3 m_last_checkpoint_pos{0.0f, 0.0f, 100.0f};
     float m_last_checkpoint_yaw = 0.0f;
+    float m_death_timer = 0.0f;
+    float m_death_total_duration = 1.35f;
 };
 
 } // namespace me

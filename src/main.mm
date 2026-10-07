@@ -806,6 +806,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     EMovement prev_state = EMovement::MOVE_Walking;
     int prev_checkpoint = 0;
+    bool prev_falling_to_death = false;
+    bool prev_fall_death_impact = false;
     float footstep_timer = 0.0f;
     bool reaction_toggled = false;
     bool suppress_space_until_release = false;
@@ -1115,6 +1117,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             prev_state = tel.move_state;
         }
+
+        if (tel.falling_to_death && !prev_falling_to_death) {
+            audio.play_effect(EAudioEffect::FallDeathScream);
+        }
+        if (tel.fall_death_impact && !prev_fall_death_impact) {
+            audio.play_effect(EAudioEffect::FallDeathImpact);
+        }
+        if (!tel.falling_to_death && !tel.fall_death_impact &&
+            (prev_falling_to_death || prev_fall_death_impact)) {
+            audio.set_sound_group_mode(ESoundGroupEffectMode::Normal);
+        }
+        prev_falling_to_death = tel.falling_to_death;
+        prev_fall_death_impact = tel.fall_death_impact;
 
         if (tel.active_checkpoint != prev_checkpoint) {
             audio.play_effect(EAudioEffect::CheckpointChime);

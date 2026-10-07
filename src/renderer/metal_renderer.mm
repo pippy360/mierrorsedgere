@@ -2008,6 +2008,28 @@ struct MetalRenderer::Impl {
             draw_ui_quad(verts, cx - 1.0f, cy + gap,            2.0f, tick_len, xhair_col);
         }
 
+        // Uncontrolled falling wind edge vignette & lethal fall impact crimson-to-black screen fade
+        if (telemetry.fall_death_impact) {
+            float p = std::clamp(telemetry.death_anim_progress, 0.0f, 1.0f);
+            float red_flash = (p < 0.25f) ? (1.0f - p / 0.25f) * 0.55f : 0.0f;
+            float blackout  = std::clamp((p - 0.12f) / 0.72f, 0.0f, 1.0f);
+            if (red_flash > 0.0f) {
+                draw_ui_quad(verts, 0.0f, 0.0f, w, h, simd_make_float4(0.82f, 0.04f, 0.04f, red_flash));
+            }
+            if (blackout > 0.0f) {
+                draw_ui_quad(verts, 0.0f, 0.0f, w, h, simd_make_float4(0.0f, 0.0f, 0.0f, blackout));
+            }
+        } else if (telemetry.falling_to_death) {
+            float rush = std::clamp((-telemetry.velocity.z - 1200.0f) / 1400.0f, 0.25f, 0.85f);
+            float edge_w = w * 0.14f;
+            float edge_h = h * 0.16f;
+            simd_float4 vig = simd_make_float4(0.02f, 0.02f, 0.04f, rush * 0.55f);
+            draw_ui_quad(verts, 0.0f, 0.0f, w, edge_h, vig);
+            draw_ui_quad(verts, 0.0f, h - edge_h, w, edge_h, vig);
+            draw_ui_quad(verts, 0.0f, edge_h, edge_w, h - 2.0f * edge_h, vig);
+            draw_ui_quad(verts, w - edge_w, edge_h, edge_w, h - 2.0f * edge_h, vig);
+        }
+
         if (telemetry.hit_marker_timer > 0.0f) {
             float alpha = std::clamp(telemetry.hit_marker_timer / 0.22f, 0.0f, 1.0f);
             simd_float4 hm_col = simd_make_float4(0.96f, 0.14f, 0.14f, alpha);

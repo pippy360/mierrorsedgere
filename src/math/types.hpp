@@ -966,6 +966,9 @@ struct PlayerTelemetry {
     bool disarm_prompt_visible = false;
     float hit_marker_timer = 0.0f;
     float damage_flash_timer = 0.0f;
+    bool falling_to_death = false;
+    bool fall_death_impact = false;
+    float death_anim_progress = 0.0f;
     std::string active_subtitle;
 
     // Cooked level intro Matinee / 1P skeletal animation playback state
