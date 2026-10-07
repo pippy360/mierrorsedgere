@@ -710,14 +710,22 @@ std::pair<std::string, std::string> UPKPackage::resolve_object_index(int32_t idx
         if (exp_i < exports_.size()) {
             const auto& exp = exports_[exp_i];
             auto [cls_name, _] = resolve_object_index(exp.class_index);
-            return {exp.object_name, cls_name};
+            std::string name = exp.object_name;
+            if (exp.object_number > 0) {
+                name += "_" + std::to_string(exp.object_number - 1);
+            }
+            return {name, cls_name};
         }
         return {"Export_" + std::to_string(exp_i), "Unknown"};
     } else if (idx < 0) {
         size_t imp_i = -idx - 1;
         if (imp_i < imports_.size()) {
             const auto& imp = imports_[imp_i];
-            return {imp.object_name, imp.class_name};
+            std::string name = imp.object_name;
+            if (imp.object_number > 0) {
+                name += "_" + std::to_string(imp.object_number - 1);
+            }
+            return {name, imp.class_name};
         }
         return {"Import_" + std::to_string(imp_i), "Unknown"};
     }
@@ -1236,7 +1244,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         // Each flag resolves instance -> in-package archetypes -> script archetype chain (the imported
         // archetype, else the class default object). Unset everywhere means false, as in UE3. Only when
         // the script packages are unavailable do the class-based fallbacks below apply.
-        a.is_blocking_volume = low_class.ends_with("blockingvolume");
+        a.is_blocking_volume = (low_class == "blockingvolume" || low_class == "dynamicblockingvolume");
         ScriptDefaults& script_defaults = ScriptDefaults::instance();
         auto script_chain = [&](int32_t idx, std::string cls) -> const ScriptDefaults::Chain& {
             for (int guard = 0; idx > 0 && static_cast<size_t>(idx) <= exports_.size() && guard < 8; ++guard) {
@@ -1323,7 +1331,10 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         const bool comp_block = comp_bool("BlockActors", true);
         const bool comp_block_nonzero = comp_bool("BlockNonZeroExtent", true);
         const bool comp_block_zero = comp_bool("BlockZeroExtent", block_zero_default);
-        a.is_collidable = actor_collide && actor_block && comp_collide && comp_block && comp_block_nonzero;
+        const bool comp_block_rb = comp_bool("BlockRigidBody", low_class == "kactor");
+        a.is_collidable = actor_collide && comp_collide &&
+                          ((actor_block && comp_block && comp_block_nonzero) ||
+                           (low_class == "kactor" && comp_block_rb));
         a.blocks_traces = actor_collide && actor_block && comp_collide && comp_block_zero;
 
         // TdTutorialStart.BelongToChallenge: array of EMovementChallenge names.
@@ -2047,9 +2058,18 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         if (get_export_class(exp) != "StaticMesh") continue;
         if (exp.serial_size < 64 || exp.serial_offset < 0) continue;
 
-        std::string key = exp.object_name;
+        std::string full_obj_name = exp.object_name;
+        if (exp.object_number > 0) {
+            full_obj_name += "_" + std::to_string(exp.object_number - 1);
+        }
+        std::string key = full_obj_name;
         std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-        if (out_meshes.find(key) != out_meshes.end()) continue;
+        if (auto it = out_meshes.find(key); it != out_meshes.end()) {
+            const bool existing_has_coll = it->second.use_simple_box_collision
+                                               ? !it->second.simple_collision.empty()
+                                               : !it->second.complex_collision.empty();
+            if (existing_has_coll) continue;
+        }
 
         size_t prop_start = find_property_start(exp);
         size_t exp_end = static_cast<size_t>(exp.serial_offset) + static_cast<size_t>(exp.serial_size);
@@ -2064,7 +2084,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         size_t rem_len = exp_end - rem_start;
 
         StaticMeshAsset asset;
-        asset.name = exp.object_name;
+        asset.name = full_obj_name;
         std::memcpy(&asset.bounds_origin.x, rem + 0, 4);
         std::memcpy(&asset.bounds_origin.y, rem + 4, 4);
         std::memcpy(&asset.bounds_origin.z, rem + 8, 4);
@@ -2329,6 +2349,13 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         }
 
         if (!asset.triangles.empty() || !asset.simple_collision.empty() || !asset.complex_collision.empty()) {
+            if (exp.object_number > 0) {
+                std::string base_key = exp.object_name;
+                std::transform(base_key.begin(), base_key.end(), base_key.begin(), ::tolower);
+                if (out_meshes.find(base_key) == out_meshes.end()) {
+                    out_meshes[base_key] = asset;
+                }
+            }
             out_meshes[key] = std::move(asset);
         }
     }
