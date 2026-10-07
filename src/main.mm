@@ -707,9 +707,70 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cout << "[Oracle] Telemetry written to /tmp/me_oracle_telemetry.json" << std::endl;
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, and door barging stage 12
+    // Stage 13: Pipe Balance Beam Walking (TdBalanceWalkVolume) & Vertical Drainpipe Climbing (TdLadderVolume)
+    std::cout << "[Oracle Stage 13] Testing Pipe Balance Beam Walking & Vertical Drainpipe Climbing..." << std::endl;
+    bool s13_pass = false;
+    {
+        InputFrame in_walk{};
+        in_walk.forward = 1.0f;
+
+        // 13A. Walk across Tutorial Stage 9 horizontal balance pipe (-5690.09, -6372.5, 4263) -> (-6860.91, -6021.5, 4263)
+        controller.reset(Vec3(-5715.0f, -6365.0f, 4263.0f), 163.3f);
+        bool entered_balance = false;
+        float min_bal_z = 99999.0f;
+        for (int i = 0; i < 420; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_Balance) entered_balance = true;
+            min_bal_z = std::min(min_bal_z, controller.get_position().z);
+            if (controller.get_position().x <= -6848.0f) break;
+        }
+        const Vec3 bal_end_pos = controller.get_position();
+        const bool bal_ok = entered_balance && (min_bal_z >= 4258.0f) && (bal_end_pos.x <= -6848.0f);
+
+        // 13B. Climb Tutorial Stage 11 Pipe 1 (-7890, -3106, 4223..4936), jump to Pipe 2 (-7663, -3106, 4596..4914),
+        //      and mantle onto upper roof (z >= 4914)
+        controller.reset(Vec3(-7890.0f, -3165.0f, 4225.0f), 90.0f);
+        bool grabbed_pipe1 = false;
+        for (int i = 0; i < 240; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_Climb) {
+                grabbed_pipe1 = true;
+                if (controller.get_position().z >= 4740.0f) break;
+            }
+        }
+        // Aim toward Pipe 2 (+X / East along the North wall) and jump across
+        controller.set_rotation(25.0f, 0.0f, 0.0f);
+        InputFrame in_pipe_jump{};
+        in_pipe_jump.jump = true;
+        in_pipe_jump.forward = 1.0f;
+        controller.step(in_pipe_jump, kDt, sim_scene);
+
+        bool caught_pipe2 = false;
+        for (int i = 0; i < 240; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_Climb &&
+                std::abs(controller.get_position().x - (-7663.0f)) < 60.0f) {
+                caught_pipe2 = true;
+            }
+            if (caught_pipe2 && controller.is_grounded() && controller.get_position().z >= 4910.0f) {
+                break;
+            }
+        }
+        const Vec3 climb_top_pos = controller.get_position();
+        const bool climb_ok = grabbed_pipe1 && caught_pipe2 && controller.is_grounded() && (climb_top_pos.z >= 4910.0f);
+
+        s13_pass = bal_ok && climb_ok;
+        std::cout << "  -> Stage 13 Result: " << (s13_pass ? "PASS" : "FAIL")
+                  << " (Balance Entered=" << (entered_balance ? "YES" : "NO")
+                  << ", Balance End X=" << bal_end_pos.x
+                  << ", Pipe1 Grabbed=" << (grabbed_pipe1 ? "YES" : "NO")
+                  << ", Pipe2 Caught=" << (caught_pipe2 ? "YES" : "NO")
+                  << ", Roof Exit Z=" << climb_top_pos.z << ")" << std::endl;
+    }
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, and pipe climb/balance stage 13
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;

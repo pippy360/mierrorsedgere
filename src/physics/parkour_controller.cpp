@@ -229,6 +229,14 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
     m_into_wallclimb_speed = 0.0f;
     m_wallclimb_reached = false;
+    m_climb_base = Vec3(0.0f, 0.0f, 0.0f);
+    m_climb_top = Vec3(0.0f, 0.0f, 0.0f);
+    m_climb_normal = Vec3(0.0f, 0.0f, 0.0f);
+    m_climb_cooldown = 0.0f;
+    m_balance_start = Vec3(0.0f, 0.0f, 0.0f);
+    m_balance_end = Vec3(0.0f, 0.0f, 0.0f);
+    m_balance_lean = 0.0f;
+    m_balance_cooldown = 0.0f;
     m_ledge_z = 0.0f;
     m_hang_time = 0.0f;
     m_base_actor = -1;
@@ -365,6 +373,8 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         m_state_timer += step_dt;
         m_telemetry.combat_anim_time = m_state_timer;
         m_wallrun_cooldown = std::max(0.0f, m_wallrun_cooldown - step_dt);
+        m_climb_cooldown = std::max(0.0f, m_climb_cooldown - step_dt);
+        m_balance_cooldown = std::max(0.0f, m_balance_cooldown - step_dt);
         if (m_illegal_wall_timer > 0.0f) {
             m_illegal_wall_timer = std::max(0.0f, m_illegal_wall_timer - step_dt);
             if (m_illegal_wall_timer <= 0.0f) m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
@@ -479,6 +489,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 update_swing_bar(input, step_dt, scene);
                 break;
 
+            case EMovement::MOVE_Climb:
+                update_climb(input, step_dt, scene);
+                break;
+
             case EMovement::MOVE_Balance:
                 update_balance(input, step_dt, scene);
                 break;
@@ -508,10 +522,11 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                                   state == EMovement::MOVE_Coil);
         const bool attached = (state == EMovement::MOVE_Grabbing || state == EMovement::MOVE_GrabPullUp ||
                                state == EMovement::MOVE_IntoGrab || state == EMovement::MOVE_ZipLine ||
-                               state == EMovement::MOVE_Swing || state == EMovement::MOVE_WallClimbing ||
-                               state == EMovement::MOVE_SpeedVaulting || state == EMovement::MOVE_VaultOver ||
-                               state == EMovement::MOVE_SpringBoarding);
+                               state == EMovement::MOVE_Swing || state == EMovement::MOVE_Climb ||
+                               state == EMovement::MOVE_WallClimbing || state == EMovement::MOVE_SpeedVaulting ||
+                               state == EMovement::MOVE_VaultOver || state == EMovement::MOVE_SpringBoarding);
         const bool wallrunning = (state == EMovement::MOVE_WallRunningLeft || state == EMovement::MOVE_WallRunningRight);
+        const bool balancing = (state == EMovement::MOVE_Balance);
         FloorHit floor;
         const float probe_depth = m_telemetry.grounded ? (kMaxStepHeight + kMaxFloorDist) : kMaxFloorDist;
         const bool has_floor = !attached &&
@@ -524,6 +539,11 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             m_telemetry.position.z = floor.z;
             m_telemetry.grounded = true;
             m_base_actor = floor.actor_index;
+            if (m_telemetry.velocity.z < 0.0f) {
+                m_telemetry.velocity.z = 0.0f;
+            }
+        } else if (balancing) {
+            m_telemetry.grounded = true;
             if (m_telemetry.velocity.z < 0.0f) {
                 m_telemetry.velocity.z = 0.0f;
             }
@@ -1487,6 +1507,8 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
 // -----------------------------------------------------------------------------
 void ParkourController::update_ground_locomotion(const InputFrame& input, float dt, const LevelScene& scene) {
     if (try_initiate_zipline(scene)) return;
+    if (try_initiate_climb(input, scene)) return;
+    if (try_initiate_balance(scene)) return;
 
     const MovementConfig& c = m_config;
     EMovement& st = m_telemetry.move_state;
@@ -1618,6 +1640,7 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     // Vault takes priority over wallclimb and ledge grab when holding forward (matching faith-runner controller.rs).
     if (!m_telemetry.falling_to_death && !dodge && !turning && !kicking) {
         if (try_initiate_zipline(scene)) return;
+        if (try_initiate_climb(input, scene)) return;
         if (try_initiate_vault(input, scene)) return;
         if (try_initiate_wallclimb(input, scene)) return;
         if (try_initiate_ledge_grab(input, scene)) return;
@@ -1770,6 +1793,11 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
 }
 
 void ParkourController::update_wallrun(const InputFrame& input, float dt, const LevelScene& scene) {
+    if (try_initiate_climb(input, scene)) {
+        m_telemetry.camera_roll_deg = 0.0f;
+        return;
+    }
+
     const MovementConfig& c = m_config;
     const Vec3 n = m_telemetry.wall_normal;
     const Vec3 along = m_wall_tangent;
@@ -1971,6 +1999,8 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
 }
 
 void ParkourController::update_wallclimb(const InputFrame& input, float dt, const LevelScene& scene) {
+    if (try_initiate_climb(input, scene)) return;
+
     const MovementConfig& c = m_config;
     const Vec3 n = m_telemetry.wall_normal;
     const Vec3 into = -n;
@@ -2628,18 +2658,247 @@ void ParkourController::update_swing_bar(const InputFrame& input, float dt, cons
     }
 }
 
-void ParkourController::update_balance(const InputFrame& input, float dt, const LevelScene& scene) {
-    (void)scene;
-    // Walking on balance beam caps speed at 0.34x
-    float target_speed = m_config.run_speed * 0.34f;
-    Vec3 fwd = facing_forward();
-    m_telemetry.velocity = fwd * (input.forward * target_speed);
-    m_telemetry.position += m_telemetry.velocity * dt;
+bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelScene& scene) {
+    if (m_telemetry.weapon.is_heavy || input.forward < -0.3f) return false;
+    if (m_telemetry.grounded && input.forward <= 0.3f) return false;
 
+    const float max_horiz = m_telemetry.grounded ? 95.0f : 115.0f;
+    for (const auto& act : scene.actors) {
+        if (!act.is_ladder) continue;
+        const Vec3 base = (act.location.z <= act.end_point.z) ? act.location : act.end_point;
+        const Vec3 top  = (act.location.z <= act.end_point.z) ? act.end_point : act.location;
+        if (top.z - base.z < 60.0f) continue;
+
+        // Cooldown applies only to re-grabbing the exact same pipe/ladder after letting go,
+        // so jumping laterally between adjacent drainpipes catches the next pipe immediately.
+        if (m_climb_cooldown > 0.0f && horiz(m_climb_base - base).length() < 80.0f) continue;
+
+        if (m_telemetry.position.z < base.z - 95.0f || m_telemetry.position.z > top.z - 20.0f) continue;
+        const float h_dist = horiz(m_telemetry.position - base).length();
+        if (h_dist > max_horiz) continue;
+
+        // Native UE3 TdLadderVolume: actor Rotation faces into the wall/ladder; -Rotation.forward() points outward
+        Vec3 wall_out = horiz(-act.rotation.forward()).normalized();
+        if (wall_out.length_sq() < 0.25f) {
+            wall_out = horiz(m_telemetry.position - base).normalized();
+        }
+        if (wall_out.length_sq() < 0.25f) wall_out = Vec3(0.0f, -1.0f, 0.0f);
+
+        // Must approach from the front/side of the wall and not face away from the pipe
+        if ((m_telemetry.position - base).dot(wall_out) < -25.0f) continue;
+        if (facing_forward().dot(-wall_out) < -0.30f) continue;
+
+        const Vec3 climb_xy = Vec3(base.x, base.y, 0.0f) + wall_out * 44.0f;
+        const float clamped_z = std::clamp(m_telemetry.position.z, base.z, std::max(base.z, top.z - 35.0f));
+
+        m_telemetry.position = Vec3(climb_xy.x, climb_xy.y, clamped_z);
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        m_telemetry.move_state = EMovement::MOVE_Climb;
+        m_telemetry.grounded = false;
+        m_base_actor = -1;
+        m_climb_base = base;
+        m_climb_top = top;
+        m_climb_normal = wall_out;
+        m_telemetry.wall_normal = wall_out;
+        m_state_timer = 0.0f;
+        m_coil_timer = 0.0f;
+        m_fall_peak_z = m_telemetry.position.z;
+        m_telemetry.yaw_deg = yaw_of(-wall_out);
+        set_stance(kEyeHeightStand);
+        return true;
+    }
+    return false;
+}
+
+void ParkourController::update_climb(const InputFrame& input, float dt, const LevelScene& scene) {
+    if (m_telemetry.position.z > m_fall_peak_z) {
+        m_fall_peak_z = m_telemetry.position.z;
+    }
+
+    const Vec3 into = -m_climb_normal;
+    const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 44.0f;
+    m_telemetry.position.x = climb_xy.x;
+    m_telemetry.position.y = climb_xy.y;
+
+    // Jump off pipe/ladder (TdMove_Climb.HandleMoveAction(MA_Jump)):
+    // Aiming away from the wall or holding A/D jumps toward adjacent pipes/ledges (e.g. Tutorial Stage 11 pipes);
+    // facing straight into the pipe with neutral strafe drops/pushes cleanly off.
     if (jump_pressed()) {
         consume_jump();
-        start_jump(scene);
+        m_climb_cooldown = 0.45f;
+        const Vec3 fwd = facing_forward();
+        const bool aiming_away = (fwd.dot(into) < 0.78f);
+        const bool strafing = (std::abs(input.strafe) > 0.25f);
+        if (aiming_away || strafing || input.forward < -0.25f) {
+            Vec3 launch_dir = aiming_away
+                ? fwd
+                : (facing_right() * sign_of(input.strafe) + m_climb_normal * 0.25f).normalized();
+            if (launch_dir.dot(m_climb_normal) < -0.05f) {
+                launch_dir = (launch_dir - m_climb_normal * launch_dir.dot(m_climb_normal)).normalized();
+            }
+            if (launch_dir.length_sq() < 0.1f) launch_dir = m_climb_normal;
+            m_telemetry.velocity = launch_dir * 420.0f + Vec3(0.0f, 0.0f, 440.0f);
+            m_last_jump_location = m_telemetry.position;
+            leave_ground(EMovement::MOVE_Jump);
+        } else {
+            m_telemetry.velocity = m_climb_normal * 180.0f + Vec3(0.0f, 0.0f, 120.0f);
+            leave_ground(EMovement::MOVE_Falling);
+        }
+        return;
     }
+
+    if (input.forward > 0.2f) {
+        constexpr float kClimbUpSpeed = 190.0f;
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, kClimbUpSpeed);
+        m_telemetry.position.z += kClimbUpSpeed * dt;
+
+        // Reaching top of pipe/ladder (TdLadderVolume.ExitAtTop):
+        // Check whether a walkable roof/ledge exists behind the pipe top; if so, mantle onto it.
+        // If no walkable roof exists (dead-end pipe below upper wall), hold at the top step.
+        if (m_telemetry.position.z >= m_climb_top.z - 25.0f) {
+            for (float dist_in : {45.0f, 80.0f, 120.0f, 165.0f, 205.0f}) {
+                const Vec3 probe_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + into * dist_in;
+                const TraceHit roof = trace_ray(
+                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z + 150.0f),
+                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z - 80.0f),
+                    scene
+                );
+                if (roof.hit && roof.normal.z >= kWalkableFloorZ) {
+                    const Vec3 stand_pos(probe_xy.x, probe_xy.y, roof.point.z + 2.0f);
+                    if (has_room_at(stand_pos, kPawnHeight, scene)) {
+                        m_telemetry.position = stand_pos;
+                        m_telemetry.velocity = into * 220.0f;
+                        m_telemetry.move_state = EMovement::MOVE_Walking;
+                        m_telemetry.grounded = true;
+                        m_climb_cooldown = 0.45f;
+                        m_fall_peak_z = stand_pos.z;
+                        return;
+                    }
+                }
+            }
+            m_telemetry.position.z = m_climb_top.z - 25.0f;
+            m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        }
+    } else if (input.forward < -0.2f) {
+        constexpr float kClimbDownSpeed = 240.0f;
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, -kClimbDownSpeed);
+        m_telemetry.position.z -= kClimbDownSpeed * dt;
+
+        FloorHit floor;
+        const bool hit_bottom_floor = check_ground(scene, 18.0f, kPawnHeight, floor);
+        if (m_telemetry.position.z <= m_climb_base.z || hit_bottom_floor) {
+            m_climb_cooldown = 0.45f;
+            m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+            if (hit_bottom_floor) {
+                m_telemetry.position.z = floor.z;
+                m_telemetry.move_state = EMovement::MOVE_Walking;
+                m_telemetry.grounded = true;
+            } else {
+                leave_ground(EMovement::MOVE_Falling);
+            }
+        }
+    } else {
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+    }
+}
+
+bool ParkourController::try_initiate_balance(const LevelScene& scene) {
+    if (m_balance_cooldown > 0.0f || m_telemetry.weapon.is_heavy) return false;
+
+    for (const auto& act : scene.actors) {
+        if (!act.is_balance_beam || act.end_point.length_sq() < 1.0f) continue;
+        const Vec3 a = act.location;
+        const Vec3 b = act.end_point;
+        const Vec3 ab = b - a;
+        const float len = ab.length_xy();
+        if (len < 40.0f) continue;
+
+        const Vec3 u = horiz(ab) / len;
+        const float s = horiz(m_telemetry.position - a).dot(u);
+        if (s <= 18.0f || s >= len - 18.0f) continue;
+
+        const Vec3 cp = a + ab * (s / len);
+        if (horiz(m_telemetry.position - cp).length() > 42.0f) continue;
+        if (std::abs(m_telemetry.position.z - cp.z) > 48.0f) continue;
+
+        // TdMove_Balance.StartMove: snap XY onto beam centerline & project horizontal velocity along beam
+        m_telemetry.position.x = cp.x;
+        m_telemetry.position.y = cp.y;
+        const float max_bal_spd = m_config.run_speed * 0.48f;
+        const float along_spd = std::clamp(horiz(m_telemetry.velocity).dot(u), -max_bal_spd, max_bal_spd);
+        m_telemetry.velocity = u * along_spd;
+        m_sprint_energy = 0.0f;
+
+        const Vec3 fwd = facing_forward();
+        const Vec3 beam_fwd = (fwd.dot(u) >= 0.0f) ? u : -u;
+        const Vec3 beam_right(beam_fwd.y, -beam_fwd.x, 0.0f);
+        m_balance_lean = std::clamp(0.2f * fwd.dot(beam_right), -0.6f, 0.6f);
+        m_balance_start = a;
+        m_balance_end = b;
+        m_telemetry.move_state = EMovement::MOVE_Balance;
+        m_telemetry.grounded = true;
+        set_stance(kEyeHeightStand);
+        return true;
+    }
+    return false;
+}
+
+void ParkourController::update_balance(const InputFrame& input, float dt, const LevelScene& scene) {
+    if (jump_pressed()) {
+        consume_jump();
+        m_balance_cooldown = 0.40f;
+        m_telemetry.camera_roll_deg = 0.0f;
+        start_jump(scene);
+        return;
+    }
+
+    const Vec3 ab = m_balance_end - m_balance_start;
+    const float len = ab.length_xy();
+    if (len < 40.0f) {
+        m_telemetry.camera_roll_deg = 0.0f;
+        m_telemetry.move_state = EMovement::MOVE_Walking;
+        return;
+    }
+
+    const Vec3 u = horiz(ab) / len;
+    const Vec3 fwd = facing_forward();
+    const Vec3 beam_fwd = (fwd.dot(u) >= 0.0f) ? u : -u;
+
+    // PlayerBalanceWalk: smooth speed control strictly along the balance pipe spline
+    const float target_speed = input.forward * (m_config.run_speed * 0.48f);
+    float cur_along = horiz(m_telemetry.velocity).dot(beam_fwd);
+    const float accel_step = 900.0f * dt;
+    if (std::abs(target_speed - cur_along) <= accel_step) {
+        cur_along = target_speed;
+    } else {
+        cur_along += sign_of(target_speed - cur_along) * accel_step;
+    }
+    m_telemetry.velocity = beam_fwd * cur_along;
+
+    // UTdMove_Balance BalanceFactor camera roll & A/D counter-steer
+    const float beam_yaw = yaw_of(beam_fwd);
+    const float yaw_diff = wrap_deg(m_telemetry.yaw_deg - beam_yaw);
+    const float sway_drive = std::clamp(yaw_diff / 60.0f, -0.5f, 0.5f) * 0.35f +
+                             input.strafe * 1.15f - m_balance_lean * 1.6f;
+    m_balance_lean = std::clamp(m_balance_lean + sway_drive * dt, -1.0f, 1.0f);
+    m_telemetry.camera_roll_deg = m_balance_lean * 9.0f;
+
+    const Vec3 next_pos = m_telemetry.position + m_telemetry.velocity * dt;
+    const float s = horiz(next_pos - m_balance_start).dot(u);
+    if (s <= 10.0f || s >= len - 10.0f) {
+        m_telemetry.position.x = next_pos.x;
+        m_telemetry.position.y = next_pos.y;
+        m_telemetry.camera_roll_deg = 0.0f;
+        m_balance_cooldown = 0.35f;
+        m_telemetry.move_state = EMovement::MOVE_Walking;
+        return;
+    }
+
+    const Vec3 on = m_balance_start + ab * (s / len);
+    m_telemetry.position.x = on.x;
+    m_telemetry.position.y = on.y;
+    m_telemetry.position.z = on.z;
+    m_fall_peak_z = m_telemetry.position.z;
 }
 
 // -----------------------------------------------------------------------------

@@ -180,6 +180,7 @@ private:
     void update_vault(const InputFrame& input, float dt, const LevelScene& scene);
     void update_zipline(const InputFrame& input, float dt, const LevelScene& scene);
     void update_swing_bar(const InputFrame& input, float dt, const LevelScene& scene);
+    void update_climb(const InputFrame& input, float dt, const LevelScene& scene);
     void update_balance(const InputFrame& input, float dt, const LevelScene& scene);
     void update_landing_moves(const InputFrame& input, float dt, const LevelScene& scene);
 
@@ -190,6 +191,8 @@ private:
     bool try_initiate_springboard(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_ledge_grab(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_zipline(const LevelScene& scene);
+    bool try_initiate_climb(const InputFrame& input, const LevelScene& scene);
+    bool try_initiate_balance(const LevelScene& scene);
     bool try_initiate_dodge_jump(const InputFrame& input);
     void start_jump(const LevelScene& scene);
     void land(const FloorHit& floor, const LevelScene& scene);
@@ -248,13 +251,21 @@ private:
     bool m_wall_turned = false;                    // TdMove_WallRun.bTurned90FromWall
     float m_illegal_wall_timer = 0.0f;             // bIllegalLedgeTimer: no re-attach to the last wall
 
-    // Wallrun / Climb / Zipline vectors
+    // Wallrun / Climb / Balance / Zipline vectors
     Vec3 m_wall_tangent{0.0f, 0.0f, 0.0f};
     Vec3 m_last_wallrun_normal{0.0f, 0.0f, 0.0f};
     float m_into_wallclimb_speed = 0.0f;           // TdMove_WallClimb.IntoWallClimbSpeed
     bool m_wallclimb_reached = false;              // TdMove_WallClimb.bHasReachedWall
     Vec3 m_zipline_start{0.0f, 0.0f, 0.0f};
     Vec3 m_zipline_end{0.0f, 0.0f, 0.0f};
+    Vec3 m_climb_base{0.0f, 0.0f, 0.0f};
+    Vec3 m_climb_top{0.0f, 0.0f, 0.0f};
+    Vec3 m_climb_normal{0.0f, 0.0f, 0.0f};
+    float m_climb_cooldown = 0.0f;
+    Vec3 m_balance_start{0.0f, 0.0f, 0.0f};
+    Vec3 m_balance_end{0.0f, 0.0f, 0.0f};
+    float m_balance_lean = 0.0f;
+    float m_balance_cooldown = 0.0f;
     Vec3 m_swing_anchor{0.0f, 0.0f, 0.0f};
     float m_swing_angle = 0.0f;
     float m_swing_angular_vel = 0.0f;
