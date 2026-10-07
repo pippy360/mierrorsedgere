@@ -446,6 +446,7 @@ struct CompiledMaterial {
     std::vector<std::string> warnings;
     std::map<std::string, int> unknown_classes;
     int shader_index = -1;
+    uint32_t texcoord_mask = 0;  // bit i: the graph reads TextureCoordinate index i
 };
 
 MatBlendMode parse_blend(const UPropertyList& props) {
@@ -684,6 +685,7 @@ Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std
         uv = c.ok() ? coerce(c, 3) : Val{"P.trefl", 3};
     } else {
         uv = c.ok() ? coerce(c, 2) : Val{"P.uv0", 2};
+        if (!c.ok()) out_.texcoord_mask |= 1u;
     }
     const std::string k = std::to_string(slot);
     std::string s = cube ? ("c" + k + ".sample(sc" + k + ", " + uv.code + ")")
@@ -748,8 +750,11 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         int idx = prop_int(p, "CoordinateIndex", 0);
         float ut = fprop("UTiling", 1.0f);
         float vt = fprop("VTiling", 1.0f);
-        if (idx > 1) warn("texture coordinate index " + std::to_string(idx) + " mapped to UV1");
-        std::string base = idx <= 0 ? "P.uv0" : "P.uv1";
+        // Which vertex UV set this index reads is settled once the whole graph is known
+        // (MaterialBuilder::compile): "@UV<n>@" stands for it until then.
+        idx = std::clamp(idx, 0, 7);
+        out_.texcoord_mask |= 1u << idx;
+        std::string base = "@UV" + std::to_string(idx) + "@";
         if (ut == 1.0f && vt == 1.0f) return {base, 2};
         if (ut == vt) return emit(2, "(" + base + " * " + fmt_float(ut) + ")");
         float t[2] = {ut, vt};
@@ -935,7 +940,10 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
     // ---- Coordinate animation ------------------------------------------------
     if (c == "Panner") {
         Val coord = input(p, "Coordinate");
-        if (!coord.ok()) coord = {"P.uv0", 2};
+        if (!coord.ok()) {
+            coord = {"P.uv0", 2};
+            out_.texcoord_mask |= 1u;
+        }
         const float sx = fprop("SpeedX", 0.0f);
         const float sy = fprop("SpeedY", 0.0f);
         Val t = input(p, "Time");
@@ -954,7 +962,10 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
     }
     if (c == "Rotator") {
         Val coord = input(p, "Coordinate");
-        if (!coord.ok()) coord = {"P.uv0", 2};
+        if (!coord.ok()) {
+            coord = {"P.uv0", 2};
+            out_.texcoord_mask |= 1u;
+        }
         Val t = input(p, "Time");
         std::string tc = t.ok() ? coerce(t, 1).code : "P.time";
         const float speed = fprop("Speed", 0.25f);
@@ -976,7 +987,10 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         Val h = input(p, "Height");
         if (!h.ok()) return {};
         Val coord = input(p, "Coordinate");
-        if (!coord.ok()) coord = {"P.uv0", 2};
+        if (!coord.ok()) {
+            coord = {"P.uv0", 2};
+            out_.texcoord_mask |= 1u;
+        }
         const float hr = fprop("HeightRatio", 0.05f);
         const float rp = fprop("ReferencePlane", 0.5f);
         Val h1 = cast_to(h, 1);
@@ -1386,6 +1400,21 @@ CompiledMaterial* MaterialBuilder::compile(MaterialGraph& g, const StaticParams&
     cm->base_path = g.path;
     GraphCompiler gc(res_, g, statics, *cm);
     gc.run();
+    // Give each TextureCoordinate index the graph reads its vertex UV set.
+    const MaterialUVSlots slots = material_uv_slots(cm->texcoord_mask);
+    int sets_read = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (!(cm->texcoord_mask & (1u << i))) continue;
+        ++sets_read;
+        const std::string token = "@UV" + std::to_string(i) + "@";
+        const char* slot = material_uv_slot(slots, i) == 0 ? "P.uv0" : "P.uv1";
+        for (size_t pos = cm->source.find(token); pos != std::string::npos; pos = cm->source.find(token, pos)) {
+            cm->source.replace(pos, token.size(), slot);
+        }
+    }
+    if (sets_read > 2 && cm->warnings.size() < 32) {
+        cm->warnings.push_back("reads " + std::to_string(sets_read) + " texture coordinate sets; a vertex carries two");
+    }
     for (const auto& [cls, count] : cm->unknown_classes) unknown_[cls] += count;
     cm->shader_index = shader_index(*cm);
     CompiledMaterial* raw = cm.get();
@@ -1495,6 +1524,8 @@ SceneMaterial MaterialBuilder::build(const std::string& leaf_path) {
     sm.blend = cm->blend;
     sm.lighting = cm->lighting;
     sm.two_sided = cm->two_sided;
+    sm.texcoord_mask = cm->texcoord_mask;
+    sm.uv_slots = material_uv_slots(cm->texcoord_mask);
     for (const auto& slot : cm->tex2d) {
         std::string path = slot.default_path;
         if (slot.is_param) {
@@ -1958,6 +1989,26 @@ inline float4 mat_scene_color(texture2d<float> t, sampler s, float2 uv) {
 }
 )msl";
     return source.c_str();
+}
+
+struct MaterialUVResolver::Impl {
+    explicit Impl(PackageManager& pm) : builder(pm, scratch, MaterialBuildOptions{}) {}
+    SceneMaterialLibrary scratch;  // receives the shaders and texture names; never loaded or used
+    MaterialBuilder builder;
+    std::unordered_map<std::string, MaterialUVSlots> cache;
+};
+
+MaterialUVResolver::MaterialUVResolver(PackageManager& pm) : impl_(std::make_unique<Impl>(pm)) {}
+MaterialUVResolver::~MaterialUVResolver() = default;
+
+MaterialUVSlots MaterialUVResolver::slots(const std::string& material_path) {
+    if (material_path.empty()) return {};
+    const std::string key = to_lower(material_path);
+    auto it = impl_->cache.find(key);
+    if (it != impl_->cache.end()) return it->second;
+    const MaterialUVSlots s = impl_->builder.build(material_path).uv_slots;
+    impl_->cache.emplace(key, s);
+    return s;
 }
 
 std::shared_ptr<SceneMaterialLibrary> build_scene_materials(PackageManager& pm,

@@ -460,7 +460,7 @@ struct Vertex {
     Vec3 tangent{1.0f, 0.0f, 0.0f};
     float u = 0.0f;
     float v = 0.0f;
-    float u2 = 0.0f; // Lightmap UV
+    float u2 = 0.0f; // second UV set: mesh set 1 unless the section's material reads another (MaterialUVSlots)
     float v2 = 0.0f;
     uint32_t color = 0xFFFFFFFF;
     float tangent_sign = 1.0f; // Binormal = cross(normal, tangent) * tangent_sign (UE3 TangentZ.w)

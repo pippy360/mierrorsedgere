@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../math/types.hpp"
+#include "scene_materials.hpp"
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -76,10 +78,29 @@ struct StaticMeshAsset {
     Vec3 bounds_extent{100.0f, 100.0f, 100.0f};
     float bounds_radius = 173.2f;
     std::vector<Vertex> triangles; // 3 vertices per triangle in local space, grouped by element
-    // UV channel 2 of each entry of `triangles` (u, v pairs), when the mesh has one. The menu
-    // city's ground and water look the sky up through it; Vertex only has room for two channels.
-    std::vector<float> uv_channel2;
+    // UV sets 2 and 3 of each entry of `triangles` (u2, v2, u3, v3), when the mesh has a third
+    // set; Vertex itself only has room for sets 0 and 1. A set the mesh lacks repeats its last
+    // one, as UE3's vertex factory binds it (FLocalVertexFactory::InitRHI).
+    std::vector<float> uv_extra;
     std::vector<StaticMeshElement> elements;
+    int num_uv_channels = 0;  // LOD0 NumTexCoords
+
+    // UV set `index` of triangle vertex `vertex`, with the last set standing in for a missing one.
+    void uv(size_t vertex, int index, float& out_u, float& out_v) const {
+        const int set = std::min(index, std::max(num_uv_channels, 1) - 1);
+        const Vertex& v = triangles[vertex];
+        if (set >= 2 && uv_extra.size() == triangles.size() * 4) {
+            const float* e = &uv_extra[vertex * 4 + (set >= 3 ? 2 : 0)];
+            out_u = e[0];
+            out_v = e[1];
+        } else if (set >= 1) {
+            out_u = v.u2;
+            out_v = v.v2;
+        } else {
+            out_u = v.u;
+            out_v = v.v;
+        }
+    }
 
     // Collision (local space, 3 vertices per triangle). UStaticMeshComponent::LineCheck uses the
     // RB_BodySetup simple geometry when the mesh has a BodySetup and UseSimpleBoxCollision
@@ -190,13 +211,16 @@ bool stream_level_to_checkpoint(const std::string& game_root, LevelScene& scene,
 // *out_material_paths (full object paths, "" = engine default material) when it is non-null.
 // Actors that are moving elevator parts (LevelActor::elevator >= 0) are skipped: they get their
 // own buffers and collision. Hidden actors collide but are not drawn.
+// `material_uvs`, when given, is asked which UV sets each section's material reads, so the two a
+// vertex carries are the right two of its mesh's; without it every section gets sets 0 and 1.
 void build_level_geometry(std::vector<LevelActor>& actors,
                           std::vector<MeshBuffer>& out_meshes,
                           CollisionWorld& out_collision,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                           std::vector<std::string>* out_material_paths = nullptr,
                           const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins = nullptr,
-                          const AABB* bsp_bounds = nullptr);
+                          const AABB* bsp_bounds = nullptr,
+                          class MaterialUVResolver* material_uvs = nullptr);
 
 // Appends one actor's UE3 collision triangles (world space) to `out` with the per-triangle
 // channels implied by the actor flags and the mesh's UseSimple*Collision settings.
