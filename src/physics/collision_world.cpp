@@ -142,8 +142,16 @@ SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, c
             const float push_neg = std::max(0.0f, r_box - tri_min);  // move the box along -axis
             const float depth = std::min(push_pos, push_neg);
             if (depth < best_depth) {
-                best_depth = depth;
-                n = (push_pos <= push_neg) ? axis : -axis;
+                const Vec3 cand_n = (push_pos <= push_neg) ? axis : -axis;
+                // Only let an edge/seam axis override the triangle face normal when either:
+                //  (a) it supports the box from below (cand_n.z >= 0.7f, e.g. standing on a roof/ramp top edge), or
+                //  (b) the sweep is actually moving into that edge (cand_n.dot(delta) < -1e-6f).
+                // Otherwise an internal seam between two wall/prop triangles perpendicular to delta would
+                // replace face_n and cause n.dot(delta) >= 0 to falsely discard a solid wall!
+                if (cand_n.z >= 0.7f || cand_n.dot(delta) < -1e-6f) {
+                    best_depth = depth;
+                    n = cand_n;
+                }
             }
         };
         for (const Vec3& a : ax) consider_axis(a);

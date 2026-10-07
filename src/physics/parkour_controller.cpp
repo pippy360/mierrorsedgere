@@ -759,10 +759,31 @@ ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& caps
         }
     }
     for (const auto& door : scene.barge_doors) {
-        if (door.state != DoorState::Closed) continue;
+        const float ang = door.open_angle_rad;
+        const bool is_rotated = (std::abs(ang) > 1e-5f);
+        const float ca = std::cos(-ang);
+        const float sa = std::sin(-ang);
+        const float ca_fwd = ca;
+        const float sa_fwd = -sa;
         for (const auto& part : door.parts) {
             if (!part.collision) continue;
-            consider(part.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
+            if (door.state != DoorState::Closed && part.is_blocker_only) continue;
+            if (!is_rotated) {
+                consider(part.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
+            } else {
+                const Vec3 rel_c = centre - door.hinge_pos;
+                const Vec3 loc_c = door.hinge_pos + Vec3(ca * rel_c.x - sa * rel_c.y, sa * rel_c.x + ca * rel_c.y, rel_c.z);
+                const Vec3 loc_d(ca * delta.x - sa * delta.y, sa * delta.x + ca * delta.y, delta.z);
+                CollisionHit h = part.collision->sweep_box(loc_c, loc_d, extent, COLL_BlockNonZeroExtent);
+                if (h.hit) {
+                    const Vec3 rel_p = h.location - door.hinge_pos;
+                    h.location = door.hinge_pos + Vec3(ca_fwd * rel_p.x - sa_fwd * rel_p.y,
+                                                       sa_fwd * rel_p.x + ca_fwd * rel_p.y, rel_p.z);
+                    h.normal = Vec3(ca_fwd * h.normal.x - sa_fwd * h.normal.y,
+                                    sa_fwd * h.normal.x + ca_fwd * h.normal.y, h.normal.z);
+                    consider(h, Vec3(0.0f, 0.0f, 0.0f));
+                }
+            }
         }
     }
     return best;
@@ -792,10 +813,32 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
         }
     }
     for (const auto& door : scene.barge_doors) {
-        if (door.state != DoorState::Closed) continue;
+        const float ang = door.open_angle_rad;
+        const bool is_rotated = (std::abs(ang) > 1e-5f);
+        const float ca = std::cos(-ang);
+        const float sa = std::sin(-ang);
+        const float ca_fwd = ca;
+        const float sa_fwd = -sa;
         for (const auto& part : door.parts) {
             if (!part.collision) continue;
-            consider(part.collision->line_check(start, end, channels), Vec3(0.0f, 0.0f, 0.0f));
+            if (door.state != DoorState::Closed && part.is_blocker_only) continue;
+            if (!is_rotated) {
+                consider(part.collision->line_check(start, end, channels), Vec3(0.0f, 0.0f, 0.0f));
+            } else {
+                const Vec3 rs = start - door.hinge_pos;
+                const Vec3 re = end - door.hinge_pos;
+                const Vec3 loc_s = door.hinge_pos + Vec3(ca * rs.x - sa * rs.y, sa * rs.x + ca * rs.y, rs.z);
+                const Vec3 loc_e = door.hinge_pos + Vec3(ca * re.x - sa * re.y, sa * re.x + ca * re.y, re.z);
+                CollisionHit h = part.collision->line_check(loc_s, loc_e, channels);
+                if (h.hit) {
+                    const Vec3 rp = h.location - door.hinge_pos;
+                    h.location = door.hinge_pos + Vec3(ca_fwd * rp.x - sa_fwd * rp.y,
+                                                       sa_fwd * rp.x + ca_fwd * rp.y, rp.z);
+                    h.normal = Vec3(ca_fwd * h.normal.x - sa_fwd * h.normal.y,
+                                    sa_fwd * h.normal.x + ca_fwd * h.normal.y, h.normal.z);
+                    consider(h, Vec3(0.0f, 0.0f, 0.0f));
+                }
+            }
         }
     }
     return best;
@@ -1024,6 +1067,8 @@ ParkourController::TraceHit ParkourController::move_and_slide(const Vec3& delta,
 // meshes are stepped up (stepUp), walls are slid along.
 void ParkourController::walk_move(const Vec3& delta, float height, const LevelScene& scene) {
     Vec3 remaining = delta;
+    Vec3 prev_wall_normal(0.0f, 0.0f, 0.0f);
+    bool has_prev_wall = false;
     for (int iter = 0; iter < 3 && remaining.length_sq() > 1e-6f; ++iter) {
         const TraceHit hit = move_swept(remaining, height, 0.0f, scene);
         if (!hit.hit) return;
@@ -1047,6 +1092,15 @@ void ParkourController::walk_move(const Vec3& delta, float height, const LevelSc
         n = n.normalized();
         remaining -= n * remaining.dot(n);
         remaining.z = 0.0f;
+        // UE3 TwoWallAdjust: if sliding along the second wall pushes back into the first blocking wall
+        // (acute / right-angle inside corner), halt horizontal motion instead of pushing into wall 0.
+        if (has_prev_wall && remaining.dot(prev_wall_normal) < -1e-4f) {
+            m_telemetry.velocity.x = 0.0f;
+            m_telemetry.velocity.y = 0.0f;
+            return;
+        }
+        prev_wall_normal = n;
+        has_prev_wall = true;
         const float vn = m_telemetry.velocity.x * n.x + m_telemetry.velocity.y * n.y;
         if (vn < 0.0f) {
             m_telemetry.velocity.x -= n.x * vn;
