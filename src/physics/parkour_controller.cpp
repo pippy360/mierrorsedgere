@@ -2021,10 +2021,67 @@ bool ParkourController::try_initiate_dodge_jump(const InputFrame& input) {
 // SkillRoll (>= 200 with a fresh crouch press, not backwards), SoftLanding (>= 300, animation
 // only) or a plain landing. Landing a plain jump caps the speed at PreJumpMomentum -
 // LandingSpeedReduction (SubtractLandingSpeed). Out of a 180 in the air you land on your back.
+bool ParkourController::is_soft_landing_surface(const FloorHit& floor, const LevelScene& scene) const {
+    if (floor.actor_index >= 0 && floor.actor_index < static_cast<int32_t>(scene.actors.size())) {
+        if (scene.actors[floor.actor_index].is_soft_landing) return true;
+    }
+    const Vec3 foot(m_telemetry.position.x, m_telemetry.position.y, floor.z);
+    for (const auto& act : scene.actors) {
+        if (!act.is_soft_landing) continue;
+        if (foot.x >= act.world_bounds.min_pt.x - 650.0f && foot.x <= act.world_bounds.max_pt.x + 650.0f &&
+            foot.y >= act.world_bounds.min_pt.y - 650.0f && foot.y <= act.world_bounds.max_pt.y + 650.0f &&
+            foot.z >= act.world_bounds.min_pt.z - 650.0f && foot.z <= act.world_bounds.max_pt.z + 650.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ParkourController::has_soft_landing_below(const LevelScene& scene) const {
+    const Vec3 pos = m_telemetry.position;
+    const Vec3 vel = m_telemetry.velocity;
+    const float gravity = std::max(100.0f, m_config.gravity);
+
+    for (const auto& act : scene.actors) {
+        if (!act.is_soft_landing && !act.is_fall_height_volume) continue;
+        const float top_z = act.world_bounds.max_pt.z;
+        const float dz = pos.z - top_z;
+        if (dz < -650.0f || dz > 3800.0f) continue;
+
+        // Check both instantaneous XY footprint and ballistic touchdown XY projection.
+        const float disc = std::max(0.0f, vel.z * vel.z + 2.0f * gravity * std::max(0.0f, dz));
+        const float t_fall = std::clamp((vel.z + std::sqrt(disc)) / gravity, 0.0f, 3.0f);
+        const Vec3 pred(pos.x + vel.x * t_fall, pos.y + vel.y * t_fall, top_z);
+
+        const float pad = 750.0f;
+        const bool over_now = (pos.x >= act.world_bounds.min_pt.x - pad && pos.x <= act.world_bounds.max_pt.x + pad &&
+                               pos.y >= act.world_bounds.min_pt.y - pad && pos.y <= act.world_bounds.max_pt.y + pad);
+        const bool over_pred = (pred.x >= act.world_bounds.min_pt.x - pad && pred.x <= act.world_bounds.max_pt.x + pad &&
+                                pred.y >= act.world_bounds.min_pt.y - pad && pred.y <= act.world_bounds.max_pt.y + pad);
+        if (over_now || over_pred) return true;
+    }
+    return false;
+}
+
+void ParkourController::update_fall_height_volumes(const LevelScene& scene) {
+    const AABB pawn_box(
+        m_telemetry.position - Vec3(kPawnRadius, kPawnRadius, 0.0f),
+        m_telemetry.position + Vec3(kPawnRadius, kPawnRadius, kPawnHeight));
+    for (const auto& act : scene.actors) {
+        if (!act.is_fall_height_volume) continue;
+        if (act.world_bounds.intersects(pawn_box)) {
+            m_fall_peak_z = act.fall_height_target_z;
+            if (m_fall_peak_z - m_telemetry.position.z < m_config.uncontrolled_fall) {
+                m_telemetry.falling_to_death = false;
+            }
+        }
+    }
+}
+
 void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
-    (void)scene;
     const MovementConfig& c = m_config;
     const float fall = std::max(0.0f, m_fall_peak_z - floor.z);
+    const bool soft_surface = is_soft_landing_surface(floor, scene);
     const EMovement air_move = m_telemetry.move_state;
     const Vec3 fwd = facing_forward();
     Vec3 h = horiz(m_telemetry.velocity);
@@ -2037,6 +2094,24 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
     m_illegal_wall_timer = 0.0f;
     m_telemetry.velocity.z = 0.0f;
     m_telemetry.grounded = true;
+    m_air_fall_start_z = floor.z;
+    m_fall_peak_z = floor.z;
+
+    // TdPlayerPawn.TakeFallingDamage / TdMove_Landing.LandOnSoftObject:
+    // Landing on a soft object (cardboard landing cushion, mattress, airbag, trash container)
+    // cancels all fall damage and lethal fall death regardless of drop height.
+    if (soft_surface && fall >= c.hard_landing_min_fall) {
+        m_telemetry.falling_to_death = false;
+        m_telemetry.fall_death_impact = false;
+        m_telemetry.move_state = EMovement::MOVE_SoftLanding;
+        m_landing_timer = 0.65f;
+        m_state_timer = 0.0f;
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        m_sprint_energy = 0.0f;
+        m_telemetry.camera_roll_deg = 0.0f;
+        set_stance(kEyeHeightStand);
+        return;
+    }
 
     if (fall >= c.uncontrolled_fall) {
         // TdPawn.UncontrolledFall: lethal fall impact -> play FallingLandDie animation + impact SFX -> fade to black -> respawn.
@@ -2235,10 +2310,17 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
 void ParkourController::update_air_locomotion(const InputFrame& input, float dt, const LevelScene& scene) {
     const MovementConfig& c = m_config;
     EMovement& st = m_telemetry.move_state;
-    if (m_telemetry.position.z > m_fall_peak_z) m_fall_peak_z = m_telemetry.position.z;
+    if (m_telemetry.velocity.z > 0.0f && m_telemetry.position.z > m_fall_peak_z) {
+        m_fall_peak_z = m_telemetry.position.z;
+    }
+    update_fall_height_volumes(scene);
 
     const float fall_dist = std::max(0.0f, m_fall_peak_z - m_telemetry.position.z);
-    if (fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
+    const bool soft_below = has_soft_landing_below(scene);
+    if (soft_below && m_telemetry.falling_to_death) {
+        m_telemetry.falling_to_death = false;
+        m_telemetry.camera_roll_deg *= std::max(0.0f, 1.0f - 8.0f * dt);
+    } else if (!soft_below && fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
         if (!m_telemetry.falling_to_death) {
             m_telemetry.falling_to_death = true;
             st = EMovement::MOVE_Falling;
@@ -3386,6 +3468,7 @@ void ParkourController::update_zipline(const InputFrame& input, float dt, const 
         m_telemetry.velocity = zip_dir * 500.0f + Vec3(0, 0, 250.0f);
         m_last_jump_location = m_telemetry.position;
         leave_ground(EMovement::MOVE_Jump);
+        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
         return;
     }
     if (m_crouch_pressed || (input.crouch && m_state_timer > 0.12f)) {
@@ -3394,6 +3477,7 @@ void ParkourController::update_zipline(const InputFrame& input, float dt, const 
         const float drop_spd = std::max(420.0f, horiz(m_telemetry.velocity).length());
         m_telemetry.velocity = Vec3(zip_dir.x * drop_spd, zip_dir.y * drop_spd, std::min(0.0f, m_telemetry.velocity.z));
         leave_ground(EMovement::MOVE_Falling);
+        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
         return;
     }
 
@@ -3409,6 +3493,7 @@ void ParkourController::update_zipline(const InputFrame& input, float dt, const 
         m_zipline_cooldown = 0.50f;
         m_telemetry.velocity = Vec3(zip_dir.x * 320.0f, zip_dir.y * 320.0f, 0.0f);
         leave_ground(EMovement::MOVE_Falling);
+        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
     }
 }
 
@@ -4672,9 +4757,18 @@ void ParkourController::update_health_and_regen(float dt) {
 // Checkpoints, Kill Volumes & Collectibles Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
-    // 1. Fall Death (WorldInfo.KillZ, lethal drop below checkpoint, or health <= 0) -> Play Death Sequence -> Respawn
+    // When grounded safely on a lower rooftop/cushion after a zipline or elevator drop, lower the
+    // checkpoint vertical void baseline so multi-story descents never trigger a false abyss kill.
+    if (m_telemetry.grounded && m_telemetry.health > 0.0f && m_telemetry.position.z < m_last_checkpoint_pos.z) {
+        m_last_checkpoint_pos.z = m_telemetry.position.z;
+    }
+    const bool void_fall = !m_telemetry.grounded &&
+                           (m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f) &&
+                           !has_soft_landing_below(scene);
+
+    // 1. Fall Death (WorldInfo.KillZ, lethal drop into void below checkpoint, or health <= 0) -> Play Death Sequence -> Respawn
     if (m_telemetry.position.z < scene.kill_z ||
-        m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f ||
+        void_fall ||
         m_telemetry.health <= 0.0f) {
         if (!m_telemetry.fall_death_impact) {
             m_telemetry.falling_to_death = true;

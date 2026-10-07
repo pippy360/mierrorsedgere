@@ -247,6 +247,9 @@ private:
     bool try_initiate_dodge_jump(const InputFrame& input);
     void start_jump(const LevelScene& scene);
     void land(const FloorHit& floor, const LevelScene& scene);
+    [[nodiscard]] bool is_soft_landing_surface(const FloorHit& floor, const LevelScene& scene) const;
+    [[nodiscard]] bool has_soft_landing_below(const LevelScene& scene) const;
+    void update_fall_height_volumes(const LevelScene& scene);
     void leave_ground(EMovement air_move);
     void set_stance(float eye_height);
     [[nodiscard]] bool can_skill_roll() const;

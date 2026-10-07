@@ -828,7 +828,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s15_pass = false;
     {
         std::cout << "[Oracle Stage 15] Testing Zipline Shift Drop, Swing Bar & Ledge Walk..." << std::endl;
-        // 15A. Zipline Shift Drop: attach to zipline in sim_scene, press Shift (crouch=true), verify immediate drop to MOVE_Falling
+        // 15A. Zipline Shift Drop: attach to zipline in sim_scene, press Shift (crouch=true),
+        // verify immediate drop to MOVE_Falling AND survival + MOVE_SoftLanding when dropping onto
+        // the high soft-landing cushion (S_CardboardBoxes_02 at (-2662, -3256, 3988), >1250 uu drop).
         bool zip_drop_ok = false;
         for (const auto& act : sim_scene.actors) {
             if (!act.is_zipline) continue;
@@ -837,8 +839,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
             const Vec3 high_pt = (zs.z >= ze.z) ? zs : ze;
             const Vec3 low_pt  = (zs.z >= ze.z) ? ze : zs;
             const Vec3 seg = low_pt - high_pt;
-            const Vec3 start_pos = high_pt + seg * 0.10f - Vec3(0.0f, 0.0f, 110.0f);
-            controller.reset(start_pos, 0.0f);
+            // Position along the zipline directly above the Tutorial soft-landing cushion (~t=0.69)
+            const Vec3 start_pos = high_pt + seg * 0.69f - Vec3(0.0f, 0.0f, 110.0f);
+            controller.reset(start_pos, 20.0f);
             InputFrame in_idle{};
             bool attached = false;
             for (int i = 0; i < 15; ++i) {
@@ -852,7 +855,23 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                 InputFrame in_drop{};
                 in_drop.crouch = true; // Shift / Crouch to detach from zip line
                 controller.step(in_drop, kDt, sim_scene);
-                zip_drop_ok = (controller.get_move_state() == EMovement::MOVE_Falling);
+                const bool detached = (controller.get_move_state() == EMovement::MOVE_Falling);
+                bool any_death_state = false;
+                bool landed_soft = false;
+                for (int i = 0; i < 180; ++i) {
+                    controller.step(in_idle, kDt, sim_scene);
+                    if (controller.get_telemetry().falling_to_death ||
+                        controller.get_telemetry().fall_death_impact) {
+                        any_death_state = true;
+                    }
+                    if (controller.is_grounded()) {
+                        landed_soft = (controller.get_move_state() == EMovement::MOVE_SoftLanding ||
+                                       controller.get_move_state() == EMovement::MOVE_Walking) &&
+                                      controller.get_telemetry().health >= 99.0f;
+                        break;
+                    }
+                }
+                zip_drop_ok = detached && !any_death_state && landed_soft;
             }
             break;
         }

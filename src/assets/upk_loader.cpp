@@ -1537,6 +1537,71 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             a.location + Vec3(r_xy, r_xy, r_z)
         );
 
+        a.is_soft_landing =
+            low_mesh.find("cardboardbox") != std::string::npos ||
+            low_mesh.find("cardboardtrash") != std::string::npos ||
+            low_mesh.find("mattress") != std::string::npos ||
+            low_mesh.find("softlanding") != std::string::npos ||
+            low_mesh.find("airbag") != std::string::npos ||
+            low_mesh.find("garbagebag") != std::string::npos ||
+            low_mesh.find("trashbin_02") != std::string::npos ||
+            low_mesh.find("trashbin_05") != std::string::npos ||
+            low_mesh.find("trashbin_06") != std::string::npos ||
+            low_obj.find("softlanding") != std::string::npos;
+        if (!a.is_soft_landing) {
+            for (const auto& mat : a.material_overrides) {
+                std::string low_mat = mat;
+                std::transform(low_mat.begin(), low_mat.end(), low_mat.begin(), ::tolower);
+                if (low_mat.find("cardboard") != std::string::npos ||
+                    low_mat.find("softlanding") != std::string::npos ||
+                    low_mat.find("mattress") != std::string::npos) {
+                    a.is_soft_landing = true;
+                    break;
+                }
+            }
+        }
+
+        a.is_fall_height_volume = (low_class.find("fallheightvolume") != std::string::npos);
+        if (a.is_fall_height_volume) {
+            Vec3 center = a.location;
+            if (const auto* pc = get_prop("Center"); pc && std::isfinite(pc->vec_val.z)) {
+                center = pc->vec_val;
+            }
+            float offset = 0.0f;
+            if (const auto* po = get_prop("FallHeightOffset"); po && std::isfinite(po->float_val)) {
+                offset = po->float_val;
+            }
+            a.fall_height_target_z = center.z + offset;
+
+            std::vector<UPropertyList> bchain;
+            int32_t b_idx = find_brush_component_index();
+            for (int guard = 0; b_idx > 0 && static_cast<size_t>(b_idx) <= exports_.size() && guard < 8; ++guard) {
+                bchain.emplace_back();
+                parse_export_properties(*this, b_idx, bchain.back());
+                b_idx = exports_[b_idx - 1].archetype;
+            }
+            for (const auto& l : bchain) {
+                if (const UProperty* agg = find_prop(l, "BrushAggGeom")) {
+                    std::vector<Vec3> local;
+                    append_agg_geom_triangles(*this, *agg, local);
+                    if (!local.empty()) {
+                        Vec3 pre_pivot(0.0f, 0.0f, 0.0f);
+                        if (const auto* p = get_prop("PrePivot")) pre_pivot = p->vec_val;
+                        const ActorTransform xf(a.location, a.rotation,
+                                                a.draw_scale_3d * a.draw_scale, pre_pivot);
+                        Vec3 bmin(1e9f, 1e9f, 1e9f), bmax(-1e9f, -1e9f, -1e9f);
+                        for (const Vec3& v : local) {
+                            const Vec3 w = xf.apply(v);
+                            bmin.x = std::min(bmin.x, w.x); bmin.y = std::min(bmin.y, w.y); bmin.z = std::min(bmin.z, w.z);
+                            bmax.x = std::max(bmax.x, w.x); bmax.y = std::max(bmax.y, w.y); bmax.z = std::max(bmax.z, w.z);
+                        }
+                        a.world_bounds = AABB(bmin, bmax);
+                        break;
+                    }
+                }
+            }
+        }
+
         actors.push_back(a);
     }
 
