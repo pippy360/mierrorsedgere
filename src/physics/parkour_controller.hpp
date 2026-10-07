@@ -66,6 +66,8 @@ public:
     [[nodiscard]] float get_yaw() const { return m_telemetry.yaw_deg; }
     [[nodiscard]] float get_pitch() const { return m_telemetry.pitch_deg; }
     [[nodiscard]] float get_roll() const { return m_telemetry.camera_roll_deg; }
+    // TdPawn.Rotation.Yaw (deg): the body, which per-move look constraints are measured from.
+    [[nodiscard]] float get_body_yaw() const { return m_pawn_yaw; }
     [[nodiscard]] float get_fov() const { return m_telemetry.fov_deg; }
     [[nodiscard]] bool is_grounded() const { return m_telemetry.grounded; }
     [[nodiscard]] int get_active_checkpoint() const { return m_telemetry.active_checkpoint; }
@@ -84,6 +86,17 @@ public:
 private:
     // Core Subsystems
     void update_camera_and_inputs(const InputFrame& input, float dt, const LevelScene& scene);
+    // TdMove camera rules (TdPlayerController.UpdateRotation -> TdMove.UpdateViewRotation ->
+    // TdPawn.FaceRotation): per-move look constraints relative to the body, look input locks,
+    // camera recentring and look-at targets. See the table in parkour_controller.cpp.
+    void camera_move_changed(EMovement from, EMovement to);
+    void camera_view_rotation(float& yaw_delta, float& pitch_delta, float dt);
+    void camera_face_rotation(float dt);
+    void camera_ignore_look(float seconds);   // TdPawn.SetIgnoreLookInput (-1 = until the move ends)
+    void camera_reset_look(float seconds);    // TdMove.ResetCameraLook
+    void camera_look_at(float yaw, float pitch, float interp_time, float duration);  // SetLookAtTargetAngle
+    void camera_look_at_location(const Vec3& target, float interp_time, float duration);  // ...Location
+    bool camera_body_yaw(float& yaw) const;  // true when the current move holds the body at `yaw`
     void update_reaction_time(const InputFrame& input, float dt, float& effective_dt);
     void update_combat_and_weapons(const InputFrame& input, float dt, LevelScene& scene);
     void update_ai_bots(float dt, LevelScene& scene);
@@ -334,6 +347,26 @@ private:
     Vec3 m_path_exit_velocity{0.0f, 0.0f, 0.0f};
     EMovement m_path_end_move = EMovement::MOVE_Walking;
     bool m_path_hang_vault = false;  // VaultOver out of a GrabTransfer: eased rise, eased drop
+
+    // TdPawn / TdMove view state (camera_* above). Angles in degrees.
+    float m_pawn_yaw = 0.0f;                // TdPawn.Rotation.Yaw: what the look constraints are relative to
+    EMovement m_cam_move = EMovement::MOVE_Walking;  // the move the camera state below belongs to
+    float m_cam_move_time = 0.0f;           // TdMove.MoveActiveTime
+    bool m_face_rotation_disabled = false;  // TdMove.bDisableFaceRotation (the body stops following the view)
+    float m_face_rotation_time_left = 0.0f; // TdPawn.FaceRotationTimeLeft (the body eases back to the view)
+    float m_ignore_look_time = 0.0f;        // TdPawn.bIgnoreLookInput: > 0 seconds left, < 0 until the move ends
+    float m_reset_look_time = -1.0f;        // TdMove.ResetCameraLook: seconds left (< 0 = inactive)
+    bool m_look_at_active = false;          // TdMove.SetLookAtTargetAngle
+    float m_look_at_yaw = 0.0f;
+    float m_look_at_pitch = 0.0f;
+    float m_look_at_interp = 0.2f;          // LookAtTargetInterpolationTime
+    float m_look_at_duration = -1.0f;       // LookAtTargetDuration (-1 = until aborted / the move ends)
+    bool m_look_at_is_location = false;     // SetLookAtTargetLocation: re-aimed at m_look_at_location
+    Vec3 m_look_at_location{0.0f, 0.0f, 0.0f};
+    float m_wallrun_yaw_min = 0.0f;         // TdMove_WallRun.MinContraintWorld (world yaw)
+    float m_wallrun_yaw_max = 0.0f;         // TdMove_WallRun.MaxContraintWorld
+    float m_vault_look_lock = 0.0f;         // VaultTypes[].VaultTimeUp of the vault started (high vaults)
+    bool m_vault_down = false;              // TdMove_SpeedVault reached VaultState 3 (the drop)
 
     // UE3 Pawn.Base: the actor the pawn stands on (moving elevator parts carry the pawn).
     int32_t m_base_actor = -1;

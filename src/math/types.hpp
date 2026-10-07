@@ -967,6 +967,9 @@ struct InputFrame {
     float strafe = 0.0f;           // +1 = right, -1 = left
     float look_yaw_delta = 0.0f;   // Horizontal mouse delta (degrees)
     float look_pitch_delta = 0.0f; // Vertical mouse delta (degrees)
+    // The look deltas steer to a recorded view (the retail replay harness): that view already went
+    // through retail's per-move camera rules, so the look locks / constraints are not applied again.
+    bool view_recorded = false;
     bool sprint = false;
     bool jump = false;
     bool crouch = false;

@@ -133,6 +133,86 @@ bool coil_allowed_from(EMovement m) {
             return false;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Per-move camera rules: the TdMove_* class defaults in TdGame.u.
+//   bConstrainLook + MinLookConstraint / MaxLookConstraint: how far the view may pitch / yaw away
+//     from the body (TdPawn.Rotation), in rotation units (65536 = 360 deg);
+//   bDisableFaceRotation: the body stops turning with the view;
+//   DisableLookTime: TdMove.StartMove -> SetIgnoreLookInput (0 none, > 0 seconds, -1 until the
+//     move ends).
+// The port's MOVE_SoftLanding / MOVE_StepUp / MOVE_AutoStepUp are walking substates, not retail's
+// TdMove_SoftLanding / TdMove_StepUp moves, so they keep Walking's free look. Vaults lock look
+// only for their VaultTimeUp (high vaults), set when the vault starts.
+// -----------------------------------------------------------------------------
+struct MoveCamera {
+    bool constrain = false;
+    float pitch_min = 0.0f;
+    float pitch_max = 0.0f;
+    float yaw_min = 0.0f;
+    float yaw_max = 0.0f;
+    bool disable_face_rotation = false;
+    float disable_look_time = 0.0f;
+};
+
+MoveCamera move_camera(EMovement m) {
+    auto lim = [](float pmin, float pmax, float ymin, float ymax, bool dfr, float dlt = 0.0f) {
+        return MoveCamera{true, pmin, pmax, ymin, ymax, dfr, dlt};
+    };
+    auto free_look = [](bool dfr, float dlt) {
+        MoveCamera r;
+        r.disable_face_rotation = dfr;
+        r.disable_look_time = dlt;
+        return r;
+    };
+    switch (m) {
+        case EMovement::MOVE_Grabbing:         return lim(-3200, 16000, -32768, 32768, true, 0.8f);
+        case EMovement::MOVE_WallRunningRight:
+        case EMovement::MOVE_WallRunningLeft:  return lim(-13000, 13000, 0, 0, true);  // yaw: world window
+        case EMovement::MOVE_SpeedVaulting:
+        case EMovement::MOVE_VaultOver:        return lim(-3000, 6000, -8000, 8000, true);
+        case EMovement::MOVE_GrabPullUp:       return lim(0, 16384, -10000, 10000, true, 0.2f);
+        case EMovement::MOVE_GrabJump:         return free_look(true, 0.0f);
+        case EMovement::MOVE_Crouch:           return lim(-14000, 14000, -32768, 32768, false);
+        case EMovement::MOVE_Slide:            return lim(-10000, 10000, -10000, 10000, true);
+        case EMovement::MOVE_Melee:            return lim(-10000, 10000, -32768, 32768, false);
+        case EMovement::MOVE_Snatch:           return free_look(false, -1.0f);  // TdMove_Disarm
+        case EMovement::MOVE_Barge:            return lim(-14000, 16384, -5000, 5000, true);
+        case EMovement::MOVE_Climb:            return lim(-5000, 10000, -32000, 32000, true);
+        case EMovement::MOVE_180Turn:          return lim(-10000, 10000, -16384, 16384, false);
+        case EMovement::MOVE_180TurnInAir:     return lim(0, 32768, -5000, 5000, true);
+        case EMovement::MOVE_LayOnGround:      return lim(-2000, 32768, -5000, 5000, true);
+        case EMovement::MOVE_ZipLine:          return lim(-3200, 32768, -7000, 7000, true);
+        case EMovement::MOVE_Balance:          return lim(-13000, 25000, -6000, 6000, true);
+        case EMovement::MOVE_LedgeWalk:        return lim(-14000, 16384, -10000, 10000, true);
+        case EMovement::MOVE_GrabTransfer:     return free_look(true, -1.0f);
+        case EMovement::MOVE_RumpSlide:        return lim(-5000, 5000, -5000, 5000, true);
+        case EMovement::MOVE_MeleeSlide:       return free_look(false, -1.0f);
+        case EMovement::MOVE_Swing:            return free_look(false, -1.0f);
+        case EMovement::MOVE_Coil:             return lim(-5000, 30000, -32768, 32768, false);
+        case EMovement::MOVE_MeleeWallrun:     return lim(-3000, 16000, -8000, 8000, false);
+        case EMovement::MOVE_SkillRoll:        return lim(-2000, 32768, -5000, 5000, true);
+        default:                               return MoveCamera{};
+    }
+}
+
+// TdMove.ConstrainAxis (rotation units, truncating where the script converts to int). The frame's
+// look delta `d` may not carry `angle` (the view relative to the body) outside [lo, hi]; it slows
+// over the last 40% of either side; and a view that starts outside (the move just began, or the
+// body turned under it) is pulled back with Speed = dt / 0.2, a 0.2 s time constant.
+float constrain_axis(float angle, float lo, float hi, float speed, float d) {
+    if (angle < lo) return std::max(std::trunc((lo - angle) * speed), d);
+    if (angle > hi) return std::min(std::trunc((hi - angle) * speed), d);
+    float t = angle + d;
+    if (t < lo) d -= t - lo;
+    else if (t > hi) d -= t - hi;
+    t = angle + d;
+    if (t < lo * 0.6f && lo != 0.0f) d = std::max(d, std::trunc(d * std::abs((lo - angle) / (lo * 0.4f))));
+    else if (t > hi * 0.6f && hi != 0.0f) d = std::min(d, std::trunc(d * std::abs((hi - angle) / (hi * 0.4f))));
+    return d;
+}
+
+constexpr float kUUPerDeg = 65536.0f / 360.0f;
 }  // namespace
 
 float LinearCurve::eval(float x) const {
@@ -262,6 +342,19 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_ledge_z = 0.0f;
     m_hang_time = 0.0f;
     m_base_actor = -1;
+
+    m_pawn_yaw = spawn_yaw;
+    m_cam_move = EMovement::MOVE_Walking;
+    m_cam_move_time = 0.0f;
+    m_face_rotation_disabled = false;
+    m_face_rotation_time_left = 0.0f;
+    m_ignore_look_time = 0.0f;
+    m_reset_look_time = -1.0f;
+    m_look_at_active = false;
+    m_wallrun_yaw_min = 0.0f;
+    m_wallrun_yaw_max = 0.0f;
+    m_vault_look_lock = 0.0f;
+    m_vault_down = false;
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
@@ -714,24 +807,42 @@ void ParkourController::update_camera_and_inputs(const InputFrame& input, float 
         }
     }
 
+    // TdMove camera rules: StopMove / StartMove of the move the pawn changed to since the last frame,
+    // then TdMove.UpdateViewRotation's look lock, look-at, constraint and recentring. A recorded
+    // view (the replay harness) already went through retail's, so it is applied as it is.
+    if (m_telemetry.move_state != m_cam_move) camera_move_changed(m_cam_move, m_telemetry.move_state);
+    m_cam_move_time += dt;
+    float yaw_delta = input.look_yaw_delta;
+    float pitch_delta = input.look_pitch_delta;
+    if (!input.view_recorded) camera_view_rotation(yaw_delta, pitch_delta, dt);
+
     if (m_turn_timer > 0.0f) {
         const float step = (wrap_deg(m_turn_target_yaw - m_telemetry.yaw_deg) /
                             std::max(m_turn_timer, 1e-4f)) * std::min(dt, m_turn_timer);
         m_telemetry.yaw_deg += step;
+        // The 180 turns are root rotations: the body turns and the view turns with it. The wallrun
+        // turn to the wall only swings the view (bDisableControllerFacingPawnYawRotation).
+        const bool wallrun = (m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
+                              m_telemetry.move_state == EMovement::MOVE_WallRunningRight);
+        if (!wallrun) m_pawn_yaw += step;
         m_turn_timer -= dt;
         if (m_turn_timer <= 0.0f) {
             m_turn_timer = 0.0f;
+            if (!wallrun) m_pawn_yaw += wrap_deg(m_turn_target_yaw - m_telemetry.yaw_deg);
             m_telemetry.yaw_deg = m_turn_target_yaw;
         }
-        m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + input.look_pitch_delta, -85.0f, 85.0f);
+        m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + pitch_delta, -85.0f, 85.0f);
     } else {
-        m_telemetry.yaw_deg += input.look_yaw_delta;
-        m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + input.look_pitch_delta, -85.0f, 85.0f);
+        m_telemetry.yaw_deg += yaw_delta;
+        m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + pitch_delta, -85.0f, 85.0f);
     }
 
     // Keep yaw normalized in [0, 360)
     while (m_telemetry.yaw_deg < 0.0f) m_telemetry.yaw_deg += 360.0f;
     while (m_telemetry.yaw_deg >= 360.0f) m_telemetry.yaw_deg -= 360.0f;
+
+    // TdPawn.FaceRotation: the body follows the final view unless the move holds it.
+    camera_face_rotation(dt);
 
     // Look-At Route Hint: Smoothly swivels view towards next checkpoint / runner objective
     if (input.look_at) {
@@ -776,6 +887,281 @@ void ParkourController::update_camera_and_inputs(const InputFrame& input, float 
         !m_telemetry.fall_death_impact) {
         m_telemetry.camera_roll_deg += (0.0f - m_telemetry.camera_roll_deg) * std::min(1.0f, 10.0f * dt);
     }
+}
+
+// -----------------------------------------------------------------------------
+// TdMove camera rules (TdPlayerController.UpdateRotation -> TdMove.UpdateViewRotation ->
+// TdPawn.FaceRotation). During many moves the view may only turn so far from the body (the table
+// in move_camera); some moves take the look away for a while (DisableLookTime /
+// SetIgnoreLookInput), swing the view back to the body (ResetCameraLook) or at a target
+// (SetLookAtTarget*). The body (m_pawn_yaw) turns with the view unless the move holds it.
+// -----------------------------------------------------------------------------
+void ParkourController::camera_ignore_look(float seconds) {
+    // TdPawn.SetIgnoreLookInput: -1 = until StopIgnoreLookInput (the move ends); a timed lock only
+    // starts when look input is not locked already.
+    if (seconds < 0.0f) m_ignore_look_time = -1.0f;
+    else if (seconds > 0.0f && m_ignore_look_time == 0.0f) m_ignore_look_time = seconds;
+}
+
+void ParkourController::camera_reset_look(float seconds) {
+    m_reset_look_time = std::max(0.0f, seconds);  // CancelResetCameraLookTime = Now + seconds
+}
+
+void ParkourController::camera_look_at(float yaw, float pitch, float interp_time, float duration) {
+    m_look_at_active = true;
+    m_look_at_is_location = false;
+    m_look_at_yaw = yaw;
+    m_look_at_pitch = pitch;
+    m_look_at_interp = std::max(interp_time, 1e-4f);
+    m_look_at_duration = duration;
+}
+
+void ParkourController::camera_look_at_location(const Vec3& target, float interp_time, float duration) {
+    camera_look_at(0.0f, 0.0f, interp_time, duration);
+    m_look_at_is_location = true;
+    m_look_at_location = target;
+}
+
+bool ParkourController::camera_body_yaw(float& yaw) const {
+    // Moves that turn the body themselves while it does not follow the view (bDisableFaceRotation
+    // with SetRotation / SetPreciseRotation / the slide's own steering in retail).
+    switch (m_telemetry.move_state) {
+        case EMovement::MOVE_Slide:
+            yaw = m_slide_yaw;
+            return true;
+        case EMovement::MOVE_WallRunningRight:
+        case EMovement::MOVE_WallRunningLeft:
+            yaw = yaw_of(m_wall_tangent);  // TdMove_WallRun.FacePawnAlongWall
+            return true;
+        case EMovement::MOVE_Grabbing:
+        case EMovement::MOVE_GrabPullUp:
+        case EMovement::MOVE_IntoGrab:
+        case EMovement::MOVE_GrabTransfer:
+            if (horiz(m_telemetry.wall_normal).length() < 0.5f) return false;
+            yaw = yaw_of(-m_telemetry.wall_normal);  // TdMove_IntoGrab: SetPreciseRotation(-MoveNormal)
+            return true;
+        case EMovement::MOVE_Climb:
+            if (horiz(m_climb_normal).length() < 0.5f) return false;
+            yaw = yaw_of(-m_climb_normal);
+            return true;
+        case EMovement::MOVE_LedgeWalk:
+            if (horiz(m_ledge_walk_normal).length() < 0.5f) return false;
+            yaw = yaw_of(m_ledge_walk_normal);  // back to the wall
+            return true;
+        case EMovement::MOVE_ZipLine: {
+            const Vec3 line = horiz(m_zipline_end - m_zipline_start);
+            if (line.length() < 1.0f) return false;
+            yaw = yaw_of(line);
+            return true;
+        }
+        case EMovement::MOVE_Balance: {
+            // The beam direction the walk uses (the end the view faces).
+            const Vec3 ab = horiz(m_balance_end - m_balance_start);
+            if (ab.length() < 1.0f) return false;
+            const Vec3 u = ab.normalized();
+            yaw = yaw_of(facing_forward().dot(u) >= 0.0f ? u : -u);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+void ParkourController::camera_move_changed(EMovement from, EMovement to) {
+    // TdMove.StopMove of the move left: look input comes back, its look-at and recentring stop, and
+    // some moves ease the body back under the view (FaceRotationTimeLeft).
+    m_ignore_look_time = 0.0f;
+    m_look_at_active = false;
+    m_reset_look_time = -1.0f;
+    switch (from) {
+        case EMovement::MOVE_Grabbing:         m_face_rotation_time_left = 0.5f; break;
+        case EMovement::MOVE_WallRunningRight:
+        case EMovement::MOVE_WallRunningLeft:  if (!m_wall_turned) m_face_rotation_time_left = 0.3f; break;
+        case EMovement::MOVE_Slide:            m_face_rotation_time_left = 0.4f; break;
+        case EMovement::MOVE_Climb:            m_face_rotation_time_left = 0.2f; break;
+        case EMovement::MOVE_Balance:          m_face_rotation_time_left = 0.4f; break;
+        default: break;
+    }
+
+    // TdMove.StartMove of the new one.
+    const MoveCamera mc = move_camera(to);
+    m_cam_move = to;
+    m_cam_move_time = 0.0f;
+    m_face_rotation_disabled = mc.disable_face_rotation;
+    m_vault_down = false;
+    // The body at the start of the move: where the move places it, or - for moves the body follows
+    // the view in - the view, which the port's move code may just have snapped to the move's facing
+    // (retail rotates the pawn and the controller follows).
+    float held = 0.0f;
+    if (m_face_rotation_disabled && camera_body_yaw(held)) m_pawn_yaw = held;
+    else if (!m_face_rotation_disabled && m_face_rotation_time_left <= 0.0f) m_pawn_yaw = wrap_deg(m_telemetry.yaw_deg);
+    if (mc.disable_look_time != 0.0f) camera_ignore_look(mc.disable_look_time);
+    const bool heavy = m_telemetry.weapon.equipped && m_telemetry.weapon.is_heavy;  // GetWeaponType() == 1
+    switch (to) {
+        case EMovement::MOVE_Falling:
+            if (from == EMovement::MOVE_WallClimbing) camera_reset_look(0.5f);
+            break;
+        case EMovement::MOVE_Grabbing:
+            camera_reset_look(0.15f);  // TdMove_IntoGrab.ReachedPreciseLocation
+            break;
+        case EMovement::MOVE_GrabPullUp:
+            camera_reset_look(0.2f);   // ResetCameraLook(DisableLookTime)
+            break;
+        case EMovement::MOVE_WallRunningRight:
+        case EMovement::MOVE_WallRunningLeft: {
+            // bUseAbsoluteYawConstraint: a world window from the wall normal to the run direction.
+            const float n = yaw_of(m_telemetry.wall_normal);
+            const bool right = (to == EMovement::MOVE_WallRunningRight);
+            m_wallrun_yaw_min = right ? n : n - 90.0f;
+            m_wallrun_yaw_max = right ? n + 90.0f : n;
+            break;
+        }
+        case EMovement::MOVE_SpeedVaulting:
+        case EMovement::MOVE_VaultOver:
+            // High vaults (VaultTimeUp > 0, bResetCamera): no look until the hand plant, and the view
+            // swings back to the body over 0.2 s.
+            if (m_vault_look_lock > 0.0f) {
+                camera_ignore_look(m_vault_look_lock);
+                camera_reset_look(0.2f);
+            }
+            break;
+        case EMovement::MOVE_Climb:
+            camera_reset_look(0.3f);
+            break;
+        case EMovement::MOVE_Barge:
+            camera_reset_look(m_barge_kick ? 0.2f : 0.3f);  // TdMove_Barge.StartBargin
+            break;
+        case EMovement::MOVE_Landing:
+            // TdMove_Landing.LandHard: no look until the landing animation is done.
+            camera_ignore_look(-1.0f);
+            camera_reset_look(heavy ? 0.1f : 0.3f);
+            break;
+        case EMovement::MOVE_LayOnGround:
+            camera_reset_look(0.3f);  // TdMove_Landing.LandBackwards
+            break;
+        case EMovement::MOVE_SkillRoll:
+            camera_ignore_look(-1.0f);
+            camera_reset_look(0.2f);
+            break;
+        case EMovement::MOVE_MeleeWallrun:
+            camera_reset_look(0.1f);
+            break;
+        case EMovement::MOVE_WallClimb180TurnJump:
+            camera_reset_look(0.2f);
+            break;
+        case EMovement::MOVE_Swing:
+            camera_reset_look(0.15f);  // AnimBlendTime
+            break;
+        case EMovement::MOVE_180TurnInAir:
+            // Look back at the take-off (LastJumpLocation + 90 above the pawn's centre) for up to 2 s.
+            camera_look_at_location(m_last_jump_location + Vec3(0.0f, 0.0f, 90.0f + 90.0f), 0.3f, 2.0f);
+            break;
+        default:
+            break;
+    }
+}
+
+void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float dt) {
+    const EMovement m = m_cam_move;
+
+    // Camera changes inside a move.
+    if ((m == EMovement::MOVE_VaultOver || m == EMovement::MOVE_SpeedVaulting) && !m_vault_down &&
+        m_telemetry.move_state == m && m_state_timer >= m_path_t1) {
+        // TdMove_SpeedVault VaultState 3 (the drop): the body turns back under the view over 0.4 s.
+        m_vault_down = true;
+        m_face_rotation_disabled = false;
+        m_face_rotation_time_left = 0.4f;
+    }
+    if (m == EMovement::MOVE_GrabPullUp && m_face_rotation_disabled && m_cam_move_time >= 0.6f) {
+        m_face_rotation_disabled = false;  // TdMove_GrabPullUp.ReleaseCamera (TimeToReleaseCamera)
+        m_face_rotation_time_left = 0.25f;
+    }
+    if (m == EMovement::MOVE_GrabJump && m_face_rotation_disabled && m_cam_move_time >= 0.1f) {
+        m_face_rotation_disabled = false;  // TdMove_GrabJump.OnTimer
+        m_face_rotation_time_left = 0.3f;
+    }
+
+    // TdPlayerInput.PlayerInput: no look input while it is ignored.
+    if (m_ignore_look_time != 0.0f) {
+        yaw_d = 0.0f;
+        pitch_d = 0.0f;
+        if (m_ignore_look_time > 0.0f) m_ignore_look_time = std::max(0.0f, m_ignore_look_time - dt);
+    }
+
+    // TdPlayerController.UpdateRotation: the view turns at 40% while it pitches 63 deg or more away
+    // from the body (RotSpeedMod).
+    if (std::abs(m_telemetry.pitch_deg) * kUUPerDeg / 16384.0f + 0.3f >= 1.0f) yaw_d *= 0.4f;
+
+    // TdMove_WallClimb.LookAtLedge: up the wall, the view is drawn to a point 100 above the eyes,
+    // one radius into the wall (squared up to the wall when within 22.5 deg of it).
+    if (m == EMovement::MOVE_WallClimbing && horiz(m_telemetry.wall_normal).length() > 0.5f) {
+        const Vec3 n = horiz(m_telemetry.wall_normal).normalized();
+        const float wall_yaw = yaw_of(-n);
+        const float yaw = (std::abs(wrap_deg(wall_yaw - m_pawn_yaw)) > 22.5f) ? m_pawn_yaw : wall_yaw;
+        camera_look_at(yaw, std::atan2(100.0f, kPawnRadius) * RAD2DEG, 0.2f, -1.0f);
+    }
+
+    // TdMove.UpdateViewRotation: the look-at target pulls the view itself...
+    if (m_look_at_active) {
+        if (m_look_at_duration < 0.0f || m_look_at_duration >= m_cam_move_time) {
+            float ty = m_look_at_yaw, tp = m_look_at_pitch;
+            if (m_look_at_is_location) {
+                const Vec3 d = m_look_at_location - (m_telemetry.position + Vec3(0.0f, 0.0f, m_telemetry.eye_height));
+                ty = d.length_xy() > 1.0f ? yaw_of(d) : m_telemetry.yaw_deg;
+                tp = std::atan2(d.z, std::max(d.length_xy(), 1e-3f)) * RAD2DEG;
+            }
+            const float f = std::min(1.0f, dt / m_look_at_interp);
+            m_telemetry.yaw_deg += wrap_deg(ty - m_telemetry.yaw_deg) * f;
+            m_telemetry.pitch_deg = std::clamp(m_telemetry.pitch_deg + (tp - m_telemetry.pitch_deg) * f, -85.0f, 85.0f);
+        } else {
+            m_look_at_active = false;
+        }
+    }
+
+    // ... the move's look constraint limits the frame's turn, relative to the body ...
+    const MoveCamera mc = move_camera(m);
+    if (mc.constrain) {
+        const float speed = dt / 0.2f;
+        float lo = mc.yaw_min, hi = mc.yaw_max;
+        if (m == EMovement::MOVE_WallRunningRight || m == EMovement::MOVE_WallRunningLeft) {
+            lo = wrap_deg(m_wallrun_yaw_min - m_pawn_yaw) * kUUPerDeg;
+            hi = wrap_deg(m_wallrun_yaw_max - m_pawn_yaw) * kUUPerDeg;
+        }
+        const float rel_yaw = wrap_deg(m_telemetry.yaw_deg - m_pawn_yaw) * kUUPerDeg;
+        yaw_d = constrain_axis(rel_yaw, lo, hi, speed, yaw_d * kUUPerDeg) / kUUPerDeg;
+        pitch_d = constrain_axis(m_telemetry.pitch_deg * kUUPerDeg, mc.pitch_min, mc.pitch_max, speed,
+                                 pitch_d * kUUPerDeg) / kUUPerDeg;
+    }
+    // TdMove_180TurnInAir.UpdateViewRotation: any yaw turn drops the look back at the take-off.
+    if (m == EMovement::MOVE_180TurnInAir && yaw_d != 0.0f) m_look_at_active = false;
+
+    // ... and ResetCameraLook swings it back to the body, level, linearly over the time left.
+    if (m_reset_look_time >= 0.0f) {
+        m_reset_look_time -= dt;
+        if (m_reset_look_time > 0.0f) {
+            const float steps = std::max(1.0f, m_reset_look_time / dt);
+            m_telemetry.yaw_deg += wrap_deg(m_pawn_yaw - m_telemetry.yaw_deg) / steps;
+            m_telemetry.pitch_deg -= m_telemetry.pitch_deg / steps;
+        } else {
+            m_telemetry.pitch_deg = 0.0f;
+            m_reset_look_time = -1.0f;
+        }
+    }
+}
+
+void ParkourController::camera_face_rotation(float dt) {
+    // TdPawn.FaceRotation: the body takes the view's yaw, eases to it over FaceRotationTimeLeft
+    // after some moves, and stays put (or where the move turns it) while the move disables it.
+    float held = 0.0f;
+    if (m_face_rotation_disabled) {
+        if (camera_body_yaw(held)) m_pawn_yaw = held;
+    } else if (m_face_rotation_time_left > 0.0f) {
+        m_pawn_yaw += wrap_deg(m_telemetry.yaw_deg - m_pawn_yaw) * std::min(1.0f, dt / m_face_rotation_time_left);
+        m_face_rotation_time_left -= dt;
+    } else {
+        m_pawn_yaw = m_telemetry.yaw_deg;
+    }
+    m_pawn_yaw = wrap_deg(m_pawn_yaw);
 }
 
 // -----------------------------------------------------------------------------
@@ -2667,6 +3053,7 @@ void ParkourController::start_grab_transfer(const RailTransfer& rail) {
     m_path_exit_velocity = horiz(rail.end - rail.hang).normalized() * 160.0f;
     m_path_end_move = rail.end_on_floor ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
     m_path_hang_vault = true;
+    m_vault_look_lock = 0.0f;  // the vault over the rail starts in its over phase
     m_telemetry.move_state = EMovement::MOVE_GrabTransfer;
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
     m_state_timer = 0.0f;
@@ -2874,6 +3261,9 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
         m_path_end_move = EMovement::MOVE_Walking;
     }
     const bool high_vault = (handplant >= kVaultHighMinHeight);
+    // VaultOverHigh / VaultOntoHigh have an up phase (VaultTimeUp 0.28 / 0.27 s) with look input
+    // ignored until the hand plant; the other vault types start in the over phase.
+    m_vault_look_lock = high_vault ? (over ? 0.28f : 0.27f) : 0.0f;
     m_path_t1 = high_vault ? 0.48f : c.vault_time_over;
     m_path_t2 = high_vault ? 0.40f : c.vault_time_down;
     const Vec3 last_leg = horiz(m_path_p2 - m_path_p1);
