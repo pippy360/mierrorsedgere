@@ -918,9 +918,114 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                   << ", LedgeWalk=" << (ledge_walk_ok ? "OK" : "FAIL") << ")" << std::endl;
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, and zipline/swing/ledge stage 15
+    // Stage 16: Per-move camera rules (TdMove bConstrainLook / DisableLookTime / ResetCameraLook):
+    // the slide keeps the view within 55 deg of the body, the wallrun keeps it between the run
+    // direction and the wall normal, the skill roll ignores look input, and walking looks freely.
+    std::cout << "[Oracle Stage 16] Testing Per-Move Camera Constraints..." << std::endl;
+    auto wrap180 = [](float a) {
+        a = std::fmod(a + 180.0f, 360.0f);
+        if (a < 0.0f) a += 360.0f;
+        return a - 180.0f;
+    };
+    // A. Free look while walking: 10 frames of +5 deg turn 50 deg, and the body follows.
+    controller.reset(Vec3(208.0f, -7790.0f, 5760.0f), 0.0f);
+    InputFrame in_look_walk{};
+    in_look_walk.look_yaw_delta = 5.0f;
+    for (int i = 0; i < 10; ++i) controller.step(in_look_walk, kDt, sim_scene);
+    const bool free_look_ok = std::abs(wrap180(controller.get_yaw() - 50.0f)) < 0.01f &&
+                              std::abs(wrap180(controller.get_body_yaw() - controller.get_yaw())) < 0.01f;
+
+    // B. Slide (TdMove_Slide: yaw +-10000 uu = +-54.9 deg of the body): turning hard during the slide
+    //    moves the view, but never more than 55 deg from the body.
+    controller.reset(Vec3(208.0f, -7790.0f, 5760.0f), 0.0f);
+    for (int i = 0; i < 100; ++i) controller.step(in_run, kDt, sim_scene);
+    InputFrame in16_slide{};
+    in16_slide.forward = 1.0f;
+    in16_slide.crouch = true;
+    controller.step(in16_slide, kDt, sim_scene);
+    const bool s16_slide = (controller.get_move_state() == EMovement::MOVE_Slide);
+    const float slide_yaw0 = controller.get_yaw();
+    in16_slide.look_yaw_delta = 6.0f;
+    float slide_max_rel = 0.0f;
+    int slide_frames = 0;
+    for (int i = 0; i < 25 && controller.get_move_state() == EMovement::MOVE_Slide; ++i) {
+        controller.step(in16_slide, kDt, sim_scene);
+        slide_max_rel = std::max(slide_max_rel, std::abs(wrap180(controller.get_yaw() - controller.get_body_yaw())));
+        ++slide_frames;
+    }
+    const float slide_turned = std::abs(wrap180(controller.get_yaw() - slide_yaw0));
+    const bool slide_cam_ok = s16_slide && slide_frames >= 10 && slide_max_rel <= 55.0f && slide_turned >= 20.0f;
+
+    // C. Wallrun (TdMove_WallRun: absolute yaw window from the wall normal to the run direction):
+    //    looking into the wall never takes the view further outside the window.
+    controller.reset(Vec3(-100.0f, -6180.0f, 4224.0f), 160.0f);
+    controller.set_velocity(Vec3(-517.0f, 188.0f, 0.0f));
+    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= -275.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
+    const EMovement s16_wr = controller.get_move_state();
+    const bool s16_wallrun = (s16_wr == EMovement::MOVE_WallRunningLeft || s16_wr == EMovement::MOVE_WallRunningRight);
+    auto window_violation = [&]() {
+        const Vec3 n = controller.get_telemetry().wall_normal;
+        const float ny = std::atan2(n.y, n.x) * RAD2DEG;
+        const bool right = (controller.get_move_state() == EMovement::MOVE_WallRunningRight);
+        const float lo = right ? ny : ny - 90.0f;  // MinContraintWorld
+        const float hi = right ? ny + 90.0f : ny;  // MaxContraintWorld
+        const float v = controller.get_yaw();
+        return std::max({0.0f, -wrap180(v - lo), wrap180(v - hi)});
+    };
+    InputFrame in16_wall = in_run;
+    // Into the wall: a left wallrun has the wall on the left (negative yaw), a right one on the right.
+    in16_wall.look_yaw_delta = (s16_wr == EMovement::MOVE_WallRunningLeft) ? -4.0f : 4.0f;
+    float wr_prev = window_violation(), wr_worst_rise = 0.0f;
+    int wr_frames = 0;
+    for (int i = 0; i < 40; ++i) {
+        controller.step(in16_wall, kDt, sim_scene);
+        const EMovement st = controller.get_move_state();
+        if (st != EMovement::MOVE_WallRunningLeft && st != EMovement::MOVE_WallRunningRight) break;
+        const float v = window_violation();
+        wr_worst_rise = std::max(wr_worst_rise, v - wr_prev);
+        wr_prev = v;
+        ++wr_frames;
+    }
+    const bool wallrun_cam_ok = s16_wallrun && wr_frames >= 10 && wr_worst_rise <= 0.05f && wr_prev <= 15.0f;
+
+    // D. Skill roll (TdMove_SkillRoll: SetIgnoreLookInput(-1) until the roll ends): mouse look does
+    //    not turn the view mid-roll.
+    controller.reset(Vec3(-8900.0f, -5280.0f, 6144.0f), 90.0f);
+    for (int i = 0; i < 35; ++i) controller.step(in_run, kDt, sim_scene);
+    controller.step(in_run_jump, kDt, sim_scene);
+    InputFrame in16_coil{};
+    in16_coil.crouch = true;
+    in16_coil.forward = 1.0f;
+    controller.step(in16_coil, kDt, sim_scene);
+    step_until(in_run, 120, sim_scene, [&] { return controller.get_position().z <= 5860.0f; });
+    step_until(in16_coil, 60, sim_scene, [&] { return controller.is_grounded(); });
+    const bool s16_roll = (controller.get_move_state() == EMovement::MOVE_SkillRoll);
+    const float roll_yaw0 = controller.get_yaw();
+    InputFrame in16_look{};
+    in16_look.look_yaw_delta = 5.0f;
+    in16_look.look_pitch_delta = 3.0f;
+    int roll_frames = 0;
+    for (int i = 0; i < 10 && controller.get_move_state() == EMovement::MOVE_SkillRoll; ++i) {
+        controller.step(in16_look, kDt, sim_scene);
+        ++roll_frames;
+    }
+    const float roll_turn = std::abs(wrap180(controller.get_yaw() - roll_yaw0));
+    const bool roll_lock_ok = s16_roll && roll_frames >= 5 && roll_turn < 0.01f;
+
+    const bool s16_pass = free_look_ok && slide_cam_ok && wallrun_cam_ok && roll_lock_ok;
+    std::cout << "  -> Stage 16 Result: " << (s16_pass ? "PASS" : "FAIL")
+              << " (FreeLook=" << (free_look_ok ? "OK" : "FAIL")
+              << ", Slide=" << (slide_cam_ok ? "OK" : "FAIL") << " [max " << slide_max_rel << "° from body, turned "
+              << slide_turned << "° in " << slide_frames << " frames]"
+              << ", Wallrun=" << (wallrun_cam_ok ? "OK" : "FAIL") << " [" << move_state_name(s16_wr)
+              << ", outside window " << wr_prev << "°, worst rise " << wr_worst_rise << "° in " << wr_frames << " frames]"
+              << ", SkillRollLookLock=" << (roll_lock_ok ? "OK" : "FAIL") << " [turned " << roll_turn << "° in "
+              << roll_frames << " frames])" << std::endl;
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15 and camera stage 16
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;

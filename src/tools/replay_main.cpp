@@ -125,6 +125,8 @@ InputFrame input_for(const Frame& f, const ParkourController& pc) {
     // turn damping reads the delta (PlayerInput.aTurn), so the look must arrive as one.
     in.look_yaw_delta = wrap180(f.yaw - pc.get_yaw());
     in.look_pitch_delta = f.pitch - pc.get_pitch();
+    // Retail's view already went through its per-move camera locks and constraints.
+    in.view_recorded = true;
     return in;
 }
 
