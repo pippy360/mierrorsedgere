@@ -901,38 +901,54 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
     if (dir.length_sq() < 1e-6f || max_rise <= min_rise) return out;
     dir = dir.normalized();
 
-    // The lowest probe that finds a face between the two heights (so a low rail counts as well as
-    // a chest-high wall).
-    WallFace wall;
-    constexpr int kSamples = 4;
-    for (int i = 0; i < kSamples && !wall.found; ++i) {
-        const float h = min_rise + (max_rise - min_rise) * (static_cast<float>(i) + 0.5f) / kSamples;
-        wall = probe_wall(dir, reach, h, scene);
-    }
-    if (!wall.found) return out;
-
-    const Vec3 into = -wall.normal;
     const Vec3& feet = m_telemetry.position;
     // TdPhysicsMove.HandPlantExtentCheckWidth / Height: the hands need a 10 x 10 x 80 clear box
     // standing on the ledge top, so a thin rail with a panel right behind it is not a ledge.
     constexpr float kHandPlantWidth = 10.0f;
     constexpr float kHandPlantHeight = 80.0f;
-    for (float extra : {6.0f, 20.0f, 40.0f}) {
-        Vec3 column = wall.point + into * extra;
-        column.z = feet.z;
-        const TraceHit top = trace_ray(column + Vec3(0.0f, 0.0f, max_rise + 10.0f),
-                                       column + Vec3(0.0f, 0.0f, std::max(0.0f, min_rise - 2.0f)), scene);
-        if (!top.hit || top.normal.z < kWalkableFloorZ) continue;
-        const float rise = top.point.z - feet.z;
-        if (rise < min_rise || rise > max_rise) continue;
-        const Vec3 hands(column.x, column.y, top.point.z + 1.0f + 0.5f * kHandPlantHeight);
-        if (!box_free(hands, Vec3(kHandPlantWidth, kHandPlantWidth, 0.5f * kHandPlantHeight), scene)) continue;
-        out.found = true;
-        out.normal = wall.normal;
-        out.top_z = top.point.z;
-        out.wall_distance = wall.distance;
-        out.top_point = Vec3(column.x, column.y, top.point.z);
-        return out;
+    // Thin probe box matching faith-runner column_top: catches 0..5 uu thin chain-link fences and
+    // vertical collision sheets whose triangles have zero horizontal cap area.
+    constexpr Vec3 kTopProbeExtent(2.5f, 2.5f, 0.5f);
+    const float z_start = feet.z + max_rise + 10.0f;
+    const float z_end = feet.z + std::max(0.0f, min_rise - 2.0f);
+
+    constexpr int kSamples = 6;
+    for (int i = 0; i < kSamples; ++i) {
+        const float h = min_rise + (max_rise - min_rise) * (static_cast<float>(i) + 0.5f) / kSamples;
+        const WallFace wall = probe_wall(dir, reach, h, scene);
+        if (!wall.found) continue;
+
+        const Vec3 into = -wall.normal;
+        for (float extra : {2.0f, 8.0f, 20.0f, 40.0f}) {
+            Vec3 column = wall.point + into * extra;
+            float top_z = 0.0f;
+            bool got_top = false;
+            const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start),
+                                           Vec3(column.x, column.y, z_end), scene);
+            if (top.hit && top.normal.z >= kWalkableFloorZ) {
+                top_z = top.point.z;
+                got_top = true;
+            } else {
+                const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start),
+                                                   kTopProbeExtent,
+                                                   Vec3(0.0f, 0.0f, z_end - z_start), scene);
+                if (box_top.hit && !box_top.start_penetrating && box_top.normal.z >= kWalkableFloorZ) {
+                    top_z = box_top.point.z - kTopProbeExtent.z;
+                    got_top = true;
+                }
+            }
+            if (!got_top) continue;
+            const float rise = top_z - feet.z;
+            if (rise < min_rise || rise > max_rise) continue;
+            const Vec3 hands(column.x, column.y, top_z + 1.0f + 0.5f * kHandPlantHeight);
+            if (!box_free(hands, Vec3(kHandPlantWidth, kHandPlantWidth, 0.5f * kHandPlantHeight), scene)) continue;
+            out.found = true;
+            out.normal = wall.normal;
+            out.top_z = top_z;
+            out.wall_distance = wall.distance;
+            out.top_point = Vec3(column.x, column.y, top_z);
+            return out;
+        }
     }
     return out;
 }
@@ -1065,13 +1081,32 @@ bool ParkourController::find_ledge_top(const Vec3& wall_normal, float max_rise, 
         }
     }
     if (wall_dist < 0.0f) return false;
-    // Walkable top just beyond the wall face.
-    for (float extra : {6.0f, 20.0f, 36.0f}) {
+    // Walkable top just beyond the wall face (including thin railings/fences via box sweep).
+    constexpr Vec3 kTopProbeExtent(2.5f, 2.5f, 0.5f);
+    for (float extra : {2.0f, 8.0f, 20.0f, 36.0f}) {
         const Vec3 column = p + into * (wall_dist + extra);
+        float top_z = 0.0f;
+        bool got_top = false;
         const TraceHit h = trace_ray(column + Vec3(0.0f, 0.0f, max_rise + 10.0f), column + Vec3(0.0f, 0.0f, 5.0f), scene);
-        if (!h.hit || h.normal.z < kWalkableFloorZ || h.point.z > p.z + max_rise) continue;
-        if (!has_room_at(Vec3(column.x, column.y, h.point.z + 0.5f), kPawnHeight, scene)) continue;
-        ledge_z = h.point.z;
+        if (h.hit && h.normal.z >= kWalkableFloorZ && h.point.z <= p.z + max_rise) {
+            top_z = h.point.z;
+            got_top = true;
+        } else {
+            const float z_start = p.z + max_rise + 10.0f;
+            const float z_end = p.z + 5.0f;
+            const TraceHit bh = sweep_box(Vec3(column.x, column.y, z_start), kTopProbeExtent,
+                                          Vec3(0.0f, 0.0f, z_end - z_start), scene);
+            if (bh.hit && !bh.start_penetrating && bh.normal.z >= kWalkableFloorZ) {
+                const float tz = bh.point.z - kTopProbeExtent.z;
+                if (tz <= p.z + max_rise) {
+                    top_z = tz;
+                    got_top = true;
+                }
+            }
+        }
+        if (!got_top) continue;
+        if (!has_room_at(Vec3(column.x, column.y, top_z + 0.5f), kPawnHeight, scene)) continue;
+        ledge_z = top_z;
         return true;
     }
     return false;
@@ -1570,11 +1605,12 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     if (st == EMovement::MOVE_Coil) m_coil_timer += dt;
 
     // Context moves (TdPlayerMoveManager auto moves while airborne — disabled once in uncontrolled lethal fall).
+    // Vault takes priority over wallclimb and ledge grab when holding forward (matching faith-runner controller.rs).
     if (!m_telemetry.falling_to_death && !dodge && !turning && !kicking) {
         if (try_initiate_zipline(scene)) return;
-        if (try_initiate_ledge_grab(input, scene)) return;
         if (try_initiate_vault(input, scene)) return;
         if (try_initiate_wallclimb(input, scene)) return;
+        if (try_initiate_ledge_grab(input, scene)) return;
         if (try_initiate_wallrun(input, scene)) return;
     }
     if (dodge && m_telemetry.velocity.z < -190.0f) {
@@ -2010,7 +2046,8 @@ void ParkourController::update_wallclimb(const InputFrame& input, float dt, cons
         }
     }
 
-    // The ledge at the top: hands catch it (IntoGrab) or, when it is already low, mantle over.
+    // The ledge at the top: vault over when holding forward on a thin fence/ledge, or catch/mantle.
+    if (try_initiate_vault(input, scene)) return;
     if (try_initiate_ledge_grab(input, scene)) return;
 
     // Still a wall ahead? Otherwise the top has been passed with nothing to grab.
@@ -2325,27 +2362,43 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     const MovementConfig& c = m_config;
     if (input.forward <= 0.8f) return false;
     const bool grounded = m_telemetry.grounded;
+    const EMovement st = m_telemetry.move_state;
     const Vec3 fwd = facing_forward();
     const Vec3 h = horiz(m_telemetry.velocity);
     const float speed = h.length();
-    // Only from a jump (rising) in the air: the VaultOverHigh / VaultOntoHigh moves.
-    if (!grounded && (m_telemetry.velocity.z < 50.0f || m_telemetry.move_state != EMovement::MOVE_Jump)) return false;
+
+    // TdMove_SpeedVault / TdMove_VaultOver (faith-runner vault::plan VaultTypes[1..5]):
+    // Checked both on ground jump press and while rising in the air (velocity.z >= 0 for 48..148,
+    // velocity.z >= 50 for 145..192). Falling across a rooftop gap (velocity.z < 0) does not vault.
+    if (!grounded) {
+        if (st == EMovement::MOVE_DodgeJump || st == EMovement::MOVE_180TurnInAir ||
+            st == EMovement::MOVE_MeleeAir || st == EMovement::MOVE_MeleeWallrun) {
+            return false;
+        }
+        if (m_telemetry.velocity.z < 0.0f) return false;
+    }
 
     // TimeToHandPlant: the ledge must be reachable within 0.4 s at the current speed (300 at least).
     const float reach = std::max(speed, 300.0f) * c.vault_max_handplant_time - kPawnRadius;
-    const float min_rise = grounded ? kMaxStepHeight : kVaultHighMinHeight;
-    const float max_rise = grounded ? kVaultMaxHeight : kVaultHighMaxHeight;
+    const float min_rise = grounded ? kMaxStepHeight : 48.0f;
+    const float max_rise = kVaultHighMaxHeight;
     const Ledge ledge = find_ledge(fwd, reach, min_rise, max_rise, scene);
     if (!ledge.found) return false;
-    if (fwd.dot(ledge.normal) > -0.2f) return false;  // view facing the obstacle
+    if (fwd.dot(ledge.normal) > -0.5f) return false;  // view facing the obstacle (not glancing along a wallrun wall)
+    if (m_last_wallrun_normal.length_sq() > 0.5f && ledge.normal.dot(m_last_wallrun_normal) > 0.9f &&
+        m_illegal_wall_timer > 0.0f && st != EMovement::MOVE_WallClimbing) {
+        return false;
+    }
     const float handplant = ledge.top_z - m_telemetry.position.z;
     if (handplant < min_rise || handplant > max_rise) return false;
+    if (!grounded && handplant >= kVaultHighMinHeight && m_telemetry.velocity.z < 50.0f) return false;
 
     const Vec3 dir = horiz(fwd).normalized();
     const Vec3 into = -ledge.normal;
     const float end_dist = std::max(48.0f, speed * 0.3f);
     const float top_z = ledge.top_z;
-    Vec3 face = ledge.top_point - into * 6.0f;  // back on the face line
+    const float probe_extra = std::max(0.0f, (ledge.top_point - m_telemetry.position).dot(into) - ledge.wall_distance);
+    Vec3 face = ledge.top_point - into * probe_extra;  // back on the front face line
     face.z = top_z;
 
     // TdMove_SpeedVault.FindValidOntoEndLocation: the body (a 1.4 x radius box, full height) has to
@@ -2394,10 +2447,19 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     m_path_p0 = m_telemetry.position;
     if (over) {
         m_path_p1 = face + into * (far_d * 0.5f) + Vec3(0.0f, 0.0f, c.vault_ledge_offset_z);
-        const Vec3 end = face + into * (far_d + end_dist);
-        m_path_p2 = Vec3(end.x, end.y, floor_found ? floor_beyond : top_z - 40.0f);
+        const Vec3 end = face + into * (far_d + std::max(end_dist, kPawnRadius + 24.0f));
+        const TraceHit land_trace = trace_ray(Vec3(end.x, end.y, top_z + 32.0f),
+                                              Vec3(end.x, end.y, top_z - 240.0f), scene);
+        if (land_trace.hit && land_trace.normal.z >= kWalkableFloorZ) {
+            floor_found = true;
+            floor_beyond = land_trace.point.z;
+        }
+        const float target_z = floor_found ? floor_beyond : (top_z - 20.0f);
+        if (!has_room_at(Vec3(end.x, end.y, target_z + 1.0f), kCrouchHeight, scene)) {
+            return false;
+        }
+        m_path_p2 = Vec3(end.x, end.y, target_z);
         m_path_end_move = floor_found ? EMovement::MOVE_Landing : EMovement::MOVE_Falling;
-        if (!floor_found) m_path_p2.z = top_z - 20.0f;
     } else {
         // Onto: room for the body on top.
         if (!has_room_at(ledge.top_point + into * (kPawnRadius + 4.0f) + Vec3(0.0f, 0.0f, 0.5f), kCrouchHeight, scene)) {
@@ -2408,10 +2470,11 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
         m_path_p2 = Vec3(end.x, end.y, top_z);
         m_path_end_move = EMovement::MOVE_Walking;
     }
-    m_path_t1 = c.vault_time_over;
-    m_path_t2 = c.vault_time_down;
+    const bool high_vault = (handplant >= kVaultHighMinHeight);
+    m_path_t1 = high_vault ? 0.48f : c.vault_time_over;
+    m_path_t2 = high_vault ? 0.40f : c.vault_time_down;
     const Vec3 last_leg = horiz(m_path_p2 - m_path_p1);
-    const float leg_speed = std::max(exit_speed * 0.5f, last_leg.length() / c.vault_time_down);
+    const float leg_speed = std::max(exit_speed * 0.5f, last_leg.length() / m_path_t2);
     m_path_exit_velocity = dir * std::min(leg_speed, c.ground_speed);
     if (over) m_path_exit_velocity = dir * exit_speed;
 

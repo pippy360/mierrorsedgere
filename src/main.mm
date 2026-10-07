@@ -246,6 +246,22 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     const Vec3 vault_land = controller.get_position();
     bool s2_vault_over = s2_vault && controller.is_grounded() && vault_land.x < -2700.0f && vault_land.z < 4300.0f;
 
+    // A2. Tutorial Stage 5 Chain-Link Fence Jump-Vault (yellow platform at x=2550,z=4344 -> fence at x=2339):
+    controller.reset(Vec3(2550.0f, -6750.0f, 4344.0f), 180.0f);
+    step_until(in_run, 60, sim_scene, [&] { return controller.get_position().x <= 2490.0f; });
+    controller.step(in_run_jump, kDt, sim_scene);
+    bool s2_fence_vault = (controller.get_move_state() == EMovement::MOVE_SpeedVaulting ||
+                           controller.get_move_state() == EMovement::MOVE_VaultOver);
+    step_until(in_run, 180, sim_scene, [&] {
+        if (controller.get_move_state() == EMovement::MOVE_SpeedVaulting ||
+            controller.get_move_state() == EMovement::MOVE_VaultOver) {
+            s2_fence_vault = true;
+        }
+        return s2_fence_vault && controller.is_grounded() && controller.get_position().x < 2290.0f;
+    });
+    const Vec3 fence_land = controller.get_position();
+    bool s2_fence_ok = s2_fence_vault && controller.is_grounded() && fence_land.x < 2290.0f;
+
     // B. Springboard: sprint east at the stacked boxes and jump off them
     controller.reset(Vec3(156.4f, -3933.6f, 3840.0f), 0.0f);
     step_until(in_run, 240, sim_scene, [&] { return controller.get_position().x >= 674.0f; });
@@ -267,9 +283,11 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     });
     // A plain jump (BaseJumpZ 630) peaks ~202 units up; the springboard (JumpZ 950) clears 300+
     bool s2_spring_high = s2_spring && (spring_apex_z - 3840.0f) > 300.0f;
-    bool s2_pass = s2_vault_over && s2_spring_high;
+    bool s2_pass = s2_vault_over && s2_fence_ok && s2_spring_high;
     std::cout << "  -> Stage 2 Result: " << (s2_pass ? "PASS" : "FAIL")
               << " (Vault=" << (s2_vault ? "OK" : "NO")
+              << ", FenceVault=" << (s2_fence_ok ? "OK" : "NO")
+              << " [x=" << fence_land.x << ", z=" << fence_land.z << "]"
               << ", Vault Landing=(" << vault_land.x << ", " << vault_land.z << ")"
               << ", SpringBoard=" << (s2_spring ? "OK" : "NO")
               << ", Apex Z=" << spring_apex_z << ")" << std::endl;
