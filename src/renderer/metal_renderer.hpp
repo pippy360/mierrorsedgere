@@ -41,6 +41,9 @@ public:
     MetalRenderer(MetalRenderer&&) noexcept;
     MetalRenderer& operator=(MetalRenderer&&) noexcept;
 
+    // The retail install the character, weapon and menu assets are read from. Call before init.
+    void set_game_root(const std::string& game_root);
+
     // Initialization modes
     bool init_headless(int width, int height);
     bool init_with_metal_layer(void* ca_metal_layer, int width, int height);
