@@ -159,6 +159,13 @@ struct ElemMatrix {
     [[nodiscard]] Vec3 apply(const Vec3& p) const { return rows[0] * p.x + rows[1] * p.y + rows[2] * p.z + rows[3]; }
 };
 
+// The immutable FMatrix is serialized as four FPlane rows, and Mirror's Edge writes each FPlane
+// W-first: (W, X, Y, Z). FPlane extends FVector, and the binary struct serializer emits the
+// derived struct's own property (W) before the inherited X/Y/Z. So an identity TM is stored as
+// [0 1 0 0 | 0 0 1 0 | 0 0 0 1 | 1 0 0 0]. Every KBoxElem/KSphereElem/KSphylElem TM in the
+// retail SP00-SP09 packages is affine and orthonormal only in this layout. Reading it as
+// X, Y, Z, W collapses each box onto x = W = 1, which removed the roof collision of meshes such
+// as S_RooftopStructure_04 (Escape) so the pawn fell through roofs that retail walks across.
 ElemMatrix read_elem_matrix(const UPKPackage& pkg, const UPropertyList& fields) {
     ElemMatrix m;
     const UProperty* tm = find_prop(fields, "TM");
@@ -166,7 +173,7 @@ ElemMatrix read_elem_matrix(const UPKPackage& pkg, const UPropertyList& fields) 
     if (!tm || tm->size != 64 || tm->value_offset + 64 > d.size()) return m;
     float f[16];
     std::memcpy(f, d.data() + tm->value_offset, 64);
-    for (int r = 0; r < 4; ++r) m.rows[r] = Vec3(f[r * 4 + 0], f[r * 4 + 1], f[r * 4 + 2]);
+    for (int r = 0; r < 4; ++r) m.rows[r] = Vec3(f[r * 4 + 1], f[r * 4 + 2], f[r * 4 + 3]);
     return m;
 }
 
