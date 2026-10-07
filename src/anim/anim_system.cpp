@@ -1085,8 +1085,10 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         }
         parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_D", swat_diffuse_tex_);
         parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_S", swat_specular_tex_);
+        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_N", swat_normal_tex_);
         swat_mesh_.tex_diffuse = swat_diffuse_tex_;
         swat_mesh_.tex_specular = swat_specular_tex_;
+        swat_mesh_.tex_normal = swat_normal_tex_;
     }
 
     // Load shared brass cartridge texture from Weapons/WP_Ammo.upk (used by M_Ammo sections on Glock18/FNSCARL/FNMinimi)
@@ -2083,7 +2085,7 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
             out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
             out_v.u = sv.u;
             out_v.v = sv.v;
-            out_v.u2 = 1.0f;
+            out_v.u2 = (sv.chunk_index == 1) ? 1.25f : 1.0f;
             out_v.color = 0xFFFFFFFF;
             out_triangles.push_back(out_v);
         }

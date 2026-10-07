@@ -325,6 +325,8 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
                                texture2d<float> wep_d_tex  [[texture(1)]],
                                texture2d<float> wep_s_tex  [[texture(2)]],
                                texture2d<float> ammo_d_tex [[texture(3)]],
+                               texture2d<float> swat_s_tex [[texture(4)]],
+                               texture2d<float> swat_n_tex [[texture(5)]],
                                depth2d_array<float> shadow_map [[texture(27)]],
                                sampler world_tex_sampler   [[sampler(0)]]) {
     // Compute geometric facet normal from screen-space derivatives to guarantee crisp architectural planes
@@ -340,10 +342,32 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float3 vtx_N = in.world_norm;
     float vtx_len = length(vtx_N);
     vtx_N = (vtx_len > 1e-4) ? (vtx_N / vtx_len) : geo_N;
-    if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
 
-    // Blend smooth vertex normal with crisp geometric face normal
-    float3 N = normalize(mix(geo_N, vtx_N, (in.uv2.x > 0.5) ? 0.75 : 0.55));
+    float3 N;
+    if (in.uv2.x > 0.5) {
+        // 3D skinned characters & weapons: preserve smooth vertex normals (no flat geo_N faceting)
+        if (dot(vtx_N, V) < -0.25) vtx_N = -vtx_N;
+        N = vtx_N;
+        if (in.uv2.x < 1.12) {
+            // Apply high-resolution 2048x2048 tangent-space normal map (T_TKY_Cop_SWAT_N)
+            float2 duvdx = dfdx(in.uv);
+            float2 duvdy = dfdy(in.uv);
+            float det_uv = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+            float3 T = (abs(det_uv) > 1e-10)
+                           ? normalize((dpdx * duvdy.y - dpdy * duvdx.y) * sign(det_uv))
+                           : normalize(dpdx - vtx_N * dot(vtx_N, dpdx));
+            T = normalize(T - vtx_N * dot(vtx_N, T));
+            float3 B = normalize(cross(vtx_N, T));
+            float3 n_ts = swat_n_tex.sample(world_tex_sampler, in.uv).rgb * 2.0 - 1.0;
+            n_ts.xy *= 0.85;
+            n_ts.z = sqrt(max(1.0 - dot(n_ts.xy, n_ts.xy), 0.04));
+            N = normalize(T * n_ts.x + B * n_ts.y + vtx_N * n_ts.z);
+        }
+    } else {
+        if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
+        N = normalize(mix(geo_N, vtx_N, 0.55));
+    }
+
     float3 L = normalize(float3(uniforms.sun_dir));
     float shadow = sample_world_shadow(in.world_pos, N, uniforms, shadow_map);
 
@@ -368,28 +392,49 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float rv_factor = saturate(max(uniforms.is_runner_vision, uniforms.runner_vision_strength));
 
     if (in.uv2.x > 0.5) {
-        if (in.uv2.x < 1.5) {
-            // KrugerSec / CPF SWAT Officer high-resolution 1024x1024 GPU texture
+        // Dynamic UE3 Spherical Harmonics (_SH) hemisphere + half-Lambert wrap + rim lighting for 3D characters & weapons
+        float wrap_sun = saturate(dot(N, L) * 0.5 + 0.5) * mix(0.68, 1.0, shadow);
+        float view_fill = saturate(dot(N, V)) * 0.34;
+        float rim_light = pow(1.0 - saturate(dot(N, V)), 2.6) * 0.44;
+        lighting = float3(0.52, 0.56, 0.64) + float3(0.68, 0.65, 0.58) * wrap_sun + view_fill + float3(0.44, 0.55, 0.72) * rim_light;
+
+        float3 H = normalize(L + V);
+        float3 H_sky = normalize(normalize(float3(0.25, -0.35, 0.90)) + V);
+        float3 R_env = reflect(-V, N);
+        float env_h = saturate(R_env.z * 0.5 + 0.5);
+        float3 env_col = mix(float3(0.14, 0.19, 0.28), float3(0.72, 0.82, 0.96), env_h);
+        float fresnel = pow(1.0 - saturate(dot(N, V)), 2.5);
+
+        if (in.uv2.x < 1.12) {
+            // UE3 MI_TKY_Cop_SWAT_SH (Diffuse Multiply = 2.4, Specular Power = 40.0, Mask quadrant at uv*0.5+0.5)
             float3 d_swat = swat_d_tex.sample(world_tex_sampler, in.uv).rgb;
-            base_albedo = pow(max(d_swat, float3(0.0)), float3(0.72)) * float3(1.18, 1.20, 1.26) + float3(0.05, 0.06, 0.08);
-            float3 H = normalize(L + V);
-            spec_add = float3(0.22, 0.25, 0.30) * pow(max(dot(N, H), 0.0), 20.0);
+            float3 s_swat = swat_s_tex.sample(world_tex_sampler, in.uv).rgb;
+            float3 mask_swat = swat_d_tex.sample(world_tex_sampler, clamp(in.uv, 0.0, 0.998) * 0.5 + 0.5).rgb;
+            base_albedo = d_swat * 2.4 + s_swat * 0.24 + float3(0.085, 0.018, 0.010) * mask_swat.b * 0.40;
+
+            float3 refl_add = env_col * s_swat * (0.22 + 0.65 * mask_swat.g) * (0.35 + 0.65 * fresnel);
+            float3 cloth_rim = float3(0.07, 0.10, 0.16) * mask_swat.r * pow(1.0 - saturate(dot(N, V)), 3.0);
+            float3 spec_lobe = s_swat * (pow(max(dot(N, H), 0.0), 32.0) * 0.55 + pow(max(dot(N, H_sky), 0.0), 20.0) * 0.30);
+            spec_add = spec_lobe + refl_add + cloth_rim;
+        } else if (in.uv2.x < 1.5) {
+            // UE3 MI_TKY_Cop_SWAT_eye_SH (EyeColor = (0.164, 0.184, 0.302), Whiteness = 0.25, Specular = 2.0)
+            base_albedo = float3(0.09, 0.10, 0.14);
+            spec_add = float3(0.85, 0.90, 0.98) * pow(max(dot(N, H), 0.0), 64.0) * 0.75;
         } else if (in.uv2.x < 2.5) {
-            // 3D Enemy Weapon / Dropped Weapon main high-res GPU texture
+            // 3D Enemy Weapon / Dropped Weapon main high-res GPU texture (linear sRGB + cubemap sheen)
             if (in.color.r > 0.85 && in.color.g < 0.20) {
                 base_albedo = in.color.rgb;
             } else {
                 float3 d_wep = wep_d_tex.sample(world_tex_sampler, in.uv).rgb;
                 float3 s_wep = wep_s_tex.sample(world_tex_sampler, in.uv).rgb;
-                base_albedo = pow(max(d_wep, float3(0.0)), float3(0.78)) * 1.15 + s_wep * 0.22 + float3(0.04, 0.05, 0.06);
-                float3 H = normalize(L + V);
-                spec_add = s_wep * (pow(max(dot(N, H), 0.0), 18.0) * 0.45 + pow(max(dot(N, H), 0.0), 48.0) * 0.35);
+                base_albedo = d_wep * 2.4 + s_wep * 0.24;
+                spec_add = s_wep * (pow(max(dot(N, H), 0.0), 20.0) * 0.48 + pow(max(dot(N, H_sky), 0.0), 36.0) * 0.38)
+                           + env_col * s_wep * (0.20 + 0.35 * fresnel);
             }
         } else {
-            // 3D Weapon M_Ammo brass cartridge / belt section
+            // 3D Weapon M_Ammo brass cartridge / belt section (linear sRGB)
             float3 d_ammo = ammo_d_tex.sample(world_tex_sampler, in.uv).rgb;
-            base_albedo = pow(max(d_ammo, float3(0.0)), float3(0.75)) * float3(1.25, 1.05, 0.72) + float3(0.14, 0.10, 0.04);
-            float3 H = normalize(L + V);
+            base_albedo = d_ammo * float3(1.65, 1.35, 0.88) + float3(0.05, 0.035, 0.012);
             spec_add = float3(0.85, 0.68, 0.36) * pow(max(dot(N, H), 0.0), 32.0) * 0.55;
         }
     } else if (rv_factor < 0.5) {
@@ -1723,6 +1768,8 @@ struct MetalRenderer::Impl {
     id<MTLTexture> vm_glove_gpu_tex = nil;
     id<MTLTexture> vm_lower_gpu_tex = nil;
     id<MTLTexture> swat_d_gpu_tex = nil;
+    id<MTLTexture> swat_s_gpu_tex = nil;
+    id<MTLTexture> swat_n_gpu_tex = nil;
     id<MTLTexture> ammo_d_gpu_tex = nil;
     std::unordered_map<std::string, WeaponGPUTextures> weapon_gpu_textures;
 
@@ -1762,7 +1809,9 @@ struct MetalRenderer::Impl {
         vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex(), false);
         vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex(), false);
         vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex(), false);
-        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex(), false);
+        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex(), true);
+        swat_s_gpu_tex   = upload_dxt1_texture(anim_system.swat_specular_tex(), true);
+        swat_n_gpu_tex   = upload_dxt1_texture(anim_system.swat_normal_tex(), false);
         ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex(), true);
 
         for (const auto& [wname, wmesh] : anim_system.weapon_meshes()) {
@@ -2738,9 +2787,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setDepthStencilState:impl_->depth_write_state];
 
         auto bind_world_char_wep_textures = [&](const std::string& wname) {
-            id<MTLTexture> t_swat = impl_->swat_d_gpu_tex ? impl_->swat_d_gpu_tex : impl_->tex_default_white;
-            id<MTLTexture> t_wep_d = impl_->tex_default_white;
-            id<MTLTexture> t_wep_s = impl_->tex_default_black;
+            id<MTLTexture> t_swat   = impl_->swat_d_gpu_tex ? impl_->swat_d_gpu_tex : impl_->tex_default_white;
+            id<MTLTexture> t_swat_s = impl_->swat_s_gpu_tex ? impl_->swat_s_gpu_tex : impl_->tex_default_black;
+            id<MTLTexture> t_swat_n = impl_->swat_n_gpu_tex ? impl_->swat_n_gpu_tex : impl_->tex_default_flat_normal;
+            id<MTLTexture> t_wep_d  = impl_->tex_default_white;
+            id<MTLTexture> t_wep_s  = impl_->tex_default_black;
             auto it_w = impl_->weapon_gpu_textures.find(wname);
             if (it_w == impl_->weapon_gpu_textures.end() && !impl_->weapon_gpu_textures.empty()) {
                 it_w = impl_->weapon_gpu_textures.find("Colt1911");
@@ -2750,10 +2801,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 if (it_w->second.specular) t_wep_s = it_w->second.specular;
             }
             id<MTLTexture> t_ammo = impl_->ammo_d_gpu_tex ? impl_->ammo_d_gpu_tex : impl_->tex_default_white;
-            [enc setFragmentTexture:t_swat  atIndex:0];
-            [enc setFragmentTexture:t_wep_d atIndex:1];
-            [enc setFragmentTexture:t_wep_s atIndex:2];
-            [enc setFragmentTexture:t_ammo  atIndex:3];
+            [enc setFragmentTexture:t_swat   atIndex:0];
+            [enc setFragmentTexture:t_wep_d  atIndex:1];
+            [enc setFragmentTexture:t_wep_s  atIndex:2];
+            [enc setFragmentTexture:t_ammo   atIndex:3];
+            [enc setFragmentTexture:t_swat_s atIndex:4];
+            [enc setFragmentTexture:t_swat_n atIndex:5];
             [enc setFragmentSamplerState:impl_->mat_samplers[0][0] atIndex:0];
         };
         bind_world_char_wep_textures("Colt1911");

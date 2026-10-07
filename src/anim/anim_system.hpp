@@ -219,6 +219,7 @@ public:
     [[nodiscard]] const DXT1Texture& faith_lower_tex() const { return faith_lower_tex_; }
     [[nodiscard]] const DXT1Texture& swat_diffuse_tex() const { return swat_diffuse_tex_; }
     [[nodiscard]] const DXT1Texture& swat_specular_tex() const { return swat_specular_tex_; }
+    [[nodiscard]] const DXT1Texture& swat_normal_tex() const { return swat_normal_tex_; }
     [[nodiscard]] const DXT1Texture& ammo_diffuse_tex() const { return ammo_diffuse_tex_; }
     [[nodiscard]] const AnimSetAsset& faith_unarmed_anims() const { return faith_unarmed_set_; }
     [[nodiscard]] const AnimSetAsset& faith_common_anims() const { return faith_common_set_; }
@@ -243,6 +244,7 @@ private:
     DXT1Texture faith_lower_tex_;
     DXT1Texture swat_diffuse_tex_;
     DXT1Texture swat_specular_tex_;
+    DXT1Texture swat_normal_tex_;
     DXT1Texture ammo_diffuse_tex_;
 
     AnimSetAsset faith_unarmed_set_;
