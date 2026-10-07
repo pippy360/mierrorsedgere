@@ -572,6 +572,7 @@ struct LevelActor {
     bool is_elevator_part = false;
     std::string source_package;
     Vec3 end_point{0.0f, 0.0f, 0.0f};
+    Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
     std::vector<std::string> material_overrides;
     // BlockingVolume BrushComponent.BrushAggGeom hulls, world space, 3 vertices per triangle.

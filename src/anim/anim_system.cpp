@@ -1670,7 +1670,10 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                     norm_time = std::clamp(st / 0.65f, 0.0f, 0.65f);
                 } else if (speed > 25.0f) {
                     // Lateral shimmy along ledge
-                    seq_a = active_set->find_sequence("HangStrafeRight");
+                    const Vec3 right = Rotator::from_degrees(0.0f, telemetry.yaw_deg, 0.0f).right();
+                    const bool go_left = telemetry.velocity.dot(right) < 0.0f;
+                    seq_a = active_set->find_sequence(go_left ? "HangStrafeLeft" : "HangStrafeRight");
+                    if (!seq_a) seq_a = active_set->find_sequence("HangStrafeRight");
                     float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.067f;
                     norm_time = std::fmod(st / dur, 1.0f);
                 } else {
