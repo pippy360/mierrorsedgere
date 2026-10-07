@@ -2747,18 +2747,22 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
 
     const float max_horiz = m_telemetry.grounded ? 95.0f : 135.0f;
     for (const auto& act : scene.actors) {
-        if (!act.is_ladder) continue;
+        if (!act.is_ladder || act.end_point.length_sq() < 1.0f) continue;
+        if (!std::isfinite(act.location.x) || !std::isfinite(act.location.y) || !std::isfinite(act.location.z) ||
+            !std::isfinite(act.end_point.x) || !std::isfinite(act.end_point.y) || !std::isfinite(act.end_point.z)) {
+            continue;
+        }
         const Vec3 base = (act.location.z <= act.end_point.z) ? act.location : act.end_point;
         const Vec3 top  = (act.location.z <= act.end_point.z) ? act.end_point : act.location;
-        if (top.z - base.z < 60.0f) continue;
+        if (!(top.z - base.z >= 60.0f)) continue;
 
         // Cooldown applies only to re-grabbing the exact same pipe/ladder after letting go,
         // so jumping laterally between adjacent drainpipes catches the next pipe immediately.
         if (m_climb_cooldown > 0.0f && horiz(m_climb_base - base).length() < 80.0f) continue;
 
-        if (m_telemetry.position.z < base.z - 95.0f || m_telemetry.position.z > top.z - 20.0f) continue;
+        if (!(m_telemetry.position.z >= base.z - 95.0f && m_telemetry.position.z <= top.z - 20.0f)) continue;
         const float h_dist = horiz(m_telemetry.position - base).length();
-        if (h_dist > max_horiz) continue;
+        if (!(h_dist <= max_horiz)) continue;
 
         // Native UE3 TdLadderVolume: actor Rotation faces into the wall/ladder when non-zero;
         // unrotated brush volumes (Rotation == 0,0,0) detect the mounting wall normal directly from scene collision.

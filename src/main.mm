@@ -768,9 +768,44 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                   << ", Roof Exit Z=" << climb_top_pos.z << ")" << std::endl;
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, and pipe climb/balance stage 13
+    bool s14_pass = false;
+    {
+        std::cout << "[Oracle Stage 14] Testing SP02 Jacknife Forward Sprint (TdLadderVolume NaN Regression)..." << std::endl;
+        LevelScene sp02_scene;
+        if (load_level_scene(game_root, "Maps/SP02/Stormdrain_p.me1", sp02_scene)) {
+            controller.reset(sp02_scene.player_spawn_pos, sp02_scene.player_spawn_yaw);
+            InputFrame in_fwd{};
+            in_fwd.forward = 1.0f;
+            bool finite_ok = true;
+            bool alive_ok = true;
+            for (int i = 0; i < 240; ++i) {
+                controller.step(in_fwd, kDt, sp02_scene);
+                const Vec3 p = controller.get_position();
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
+                    finite_ok = false;
+                    break;
+                }
+                if (controller.get_telemetry().falling_to_death) {
+                    alive_ok = false;
+                    break;
+                }
+            }
+            const Vec3 end_p = controller.get_position();
+            const float dist_moved = end_p.distance_xy(sp02_scene.player_spawn_pos);
+            s14_pass = finite_ok && alive_ok && (dist_moved > 1000.0f);
+            std::cout << "  -> Stage 14 Result: " << (s14_pass ? "PASS" : "FAIL")
+                      << " (Finite=" << (finite_ok ? "YES" : "NO")
+                      << ", Alive=" << (alive_ok ? "YES" : "NO")
+                      << ", DistMoved=" << dist_moved
+                      << ", EndPos=(" << end_p.x << ", " << end_p.y << ", " << end_p.z << "))" << std::endl;
+        } else {
+            std::cout << "  -> Stage 14 Result: FAIL (Could not load Maps/SP02/Stormdrain_p.me1)" << std::endl;
+        }
+    }
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, and SP02 forward sprint stage 14
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;

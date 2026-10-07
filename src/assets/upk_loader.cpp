@@ -1274,7 +1274,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         a.is_checkpoint = (low_class.find("checkpoint") != std::string::npos || low_obj.find("checkpoint") != std::string::npos);
         a.is_trigger = (low_class.find("trigger") != std::string::npos);
         a.is_zipline = (low_class.find("ziplinevolume") != std::string::npos);
-        a.is_ladder = (low_class.find("laddervolume") != std::string::npos || low_mesh.find("ladder") != std::string::npos);
+        a.is_ladder = (low_class.find("laddervolume") != std::string::npos);
         a.is_ledge = (low_class.find("ledgewalkvolume") != std::string::npos || low_class.find("ledge") != std::string::npos);
         a.is_springboard = (low_class.find("springboard") != std::string::npos || low_obj.find("springboard") != std::string::npos ||
                             low_mesh.find("springboard") != std::string::npos ||
@@ -1285,7 +1285,9 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         a.is_enemy = (low_class.find("ai") != std::string::npos || low_class.find("botpawn") != std::string::npos || low_class.find("cop") != std::string::npos);
         a.is_bag = (low_class.find("bag") != std::string::npos || low_obj.find("bag") != std::string::npos || low_mesh.find("s_bag") != std::string::npos);
         a.is_elevator_part = is_elev_mesh || is_elev_button;
-        a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline || a.is_ladder || a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
+        a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline ||
+                             a.is_ladder || (low_mesh.find("ladder") != std::string::npos) ||
+                             a.is_swing_bar || a.is_bag || (low_obj.find("runner") != std::string::npos);
 
         // --- UE3 collision flags -------------------------------------------------------------
         // Blocks pawn movement: Actor.bCollideActors && Actor.bBlockActors &&
@@ -1341,24 +1343,28 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             return fallback;
         };
 
-        bool block_zero_default = true;
-        if (a.is_blocking_volume) {
-            // Fallback mirrors BlockingVolume.BrushComponent0: BlockZeroExtent=false, BlockNonZeroExtent=true.
-            block_zero_default = false;
-            int32_t brush_idx = 0;
-            if (const auto* p = get_prop("BrushComponent")) brush_idx = p->obj_ref_index;
-            if (brush_idx <= 0) {
-                if (const auto* p = get_prop("CollisionComponent")) brush_idx = p->obj_ref_index;
+        auto find_brush_component_index = [&]() -> int32_t {
+            int32_t b_idx = 0;
+            if (const auto* p = get_prop("BrushComponent")) b_idx = p->obj_ref_index;
+            if (b_idx <= 0) {
+                if (const auto* p = get_prop("CollisionComponent")) b_idx = p->obj_ref_index;
             }
-            if (brush_idx <= 0) {
+            if (b_idx <= 0) {
                 for (const auto& [comp_name, c_idx] : exp.component_map) {
                     if (comp_name.find("Brush") != std::string::npos) {
-                        brush_idx = c_idx;
+                        b_idx = c_idx;
                         break;
                     }
                 }
             }
-            load_comp_chain(brush_idx);
+            return b_idx;
+        };
+
+        bool block_zero_default = true;
+        if (a.is_blocking_volume) {
+            // Fallback mirrors BlockingVolume.BrushComponent0: BlockZeroExtent=false, BlockNonZeroExtent=true.
+            block_zero_default = false;
+            load_comp_chain(find_brush_component_index());
             for (const auto& l : comp_chain) {
                 if (const UProperty* agg = find_prop(l, "BrushAggGeom")) {
                     std::vector<Vec3> local;
@@ -1368,7 +1374,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     const ActorTransform xf(a.location, a.rotation,
                                             Vec3(a.draw_scale * a.draw_scale_3d.x, a.draw_scale * a.draw_scale_3d.y,
                                                  a.draw_scale * a.draw_scale_3d.z),
-                                            pre_pivot);
+                                                 pre_pivot);
                     a.brush_triangles.reserve(local.size());
                     for (const Vec3& v : local) a.brush_triangles.push_back(xf.apply(v));
                     break;
@@ -1396,9 +1402,85 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
         // Movement volumes (TdZiplineVolume, TdBalanceWalkVolume, TdLadderVolume, TdLedgeWalkVolume, TdSwingVolume)
         // store their world-space spline endpoints in Start and End properties.
+        // Some cooked sublevels (e.g. Stormdrain_p.me1) contain unbaked TdLadderVolume brushes whose Start/End
+        // were serialized as NaN or unclipped raycast endpoints (±1e7..1e9); fall back to BrushAggGeom world bounds.
         if (a.is_zipline || a.is_balance_beam || a.is_ladder || a.is_ledge || a.is_swing_bar) {
-            if (const auto* ps = get_prop("Start")) a.location = ps->vec_val;
-            if (const auto* pe = get_prop("End")) a.end_point = pe->vec_val;
+            auto is_valid_world_vec = [](const Vec3& v) {
+                return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+                       std::abs(v.x) < 262144.0f && std::abs(v.y) < 262144.0f && std::abs(v.z) < 262144.0f;
+            };
+            const Vec3 orig_loc = is_valid_world_vec(a.location) ? a.location : Vec3(0.0f, 0.0f, 0.0f);
+            a.location = orig_loc;
+
+            const auto* ps = get_prop("Start");
+            const auto* pe = get_prop("End");
+            const bool valid_se = ps && pe && is_valid_world_vec(ps->vec_val) && is_valid_world_vec(pe->vec_val) &&
+                                  (pe->vec_val - ps->vec_val).length_sq() >= 100.0f;
+
+            if (a.is_ladder) {
+                const float dz = valid_se ? std::abs(pe->vec_val.z - ps->vec_val.z) : 0.0f;
+                const float dxy = valid_se ? (pe->vec_val - ps->vec_val).length_xy() : 1e9f;
+                if (valid_se && dz >= 60.0f && dz <= 5000.0f && dxy < 500.0f) {
+                    a.location = ps->vec_val;
+                    a.end_point = pe->vec_val;
+                } else {
+                    // Reconstruct vertical ladder span from BrushAggGeom convex hull vertices around orig_loc
+                    std::vector<UPropertyList> bchain;
+                    int32_t b_idx = find_brush_component_index();
+                    for (int guard = 0; b_idx > 0 && static_cast<size_t>(b_idx) <= exports_.size() && guard < 8; ++guard) {
+                        bchain.emplace_back();
+                        parse_export_properties(*this, b_idx, bchain.back());
+                        b_idx = exports_[b_idx - 1].archetype;
+                    }
+                    bool rebuilt = false;
+                    for (const auto& l : bchain) {
+                        if (const UProperty* agg = find_prop(l, "BrushAggGeom")) {
+                            std::vector<Vec3> local;
+                            append_agg_geom_triangles(*this, *agg, local);
+                            if (!local.empty()) {
+                                Vec3 pre_pivot(0.0f, 0.0f, 0.0f);
+                                if (const auto* p = get_prop("PrePivot")) pre_pivot = p->vec_val;
+                                const ActorTransform xf(orig_loc, a.rotation,
+                                                        Vec3(a.draw_scale * a.draw_scale_3d.x,
+                                                             a.draw_scale * a.draw_scale_3d.y,
+                                                             a.draw_scale * a.draw_scale_3d.z),
+                                                        pre_pivot);
+                                float min_z = 1e9f, max_z = -1e9f;
+                                for (const Vec3& v : local) {
+                                    Vec3 wv = xf.apply(v);
+                                    if (std::isfinite(wv.z)) {
+                                        min_z = std::min(min_z, wv.z);
+                                        max_z = std::max(max_z, wv.z);
+                                    }
+                                }
+                                if (max_z - min_z >= 60.0f && max_z - min_z <= 5000.0f) {
+                                    const float lx = (ps && std::isfinite(ps->vec_val.x) && std::abs(ps->vec_val.x - orig_loc.x) < 200.0f)
+                                                         ? ps->vec_val.x
+                                                         : orig_loc.x;
+                                    const float ly = (ps && std::isfinite(ps->vec_val.y) && std::abs(ps->vec_val.y - orig_loc.y) < 200.0f)
+                                                         ? ps->vec_val.y
+                                                         : orig_loc.y;
+                                    a.location = Vec3(lx, ly, min_z);
+                                    a.end_point = Vec3(lx, ly, max_z);
+                                    rebuilt = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if (!rebuilt) {
+                        a.is_ladder = false;
+                    }
+                }
+            } else if (valid_se) {
+                a.location = ps->vec_val;
+                a.end_point = pe->vec_val;
+            } else {
+                a.is_zipline = false;
+                a.is_balance_beam = false;
+                a.is_ledge = false;
+                a.is_swing_bar = false;
+            }
         }
 
         // Approximate initial world bounds (refined later when StaticMeshAsset is bound)
