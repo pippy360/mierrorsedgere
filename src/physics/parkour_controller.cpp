@@ -247,6 +247,25 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_death_total_duration = 1.35f;
 }
 
+void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw, float pitch,
+                               bool grounded, const AnchorState& state) {
+    reset(feet, yaw);
+    m_telemetry.velocity = velocity;
+    m_telemetry.speed_2d = velocity.length_xy();
+    m_telemetry.speed_3d = velocity.length();
+    m_telemetry.pitch_deg = std::clamp(pitch, -85.0f, 85.0f);
+    m_sprint_energy = state.sprint_energy;
+    m_accel_time = state.accel_time;
+    m_stop_timer = state.stop_left;
+    m_prev_jump = state.held_jump;
+    m_prev_crouch = state.held_crouch;
+    if (!grounded) {
+        leave_ground(state.jump ? EMovement::MOVE_Jump : EMovement::MOVE_Falling);
+        if (state.jump == 1) m_telemetry.move_state = EMovement::MOVE_Falling;
+    }
+    if (state.jump) m_pre_jump_momentum = state.pre_jump_momentum;
+}
+
 void ParkourController::equip_weapon(const std::string& weapon_name) {
     struct WeaponSpec {
         const char* id;
