@@ -102,6 +102,8 @@ struct SkinnedVertex {
     Vec3 bind_tangent{1.0f, 0.0f, 0.0f};
     float u = 0.0f;
     float v = 0.0f;
+    float un = 0.0f;
+    float vn = 0.0f;
     uint8_t bones[4] = {0, 0, 0, 0};
     uint8_t weights[4] = {255, 0, 0, 0};
     uint8_t chunk_index = 0;
@@ -137,6 +139,7 @@ struct SkeletalMeshAsset {
     DXT1Texture tex_diffuse;
     DXT1Texture tex_specular;
     DXT1Texture tex_normal;
+    DXT1Texture tex_mask;
 
     [[nodiscard]] bool is_valid() const {
         return !bones.empty() && !vertices.empty() && !indices.empty();
