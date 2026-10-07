@@ -796,6 +796,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     }
 
     renderer.set_menu_open(start_in_main_menu);
+    audio.set_menu_music(start_in_main_menu);
     SDL_SetRelativeMouseMode(start_in_main_menu ? SDL_FALSE : SDL_TRUE);
     ensure_dir("screenshots");
 
@@ -1138,6 +1139,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Update 3D listener and dynamic audio stems
+        audio.set_menu_music(renderer.is_menu_open());
         Vec3 ear = tel.position + Vec3(0, 0, tel.eye_height);
         Rotator ear_rot = Rotator::from_degrees(tel.pitch_deg, tel.yaw_deg, tel.camera_roll_deg);
         audio.update(dt, ear, ear_rot.forward(), ear_rot.up(), tel.speed_2d, tel.reaction_active);
