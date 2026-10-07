@@ -2590,7 +2590,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
         const bool cutscene_active = (impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing());
-        if (!impl_->menu_open && !cutscene_active) {
+        const bool bink_video_active = (cutscene_active && impl_->cutscene_player->get_mode() == ECutsceneMode::BinkVideo);
+        if (!impl_->menu_open && !bink_video_active) {
             impl_->build_faith_viewmodel(telemetry);
             if (!impl_->faith_viewmodel_mesh.empty()) {
                 [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 0.05}];

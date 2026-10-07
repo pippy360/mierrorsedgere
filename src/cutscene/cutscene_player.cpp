@@ -1,4 +1,6 @@
 #include "cutscene_player.hpp"
+#include "../anim/anim_system.hpp"
+#include "../assets/upk_loader.hpp"
 
 #include <SDL2/SDL.h>
 
@@ -382,17 +384,94 @@ bool CutscenePlayer::play_bink_movie(const std::string& movie_name, bool chain_i
     return true;
 }
 
+namespace {
+
+static const AnimSequenceAsset* resolve_cooked_intro_seq(const LevelIntroSequence& intro) {
+    if (!intro.valid || intro.anim_export_index_1 <= 0 || intro.package_path.empty()) {
+        return nullptr;
+    }
+    static std::unordered_map<std::string, AnimSetAsset> s_cache;
+    std::string key = intro.package_path + "#" + std::to_string(intro.anim_export_index_1);
+    auto it = s_cache.find(key);
+    if (it == s_cache.end()) {
+        UPKPackage pkg(intro.package_path);
+        AnimSetAsset aset{};
+        if (pkg.is_valid() && AnimSystem::parse_single_anim_sequence(pkg, intro.anim_export_index_1, aset)) {
+            it = s_cache.emplace(key, std::move(aset)).first;
+        }
+    }
+    if (it == s_cache.end() || it->second.sequences.empty()) {
+        return nullptr;
+    }
+    const AnimSequenceAsset* seq = it->second.find_sequence(intro.seq_name);
+    return seq ? seq : &it->second.sequences.begin()->second;
+}
+
+static Vec3 eval_track_pos(const AnimTrack& tr, float norm_t) {
+    if (tr.positions.empty()) return Vec3(0.0f, 0.0f, 0.0f);
+    if (tr.positions.size() == 1) return tr.positions[0];
+    float fidx = std::clamp(norm_t, 0.0f, 1.0f) * float(tr.positions.size() - 1);
+    size_t i0 = static_cast<size_t>(std::floor(fidx));
+    size_t i1 = std::min(i0 + 1, tr.positions.size() - 1);
+    float alpha = fidx - float(i0);
+    return tr.positions[i0] + (tr.positions[i1] - tr.positions[i0]) * alpha;
+}
+
+static Quat4 eval_track_quat(const AnimTrack& tr, float norm_t) {
+    if (tr.rotations.empty()) return Quat4();
+    if (tr.rotations.size() == 1) return tr.rotations[0];
+    float fidx = std::clamp(norm_t, 0.0f, 1.0f) * float(tr.rotations.size() - 1);
+    size_t i0 = static_cast<size_t>(std::floor(fidx));
+    size_t i1 = std::min(i0 + 1, tr.rotations.size() - 1);
+    float alpha = fidx - float(i0);
+    return Quat4::slerp(tr.rotations[i0], tr.rotations[i1], alpha);
+}
+
+static Vec3 intro_rig_to_world_pos(const Vec3& actor_loc, float actor_yaw_deg, const Vec3& rig_p) {
+    float yaw_rad = actor_yaw_deg * DEG2RAD;
+    float cy = std::cos(yaw_rad);
+    float sy = std::sin(yaw_rad);
+    Vec3 fwd(cy, sy, 0.0f);
+    Vec3 left(sy, -cy, 0.0f);
+    Vec3 up(0.0f, 0.0f, 1.0f);
+    return actor_loc + left * rig_p.x + up * (-rig_p.y) + fwd * rig_p.z;
+}
+
+static Vec3 intro_rig_to_world_vec(float actor_yaw_deg, const Vec3& rig_v) {
+    float yaw_rad = actor_yaw_deg * DEG2RAD;
+    float cy = std::cos(yaw_rad);
+    float sy = std::sin(yaw_rad);
+    Vec3 fwd(cy, sy, 0.0f);
+    Vec3 left(sy, -cy, 0.0f);
+    Vec3 up(0.0f, 0.0f, 1.0f);
+    return left * rig_v.x + up * (-rig_v.y) + fwd * rig_v.z;
+}
+
+} // namespace
+
 void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
                                           const PlayerTelemetry& telemetry,
                                           float duration_sec) {
     close_bink_streams();
 
     mode_ = ECutsceneMode::InEngineMatinee;
-    current_movie_name_ = scene.map_name + "_MatineeIntro";
     chain_in_engine_after_bink_ = false;
     elapsed_sec_ = 0.0f;
-    duration_sec_ = std::max(2.5f, duration_sec);
     letterbox_amount_ = 1.0f;
+
+    const AnimSequenceAsset* cooked_seq = resolve_cooked_intro_seq(scene.level_intro);
+    if (cooked_seq && cooked_seq->length > 0.5f) {
+        current_movie_name_ = scene.level_intro.seq_name;
+        duration_sec_ = cooked_seq->length;
+        matinee_keys_.clear();
+        active_subtitle_.clear();
+        std::cout << "[Cutscene] Playing cooked level intro Matinee '" << current_movie_name_
+                  << "' (" << duration_sec_ << "s, " << cooked_seq->num_frames << " frames)" << std::endl;
+        return;
+    }
+
+    current_movie_name_ = scene.map_name + "_MatineeIntro";
+    duration_sec_ = std::max(2.5f, duration_sec);
 
     Vec3 eye_end = telemetry.position + Vec3(0.0f, 0.0f, telemetry.eye_height);
     float end_yaw = telemetry.yaw_deg;
@@ -402,23 +481,23 @@ void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
     Vec3 fwd = end_rot.forward();
     Vec3 right = end_rot.right();
 
-    // Construct a cinematic 3-keyframe rooftop crane sweep ending cleanly in Faith's eyes
+    // Rooftop camera crane + Faith scripted run-in ending cleanly in Faith's eyes
     matinee_keys_.clear();
     MatineeKeyframe k0;
     k0.time = 0.0f;
-    k0.position = eye_end - fwd * 420.0f + right * 190.0f + Vec3(0.0f, 0.0f, 240.0f);
-    k0.yaw_deg = end_yaw - 22.0f;
-    k0.pitch_deg = -16.0f;
-    k0.roll_deg = -4.0f;
-    k0.fov_deg = 78.0f;
+    k0.position = eye_end - fwd * 480.0f + right * 140.0f + Vec3(0.0f, 0.0f, 210.0f);
+    k0.yaw_deg = end_yaw - 18.0f;
+    k0.pitch_deg = -14.0f;
+    k0.roll_deg = -3.5f;
+    k0.fov_deg = 82.0f;
 
     MatineeKeyframe k1;
-    k1.time = duration_sec_ * 0.55f;
-    k1.position = eye_end - fwd * 165.0f + right * 55.0f + Vec3(0.0f, 0.0f, 75.0f);
-    k1.yaw_deg = end_yaw - 8.0f;
-    k1.pitch_deg = -6.0f;
-    k1.roll_deg = -1.5f;
-    k1.fov_deg = 88.0f;
+    k1.time = duration_sec_ * 0.45f;
+    k1.position = eye_end - fwd * 260.0f;
+    k1.yaw_deg = end_yaw;
+    k1.pitch_deg = -3.0f;
+    k1.roll_deg = 0.0f;
+    k1.fov_deg = telemetry.fov_deg;
 
     MatineeKeyframe k2;
     k2.time = duration_sec_;
@@ -564,17 +643,74 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             }
         }
     } else if (mode_ == ECutsceneMode::InEngineMatinee) {
-        if (elapsed_sec_ >= duration_sec_ || matinee_keys_.size() < 2) {
+        if (elapsed_sec_ >= duration_sec_) {
             mode_ = ECutsceneMode::None;
             letterbox_amount_ = 0.0f;
+            io_telemetry.intro_active = false;
+            io_telemetry.camera_roll_deg = 0.0f;
             return;
         }
 
-        float norm = std::clamp(elapsed_sec_ / duration_sec_, 0.0f, 1.0f);
-        // Smooth fade-out of widescreen bars over the final 25% of the camera fly-in
+        float norm = std::clamp(elapsed_sec_ / std::max(0.01f, duration_sec_), 0.0f, 1.0f);
+        // Smooth fade-out of widescreen bars over the final 25% of the level intro
         letterbox_amount_ = (norm > 0.75f) ? ((1.0f - norm) / 0.25f) : 1.0f;
 
-        // Interpolate along matinee_keys_
+        const AnimSequenceAsset* cooked_seq = resolve_cooked_intro_seq(scene.level_intro);
+        if (cooked_seq && cooked_seq->tracks.size() >= 73) {
+            const float actor_yaw = scene.level_intro.actor_yaw_deg;
+            const Vec3 actor_loc = scene.level_intro.actor_location;
+
+            Vec3 r_pos = eval_track_pos(cooked_seq->tracks[0], norm);
+            Quat4 r_q  = eval_track_quat(cooked_seq->tracks[0], norm);
+            Vec3 e_pos = eval_track_pos(cooked_seq->tracks[72], norm);
+            Quat4 e_q  = eval_track_quat(cooked_seq->tracks[72], norm);
+            Quat4 c_q  = (cooked_seq->tracks.size() > 73) ? eval_track_quat(cooked_seq->tracks[73], norm) : Quat4();
+
+            Vec3 comp_eye = r_pos + r_q.rotate(e_pos);
+            Quat4 comp_q  = Quat4::multiply(Quat4::multiply(r_q, e_q), c_q).normalized();
+
+            Vec3 world_eye = intro_rig_to_world_pos(actor_loc, actor_yaw, comp_eye);
+            Vec3 world_fwd = intro_rig_to_world_vec(actor_yaw, comp_q.rotate(Vec3(0.0f, 0.0f, 1.0f))).normalized();
+            Vec3 world_up  = intro_rig_to_world_vec(actor_yaw, comp_q.rotate(Vec3(0.0f, -1.0f, 0.0f))).normalized();
+
+            float yaw_deg = std::atan2(world_fwd.y, world_fwd.x) * RAD2DEG;
+            float pitch_deg = std::asin(std::clamp(world_fwd.z, -1.0f, 1.0f)) * RAD2DEG;
+            Rotator base_rot = Rotator::from_degrees(pitch_deg, yaw_deg, 0.0f);
+            float roll_deg = std::atan2(world_up.dot(base_rot.right()), world_up.dot(base_rot.up())) * RAD2DEG;
+
+            // Compute instantaneous horizontal root velocity for authentic run state & HUD speedometer
+            const float eps = std::min(1.0f / 30.0f, duration_sec_ * 0.02f);
+            float norm_prev = std::clamp((elapsed_sec_ - eps) / duration_sec_, 0.0f, 1.0f);
+            Vec3 r_prev = intro_rig_to_world_pos(actor_loc, actor_yaw, eval_track_pos(cooked_seq->tracks[0], norm_prev));
+            Vec3 r_curr = intro_rig_to_world_pos(actor_loc, actor_yaw, r_pos);
+            float spd_2d = (eps > 1e-4f) ? ((r_curr - r_prev).length_xy() / eps) : 0.0f;
+
+            io_telemetry.position = world_eye - Vec3(0.0f, 0.0f, io_telemetry.eye_height);
+            io_telemetry.yaw_deg = yaw_deg;
+            io_telemetry.pitch_deg = pitch_deg;
+            io_telemetry.camera_roll_deg = std::clamp(roll_deg, -35.0f, 35.0f);
+            io_telemetry.speed_2d = spd_2d;
+            io_telemetry.grounded = (std::abs(r_curr.z - r_prev.z) < eps * 260.0f);
+            io_telemetry.move_state = io_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
+            io_telemetry.intro_active = true;
+            io_telemetry.intro_anim_name = scene.level_intro.seq_name;
+            io_telemetry.intro_pkg_path = scene.level_intro.package_path;
+            io_telemetry.intro_anim_exp_1 = scene.level_intro.anim_export_index_1;
+            io_telemetry.intro_anim_time = elapsed_sec_;
+            if (!active_subtitle_.empty()) {
+                io_telemetry.active_subtitle = active_subtitle_;
+            }
+            return;
+        }
+
+        if (matinee_keys_.size() < 2) {
+            mode_ = ECutsceneMode::None;
+            letterbox_amount_ = 0.0f;
+            io_telemetry.intro_active = false;
+            return;
+        }
+
+        // Fallback rooftop camera crane + Faith run-in along matinee_keys_
         size_t seg = 0;
         while (seg + 2 < matinee_keys_.size() && elapsed_sec_ > matinee_keys_[seg + 1].time) {
             ++seg;
@@ -586,11 +722,16 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
         float s = u * u * (3.0f - 2.0f * u); // Smoothstep easing into Faith's eyes
 
         Vec3 cam_eye = a.position + (b.position - a.position) * s;
+        float run_spd = (norm > 0.35f) ? (380.0f * std::sin(std::clamp((1.0f - norm) / 0.65f, 0.0f, 1.0f) * 1.570796f)) : 0.0f;
         io_telemetry.position = cam_eye - Vec3(0.0f, 0.0f, io_telemetry.eye_height);
         io_telemetry.yaw_deg = a.yaw_deg + (b.yaw_deg - a.yaw_deg) * s;
         io_telemetry.pitch_deg = a.pitch_deg + (b.pitch_deg - a.pitch_deg) * s;
         io_telemetry.camera_roll_deg = a.roll_deg + (b.roll_deg - a.roll_deg) * s;
         io_telemetry.fov_deg = a.fov_deg + (b.fov_deg - a.fov_deg) * s;
+        io_telemetry.speed_2d = run_spd;
+        io_telemetry.grounded = true;
+        io_telemetry.move_state = EMovement::MOVE_Walking;
+        io_telemetry.sim_time += dt;
         if (!active_subtitle_.empty()) {
             io_telemetry.active_subtitle = active_subtitle_;
         }

@@ -195,6 +195,7 @@ public:
     // Standalone binary parsers exposed for inspection and unit verification
     static bool parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport& exp, SkeletalMeshAsset& out_mesh);
     static bool parse_anim_set_package(const UPKPackage& pkg, AnimSetAsset& out_anim_set);
+    static bool parse_single_anim_sequence(const UPKPackage& pkg, int32_t seq_export_index_1, AnimSetAsset& out_anim_set);
     static bool parse_dxt1_texture(const UPKPackage& pkg, const std::string& tex_name, DXT1Texture& out_tex);
 
     // Verification & diagnostics summary
@@ -228,6 +229,7 @@ private:
     AnimSetAsset faith_2h_common_set_;
     AnimSetAsset faith_colt_set_;
     std::unordered_map<std::string, AnimSetAsset> faith_weapon_sets_;
+    mutable std::unordered_map<std::string, AnimSetAsset> level_intro_sets_;
     AnimSetAsset swat_set_;
     AnimSetAsset swat_2h_set_;
 

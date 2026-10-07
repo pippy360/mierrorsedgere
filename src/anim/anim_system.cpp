@@ -693,6 +693,139 @@ bool AnimSystem::parse_anim_set_package(const UPKPackage& pkg, AnimSetAsset& out
     return !out_anim_set.sequences.empty();
 }
 
+bool AnimSystem::parse_single_anim_sequence(const UPKPackage& pkg, int32_t seq_export_index_1,
+                                            AnimSetAsset& out_anim_set) {
+    out_anim_set = AnimSetAsset{};
+    const auto& exps = pkg.get_exports();
+    const auto& data = pkg.get_data();
+    if (seq_export_index_1 <= 0 || static_cast<size_t>(seq_export_index_1) > exps.size()) {
+        return false;
+    }
+    const auto& exp = exps[seq_export_index_1 - 1];
+    if (pkg.get_export_class(exp) != "AnimSequence") {
+        return false;
+    }
+
+    // Extract TrackBoneNames from the sequence's exact owning AnimSet export (exp.outer_index)
+    if (exp.outer_index > 0 && static_cast<size_t>(exp.outer_index) <= exps.size()) {
+        const auto& set_exp = exps[exp.outer_index - 1];
+        size_t s_prop_start = pkg.find_property_start(set_exp);
+        auto s_props = pkg.parse_properties(s_prop_start, set_exp.serial_size);
+        auto it_tbn = s_props.find("TrackBoneNames");
+        if (it_tbn != s_props.end() && it_tbn->second.raw_bytes.size() >= 4) {
+            const auto& raw = it_tbn->second.raw_bytes;
+            const uint8_t* ptr = raw.data();
+            const uint8_t* end = raw.data() + raw.size();
+            int32_t count = read_le<int32_t>(ptr, end);
+            if (count > 0 && count <= 512 && ptr + count * 8 <= end) {
+                out_anim_set.name = set_exp.object_name;
+                out_anim_set.track_bone_names.resize(count);
+                for (int32_t i = 0; i < count; ++i) {
+                    int32_t n_idx = read_le<int32_t>(ptr, end);
+                    int32_t n_num = read_le<int32_t>(ptr, end);
+                    std::string bname = read_fname_str(pkg, n_idx, n_num);
+                    out_anim_set.track_bone_names[i] = bname;
+                    out_anim_set.bone_to_track[to_lower_str(bname)] = i;
+                }
+            }
+        }
+    }
+
+    size_t prop_start = pkg.find_property_start(exp);
+    size_t bytes_read = 0;
+    auto props = pkg.parse_properties(prop_start, exp.serial_size, &bytes_read);
+    auto it_offs = props.find("CompressedTrackOffsets");
+    if (it_offs == props.end() || it_offs->second.raw_bytes.size() < 4) return false;
+
+    const auto& raw_offs = it_offs->second.raw_bytes;
+    const uint8_t* op = raw_offs.data();
+    const uint8_t* oend = raw_offs.data() + raw_offs.size();
+    int32_t num_ints = read_le<int32_t>(op, oend);
+    if (num_ints <= 0 || (num_ints % 4) != 0 || op + num_ints * 4 > oend) return false;
+    size_t num_tracks = static_cast<size_t>(num_ints / 4);
+    std::vector<int32_t> track_offs(num_ints);
+    for (int32_t i = 0; i < num_ints; ++i) {
+        track_offs[i] = read_le<int32_t>(op, oend);
+    }
+
+    size_t tail_off = prop_start + bytes_read;
+    size_t exp_end = static_cast<size_t>(exp.serial_offset) + static_cast<size_t>(exp.serial_size);
+    if (tail_off + 4 > exp_end || exp_end > data.size()) return false;
+    const uint8_t* tail_ptr = data.data() + tail_off;
+    const uint8_t* tail_end = data.data() + exp_end;
+    int32_t stream_size = read_le<int32_t>(tail_ptr, tail_end);
+    if (stream_size <= 0 || tail_ptr + stream_size > tail_end) return false;
+    const uint8_t* stream = tail_ptr;
+
+    AnimSequenceAsset seq{};
+    seq.name = props.count("SequenceName") ? props["SequenceName"].str_val : exp.object_name;
+    seq.length = props.count("SequenceLength") ? props["SequenceLength"].float_val : 1.0f;
+    seq.num_frames = props.count("NumFrames") ? props["NumFrames"].int_val : 1;
+    seq.rate_scale = props.count("RateScale") ? props["RateScale"].float_val : 1.0f;
+    if (props.count("TranslationCompressionFormat")) seq.trans_compression = props["TranslationCompressionFormat"].str_val;
+    if (props.count("RotationCompressionFormat")) seq.rot_compression = props["RotationCompressionFormat"].str_val;
+    seq.tracks.resize(num_tracks);
+    const bool is_float96 = (seq.rot_compression == "ACF_Float96NoW");
+
+    for (size_t t = 0; t < num_tracks; ++t) {
+        int32_t trans_off  = track_offs[t * 4 + 0];
+        int32_t trans_keys = track_offs[t * 4 + 1];
+        int32_t rot_off    = track_offs[t * 4 + 2];
+        int32_t rot_keys   = track_offs[t * 4 + 3];
+        AnimTrack& dst = seq.tracks[t];
+        if (trans_keys > 0 && trans_off >= 0 && trans_off + trans_keys * 12 <= stream_size) {
+            dst.positions.resize(trans_keys);
+            for (int32_t k = 0; k < trans_keys; ++k) {
+                const uint8_t* kp = stream + trans_off + k * 12;
+                float px = 0.0f, py = 0.0f, pz = 0.0f;
+                std::memcpy(&px, kp + 0, 4);
+                std::memcpy(&py, kp + 4, 4);
+                std::memcpy(&pz, kp + 8, 4);
+                dst.positions[k] = Vec3(px, py, pz);
+            }
+        }
+        if (rot_keys == 1 && rot_off >= 0 && rot_off + 12 <= stream_size) {
+            const uint8_t* kp = stream + rot_off;
+            float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+            std::memcpy(&rx, kp + 0, 4);
+            std::memcpy(&ry, kp + 4, 4);
+            std::memcpy(&rz, kp + 8, 4);
+            float rw = std::sqrt(std::max(0.0f, 1.0f - (rx * rx + ry * ry + rz * rz)));
+            dst.rotations.push_back(Quat4(rx, ry, rz, -rw).normalized());
+        } else if (rot_keys > 1 && rot_off >= 0) {
+            if (is_float96 && rot_off + 24 + rot_keys * 12 <= stream_size) {
+                dst.rotations.resize(rot_keys);
+                for (int32_t k = 0; k < rot_keys; ++k) {
+                    const uint8_t* kp = stream + rot_off + 24 + k * 12;
+                    float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+                    std::memcpy(&rx, kp + 0, 4);
+                    std::memcpy(&ry, kp + 4, 4);
+                    std::memcpy(&rz, kp + 8, 4);
+                    float rw = std::sqrt(std::max(0.0f, 1.0f - (rx * rx + ry * ry + rz * rz)));
+                    dst.rotations[k] = Quat4(rx, ry, rz, -rw).normalized();
+                }
+            } else if (!is_float96 && rot_off + 24 + rot_keys * 6 <= stream_size) {
+                dst.rotations.resize(rot_keys);
+                for (int32_t k = 0; k < rot_keys; ++k) {
+                    const uint8_t* kp = stream + rot_off + 24 + k * 6;
+                    uint16_t qx = 0, qy = 0, qz = 0;
+                    std::memcpy(&qx, kp + 0, 2);
+                    std::memcpy(&qy, kp + 2, 2);
+                    std::memcpy(&qz, kp + 4, 2);
+                    float rx = (static_cast<float>(qx) - 32767.0f) * (1.0f / 32767.0f);
+                    float ry = (static_cast<float>(qy) - 32767.0f) * (1.0f / 32767.0f);
+                    float rz = (static_cast<float>(qz) - 32767.0f) * (1.0f / 32767.0f);
+                    float rw = std::sqrt(std::max(0.0f, 1.0f - (rx * rx + ry * ry + rz * rz)));
+                    dst.rotations[k] = Quat4(rx, ry, rz, -rw).normalized();
+                }
+            }
+        }
+    }
+
+    out_anim_set.sequences[to_lower_str(seq.name)] = std::move(seq);
+    return !out_anim_set.sequences.empty();
+}
+
 // -----------------------------------------------------------------------------
 // Initialize AnimSystem from Mirror's Edge Game Root
 // -----------------------------------------------------------------------------
@@ -1112,8 +1245,31 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                          : &faith_common_set_;
     }
 
-    // 1. Check high-priority combat moves (Snatch, Melee, MeleeAir, MeleeSlide, MeleeWallrun, Barge)
-    if (state == EMovement::MOVE_Snatch) {
+    // 0. Cooked Matinee level intro sequence override (e.g. sp01_intro..sp09_intro)
+    if (telemetry.intro_active && telemetry.intro_anim_exp_1 > 0 && !telemetry.intro_pkg_path.empty()) {
+        std::string cache_key = telemetry.intro_pkg_path + "#" + std::to_string(telemetry.intro_anim_exp_1);
+        auto it_intro = level_intro_sets_.find(cache_key);
+        if (it_intro == level_intro_sets_.end()) {
+            UPKPackage intro_pkg(telemetry.intro_pkg_path);
+            AnimSetAsset parsed_set{};
+            if (intro_pkg.is_valid() && parse_single_anim_sequence(intro_pkg, telemetry.intro_anim_exp_1, parsed_set)) {
+                it_intro = level_intro_sets_.emplace(cache_key, std::move(parsed_set)).first;
+            }
+        }
+        if (it_intro != level_intro_sets_.end()) {
+            const AnimSequenceAsset* intro_seq = it_intro->second.find_sequence(telemetry.intro_anim_name);
+            if (!intro_seq && !it_intro->second.sequences.empty()) {
+                intro_seq = &it_intro->second.sequences.begin()->second;
+            }
+            if (intro_seq && intro_seq->length > 0.0f) {
+                active_set = &it_intro->second;
+                seq_a = intro_seq;
+                norm_time = std::clamp(telemetry.intro_anim_time / intro_seq->length, 0.0f, 1.0f);
+                vm_offset = Vec3(0.0f, 10.0f, 12.0f);
+                show_lower_body = true;
+            }
+        }
+    } else if (state == EMovement::MOVE_Snatch) {
         const char* snatch_seq = telemetry.snatch_from_back ? "SnatchBack" : "SnatchFwd";
         seq_a = resolve_seq(w_spec_set, w_comm_set, snatch_seq, &active_set);
         if (!seq_a) seq_a = resolve_seq(w_spec_set, &faith_common_set_, "SnatchFwd", &active_set);
