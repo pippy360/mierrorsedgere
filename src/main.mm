@@ -998,6 +998,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     bool reaction_toggled = false;
     bool suppress_space_until_release = false;
 
+    constexpr std::array<int, 6> kSensPresets = {50, 75, 100, 125, 150, 200};
+    constexpr std::array<int, 6> kFovPresets  = {85, 90, 95, 100, 105, 110};
+    int sens_preset_idx = 2; // 100%
+    int fov_preset_idx  = 1; // 90 deg
+    bool is_fullscreen  = false;
+    renderer.set_menu_options_state(kSensPresets[sens_preset_idx], kFovPresets[fov_preset_idx], is_fullscreen);
+
     std::cout << "\n[Controls]" << std::endl;
     std::cout << "  WASD: Move (Sprint active by default, momentum acceleration)" << std::endl;
     std::cout << "  Mouse: Look (Yaw/Pitch)" << std::endl;
@@ -1026,6 +1033,85 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         // By default sprint is active for momentum acceleration matching retail Mirror's Edge
         input.sprint = true;
 
+        auto activate_menu_selection = [&]() {
+            const int tab = renderer.selected_menu_tab();
+            if (tab == 0) {
+                // STORY: Launch selected chapter with Bink / 3D opening cutscene
+                set_menu_active(false);
+                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+            } else if (tab == 1) {
+                // RACE (SPEED RUN): Launch selected course directly into timed run (no cutscene)
+                set_menu_active(false);
+                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/false);
+            } else if (tab == 2) {
+                // OPTIONS: Toggle / cycle the selected game setting
+                const int row = std::clamp(renderer.selected_menu_row(), 0, 5);
+                if (row == 0) {
+                    sens_preset_idx = (sens_preset_idx + 1) % static_cast<int>(kSensPresets.size());
+                    renderer.set_menu_options_state(kSensPresets[sens_preset_idx], kFovPresets[fov_preset_idx], is_fullscreen);
+                } else if (row == 1) {
+                    fov_preset_idx = (fov_preset_idx + 1) % static_cast<int>(kFovPresets.size());
+                    controller.get_telemetry().fov_deg = static_cast<float>(kFovPresets[fov_preset_idx]);
+                    renderer.set_menu_options_state(kSensPresets[sens_preset_idx], kFovPresets[fov_preset_idx], is_fullscreen);
+                } else if (row == 2) {
+                    is_fullscreen = !is_fullscreen;
+                    SDL_SetWindowFullscreen(window, is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    SDL_Metal_GetDrawableSize(window, &drawable_w, &drawable_h);
+                    renderer.resize(drawable_w, drawable_h);
+                    renderer.set_menu_options_state(kSensPresets[sens_preset_idx], kFovPresets[fov_preset_idx], is_fullscreen);
+                } else if (row == 3) {
+                    reaction_toggled = !reaction_toggled;
+                    controller.get_telemetry().reaction_active = reaction_toggled;
+                } else if (row == 4) {
+                    controller.get_telemetry().intro_active = false;
+                    cutscene_player.stop();
+                    int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
+                                        std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
+                    Vec3 spawn = active_scene.checkpoints.empty() ? active_scene.player_spawn_pos : active_scene.checkpoints[cp];
+                    controller.reset(spawn, active_scene.player_spawn_yaw);
+                    set_menu_active(false);
+                } else if (row == 5) {
+                    running = false;
+                }
+            } else if (tab == 3) {
+                // EXTRAS: Cutscene gallery & runner bonus actions
+                const int row = std::clamp(renderer.selected_menu_row(), 0, 5);
+                if (row == 0) {
+                    static const char* kMenuChapterMaps[10] = {
+                        "Maps/SP00/Tutorial_p.me1", "Maps/SP01/Edge_p.me1", "Maps/SP02/Stormdrain_p.me1",
+                        "Maps/SP03/Cranes_p.me1",   "Maps/SP04/Subway_p.me1", "Maps/SP05/Mall_p.me1",
+                        "Maps/SP06/Factory_p.me1",  "Maps/SP07/Boat_p.me1",   "Maps/SP08/Convoy_p.me1",
+                        "Maps/SP09/Scraper_p.me1"
+                    };
+                    set_menu_active(false);
+                    std::string map_file = kMenuChapterMaps[std::clamp(current_chapter_idx, 0, 9)];
+                    std::string intro_movie = CutscenePlayer::get_chapter_intro_movie(map_file);
+                    if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
+                        // Playing chapter Bink movie
+                    } else {
+                        cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+                    }
+                } else if (row == 1) {
+                    set_menu_active(false);
+                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    controller.get_telemetry().intro_active = false;
+                    cutscene_player.cycle_next_cutscene(active_scene, controller.get_telemetry());
+                } else if (row == 2) {
+                    set_menu_active(false);
+                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+                } else if (row == 3) {
+                    controller.equip_weapon("Colt1911");
+                    set_menu_active(false);
+                } else if (row == 4) {
+                    input.spawn_combat_squad = true;
+                    set_menu_active(false);
+                } else if (row == 5) {
+                    renderer.set_selected_menu_tab(0);
+                }
+            }
+        };
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
@@ -1039,19 +1125,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 if (renderer.is_menu_open()) {
                     float ux = 0.0f, uy = 0.0f;
                     to_menu_coords(ev.motion.x, ev.motion.y, ux, uy);
-                    // Hover over left-column 10 Chapter rows (lx = 96..450, list_top = 142, row_step = 35.5)
-                    if (ux >= 80.0f && ux <= 460.0f && uy >= 142.0f && uy < 497.0f) {
-                        int row = std::clamp(static_cast<int>((uy - 142.0f) / 35.5f), 0, 9);
-                        current_chapter_idx = row;
-                        renderer.set_selected_chapter(row);
-                    }
-                    // Hover over lower-third 4 Category columns (x = 96..1184, y = 528..590)
-                    if (ux >= 96.0f && ux < 1184.0f && uy >= 528.0f && uy <= 590.0f) {
-                        int col = std::clamp(static_cast<int>((ux - 96.0f) / 272.0f), 0, 3);
-                        renderer.set_selected_menu_tab(col);
+                    const int tab = renderer.selected_menu_tab();
+                    const int max_rows = (tab <= 1) ? 10 : 6;
+                    if (ux >= 80.0f && ux <= 540.0f && uy >= 142.0f && uy < 142.0f + max_rows * 35.5f) {
+                        int row = std::clamp(static_cast<int>((uy - 142.0f) / 35.5f), 0, max_rows - 1);
+                        if (tab <= 1) {
+                            current_chapter_idx = row;
+                            renderer.set_selected_chapter(row);
+                        } else {
+                            renderer.set_selected_menu_row(row);
+                        }
                     }
                 } else if (SDL_GetRelativeMouseMode() == SDL_TRUE && !cutscene_player.is_playing()) {
-                    float sens = 0.15f;
+                    float sens = 0.15f * (static_cast<float>(kSensPresets[sens_preset_idx]) / 100.0f);
                     input.look_yaw_delta += float(ev.motion.xrel) * sens;
                     input.look_pitch_delta -= float(ev.motion.yrel) * sens;
                 }
@@ -1060,32 +1146,36 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     if (ev.button.button == SDL_BUTTON_LEFT) {
                         float ux = 0.0f, uy = 0.0f;
                         to_menu_coords(ev.button.x, ev.button.y, ux, uy);
-                        if (ux >= 80.0f && ux <= 460.0f && uy >= 142.0f && uy < 497.0f) {
-                            // Clicked a specific Chapter row -> select and immediately launch it
-                            int row = std::clamp(static_cast<int>((uy - 142.0f) / 35.5f), 0, 9);
-                            current_chapter_idx = row;
-                            renderer.set_selected_chapter(row);
-                            set_menu_active(false);
-                            load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                        const int tab = renderer.selected_menu_tab();
+                        const int max_rows = (tab <= 1) ? 10 : 6;
+                        if (ux >= 80.0f && ux <= 540.0f && uy >= 142.0f && uy < 142.0f + max_rows * 35.5f) {
+                            // Clicked a specific row on the active tab -> select and activate it
+                            int row = std::clamp(static_cast<int>((uy - 142.0f) / 35.5f), 0, max_rows - 1);
+                            if (tab <= 1) {
+                                current_chapter_idx = row;
+                                renderer.set_selected_chapter(row);
+                            } else {
+                                renderer.set_selected_menu_row(row);
+                            }
+                            activate_menu_selection();
                         } else if (ux >= 810.0f && ux <= 1190.0f && uy >= 100.0f && uy <= 425.0f) {
-                            // Clicked the Chapter Preview photograph/stats card -> launch selected chapter
-                            set_menu_active(false);
-                            load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                            // Clicked the right-side Preview card -> activate selected item
+                            activate_menu_selection();
                         } else if (ux >= 96.0f && ux < 1184.0f && uy >= 528.0f && uy <= 590.0f) {
                             // Clicked one of the 4 Category columns (STORY / RACE / OPTIONS / EXTRAS)
                             int col = std::clamp(static_cast<int>((ux - 96.0f) / 272.0f), 0, 3);
-                            renderer.set_selected_menu_tab(col);
-                            if (col == 0) {
-                                set_menu_active(false);
-                                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                            if (renderer.selected_menu_tab() == col && col <= 1) {
+                                activate_menu_selection();
+                            } else {
+                                renderer.set_selected_menu_tab(col);
+                                renderer.set_selected_menu_row(0);
                             }
                         } else if (uy >= 630.0f && uy <= 675.0f) {
-                            // Clicked Bottom Button Bar ([ENTER] PLAY CHAPTER or [ESC] RESUME)
+                            // Clicked Bottom Button Bar ([ENTER] ACTION or [ESC] RESUME)
                             if (ux >= 995.0f && ux <= 1195.0f) {
                                 set_menu_active(false);
-                            } else if (ux >= 620.0f && ux < 995.0f) {
-                                set_menu_active(false);
-                                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                            } else if (ux >= 580.0f && ux < 995.0f) {
+                                activate_menu_selection();
                             }
                         }
                     } else if (ev.button.button == SDL_BUTTON_RIGHT) {
@@ -1104,8 +1194,14 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 }
             } else if (ev.type == SDL_MOUSEWHEEL) {
                 if (renderer.is_menu_open() && ev.wheel.y != 0) {
-                    current_chapter_idx = (current_chapter_idx + (ev.wheel.y > 0 ? 9 : 1)) % 10;
-                    renderer.set_selected_chapter(current_chapter_idx);
+                    const int tab = renderer.selected_menu_tab();
+                    if (tab <= 1) {
+                        current_chapter_idx = (current_chapter_idx + (ev.wheel.y > 0 ? 9 : 1)) % 10;
+                        renderer.set_selected_chapter(current_chapter_idx);
+                    } else {
+                        int r = (renderer.selected_menu_row() + (ev.wheel.y > 0 ? 5 : 1)) % 6;
+                        renderer.set_selected_menu_row(r);
+                    }
                 } else if (!renderer.is_menu_open() && !cutscene_player.is_playing() && ev.wheel.y != 0) {
                     input.cycle_weapon_dir = (ev.wheel.y > 0) ? 1 : -1;
                 }
@@ -1121,18 +1217,31 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     } else {
                         set_menu_active(true);
                     }
-                } else if (renderer.is_menu_open() &&
-                           (key == SDLK_UP || key == SDLK_w || key == SDLK_LEFT || key == SDLK_a)) {
-                    current_chapter_idx = (current_chapter_idx + 9) % 10;
-                    renderer.set_selected_chapter(current_chapter_idx);
-                } else if (renderer.is_menu_open() &&
-                           (key == SDLK_DOWN || key == SDLK_s || key == SDLK_RIGHT || key == SDLK_d)) {
-                    current_chapter_idx = (current_chapter_idx + 1) % 10;
-                    renderer.set_selected_chapter(current_chapter_idx);
+                } else if (renderer.is_menu_open() && (key == SDLK_LEFT || key == SDLK_a)) {
+                    int tab = (renderer.selected_menu_tab() + 3) % 4;
+                    renderer.set_selected_menu_tab(tab);
+                    renderer.set_selected_menu_row(0);
+                } else if (renderer.is_menu_open() && (key == SDLK_RIGHT || key == SDLK_d)) {
+                    int tab = (renderer.selected_menu_tab() + 1) % 4;
+                    renderer.set_selected_menu_tab(tab);
+                    renderer.set_selected_menu_row(0);
+                } else if (renderer.is_menu_open() && (key == SDLK_UP || key == SDLK_w)) {
+                    if (renderer.selected_menu_tab() <= 1) {
+                        current_chapter_idx = (current_chapter_idx + 9) % 10;
+                        renderer.set_selected_chapter(current_chapter_idx);
+                    } else {
+                        renderer.set_selected_menu_row((renderer.selected_menu_row() + 5) % 6);
+                    }
+                } else if (renderer.is_menu_open() && (key == SDLK_DOWN || key == SDLK_s)) {
+                    if (renderer.selected_menu_tab() <= 1) {
+                        current_chapter_idx = (current_chapter_idx + 1) % 10;
+                        renderer.set_selected_chapter(current_chapter_idx);
+                    } else {
+                        renderer.set_selected_menu_row((renderer.selected_menu_row() + 1) % 6);
+                    }
                 } else if (renderer.is_menu_open() && (key == SDLK_RETURN || key == SDLK_SPACE)) {
                     suppress_space_until_release = true;
-                    set_menu_active(false);
-                    load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                    activate_menu_selection();
                 } else if ((key == SDLK_SPACE || key == SDLK_RETURN) && cutscene_player.is_playing()) {
                     suppress_space_until_release = true;
                     if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo) {

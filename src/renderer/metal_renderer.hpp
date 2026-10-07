@@ -67,6 +67,9 @@ public:
     [[nodiscard]] int selected_chapter() const;
     void set_selected_menu_tab(int tab);
     [[nodiscard]] int selected_menu_tab() const;
+    void set_selected_menu_row(int row);
+    [[nodiscard]] int selected_menu_row() const;
+    void set_menu_options_state(int sens_pct, int fov_deg, bool fullscreen);
     void set_cutscene_player(const class CutscenePlayer* player);
 
     // Raw Metal device handles (for external toolchain probes)
