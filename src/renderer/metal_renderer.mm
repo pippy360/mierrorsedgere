@@ -1090,17 +1090,54 @@ struct MetalRenderer::Impl {
     // First-Person Faith Viewmodel Mesh & 3D Enemy Guard Mesh
     std::vector<Vertex> faith_viewmodel_mesh;
     std::vector<Vertex> enemy_guard_mesh;
+    std::vector<std::vector<Vertex>> frame_enemy_meshes;
     AnimSystem anim_system;
+
+    // Triple-buffered CPU/GPU frame synchronization & reusable dynamic vertex buffers
+    static constexpr int kMaxFramesInFlight = 3;
+    dispatch_semaphore_t in_flight_sem = dispatch_semaphore_create(kMaxFramesInFlight);
+    id<MTLCommandBuffer> last_cmd_buffer = nil;
+    std::vector<id<MTLBuffer>> dyn_vertex_buffers[kMaxFramesInFlight];
+    size_t dyn_vertex_cursor[kMaxFramesInFlight] = {0, 0, 0};
+
+    id<MTLBuffer> acquire_dynamic_vertex_buffer(int slot, const void* data, size_t length) {
+        auto& pool = dyn_vertex_buffers[slot];
+        size_t idx = dyn_vertex_cursor[slot]++;
+        if (idx >= pool.size()) {
+            pool.push_back(nil);
+        }
+        id<MTLBuffer> buf = pool[idx];
+        if (!buf || buf.length < length) {
+            size_t cap = std::max<size_t>((length + 4095u) & ~size_t(4095u), 65536u);
+            buf = [device newBufferWithLength:cap options:MTLResourceStorageModeShared];
+            pool[idx] = buf;
+        }
+        std::memcpy(buf.contents, data, length);
+        return buf;
+    }
+
+    ~Impl() {
+        if (last_cmd_buffer) {
+            [last_cmd_buffer waitUntilCompleted];
+            last_cmd_buffer = nil;
+        }
+    }
 
     // Cutscene Bink Video & Matinee Renderer State
     const CutscenePlayer* cutscene_player = nullptr;
     id<MTLTexture> bink_video_tex = nil;
     uint64_t bink_uploaded_serial = 0;
 
-    // Cached GPU Vertex Buffers for Scene Meshes
+    // Cached GPU Vertex Buffers & Per-Section Material/Shadow Metadata for Scene Meshes
     std::string cached_map_name;
     size_t cached_total_verts = 0;
     std::vector<id<MTLBuffer>> cached_mesh_buffers;
+    std::shared_ptr<const SceneMaterialLibrary> cached_section_mat_lib;
+    bool cached_has_translucent = false;
+    bool cached_needs_scene_copies = false;
+    static constexpr uint8_t kSecShadowCaster = 1u << 0;
+    static constexpr uint8_t kSecTranslucent  = 1u << 1;
+    std::vector<std::vector<uint8_t>> cached_section_flags;
 
     // -------------------------------------------------------------------------
     // Mirror's Edge material system (LevelScene::materials) GPU cache
@@ -1440,7 +1477,7 @@ struct MetalRenderer::Impl {
             }
         };
         const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-        const unsigned num_threads = static_cast<unsigned>(std::min<size_t>(num_groups, std::min(hw, 8u)));
+        const unsigned num_threads = static_cast<unsigned>(std::min<size_t>(num_groups, hw));
         std::vector<std::thread> pool;
         pool.reserve(num_threads);
         for (unsigned t = 0; t < num_threads; ++t) pool.emplace_back(worker);
@@ -1468,18 +1505,33 @@ struct MetalRenderer::Impl {
         if (!lib) return;
 
         const auto t0 = std::chrono::steady_clock::now();
-        size_t uploaded = 0;
-        mat_textures.assign(lib->textures.size(), nil);
-        for (size_t i = 0; i < lib->textures.size(); ++i) {
-            @autoreleasepool {
-                mat_textures[i] = upload_scene_texture(lib->textures[i]);
-                if (mat_textures[i]) uploaded++;
+        const size_t n_tex = lib->textures.size();
+        mat_textures.assign(n_tex, nil);
+        std::atomic<size_t> next_tex{0};
+        std::atomic<size_t> uploaded{0};
+        const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned tex_threads = static_cast<unsigned>(std::min<size_t>(std::max<size_t>(1, n_tex), hw));
+        auto tex_worker = [&]() {
+            while (true) {
+                const size_t i = next_tex.fetch_add(1, std::memory_order_relaxed);
+                if (i >= n_tex) break;
+                @autoreleasepool {
+                    id<MTLTexture> tex = upload_scene_texture(lib->textures[i]);
+                    mat_textures[i] = tex;
+                    if (tex) uploaded.fetch_add(1, std::memory_order_relaxed);
+                }
             }
+        };
+        if (n_tex > 0) {
+            std::vector<std::thread> tex_pool;
+            tex_pool.reserve(tex_threads);
+            for (unsigned t = 0; t < tex_threads; ++t) tex_pool.emplace_back(tex_worker);
+            for (auto& th : tex_pool) th.join();
         }
         compile_material_shaders(*lib);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::cout << "[MetalRenderer] Material library resident: " << lib->materials.size() << " materials, "
-                  << uploaded << "/" << lib->textures.size() << " textures uploaded in " << secs << " s" << std::endl;
+                  << uploaded.load() << "/" << n_tex << " textures uploaded in " << secs << " s" << std::endl;
     }
 
     // Returns the pipeline for a mesh section, or nil when it must use legacy procedural shading.
@@ -2651,30 +2703,24 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                                                      active_scene.mod_shadow_color.z);
         uniforms.shadow_enabled = in_main_menu ? 2.0f : 1.0f;
 
+        const int frame_slot = static_cast<int>(impl_->frame_index % MetalRenderer::Impl::kMaxFramesInFlight);
+        if (!impl_->headless && impl_->in_flight_sem) {
+            dispatch_semaphore_wait(impl_->in_flight_sem, DISPATCH_TIME_FOREVER);
+        }
+        impl_->dyn_vertex_cursor[frame_slot] = 0;
+
         // ---------------------------------------------------------------------
         // Mirror's Edge materials: make the scene's material library resident
         // (texture upload + MSL compile happen once per library) and find out
         // whether this frame needs a translucency pass / opaque scene copies.
         // ---------------------------------------------------------------------
         impl_->sync_material_library(active_scene.materials);
-        bool has_translucent = false;
-        bool needs_scene_copies = false;
-        if (impl_->mat_lib) {
-            for (const auto& mesh : active_scene.meshes) {
-                for (const auto& s : mesh.sections) {
-                    const MaterialShader* sh = nullptr;
-                    if (!impl_->section_pipeline(s, &sh, nullptr) || !mat_blend_is_translucent(sh->blend)) continue;
-                    has_translucent = true;
-                    if (sh->uses_scene_color || sh->uses_scene_depth) needs_scene_copies = true;
-                }
-            }
-        }
 
         auto bind_vertex_bytes_or_buffer = [&](id<MTLRenderCommandEncoder> encoder, const void* data, size_t length, NSUInteger index) {
             if (length <= 4096) {
                 [encoder setVertexBytes:data length:length atIndex:index];
             } else {
-                id<MTLBuffer> buf = [impl_->device newBufferWithBytes:data length:length options:MTLResourceStorageModeShared];
+                id<MTLBuffer> buf = impl_->acquire_dynamic_vertex_buffer(frame_slot, data, length);
                 [encoder setVertexBuffer:buf offset:0 atIndex:index];
             }
         };
@@ -2683,8 +2729,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         size_t total_scene_verts = 0;
         for (const auto& m : active_scene.meshes) total_scene_verts += m.vertices.size();
 
-        if (active_scene.map_name != impl_->cached_map_name || total_scene_verts != impl_->cached_total_verts ||
-            impl_->cached_mesh_buffers.size() != active_scene.meshes.size()) {
+        const bool meshes_changed = (active_scene.map_name != impl_->cached_map_name ||
+                                     total_scene_verts != impl_->cached_total_verts ||
+                                     impl_->cached_mesh_buffers.size() != active_scene.meshes.size());
+        if (meshes_changed) {
             impl_->cached_map_name = active_scene.map_name;
             impl_->cached_total_verts = total_scene_verts;
             impl_->cached_mesh_buffers.clear();
@@ -2698,6 +2746,61 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                                                                 options:MTLResourceStorageModeShared];
                     impl_->cached_mesh_buffers.push_back(b);
                 }
+            }
+        }
+
+        if (meshes_changed || impl_->cached_section_mat_lib != impl_->mat_lib ||
+            impl_->cached_section_flags.size() != active_scene.meshes.size()) {
+            impl_->cached_section_mat_lib = impl_->mat_lib;
+            impl_->cached_has_translucent = false;
+            impl_->cached_needs_scene_copies = false;
+            impl_->cached_section_flags.assign(active_scene.meshes.size(), {});
+            for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
+                const auto& mesh = active_scene.meshes[i];
+                auto& sflags = impl_->cached_section_flags[i];
+                sflags.assign(mesh.sections.size(), 0u);
+                for (size_t si = 0; si < mesh.sections.size(); ++si) {
+                    const auto& s = mesh.sections[si];
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    id<MTLRenderPipelineState> ps = impl_->section_pipeline(s, &sh, &m);
+                    uint8_t fl = MetalRenderer::Impl::kSecShadowCaster;
+                    if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) {
+                        fl &= ~MetalRenderer::Impl::kSecShadowCaster;
+                    }
+                    if (m && (m->name.find("Skydome") != std::string::npos ||
+                              m->name.find("skydome") != std::string::npos)) {
+                        fl &= ~MetalRenderer::Impl::kSecShadowCaster;
+                    }
+                    if (ps && sh && mat_blend_is_translucent(sh->blend)) {
+                        fl |= MetalRenderer::Impl::kSecTranslucent;
+                        impl_->cached_has_translucent = true;
+                        if (sh->uses_scene_color || sh->uses_scene_depth) {
+                            impl_->cached_needs_scene_copies = true;
+                        }
+                    }
+                    sflags[si] = fl;
+                }
+            }
+        }
+        const bool has_translucent = impl_->cached_has_translucent;
+        const bool needs_scene_copies = impl_->cached_needs_scene_copies;
+
+        // Pre-skin active SWAT/CPF enemies once per frame and share between Pass 0 (Shadow) and Pass 1 (World)
+        const bool need_enemies = impl_->anim_system.is_loaded() && !active_scene.enemies.empty() &&
+                                  (!impl_->menu_open || (impl_->shadow_depth_tex && impl_->shadow_pipeline));
+        if (need_enemies) {
+            if (impl_->frame_enemy_meshes.size() < active_scene.enemies.size()) {
+                impl_->frame_enemy_meshes.resize(active_scene.enemies.size());
+            }
+            for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
+                const auto& bot = active_scene.enemies[ei];
+                if (!bot.alive && impl_->menu_open) {
+                    impl_->frame_enemy_meshes[ei].clear();
+                    continue;
+                }
+                impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active,
+                                                       impl_->frame_enemy_meshes[ei]);
             }
         }
 
@@ -2769,29 +2872,27 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
                         continue;
                     }
-                    for (const auto& s : mesh.sections) {
+                    const auto& sflags = impl_->cached_section_flags[i];
+                    for (size_t si = 0; si < mesh.sections.size(); ++si) {
+                        const auto& s = mesh.sections[si];
                         if (!section_in_range(mesh, s)) continue;
-                        const MaterialShader* sh = nullptr;
-                        const SceneMaterial* m = nullptr;
-                        impl_->section_pipeline(s, &sh, &m);
-                        if (sh && (mat_blend_is_translucent(sh->blend) || sh->lighting == MatLightingModel::Unlit)) continue;
-                        if (m && (m->name.find("Skydome") != std::string::npos || m->name.find("skydome") != std::string::npos)) continue;
+                        if ((sflags[si] & MetalRenderer::Impl::kSecShadowCaster) == 0) continue;
                         [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
                     }
                 }
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
 
-                if (dynamic_casters && impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
-                    for (const auto& bot : active_scene.enemies) {
+                if (dynamic_casters && need_enemies) {
+                    for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
+                        const auto& bot = active_scene.enemies[ei];
                         if (!bot.alive) continue;
-                        impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
-                        if (impl_->enemy_guard_mesh.empty()) continue;
-                        bind_vertex_bytes_or_buffer(shEnc, impl_->enemy_guard_mesh.data(),
-                                                    impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
+                        const auto& emesh = impl_->frame_enemy_meshes[ei];
+                        if (emesh.empty()) continue;
+                        bind_vertex_bytes_or_buffer(shEnc, emesh.data(), emesh.size() * sizeof(Vertex), 0);
                         Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                         std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                         [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
-                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
+                        [shEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:emesh.size()];
                     }
                     std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
                 }
@@ -2940,20 +3041,20 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setDepthStencilState:impl_->depth_write_state];
         [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
         bind_world_char_wep_textures("Colt1911");
-        if (!impl_->menu_open && impl_->anim_system.is_loaded() && !active_scene.enemies.empty()) {
-            for (const auto& bot : active_scene.enemies) {
-                impl_->anim_system.evaluate_enemy_swat(bot, telemetry.sim_time, telemetry.reaction_active, impl_->enemy_guard_mesh);
-                if (impl_->enemy_guard_mesh.empty()) continue;
+        if (!impl_->menu_open && need_enemies) {
+            for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
+                const auto& bot = active_scene.enemies[ei];
+                const auto& emesh = impl_->frame_enemy_meshes[ei];
+                if (emesh.empty()) continue;
                 bind_world_char_wep_textures(bot.weapon_name);
-                bind_vertex_bytes_or_buffer(enc, impl_->enemy_guard_mesh.data(),
-                                            impl_->enemy_guard_mesh.size() * sizeof(Vertex), 0);
+                bind_vertex_bytes_or_buffer(enc, emesh.data(), emesh.size() * sizeof(Vertex), 0);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->enemy_guard_mesh.size()];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:emesh.size()];
             }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
@@ -3287,8 +3388,17 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [cmd_buffer presentDrawable:drawable];
         }
 
-        [cmd_buffer commit];
-        [cmd_buffer waitUntilCompleted];
+        impl_->last_cmd_buffer = cmd_buffer;
+        if (!impl_->headless && impl_->in_flight_sem) {
+            dispatch_semaphore_t sem = impl_->in_flight_sem;
+            [cmd_buffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                dispatch_semaphore_signal(sem);
+            }];
+            [cmd_buffer commit];
+        } else {
+            [cmd_buffer commit];
+            [cmd_buffer waitUntilCompleted];
+        }
 
         impl_->frame_index++;
     }
@@ -3296,6 +3406,9 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
 bool MetalRenderer::save_screenshot_ppm(const std::string& path) {
     if (!impl_->initialized || !impl_->offscreen_color_tex) return false;
+    if (impl_->last_cmd_buffer) {
+        [impl_->last_cmd_buffer waitUntilCompleted];
+    }
 
     int w = impl_->width;
     int h = impl_->height;
@@ -3325,6 +3438,9 @@ bool MetalRenderer::save_screenshot_ppm(const std::string& path) {
 
 bool MetalRenderer::save_screenshot_png(const std::string& path) {
     if (!impl_->initialized || !impl_->offscreen_color_tex) return false;
+    if (impl_->last_cmd_buffer) {
+        [impl_->last_cmd_buffer waitUntilCompleted];
+    }
 
     int w = impl_->width;
     int h = impl_->height;

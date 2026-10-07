@@ -96,7 +96,8 @@ void sample_sequence_pose(const SkeletalMeshAsset& mesh,
     if (t_clamped < 0.0f) t_clamped += 1.0f;
 
     for (size_t b = 0; b < num_bones; ++b) {
-        auto it = anim_set.bone_to_track.find(to_lower_str(mesh.bones[b].name));
+        const std::string& key = mesh.bones[b].name_lower.empty() ? to_lower_str(mesh.bones[b].name) : mesh.bones[b].name_lower;
+        auto it = anim_set.bone_to_track.find(key);
         if (it == anim_set.bone_to_track.end()) continue;
         int32_t track_idx = it->second;
         if (track_idx < 0 || static_cast<size_t>(track_idx) >= seq->tracks.size()) continue;
@@ -455,11 +456,12 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
 
         SkeletalBone& bone = out_mesh.bones[i];
         bone.name = read_fname_str(pkg, n_idx, n_num);
+        bone.name_lower = to_lower_str(bone.name);
         bone.flags = flags;
         bone.parent_index = (i == 0) ? -1 : parent_idx;
         bone.bind_pos = Vec3(px, py, pz);
         bone.bind_quat = Quat4(qx, qy, qz, qw).normalized();
-        out_mesh.bone_name_to_index[to_lower_str(bone.name)] = i;
+        out_mesh.bone_name_to_index[bone.name_lower] = i;
     }
 
     // Precompute bind-pose component-space bone transforms
@@ -1893,8 +1895,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         seq_a = faith_unarmed_set_.find_sequence("Stand");
     }
 
-    std::vector<Vec3> local_pos, local_pos_b;
-    std::vector<Quat4> local_quat, local_quat_b;
+    thread_local std::vector<Vec3> local_pos, local_pos_b, wp_pos, comp_pos, delta_pos;
+    thread_local std::vector<Quat4> local_quat, local_quat_b, wp_quat, comp_quat, delta_quat;
     sample_sequence_pose(faith_upper_, *active_set, seq_a, norm_time, local_pos, local_quat);
 
     if (seq_b && blend_alpha > 0.001f) {
@@ -1913,8 +1915,6 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 : w_spec_set->find_sequence("WeaponPose");
         if (!wp_seq) wp_seq = w_spec_set->find_sequence("standfire");
         if (wp_seq) {
-            std::vector<Vec3> wp_pos;
-            std::vector<Quat4> wp_quat;
             sample_sequence_pose(faith_upper_, *w_spec_set, wp_seq, 0.0f, wp_pos, wp_quat);
             for (size_t b = 49; b <= 68 && b < local_pos.size(); ++b) {
                 local_pos[b] = wp_pos[b];
@@ -1924,13 +1924,9 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     }
 
     // Forward kinematics in component space
-    std::vector<Vec3> comp_pos;
-    std::vector<Quat4> comp_quat;
     compute_skeleton_fk(faith_upper_.bones, local_pos, local_quat, comp_pos, comp_quat);
 
     // Compute per-bone Linear Blend Skinning deltas
-    std::vector<Vec3> delta_pos;
-    std::vector<Quat4> delta_quat;
     compute_skin_deltas(faith_upper_, comp_pos, comp_quat, delta_pos, delta_quat);
 
     // EyeJoint (Bone 72) reference frame
@@ -1970,10 +1966,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         return Vec3(rel.x, rel.z, -rel.y).normalized();
     };
 
+    thread_local std::vector<Vec3> skinned_pos;
+    thread_local std::vector<Vec3> skinned_norm;
+    thread_local std::vector<uint8_t> vert_valid;
+
     auto append_skinned_mesh = [&](const SkeletalMeshAsset& mesh, bool is_lower) {
-        std::vector<Vec3> skinned_pos(mesh.vertices.size());
-        std::vector<Vec3> skinned_norm(mesh.vertices.size());
-        std::vector<uint8_t> vert_valid(mesh.vertices.size(), 1);
+        skinned_pos.resize(mesh.vertices.size());
+        skinned_norm.resize(mesh.vertices.size());
+        vert_valid.assign(mesh.vertices.size(), 1);
 
         for (size_t i = 0; i < mesh.vertices.size(); ++i) {
             const SkinnedVertex& sv = mesh.vertices[i];
@@ -2061,8 +2061,10 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
 
         bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
         const size_t wb_cnt = equipped_wmesh->bones.size();
-        std::vector<Vec3> wep_local_pos(wb_cnt);
-        std::vector<Quat4> wep_local_quat(wb_cnt);
+        thread_local std::vector<Vec3> wep_local_pos;
+        thread_local std::vector<Quat4> wep_local_quat;
+        wep_local_pos.resize(wb_cnt);
+        wep_local_quat.resize(wb_cnt);
         for (size_t b = 0; b < wb_cnt; ++b) {
             wep_local_pos[b] = equipped_wmesh->bones[b].bind_pos;
             wep_local_quat[b] = equipped_wmesh->bones[b].bind_quat;
@@ -2082,7 +2084,10 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             float tc = t_norm - std::floor(t_norm);
             if (tc < 0.0f) tc += 1.0f;
             for (size_t b = 1; b < wb_cnt; ++b) {
-                auto it = aset->bone_to_track.find(to_lower_str(equipped_wmesh->bones[b].name));
+                const std::string& wkey = equipped_wmesh->bones[b].name_lower.empty()
+                                              ? to_lower_str(equipped_wmesh->bones[b].name)
+                                              : equipped_wmesh->bones[b].name_lower;
+                auto it = aset->bone_to_track.find(wkey);
                 if (it == aset->bone_to_track.end()) continue;
                 int32_t tidx = it->second;
                 if (tidx < 0 || static_cast<size_t>(tidx) >= seq->tracks.size()) continue;
@@ -2262,8 +2267,8 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
     // Ensure active_set owns seq_a for track mapping
     const AnimSetAsset* owner_a = (active_set->find_sequence(seq_a->name) == seq_a) ? active_set : &swat_set_;
 
-    std::vector<Vec3> local_pos, local_pos_b;
-    std::vector<Quat4> local_quat, local_quat_b;
+    thread_local std::vector<Vec3> local_pos, local_pos_b, comp_pos, delta_pos, skinned_pos, skinned_norm;
+    thread_local std::vector<Quat4> local_quat, local_quat_b, comp_quat, delta_quat;
     sample_sequence_pose(swat_mesh_, *owner_a, seq_a, norm_time, local_pos, local_quat);
     if (seq_b && blend_alpha > 0.001f) {
         const AnimSetAsset* owner_b = (active_set->find_sequence(seq_b->name) == seq_b) ? active_set : &swat_set_;
@@ -2271,17 +2276,12 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
-    std::vector<Vec3> comp_pos;
-    std::vector<Quat4> comp_quat;
     compute_skeleton_fk(swat_mesh_.bones, local_pos, local_quat, comp_pos, comp_quat);
-
-    std::vector<Vec3> delta_pos;
-    std::vector<Quat4> delta_quat;
     compute_skin_deltas(swat_mesh_, comp_pos, comp_quat, delta_pos, delta_quat);
 
     // Map raw component coordinates (X=Left, -Y=Up, +Z=Forward) to Unreal/Engine bot local space (+X=Forward, +Y=Right, +Z=Up)
-    std::vector<Vec3> skinned_pos(swat_mesh_.vertices.size());
-    std::vector<Vec3> skinned_norm(swat_mesh_.vertices.size());
+    skinned_pos.resize(swat_mesh_.vertices.size());
+    skinned_norm.resize(swat_mesh_.vertices.size());
     for (size_t i = 0; i < swat_mesh_.vertices.size(); ++i) {
         const SkinnedVertex& sv = swat_mesh_.vertices[i];
         Vec3 p_acc(0.0f, 0.0f, 0.0f);

@@ -80,6 +80,7 @@ struct Quat4 {
 
 struct SkeletalBone {
     std::string name;
+    std::string name_lower;
     int32_t parent_index = 0;
     uint32_t flags = 0;
     Vec3 bind_pos{0.0f, 0.0f, 0.0f};

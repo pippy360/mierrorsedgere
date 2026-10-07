@@ -24,27 +24,24 @@ inline AABB triangle_box(const CollisionWorld::Triangle& t) {
     return AABB(vmin(t.a, vmin(t.b, t.c)), vmax(t.a, vmax(t.b, t.c)));
 }
 
+inline bool slab_axis(float o, float inv, bool par, float bmin, float bmax, float& t0, float& t1) {
+    if (par) return o >= bmin && o <= bmax;
+    float ta = (bmin - o) * inv;
+    float tb = (bmax - o) * inv;
+    if (ta > tb) std::swap(ta, tb);
+    t0 = std::max(t0, ta);
+    t1 = std::min(t1, tb);
+    return t0 <= t1;
+}
+
 // Segment (origin + t * dir, t in [0, t_max]) vs AABB slab test. Returns the entry time.
 inline bool segment_hits_box(const Vec3& origin, const Vec3& inv_dir, const bool parallel[3], const AABB& box,
                              float t_max, float& t_entry) {
     float t0 = 0.0f;
     float t1 = t_max;
-    const float o[3] = {origin.x, origin.y, origin.z};
-    const float inv[3] = {inv_dir.x, inv_dir.y, inv_dir.z};
-    const float bmin[3] = {box.min_pt.x, box.min_pt.y, box.min_pt.z};
-    const float bmax[3] = {box.max_pt.x, box.max_pt.y, box.max_pt.z};
-    for (int k = 0; k < 3; ++k) {
-        if (parallel[k]) {
-            if (o[k] < bmin[k] || o[k] > bmax[k]) return false;
-            continue;
-        }
-        float ta = (bmin[k] - o[k]) * inv[k];
-        float tb = (bmax[k] - o[k]) * inv[k];
-        if (ta > tb) std::swap(ta, tb);
-        t0 = std::max(t0, ta);
-        t1 = std::min(t1, tb);
-        if (t0 > t1) return false;
-    }
+    if (!slab_axis(origin.x, inv_dir.x, parallel[0], box.min_pt.x, box.max_pt.x, t0, t1)) return false;
+    if (!slab_axis(origin.y, inv_dir.y, parallel[1], box.min_pt.y, box.max_pt.y, t0, t1)) return false;
+    if (!slab_axis(origin.z, inv_dir.z, parallel[2], box.min_pt.z, box.max_pt.z, t0, t1)) return false;
     t_entry = t0;
     return true;
 }
@@ -59,7 +56,7 @@ struct SweepResult {
 };
 
 SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, const Vec3& tri_normal,
-                               const Vec3& delta, const Vec3& extent) {
+                               const Vec3& delta, const Vec3& extent, float max_time = 1.0f) {
     SweepResult r;
     float t_enter = -FLT_MAX;
     float t_exit = FLT_MAX;
@@ -93,7 +90,7 @@ SweepResult sweep_box_triangle(const Vec3& v0, const Vec3& v1, const Vec3& v2, c
             n_enter = n;
         }
         t_exit = std::min(t_exit, tb);
-        return t_enter <= t_exit;
+        return t_enter <= t_exit && t_exit >= 0.0f && t_enter <= max_time;
     };
 
     const Vec3 e0 = v1 - v0;
@@ -327,28 +324,56 @@ CollisionHit CollisionWorld::sweep_box(const Vec3& start, const Vec3& delta, con
     // Small inflation keeps grazing contacts inside the broad phase.
     const Vec3 grow = extent + Vec3(0.5f, 0.5f, 0.5f);
 
-    uint32_t stack[64];
+    struct StackEntry {
+        uint32_t node;
+        float t_entry;
+    };
+    StackEntry stack[64];
     int sp = 0;
-    stack[sp++] = 0;
+    float root_entry = 0.0f;
+    if (!segment_hits_box(start, inv, parallel, AABB(nodes_[0].box.min_pt - grow, nodes_[0].box.max_pt + grow), 1.0f,
+                          root_entry)) {
+        return best;
+    }
+    stack[sp++] = {0u, root_entry};
     float best_time = 1.0f;
     bool have_hit = false;
     while (sp > 0) {
-        const Node& node = nodes_[stack[--sp]];
-        const AABB grown(node.box.min_pt - grow, node.box.max_pt + grow);
-        float t_entry = 0.0f;
-        if (!segment_hits_box(start, inv, parallel, grown, have_hit ? best_time : 1.0f, t_entry)) continue;
+        const StackEntry top = stack[--sp];
+        if (have_hit && top.t_entry > best_time) continue;
+        const Node& node = nodes_[top.node];
         if (node.count == 0) {
-            const uint32_t self = static_cast<uint32_t>(&node - nodes_.data());
-            if (sp + 2 <= 64) {
-                stack[sp++] = node.first;  // right
-                stack[sp++] = self + 1;    // left (visited first)
+            const uint32_t left = top.node + 1;
+            const uint32_t right = node.first;
+            const float limit = have_hit ? best_time : 1.0f;
+            float tl = 0.0f, tr = 0.0f;
+            const bool hit_l = segment_hits_box(
+                start, inv, parallel, AABB(nodes_[left].box.min_pt - grow, nodes_[left].box.max_pt + grow), limit, tl);
+            const bool hit_r = segment_hits_box(
+                start, inv, parallel, AABB(nodes_[right].box.min_pt - grow, nodes_[right].box.max_pt + grow), limit, tr);
+            if (hit_l && hit_r) {
+                if (sp + 2 <= 64) {
+                    if (tr < tl) {
+                        stack[sp++] = {left, tl};
+                        stack[sp++] = {right, tr};  // right strictly closer -> visited first
+                    } else {
+                        stack[sp++] = {right, tr};
+                        stack[sp++] = {left, tl};   // left visited first (preserves tie order)
+                    }
+                }
+            } else if (hit_l && sp + 1 <= 64) {
+                stack[sp++] = {left, tl};
+            } else if (hit_r && sp + 1 <= 64) {
+                stack[sp++] = {right, tr};
             }
             continue;
         }
         for (uint32_t i = node.first; i < node.first + node.count; ++i) {
             const Triangle& t = tris_[i];
             if ((t.channels & channels) == 0) continue;
-            const SweepResult sr = sweep_box_triangle(t.a - start, t.b - start, t.c - start, t.normal, delta, extent);
+            const SweepResult sr =
+                sweep_box_triangle(t.a - start, t.b - start, t.c - start, t.normal, delta, extent,
+                                   have_hit ? best_time : 1.0f);
             if (!sr.hit) continue;
             if (!have_hit || sr.time < best_time ||
                 (sr.time == best_time && sr.normal.z > best.normal.z)) {
@@ -375,22 +400,48 @@ CollisionHit CollisionWorld::line_check(const Vec3& start, const Vec3& end, uint
     const Vec3 dir = end - start;
     const bool parallel[3] = {std::abs(dir.x) < 1e-12f, std::abs(dir.y) < 1e-12f, std::abs(dir.z) < 1e-12f};
     const Vec3 inv(parallel[0] ? 0.0f : 1.0f / dir.x, parallel[1] ? 0.0f : 1.0f / dir.y, parallel[2] ? 0.0f : 1.0f / dir.z);
+    const Vec3 eps(0.01f, 0.01f, 0.01f);
 
-    uint32_t stack[64];
+    struct StackEntry {
+        uint32_t node;
+        float t_entry;
+    };
+    StackEntry stack[64];
     int sp = 0;
-    stack[sp++] = 0;
+    float root_entry = 0.0f;
+    if (!segment_hits_box(start, inv, parallel, AABB(nodes_[0].box.min_pt - eps, nodes_[0].box.max_pt + eps), 1.0f,
+                          root_entry)) {
+        return best;
+    }
+    stack[sp++] = {0u, root_entry};
     float best_time = 1.0f;
     bool have_hit = false;
     while (sp > 0) {
-        const Node& node = nodes_[stack[--sp]];
-        float t_entry = 0.0f;
-        const AABB grown(node.box.min_pt - Vec3(0.01f, 0.01f, 0.01f), node.box.max_pt + Vec3(0.01f, 0.01f, 0.01f));
-        if (!segment_hits_box(start, inv, parallel, grown, best_time, t_entry)) continue;
+        const StackEntry top = stack[--sp];
+        if (top.t_entry > best_time) continue;
+        const Node& node = nodes_[top.node];
         if (node.count == 0) {
-            const uint32_t self = static_cast<uint32_t>(&node - nodes_.data());
-            if (sp + 2 <= 64) {
-                stack[sp++] = node.first;
-                stack[sp++] = self + 1;
+            const uint32_t left = top.node + 1;
+            const uint32_t right = node.first;
+            float tl = 0.0f, tr = 0.0f;
+            const bool hit_l = segment_hits_box(
+                start, inv, parallel, AABB(nodes_[left].box.min_pt - eps, nodes_[left].box.max_pt + eps), best_time, tl);
+            const bool hit_r = segment_hits_box(
+                start, inv, parallel, AABB(nodes_[right].box.min_pt - eps, nodes_[right].box.max_pt + eps), best_time, tr);
+            if (hit_l && hit_r) {
+                if (sp + 2 <= 64) {
+                    if (tr < tl) {
+                        stack[sp++] = {left, tl};
+                        stack[sp++] = {right, tr};
+                    } else {
+                        stack[sp++] = {right, tr};
+                        stack[sp++] = {left, tl};
+                    }
+                }
+            } else if (hit_l && sp + 1 <= 64) {
+                stack[sp++] = {left, tl};
+            } else if (hit_r && sp + 1 <= 64) {
+                stack[sp++] = {right, tr};
             }
             continue;
         }
