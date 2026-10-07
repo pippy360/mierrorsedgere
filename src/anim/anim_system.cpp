@@ -570,19 +570,28 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             std::memcpy(&sv.bind_pos.z, vp + 8, 4);
             sv.bind_tangent = unpack_normal(vp + 12);
             sv.bind_norm = unpack_normal(vp + 20);
-            float u0 = 0.0f, v0 = 0.0f, u2 = 0.0f, v2 = 0.0f;
+            float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f, u2 = 0.0f, v2 = 0.0f;
             std::memcpy(&u0, vp + 24, 4);
             std::memcpy(&v0, vp + 28, 4);
+            std::memcpy(&u1, vp + 32, 4);
+            std::memcpy(&v1, vp + 36, 4);
             std::memcpy(&u2, vp + 40, 4);
             std::memcpy(&v2, vp + 44, 4);
-            // All UE3 weapon & ammo materials in Mirror's Edge bind CoordinateIndex=2 (UVs[2] at vp+40/44),
-            // whereas character meshes (Faith/SWAT) have UVs[2]=(0,0) and bind CoordinateIndex=0 (UVs[0]).
+            // UE3 weapon materials bind CoordinateIndex=2 (UVs[2]) for Diffuse/Spec/Mask
+            // and CoordinateIndex=1 (UVs[1], or UVs[0] on FNSCARL) for Normal Map T_<Weapon>_N.
             if (std::abs(u2) > 1e-6f || std::abs(v2) > 1e-6f) {
                 sv.u = u2;
                 sv.v = v2;
             } else {
                 sv.u = u0;
                 sv.v = v0;
+            }
+            if (std::abs(u1) > 1e-6f || std::abs(v1) > 1e-6f) {
+                sv.un = u1;
+                sv.vn = v1;
+            } else {
+                sv.un = u0;
+                sv.vn = v0;
             }
             uint8_t local_b = vp[48];
             uint8_t real_b = (local_b < bone_map.size() && bone_map[local_b] < bone_count)
@@ -603,9 +612,11 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             std::memcpy(&sv.bind_pos.z, vp + 8, 4);
             sv.bind_tangent = unpack_normal(vp + 12);
             sv.bind_norm = unpack_normal(vp + 20);
-            float u0 = 0.0f, v0 = 0.0f, u2 = 0.0f, v2 = 0.0f;
+            float u0 = 0.0f, v0 = 0.0f, u1 = 0.0f, v1 = 0.0f, u2 = 0.0f, v2 = 0.0f;
             std::memcpy(&u0, vp + 24, 4);
             std::memcpy(&v0, vp + 28, 4);
+            std::memcpy(&u1, vp + 32, 4);
+            std::memcpy(&v1, vp + 36, 4);
             std::memcpy(&u2, vp + 40, 4);
             std::memcpy(&v2, vp + 44, 4);
             if (std::abs(u2) > 1e-6f || std::abs(v2) > 1e-6f) {
@@ -614,6 +625,13 @@ bool AnimSystem::parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport&
             } else {
                 sv.u = u0;
                 sv.v = v0;
+            }
+            if (std::abs(u1) > 1e-6f || std::abs(v1) > 1e-6f) {
+                sv.un = u1;
+                sv.vn = v1;
+            } else {
+                sv.un = u0;
+                sv.vn = v0;
             }
             for (int k = 0; k < 4; ++k) {
                 uint8_t local_b = vp[48 + k];
@@ -1124,6 +1142,8 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         parse_dxt1_texture(pkg_w, ws.tex_d, w_mesh.tex_diffuse);
         parse_dxt1_texture(pkg_w, ws.tex_s, w_mesh.tex_specular);
         parse_dxt1_texture(pkg_w, ws.tex_n, w_mesh.tex_normal);
+        std::string tex_m = std::string("T_") + ws.key + "_M";
+        parse_dxt1_texture(pkg_w, tex_m, w_mesh.tex_mask);
 
         for (auto& v : w_mesh.vertices) {
             v.color = 0xFFFFFFFF;
@@ -1921,7 +1941,9 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 out_v.u = sv.u;
                 out_v.v = sv.v;
                 out_v.u2 = (sv.mat_type == 1) ? 5.0f : (sv.mat_type == 2 ? 6.0f : 4.0f);
-                out_v.color = 0xFFFFFFFF;
+                uint32_t un16 = static_cast<uint32_t>(std::clamp(sv.un, 0.0f, 1.0f) * 65535.0f + 0.5f);
+                uint32_t vn16 = static_cast<uint32_t>(std::clamp(sv.vn, 0.0f, 1.0f) * 65535.0f + 0.5f);
+                out_v.color = (un16 & 0xFFFFu) | ((vn16 & 0xFFFFu) << 16);
                 out_triangles.push_back(out_v);
             }
         }

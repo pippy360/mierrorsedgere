@@ -497,6 +497,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
                                    texture2d<float> vm_wep_s_tex [[texture(4)]],
                                    texture2d<float> vm_wep_n_tex [[texture(5)]],
                                    texture2d<float> vm_ammo_tex  [[texture(6)]],
+                                   texture2d<float> vm_wep_m_tex [[texture(7)]],
                                    sampler vm_sampler            [[sampler(0)]]) {
     int slot = int(round(in.uv2.x));
     if (slot == 0) {
@@ -515,10 +516,9 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
 
     float3 vtx_N = in.world_norm;
     float vtx_len = length(vtx_N);
-    vtx_N = (vtx_len > 1e-4) ? (vtx_N / vtx_len) : geo_N;
-    if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
+    float3 N = (vtx_len > 1e-4) ? (vtx_N / vtx_len) : geo_N;
+    if (dot(N, V) < -0.25) N = -N;
 
-    float3 N = normalize(mix(geo_N, vtx_N, 0.72));
     float3 L = normalize(float3(0.35, -0.45, 0.82));
     float3 H = normalize(L + V);
 
@@ -564,12 +564,12 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
     }
 
     if (slot == 5) {
-        // Weapon M_Ammo Brass Cartridges & Belt (T_Ammo_D)
-        float3 a_raw = vm_ammo_tex.sample(vm_sampler, in.uv).rgb;
-        float3 albedo = pow(max(a_raw, float3(0.0)), float3(0.78)) * float3(1.26, 1.05, 0.72) + float3(0.12, 0.09, 0.04);
+        // Weapon M_Ammo Brass Cartridges & Belt (T_Ammo_D, sRGB decoded)
+        float3 a_lin = vm_ammo_tex.sample(vm_sampler, in.uv).rgb;
+        float3 albedo = a_lin * float3(1.55, 1.25, 0.78) + float3(0.04, 0.03, 0.01);
         float NdotL = max(dot(N, L), 0.0);
-        float spec_brass = pow(max(dot(N, H), 0.0), 36.0) * 0.65 + pow(max(dot(N, H), 0.0), 12.0) * 0.25;
-        float3 col = albedo * (0.42 + 0.58 * NdotL) + float3(0.92, 0.76, 0.42) * spec_brass;
+        float spec_brass = pow(max(dot(N, H), 0.0), 36.0) * 0.75 + pow(max(dot(N, H), 0.0), 12.0) * 0.25;
+        float3 col = albedo * (0.35 + 0.65 * NdotL) + float3(0.95, 0.78, 0.40) * spec_brass;
         return float4(col, 1.0);
     }
 
@@ -579,40 +579,60 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         float glint = pow(max(dot(N, H), 0.0), 96.0);
         float2 centered = abs(fract(in.uv) - 0.5);
         float crosshair = (min(centered.x, centered.y) < 0.006 && max(centered.x, centered.y) < 0.35) ? 0.18 : 0.0;
-        float3 glass_col = float3(0.05, 0.11, 0.17) + float3(0.32, 0.58, 0.88) * fresnel * 0.65 + float3(glint * 0.9) + float3(crosshair * 0.12);
+        float3 glass_col = float3(0.03, 0.08, 0.14) + float3(0.30, 0.56, 0.88) * fresnel * 0.65 + float3(glint * 0.95) + float3(crosshair * 0.12);
         return float4(glass_col, 1.0);
     }
 
-    // Slot 4: Equipped Weapon High-Resolution Main Material (T_<Weapon>_D + T_<Weapon>_S + T_<Weapon>_N)
-    float3 d_raw = vm_wep_d_tex.sample(vm_sampler, in.uv).rgb;
-    float3 s_raw = vm_wep_s_tex.sample(vm_sampler, in.uv).rgb;
-    float3 n_ts  = vm_wep_n_tex.sample(vm_sampler, in.uv).rgb * 2.0 - 1.0;
+    // Slot 4: Equipped Weapon High-Resolution UE3 Material Graph (WP_*.upk M_<Weapon>)
+    // - Diffuse/Specular/Mask: CoordinateIndex = 2 (in.uv), hardware sRGB -> linear
+    // - Normal Map (T_<Weapon>_N): CoordinateIndex = 1 (unpacked 16-bit unorm from in.color), linear [-1, 1]
+    float2 uv_n = float2(in.color.r * 255.0 + in.color.g * 65280.0,
+                         in.color.b * 255.0 + in.color.a * 65280.0) * (1.0 / 65535.0);
 
-    // Screen-space cotangent normal map perturbation for crisp picatinny rails, grip checkering, screws & markings
-    float2 duv1 = dfdx(in.uv);
-    float2 duv2 = dfdy(in.uv);
+    float3 d_lin = vm_wep_d_tex.sample(vm_sampler, in.uv).rgb;
+    float3 s_lin = vm_wep_s_tex.sample(vm_sampler, in.uv).rgb;
+    float3 m_lin = vm_wep_m_tex.sample(vm_sampler, in.uv).rgb;
+    float3 n_ts  = vm_wep_n_tex.sample(vm_sampler, uv_n).rgb * 2.0 - 1.0;
+
+    // Screen-space cotangent normal perturbation using the Normal Map UV channel (uv_n)
+    float2 duv1 = dfdx(uv_n);
+    float2 duv2 = dfdy(uv_n);
     float3 dp2perp = cross(dpdy, N);
     float3 dp1perp = cross(N, dpdx);
     float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
     float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
-    float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-8);
-    N = normalize(N + (T * n_ts.x + B * n_ts.y) * (invmax * 0.65));
+    float t_len2 = max(dot(T, T), dot(B, B));
+    if (t_len2 > 1e-10) {
+        float invmax = rsqrt(t_len2);
+        N = normalize(N + (T * n_ts.x + B * n_ts.y) * (invmax * 0.85));
+    }
+
+    // UE3 ReflectionVector (-V reflected about perturbed N) sampling CM_GenericHighlights_01 studio/sky cubemap
+    float3 R = reflect(-V, N);
+    float sky_band   = saturate(R.z * 0.5 + 0.5);
+    float studio_key = pow(saturate(dot(R, normalize(float3(0.25, -0.55, 0.80)))), 6.0);
+    float3 cm_highlights = mix(float3(0.06, 0.07, 0.09), float3(0.62, 0.76, 0.95), pow(sky_band, 1.6))
+                         + float3(0.85, 0.90, 0.98) * studio_key;
+
+    // Exact UE3 Material Graph:
+    //   DiffuseColor  = T_Weapon_D + CM_GenericHighlights_01(ReflectionVector) * T_Weapon_S * T_Weapon_M * 1.5
+    //   SpecularColor = T_Weapon_S
+    //   SpecularPower = 20.0
+    float3 ue3_diffuse_color = d_lin * 1.35 + cm_highlights * s_lin * m_lin * 1.65;
 
     float NdotL = max(dot(N, L), 0.0);
-    float sky_hemi = saturate(N.z * 0.5 + 0.5);
+    float sky_hemi  = saturate(N.z * 0.5 + 0.5);
     float side_fill = saturate(-N.x * 0.5 + 0.5);
 
-    // Authentic UE3 M_Weapon_Master gunmetal + polymer shading with City of Glass sky reflection
-    float3 albedo = pow(max(d_raw, float3(0.0)), float3(0.82)) * 1.15 + s_raw * 0.18;
-    float3 hemi_light = float3(0.34, 0.37, 0.42) + float3(0.24, 0.32, 0.44) * sky_hemi + float3(0.10, 0.11, 0.13) * side_fill;
-    float3 sun_diff   = float3(0.68, 0.65, 0.60) * NdotL;
+    // Linear scene lighting (matches UE3 Tutorial_lgts DirectionalLight + SkyLight before Pass 2 gamma 2.2)
+    float3 ambient_light = float3(0.24, 0.27, 0.33) + float3(0.28, 0.38, 0.52) * sky_hemi + float3(0.09, 0.10, 0.12) * side_fill;
+    float3 direct_sun    = float3(1.15, 1.08, 0.96) * NdotL;
 
-    float spec_broad = pow(max(dot(N, H), 0.0), 16.0) * 0.45;
-    float spec_tight = pow(max(dot(N, H), 0.0), 64.0) * 0.60;
-    float fresnel    = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.26;
-    float3 spec_col  = s_raw * (spec_broad + spec_tight) + float3(0.68, 0.84, 1.0) * fresnel * (0.18 + s_raw * 0.85);
+    float spec_lobe = pow(max(dot(N, H), 0.0), 20.0);
+    float fresnel   = pow(1.0 - max(dot(N, V), 0.0), 3.5);
+    float3 spec_col = s_lin * (spec_lobe * 0.95 + float3(0.55, 0.70, 0.92) * fresnel * (0.25 + m_lin * 0.75));
 
-    float3 col = albedo * (hemi_light + sun_diff) + spec_col;
+    float3 col = ue3_diffuse_color * (ambient_light + direct_sun) + spec_col;
     return float4(col, 1.0);
 }
 
@@ -1697,6 +1717,7 @@ struct MetalRenderer::Impl {
         id<MTLTexture> diffuse = nil;
         id<MTLTexture> specular = nil;
         id<MTLTexture> normal = nil;
+        id<MTLTexture> mask = nil;
     };
     id<MTLTexture> vm_skin_gpu_tex = nil;
     id<MTLTexture> vm_glove_gpu_tex = nil;
@@ -1705,11 +1726,12 @@ struct MetalRenderer::Impl {
     id<MTLTexture> ammo_d_gpu_tex = nil;
     std::unordered_map<std::string, WeaponGPUTextures> weapon_gpu_textures;
 
-    id<MTLTexture> upload_dxt1_texture(const DXT1Texture& dxt) {
+    id<MTLTexture> upload_dxt1_texture(const DXT1Texture& dxt, bool srgb = false) {
         if (!dxt.is_valid()) return nil;
         std::vector<uint8_t> rgba;
         if (!dxt.decode_rgba8(rgba) || rgba.empty()) return nil;
-        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        MTLPixelFormat fmt = srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
                                                                                         width:static_cast<NSUInteger>(dxt.width)
                                                                                        height:static_cast<NSUInteger>(dxt.height)
                                                                                     mipmapped:YES];
@@ -1737,17 +1759,18 @@ struct MetalRenderer::Impl {
         anim_system.init_from_game_root("/Users/tomnom/mirrorsedge");
         if (!anim_system.is_loaded()) return;
 
-        vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex());
-        vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex());
-        vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex());
-        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex());
-        ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex());
+        vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex(), false);
+        vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex(), false);
+        vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex(), false);
+        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex(), false);
+        ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex(), true);
 
         for (const auto& [wname, wmesh] : anim_system.weapon_meshes()) {
             WeaponGPUTextures wtex{};
-            wtex.diffuse  = upload_dxt1_texture(wmesh.tex_diffuse);
-            wtex.specular = upload_dxt1_texture(wmesh.tex_specular);
-            wtex.normal   = upload_dxt1_texture(wmesh.tex_normal);
+            wtex.diffuse  = upload_dxt1_texture(wmesh.tex_diffuse, true);
+            wtex.specular = upload_dxt1_texture(wmesh.tex_specular, true);
+            wtex.normal   = upload_dxt1_texture(wmesh.tex_normal, false);
+            wtex.mask     = upload_dxt1_texture(wmesh.tex_mask, true);
             weapon_gpu_textures[wname] = wtex;
         }
     }
@@ -2924,6 +2947,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 id<MTLTexture> t_wep_d = impl_->tex_default_white;
                 id<MTLTexture> t_wep_s = impl_->tex_default_black;
                 id<MTLTexture> t_wep_n = impl_->tex_default_flat_normal;
+                id<MTLTexture> t_wep_m = impl_->tex_default_white;
                 auto it_w = impl_->weapon_gpu_textures.find(telemetry.weapon.name);
                 if (it_w == impl_->weapon_gpu_textures.end() && !impl_->weapon_gpu_textures.empty()) {
                     it_w = impl_->weapon_gpu_textures.find("Colt1911");
@@ -2932,6 +2956,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     if (it_w->second.diffuse)  t_wep_d = it_w->second.diffuse;
                     if (it_w->second.specular) t_wep_s = it_w->second.specular;
                     if (it_w->second.normal)   t_wep_n = it_w->second.normal;
+                    if (it_w->second.mask)     t_wep_m = it_w->second.mask;
                 }
                 id<MTLTexture> t_ammo = impl_->ammo_d_gpu_tex ? impl_->ammo_d_gpu_tex : impl_->tex_default_white;
 
@@ -2942,6 +2967,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc setFragmentTexture:t_wep_s atIndex:4];
                 [enc setFragmentTexture:t_wep_n atIndex:5];
                 [enc setFragmentTexture:t_ammo  atIndex:6];
+                [enc setFragmentTexture:t_wep_m atIndex:7];
                 [enc setFragmentSamplerState:impl_->mat_samplers[0][0] atIndex:0];
 
                 bind_vertex_bytes_or_buffer(enc, impl_->faith_viewmodel_mesh.data(),
