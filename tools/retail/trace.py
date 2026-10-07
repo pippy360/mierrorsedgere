@@ -18,6 +18,7 @@ Positions are UE units throughout. Retail's pawn Location is the capsule
 CENTRE, centre_above_feet() over the floor.
 """
 import bisect
+import gzip
 import json
 import math
 
@@ -99,6 +100,13 @@ def pawn_sample(d):
     return d.get("px") is not None and d.get("valid", True) and not d.get("freecam")
 
 
+def open_trace(path):
+    """A recording as text: plain .jsonl, or .jsonl.gz as recordings/ keeps them."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", errors="replace")
+    return open(path, errors="replace")
+
+
 def load_trace(path, game_clock=True):
     """(meta, samples, keys). The sound events a v6 trace carries are kept on
     the meta as meta["sounds"] - a list of the raw records, in time order -
@@ -129,7 +137,7 @@ def load_trace(path, game_clock=True):
     seen = set()
     raw = []
     noclip_t = None
-    with open(path, errors="replace") as f:
+    with open_trace(path) as f:
         for line in f:
             try:
                 d = json.loads(line)

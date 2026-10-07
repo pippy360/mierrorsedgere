@@ -61,13 +61,25 @@ assert set(BITS) == set(KEYS.values())
 # ---------------------------------------------------------------------------
 # Where things are
 
+def trace_stem(path):
+    """'20260930_213855_escape_overlay_session' for .jsonl and .jsonl.gz alike."""
+    name = os.path.basename(path)
+    for ext in (".gz", ".jsonl"):
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+    return name
+
+
 def newest_trace():
-    files = sorted(glob.glob(os.path.join(paths.build_dir("trials"), "*.jsonl")),
-                   key=os.path.getmtime)
+    """The newest recording: new ones in build/retail/trials, the committed
+    ones in recordings/. By the stamp in the name, which a checkout keeps and
+    a file's mtime does not."""
+    files = (glob.glob(os.path.join(paths.build_dir("trials"), "*.jsonl"))
+             + glob.glob(os.path.join(ROOT, "recordings", "*.jsonl.gz")))
     if not files:
-        raise SystemExit("no recordings in %s - record one with "
+        raise SystemExit("no recordings in %s or recordings/ - record one with "
                          "python -m tools.retail.record_session" % paths.build_dir("trials"))
-    return files[-1]
+    return max(files, key=trace_stem)
 
 
 def find_exe(given=None):
@@ -369,7 +381,7 @@ def report(tracepath, level, samples, windows, frames, out, keys, names):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--trace", help="recording .jsonl (default: the newest)")
+    ap.add_argument("--trace", help="recording .jsonl or .jsonl.gz (default: the newest)")
     ap.add_argument("--level", help="map package relative to CookedPC, e.g. Maps/SP01/Escape_p.me1 "
                                     "(default: the recording's own map)")
     ap.add_argument("--segment", type=float, default=4.0,
@@ -400,7 +412,7 @@ def main(argv=None):
         print("retail was PAUSED %.2f s at t %.2f: cut" % (p["seconds"], p["t"]))
 
     outdir = paths.ensure_dir(paths.build_dir("replay"))
-    stem = a.name or os.path.splitext(os.path.basename(tracepath))[0]
+    stem = a.name or trace_stem(tracepath)
     out = os.path.join(outdir, stem)
     script = out + "_script.txt"
     write_script(script, samples, fk, windows)
