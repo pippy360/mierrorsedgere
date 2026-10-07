@@ -3357,8 +3357,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             if (!impl_->frontend_tex ||
                 (int)impl_->frontend_tex.width != fw ||
                 (int)impl_->frontend_tex.height != fh) {
+                // Not an sRGB texture: the frame is display values already, and this pass writes
+                // straight to an RGBA8Unorm target, as the other UI textures do.
                 MTLTextureDescriptor* td = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                  width:fw
                                                 height:fh
                                              mipmapped:NO];
