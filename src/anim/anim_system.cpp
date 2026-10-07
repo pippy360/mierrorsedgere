@@ -1051,10 +1051,14 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
     static const WeaponAnimSpec kWeaponAnimSpecs[] = {
         {"Glock18",      "Animations/AS_C1P_OneHanded_Glock18.upk"},
         {"BerettaM93R",  "Animations/AS_C1P_OneHanded_BerettaM93R.upk"},
+        {"SteyrTMP",     "Animations/AS_C1P_OneHanded_SteyrTMP.upk"},
         {"G36C",         "Animations/AS_C1P_TwoHanded_G36C.upk"},
         {"Remington870", "Animations/AS_C1P_TwoHanded_Remington.upk"},
+        {"Neostead",     "Animations/AS_C1P_TwoHanded_Neostead.upk"},
         {"FNSCARL",      "Animations/AS_C1P_TwoHanded_FNSCARL.upk"},
-        {"MP5K",         "Animations/AS_C1P_TwoHanded_MP5K.upk"}
+        {"MP5K",         "Animations/AS_C1P_TwoHanded_MP5K.upk"},
+        {"FNMinimi",     "Animations/AS_C1P_TwoHanded_FNMinimi.upk"},
+        {"M95",          "Animations/AS_C1P_TwoHanded_M95.upk"}
     };
     for (const auto& was : kWeaponAnimSpecs) {
         UPKPackage pkg_wa(cooked + was.upk_file);
@@ -1233,11 +1237,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     const AnimSetAsset* w_spec_set = nullptr;
     const AnimSetAsset* w_comm_set = &faith_common_set_;
     if (telemetry.weapon.equipped || state == EMovement::MOVE_Snatch) {
-        std::string wkey = telemetry.weapon.name;
-        if (wkey == "Neostead") wkey = "Remington870";
-        else if (wkey == "FNMinimi" || wkey == "M95") wkey = "FNSCARL";
-        else if (wkey == "SteyrTMP") wkey = "BerettaM93R";
-        auto it_ws = faith_weapon_sets_.find(wkey);
+        auto it_ws = faith_weapon_sets_.find(telemetry.weapon.name);
         if (it_ws != faith_weapon_sets_.end()) w_spec_set = &it_ws->second;
         bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
         w_comm_set = (heavy && !faith_2h_common_set_.sequences.empty())
@@ -1275,7 +1275,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         if (!seq_a) seq_a = resolve_seq(w_spec_set, &faith_common_set_, "SnatchFwd", &active_set);
         norm_time = std::clamp(0.15f + combat_progress * 0.75f, 0.0f, 0.96f);
         float lunge = std::sin(combat_progress * PI);
-        vm_offset = Vec3(0.0f, 12.0f + lunge * 6.0f, 8.0f + lunge * 4.0f);
+        vm_offset = Vec3(0.0f, 14.0f + lunge * 5.0f, 5.0f + lunge * 3.0f);
     } else if (state == EMovement::MOVE_Melee) {
         float strike_arc = std::sin(combat_progress * PI);
         norm_time = combat_progress;
@@ -1341,19 +1341,20 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         blend_alpha = 0.35f;
         vm_offset = Vec3(2.0f, 10.0f, 10.0f);
     } else if (telemetry.weapon.equipped) {
-        // 2. Armed 1P Animation Tree (TdAnimNodeBlendByArmed + TdAnimNodeBlendByFire + TdSkelControlRecoil)
+        // 2. Armed 1P Animation Tree (TdAnimNodeBlendByArmed + TdAnimNodeBlendByFire + TdAnimNodeWeaponPose)
         bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
-        Vec3 base_armed_offset = heavy ? Vec3(3.0f, 12.0f, 5.5f) : Vec3(2.0f, 10.0f, 4.0f);
+        Vec3 base_armed_offset = heavy ? Vec3(2.0f, 15.0f, 3.5f) : Vec3(2.0f, 11.0f, 3.5f);
 
         if (telemetry.weapon.drop_timer > 0.0f) {
             seq_a = resolve_seq(w_spec_set, w_comm_set, "throwaway", &active_set);
             norm_time = std::clamp(1.0f - (telemetry.weapon.drop_timer / 0.35f), 0.0f, 1.0f);
-            vm_offset = base_armed_offset + Vec3(0.0f, 4.0f * norm_time, -6.0f * norm_time);
+            vm_offset = base_armed_offset + Vec3(0.0f, 3.0f * norm_time, -4.0f * norm_time);
         } else if (telemetry.weapon.equip_timer > 0.0f) {
+            float eq_dur = heavy ? 0.65f : 0.45f;
             seq_a = resolve_seq(w_spec_set, w_comm_set, "unholster", &active_set);
             if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
-            norm_time = std::clamp(1.0f - (telemetry.weapon.equip_timer / 0.45f), 0.0f, 1.0f);
-            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, -5.0f * (1.0f - norm_time));
+            norm_time = std::clamp(1.0f - (telemetry.weapon.equip_timer / eq_dur), 0.0f, 1.0f);
+            vm_offset = base_armed_offset;
         } else if (telemetry.weapon.fire_anim_timer > 0.0f) {
             const char* fire_name = (telemetry.weapon.ammo == 0) ? "standfireempty" : "standfire";
             seq_a = resolve_seq(w_spec_set, w_comm_set, fire_name, &active_set);
@@ -1361,33 +1362,52 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
             float prog = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
             norm_time = prog;
-            float recoil_env = std::sin( std::min(prog * 3.0f, 1.0f) * PI );
-            vm_offset = base_armed_offset + Vec3(0.0f, -2.8f * recoil_env, 1.8f * recoil_env);
+            float recoil_env = std::sin(std::min(prog * 3.5f, 1.0f) * PI);
+            vm_offset = base_armed_offset + Vec3(0.0f, -1.2f * recoil_env, 0.8f * recoil_env);
         } else if (state == EMovement::MOVE_Slide) {
             seq_a = resolve_seq(w_spec_set, w_comm_set, "CrouchSlide", &active_set);
             norm_time = 0.33f;
-            vm_offset = Vec3(0.0f, 6.0f, 10.0f);
+            vm_offset = base_armed_offset + Vec3(0.0f, -4.0f, 4.0f);
             show_lower_body = true;
         } else if (state == EMovement::MOVE_Crouch) {
             const char* cname = (speed > 20.0f) ? "crouchfwdready" : "crouchstill";
             seq_a = resolve_seq(w_spec_set, w_comm_set, cname, &active_set);
             if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
             norm_time = std::fmod(sim_t * 1.2f, 1.0f);
-            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, -1.5f);
+            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, -1.0f);
         } else if (state == EMovement::MOVE_WallRunningRight || state == EMovement::MOVE_WallRunningLeft) {
             const char* wname = (state == EMovement::MOVE_WallRunningRight) ? "WallrunRight" : "WallrunLeft";
             seq_a = resolve_seq(w_spec_set, &faith_common_set_, wname, &active_set);
             norm_time = 0.12f;
             vm_offset = base_armed_offset;
-        } else {
-            // Armed standing / walking / running with subtle weapon sway
-            seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
-            norm_time = 0.0f;
+        } else if (speed > 55.0f) {
+            // Armed walking / running ready cycle (runfwdready / walkfwdready blended with WeaponPose)
+            const char* move_name = (speed < 240.0f) ? "walkfwdready" : "runfwdready";
+            seq_a = resolve_seq(w_spec_set, w_comm_set, move_name, &active_set);
+            if (!seq_a) seq_a = resolve_seq(w_spec_set, w_comm_set, "runfwdready", &active_set);
+            if (seq_a) {
+                float cycle_rate = std::clamp(speed / 380.0f, 0.9f, 1.75f);
+                norm_time = std::fmod(sim_t * cycle_rate, 1.0f);
+            } else {
+                seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+                norm_time = 0.0f;
+            }
             float sway_freq = std::clamp(speed * 0.018f, 2.0f, 11.0f);
-            float sway_amp = std::clamp(speed / 450.0f, 0.08f, 1.0f);
-            float bob_x = std::sin(sim_t * sway_freq) * 1.4f * sway_amp;
-            float bob_z = std::abs(std::cos(sim_t * sway_freq)) * -1.2f * sway_amp;
+            float sway_amp = std::clamp(speed / 480.0f, 0.08f, 0.85f);
+            float bob_x = std::sin(sim_t * sway_freq) * 0.9f * sway_amp;
+            float bob_z = std::abs(std::cos(sim_t * sway_freq)) * -0.8f * sway_amp;
             vm_offset = base_armed_offset + Vec3(bob_x, 0.0f, bob_z);
+        } else {
+            // Armed standing idle (uses weaponposeempty when empty on pistols, or WeaponPose / standfire(t=0))
+            if (telemetry.weapon.ammo == 0 && w_spec_set && w_spec_set->find_sequence("weaponposeempty")) {
+                active_set = w_spec_set;
+                seq_a = w_spec_set->find_sequence("weaponposeempty");
+            } else {
+                seq_a = resolve_seq(w_spec_set, w_comm_set, "standfire", &active_set);
+            }
+            norm_time = 0.0f;
+            float bob_z = std::sin(sim_t * 1.8f) * 0.25f;
+            vm_offset = base_armed_offset + Vec3(0.0f, 0.0f, bob_z);
         }
     } else {
         // 3. Unarmed Parkour & Locomotion Tree
@@ -1505,6 +1525,26 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
+    // TdAnimNodeWeaponPose: when playing a shared/common locomotion animation (active_set != w_spec_set),
+    // preserve the weapon-specific RightWeapon attachment bone (49) and right-hand grip phalanges (50..68)
+    // from w_spec_set's WeaponPose so every weapon stays locked inside Faith's right palm & trigger finger!
+    if (w_spec_set && active_set != w_spec_set) {
+        const AnimSequenceAsset* wp_seq =
+            (telemetry.weapon.ammo == 0 && w_spec_set->find_sequence("weaponposeempty"))
+                ? w_spec_set->find_sequence("weaponposeempty")
+                : w_spec_set->find_sequence("WeaponPose");
+        if (!wp_seq) wp_seq = w_spec_set->find_sequence("standfire");
+        if (wp_seq) {
+            std::vector<Vec3> wp_pos;
+            std::vector<Quat4> wp_quat;
+            sample_sequence_pose(faith_upper_, *w_spec_set, wp_seq, 0.0f, wp_pos, wp_quat);
+            for (size_t b = 49; b <= 68 && b < local_pos.size(); ++b) {
+                local_pos[b] = wp_pos[b];
+                local_quat[b] = wp_quat[b];
+            }
+        }
+    }
+
     // Forward kinematics in component space
     std::vector<Vec3> comp_pos;
     std::vector<Quat4> comp_quat;
@@ -1595,7 +1635,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             }
             skinned_pos[i] = raw_to_vm_pos(p_acc, is_lower);
             skinned_norm[i] = raw_to_vm_dir(n_acc);
-            if (skinned_pos[i].y < (is_lower ? 10.0f : 4.0f)) {
+            if (skinned_pos[i].y < (is_lower ? 10.0f : 2.0f)) {
                 vert_valid[i] = 0; // Behind near plane
             }
         }
@@ -1634,68 +1674,121 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         append_skinned_mesh(faith_lower_, true);
     }
 
-    // Attach equipped weapon skeletal mesh (SK_Colt1911, SK_G36C, SK_Remington870, SK_MP5K, SK_FNSCARL, etc.)
+    // Attach & skin equipped weapon skeletal mesh via RightWeapon (bone 49) + cooked weapon tracks (74..)
     if (equipped_wmesh && equipped_wmesh->is_valid()) {
-        int32_t rh_idx = 48;
-        auto it_rh = faith_upper_.bone_name_to_index.find("righthand");
-        if (it_rh != faith_upper_.bone_name_to_index.end()) rh_idx = it_rh->second;
-        Vec3 hand_vm = raw_to_vm_pos(comp_pos[rh_idx], false);
+        int32_t rw_idx = 49;
+        auto it_rw = faith_upper_.bone_name_to_index.find("rightweapon");
+        if (it_rw != faith_upper_.bone_name_to_index.end()) rw_idx = it_rw->second;
 
         bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name);
-        const float gun_scale = heavy ? 0.50f : 0.62f;
-
-        // Align Wep_Trigger (bone[2]) to RightHand palm so both 1H pistols (trigger z~8)
-        // and 2H rifles/shotguns/LMGs/snipers (trigger z~33..39, stock at z=0) sit naturally in Faith's grip!
-        Vec3 trigger_bind = (equipped_wmesh->bones.size() > 2)
-                                ? equipped_wmesh->bones[2].bind_pos
-                                : Vec3(0.0f, 1.5f, 8.0f);
-        Vec3 palm_offset = heavy ? Vec3(1.2f, 8.5f, 4.2f) : Vec3(1.5f, 9.2f, 3.8f);
-
-        // Procedural slide/bolt blowback (Wep_Slide = bone 5) and trigger pull (Wep_Trigger = bone 2)
-        float slide_back = 0.0f;
-        float trigger_pull = 0.0f;
-        if (telemetry.weapon.fire_anim_timer > 0.0f) {
-            float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
-            float p = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
-            slide_back = std::sin(std::min(p * 3.5f, 1.0f) * PI) * (heavy ? 6.5f : 3.8f);
-            trigger_pull = std::sin(std::min(p * 4.0f, 1.0f) * PI) * 0.9f;
-        } else if (!heavy && telemetry.weapon.ammo == 0 && telemetry.weapon.max_ammo > 0) {
-            slide_back = 3.4f; // Pistol slide locked back on empty magazine (weaponposeempty)
+        const size_t wb_cnt = equipped_wmesh->bones.size();
+        std::vector<Vec3> wep_local_pos(wb_cnt);
+        std::vector<Quat4> wep_local_quat(wb_cnt);
+        for (size_t b = 0; b < wb_cnt; ++b) {
+            wep_local_pos[b] = equipped_wmesh->bones[b].bind_pos;
+            wep_local_quat[b] = equipped_wmesh->bones[b].bind_quat;
         }
 
-        // Recoil upward pitch rotation around grip
-        float recoil_pitch_rad = 0.0f;
-        if (telemetry.weapon.fire_anim_timer > 0.0f) {
-            float dur = std::max(0.15f, telemetry.weapon.fire_anim_duration);
-            float p = std::clamp(1.0f - (telemetry.weapon.fire_anim_timer / dur), 0.0f, 1.0f);
-            recoil_pitch_rad = std::sin(std::min(p * 3.0f, 1.0f) * PI) * (heavy ? 0.09f : 0.14f);
+        // 1. Initialize weapon sub-bones (Wep_Extra1..Wep_Mag, Belt_Joint1..12) from weapon's WeaponPose
+        const AnimSequenceAsset* base_wep_seq = nullptr;
+        if (w_spec_set) {
+            if (telemetry.weapon.ammo == 0 && telemetry.weapon.fire_anim_timer <= 0.0f) {
+                base_wep_seq = w_spec_set->find_sequence("weaponposeempty");
+            }
+            if (!base_wep_seq) base_wep_seq = w_spec_set->find_sequence("WeaponPose");
+            if (!base_wep_seq) base_wep_seq = w_spec_set->find_sequence("standfire");
         }
-        float cos_r = std::cos(recoil_pitch_rad);
-        float sin_r = std::sin(recoil_pitch_rad);
-
-        auto transform_wep_pt = [&](const Vec3& bind_p, uint8_t dom_bone) -> Vec3 {
-            Vec3 bp = bind_p;
-            if (dom_bone == 5) bp.z -= slide_back;
-            else if (dom_bone == 2) bp.z -= trigger_pull;
-            Vec3 rel = (bp - trigger_bind) * gun_scale;
-            // Convert Maya weapon bind space (x=Left, -y=Up, +z=Forward) to VM space (+x=Left, +y=Forward, +z=Up)
-            float vx = rel.x;
-            float vy = rel.z;
-            float vz = -rel.y;
-            // Apply recoil pitch around grip
-            float ry = vy * cos_r - vz * sin_r;
-            float rz = vy * sin_r + vz * cos_r;
-            return hand_vm + palm_offset + Vec3(vx, ry, rz);
+        auto apply_weapon_tracks = [&](const AnimSetAsset* aset, const AnimSequenceAsset* seq, float t_norm) {
+            if (!aset || !seq) return;
+            float tc = t_norm - std::floor(t_norm);
+            if (tc < 0.0f) tc += 1.0f;
+            for (size_t b = 1; b < wb_cnt; ++b) {
+                auto it = aset->bone_to_track.find(to_lower_str(equipped_wmesh->bones[b].name));
+                if (it == aset->bone_to_track.end()) continue;
+                int32_t tidx = it->second;
+                if (tidx < 0 || static_cast<size_t>(tidx) >= seq->tracks.size()) continue;
+                const AnimTrack& tr = seq->tracks[tidx];
+                if (tr.positions.size() == 1) {
+                    wep_local_pos[b] = tr.positions[0];
+                } else if (tr.positions.size() > 1) {
+                    float f_idx = tc * static_cast<float>(tr.positions.size() - 1);
+                    size_t i0 = static_cast<size_t>(f_idx);
+                    size_t i1 = std::min(i0 + 1, tr.positions.size() - 1);
+                    float frac = f_idx - static_cast<float>(i0);
+                    wep_local_pos[b] = tr.positions[i0] + (tr.positions[i1] - tr.positions[i0]) * frac;
+                }
+                if (tr.rotations.size() == 1) {
+                    wep_local_quat[b] = tr.rotations[0];
+                } else if (tr.rotations.size() > 1) {
+                    float f_idx = tc * static_cast<float>(tr.rotations.size() - 1);
+                    size_t i0 = static_cast<size_t>(f_idx);
+                    size_t i1 = std::min(i0 + 1, tr.rotations.size() - 1);
+                    float frac = f_idx - static_cast<float>(i0);
+                    wep_local_quat[b] = Quat4::slerp(tr.rotations[i0], tr.rotations[i1], frac);
+                }
+            }
         };
 
+        if (base_wep_seq) {
+            apply_weapon_tracks(w_spec_set, base_wep_seq, 0.0f);
+        }
+        // 2. When playing a weapon-specific animation (standfire, unholster, throwaway, SnatchFwd, etc.),
+        // evaluate real cooked weapon tracks (e.g. M95 bolt pull, Remington/Neostead pump, pistol slide blowback, Minimi belt)
+        if (w_spec_set && active_set == w_spec_set && seq_a) {
+            apply_weapon_tracks(w_spec_set, seq_a, norm_time);
+        }
+
+        // 3. Anchor Wep_Root (bone[0]) directly to Faith's RightWeapon bone in component space at 1:1 scale
+        if (!wep_local_pos.empty()) {
+            wep_local_pos[0] = comp_pos[rw_idx];
+            wep_local_quat[0] = comp_quat[rw_idx];
+        }
+
+        std::vector<Vec3> wep_comp_pos;
+        std::vector<Quat4> wep_comp_quat;
+        compute_skeleton_fk(equipped_wmesh->bones, wep_local_pos, wep_local_quat, wep_comp_pos, wep_comp_quat);
+
+        std::vector<Vec3> wep_delta_pos;
+        std::vector<Quat4> wep_delta_quat;
+        compute_skin_deltas(*equipped_wmesh, wep_comp_pos, wep_comp_quat, wep_delta_pos, wep_delta_quat);
+
+        std::vector<Vec3> w_skinned_pos(equipped_wmesh->vertices.size());
+        std::vector<Vec3> w_skinned_norm(equipped_wmesh->vertices.size());
+        std::vector<uint8_t> w_vert_valid(equipped_wmesh->vertices.size(), 1);
+        for (size_t i = 0; i < equipped_wmesh->vertices.size(); ++i) {
+            const SkinnedVertex& sv = equipped_wmesh->vertices[i];
+            Vec3 p_acc(0.0f, 0.0f, 0.0f);
+            Vec3 n_acc(0.0f, 0.0f, 0.0f);
+            for (int k = 0; k < 4; ++k) {
+                if (sv.weights[k] == 0) continue;
+                float w = static_cast<float>(sv.weights[k]) * (1.0f / 255.0f);
+                size_t b = std::min(static_cast<size_t>(sv.bones[k]), wep_delta_pos.size() - 1);
+                p_acc += (wep_delta_quat[b].rotate(sv.bind_pos) + wep_delta_pos[b]) * w;
+                n_acc += wep_delta_quat[b].rotate(sv.bind_norm) * w;
+            }
+            w_skinned_pos[i] = raw_to_vm_pos(p_acc, false);
+            w_skinned_norm[i] = raw_to_vm_dir(n_acc);
+            if (w_skinned_pos[i].y < 1.5f) {
+                w_vert_valid[i] = 0;
+            }
+        }
+
         for (size_t i = 0; i + 2 < equipped_wmesh->indices.size(); i += 3) {
+            uint16_t i0 = equipped_wmesh->indices[i + 0];
+            uint16_t i1 = equipped_wmesh->indices[i + 1];
+            uint16_t i2 = equipped_wmesh->indices[i + 2];
+            if (i0 >= equipped_wmesh->vertices.size() ||
+                i1 >= equipped_wmesh->vertices.size() ||
+                i2 >= equipped_wmesh->vertices.size()) continue;
+            if (!w_vert_valid[i0] || !w_vert_valid[i1] || !w_vert_valid[i2]) continue;
+
+            const uint16_t idx_tri[3] = {i0, i1, i2};
             for (int k = 0; k < 3; ++k) {
-                uint16_t vi = equipped_wmesh->indices[i + k];
-                if (vi >= equipped_wmesh->vertices.size()) continue;
+                uint16_t vi = idx_tri[k];
                 const SkinnedVertex& sv = equipped_wmesh->vertices[vi];
                 Vertex out_v{};
-                out_v.position = transform_wep_pt(sv.bind_pos, sv.bones[0]);
-                out_v.normal = Vec3(sv.bind_norm.x, sv.bind_norm.z, -sv.bind_norm.y).normalized();
+                out_v.position = w_skinned_pos[vi];
+                out_v.normal = w_skinned_norm[vi];
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
@@ -1704,15 +1797,15 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             }
         }
 
-        // Emit 3D Muzzle Flash at Wep_Flash (bone[3]) when firing
-        if (telemetry.weapon.muzzle_flash_timer > 0.0f && equipped_wmesh->bones.size() > 3) {
-            Vec3 flash_bind = equipped_wmesh->bones[3].bind_pos;
-            Vec3 flash_vm = transform_wep_pt(flash_bind, 3);
+        // Emit 3D Muzzle Flash at animated Wep_Flash (bone[3]) along animated barrel forward vector
+        if (telemetry.weapon.muzzle_flash_timer > 0.0f && wep_comp_pos.size() > 3) {
+            Vec3 flash_vm = raw_to_vm_pos(wep_comp_pos[3], false);
+            Vec3 barrel_fwd = raw_to_vm_dir(wep_comp_quat[0].rotate(Vec3(0.0f, 0.0f, 1.0f)));
+            Vec3 barrel_right = raw_to_vm_dir(wep_comp_quat[0].rotate(Vec3(1.0f, 0.0f, 0.0f)));
+            Vec3 barrel_up = raw_to_vm_dir(wep_comp_quat[0].rotate(Vec3(0.0f, -1.0f, 0.0f)));
             float flash_scale = heavy ? 5.2f : 3.6f;
             append_muzzle_flash_mesh(out_triangles, flash_vm,
-                                     Vec3(0.0f, 1.0f, 0.0f),
-                                     Vec3(1.0f, 0.0f, 0.0f),
-                                     Vec3(0.0f, 0.0f, 1.0f),
+                                     barrel_fwd, barrel_right, barrel_up,
                                      flash_scale, flash_scale * 1.8f);
         }
     }
@@ -1844,7 +1937,7 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         }
     }
 
-    // Attach weapon to officer's RightWeapon / RightHand bone when armed
+    // Attach weapon to officer's RightWeapon bone in component space (1:1 scale + animated RightWeapon rotation)
     if (bot_wmesh && bot_wmesh->is_valid()) {
         int32_t rw_idx = 0;
         auto it_rw = swat_mesh_.bone_name_to_index.find("rightweapon");
@@ -1853,22 +1946,20 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
         }
         if (it_rw != swat_mesh_.bone_name_to_index.end()) rw_idx = it_rw->second;
 
-        Vec3 raw_hand = comp_pos[rw_idx];
-        Vec3 hand_local(raw_hand.z, -raw_hand.x, -raw_hand.y);
+        const Vec3 rw_pos = comp_pos[rw_idx];
+        const Quat4 rw_quat = comp_quat[rw_idx];
         uint32_t disarm_red = pack_rgba8(0.95f, 0.08f, 0.08f);
-
-        Vec3 trigger_bind = (bot_wmesh->bones.size() > 2) ? bot_wmesh->bones[2].bind_pos : Vec3(0.0f, 1.5f, 8.0f);
-        const float bot_gun_scale = two_handed ? 0.58f : 0.65f;
 
         for (size_t i = 0; i + 2 < bot_wmesh->indices.size(); i += 3) {
             for (int k = 0; k < 3; ++k) {
                 uint16_t vi = bot_wmesh->indices[i + k];
                 if (vi >= bot_wmesh->vertices.size()) continue;
                 const SkinnedVertex& sv = bot_wmesh->vertices[vi];
-                Vec3 rel = (sv.bind_pos - trigger_bind) * bot_gun_scale;
+                Vec3 p_comp = rw_pos + rw_quat.rotate(sv.bind_pos);
+                Vec3 n_comp = rw_quat.rotate(sv.bind_norm);
                 Vertex out_v{};
-                out_v.position = hand_local + Vec3(rel.z + 6.0f, -rel.x, -rel.y);
-                out_v.normal = Vec3(sv.bind_norm.z, -sv.bind_norm.x, -sv.bind_norm.y).normalized();
+                out_v.position = Vec3(p_comp.z, -p_comp.x, -p_comp.y);
+                out_v.normal = Vec3(n_comp.z, -n_comp.x, -n_comp.y).normalized();
                 out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
                 out_v.u = sv.u;
                 out_v.v = sv.v;
@@ -1879,12 +1970,15 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
 
         // Emit 3D Muzzle Flash at enemy weapon barrel tip when firing
         if (bot.muzzle_flash_timer > 0.0f && bot_wmesh->bones.size() > 3) {
-            Vec3 flash_rel = (bot_wmesh->bones[3].bind_pos - trigger_bind) * bot_gun_scale;
-            Vec3 flash_local = hand_local + Vec3(flash_rel.z + 6.0f, -flash_rel.x, -flash_rel.y);
+            Vec3 flash_comp = rw_pos + rw_quat.rotate(bot_wmesh->bones[3].bind_pos);
+            Vec3 flash_local(flash_comp.z, -flash_comp.x, -flash_comp.y);
+            Vec3 fwd_comp = rw_quat.rotate(Vec3(0.0f, 0.0f, 1.0f));
+            Vec3 right_comp = rw_quat.rotate(Vec3(-1.0f, 0.0f, 0.0f));
+            Vec3 up_comp = rw_quat.rotate(Vec3(0.0f, -1.0f, 0.0f));
             append_muzzle_flash_mesh(out_triangles, flash_local,
-                                     Vec3(1.0f, 0.0f, 0.0f),
-                                     Vec3(0.0f, 1.0f, 0.0f),
-                                     Vec3(0.0f, 0.0f, 1.0f),
+                                     Vec3(fwd_comp.z, -fwd_comp.x, -fwd_comp.y).normalized(),
+                                     Vec3(right_comp.z, -right_comp.x, -right_comp.y).normalized(),
+                                     Vec3(up_comp.z, -up_comp.x, -up_comp.y).normalized(),
                                      9.0f, 16.0f);
         }
     }
