@@ -367,6 +367,9 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
     m_cam_constrain_look = false;
     m_snatch_align = false;
+    m_against_wall = 0;
+    m_against_wall_off = 0.0f;
+    m_telemetry.against_wall = 0;
     m_telemetry.melee_hit_confirmed = false;
     m_telemetry.disarm_prompt_visible = false;
     m_telemetry.hit_marker_timer = 0.0f;
@@ -877,6 +880,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.sim_time += effective_dt;
     m_telemetry.swing_angle = m_swing_angle;
     m_telemetry.body_yaw_deg = m_pawn_yaw;
+    update_against_wall(effective_dt, scene);
     m_telemetry.balance_lean = m_balance_lean;
     if (m_telemetry.move_state != EMovement::MOVE_Balance) {
         m_telemetry.balance_danger = 0;
@@ -1042,6 +1046,48 @@ void ParkourController::camera_reset_look(float seconds) {
     m_reset_look_time = std::max(0.0f, seconds);  // CancelResetCameraLookTime = Now + seconds
 }
 
+// TdPlayerPawn.UpdateAgainstWall / CheckAgainstWall are native. From a retail recording made for
+// it, walking into a flat wall and away again, standing and crouched, with and without a pistol:
+//  - at the wall both hands go up on it (state 1); with the body turned 45 degrees off it, which
+//    is as far as the view goes there, only the hand of the near shoulder (2 the left, 3 the right);
+//  - running at it (435 uu/s) the hands start up 70 to 100 uu before she gets there, creeping
+//    up to it crouched only as she arrives: the reach grows with her speed at the wall;
+//  - walking away it ends about 0.15 s after she starts (StopAgainstWall checks again on a 0.15 s
+//    timer), 30 to 40 uu out.
+// Only in the moves with bEnableAgainstWall (Walking, Crouch, LedgeWalk).
+void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
+    const EMovement m = m_telemetry.move_state;
+    int state = 0;
+    if ((m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch || m == EMovement::MOVE_LedgeWalk) && m_telemetry.grounded) {
+        const Rotator body = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f);
+        const Vec3 fwd = body.forward();
+        const Vec3 right = body.right();
+        const float toward = std::max(0.0f, horiz(m_telemetry.velocity).dot(fwd));
+        const float reach = kPawnRadius + 8.0f + 0.14f * toward;
+        const float shoulder = 0.78f * (m == EMovement::MOVE_Crouch ? kCrouchHeight : kPawnHeight);
+        bool hand[2] = {false, false};
+        Vec3 normal(0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < 2; ++k) {
+            const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, shoulder) + right * (k == 0 ? -15.0f : 15.0f);
+            const TraceHit hit = trace_ray(start, start + fwd * reach, scene);
+            if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f) {
+                hand[k] = true;
+                normal = normal + horiz(hit.normal);
+            }
+        }
+        state = hand[0] && hand[1] ? 1 : hand[0] ? 2 : hand[1] ? 3 : 0;
+        if (state != 0 && normal.length_sq() > 1e-4f) m_against_wall_yaw = yaw_of(-normal);
+    }
+    if (state != 0) {
+        m_against_wall = state;
+        m_against_wall_off = 0.0f;
+    } else if (m_against_wall != 0) {
+        m_against_wall_off += dt;
+        if (m_against_wall_off >= 0.15f) m_against_wall = 0;
+    }
+    m_telemetry.against_wall = m_against_wall;
+}
+
 // TdMove.CheckForCameraCollision and the moves' own (Walking, Crouch, Slide, GrabPullUp, SpeedVault):
 // a 2 uu box swept from 5 behind the camera to a little ahead of it, and where it meets something
 // TdPawn.OffsetMeshXY moves the first-person mesh, and so the eye, back by what is missing. The
@@ -1117,7 +1163,7 @@ void ParkourController::update_camera_collision(const Vec3& eye, float dt, const
     // fifth of the sweep, or as the limit comes on, it is brought up by how soon it was met.
     const bool was = m_cam_constrain_look;
     m_cam_constrain_look = false;
-    if (m == EMovement::MOVE_Walking) {
+    if (m == EMovement::MOVE_Walking && m_against_wall == 0) {
         const Vec3 camera = eye + m_cam_mesh_offset;
         const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
         const Vec3 start = camera - view * 5.0f;
@@ -1344,7 +1390,16 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
 
     // ... the move's look constraint limits the frame's turn, relative to the body ...
     MoveCamera mc = move_camera(m);
-    if (m == EMovement::MOVE_Walking && m_cam_constrain_look) {
+    const bool at_wall = m_against_wall != 0 && (m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch);
+    if (at_wall) {
+        // Against a wall retail's view stops 27.2 degrees down, standing or crouched, and 44.8
+        // degrees to either side of the way into the wall (5000 and 8192 in Unreal units, by the
+        // look of it; how far up it goes was not tried). Away from the wall the same view went to
+        // 80 down.
+        mc.constrain = true;
+        mc.pitch_min = -5000.0f;
+        mc.pitch_max = 32768.0f;
+    } else if (m == EMovement::MOVE_Walking && m_cam_constrain_look) {
         // TdMove_Walking.CheckForCameraCollision: with something right in front of the camera she
         // cannot look further down (bConstrainLook; nothing limits the yaw or looking up).
         mc.constrain = true;
@@ -1359,6 +1414,9 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
         if (m == EMovement::MOVE_WallRunningRight || m == EMovement::MOVE_WallRunningLeft) {
             lo = wrap_deg(m_wallrun_yaw_min - m_pawn_yaw) * kUUPerDeg;
             hi = wrap_deg(m_wallrun_yaw_max - m_pawn_yaw) * kUUPerDeg;
+        } else if (at_wall) {
+            lo = wrap_deg(m_against_wall_yaw - 45.0f - m_pawn_yaw) * kUUPerDeg;
+            hi = wrap_deg(m_against_wall_yaw + 45.0f - m_pawn_yaw) * kUUPerDeg;
         }
         const float rel_yaw = wrap_deg(m_telemetry.yaw_deg - m_pawn_yaw) * kUUPerDeg;
         yaw_d = constrain_axis(rel_yaw, lo, hi, speed, yaw_d * kUUPerDeg) / kUUPerDeg;
@@ -4984,6 +5042,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 
     // 4. Context-Sensitive Unarmed Melee Strikes (`input.melee`: Combo Punch/Kick, Crouch Uppercut, Jump Kick, Barge)
     if (input.melee && m_melee_cooldown <= 0.0f && (!ws.equipped || ws.drop_timer > 0.0f) &&
+        !(m_against_wall != 0 && m_telemetry.move_state == EMovement::MOVE_Walking) &&  // TdMove_Melee.CanDoMove
         m_telemetry.move_state != EMovement::MOVE_MeleeSlide &&
         m_telemetry.move_state != EMovement::MOVE_MeleeWallrun) {
 

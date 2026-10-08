@@ -131,20 +131,38 @@ void PoseEvaluator::set_weapon_pose(const AnimSetAsset* weapon_set, const AnimSe
 }
 
 // The arm from `bone` out is turned about that bone by `degrees` of pitch, in the mesh's space.
-void PoseEvaluator::turn_arm(int bone, float degrees, Pose& out) const {
-    if (bone < 0 || degrees == 0.0f) return;
-    Quat4 parent;  // the parent's rotation in the mesh's space
-    std::vector<int> chain;
-    for (int b = mesh_->bones[static_cast<size_t>(bone)].parent_index; b >= 0; b = (b == 0 ? -1 : mesh_->bones[static_cast<size_t>(b)].parent_index)) {
-        chain.push_back(b);
-        if (b == 0) break;
-    }
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it) parent = Quat4::multiply(parent, out.rot[static_cast<size_t>(*it)]).normalized();
+// TdSkelControlAim1p (native): the armed arm keeps its place in the view. In retail's frames a
+// pistol and a rifle are at the same spot on the screen at every pitch from 75 degrees up to 75
+// down, with the camera craned out over the feet by the swan neck or not. So the arm, from its
+// spine bone out, is carried rigidly with the camera: turned by the view's pitch about the eye,
+// and moved by what the swan neck moves the camera.
+void PoseEvaluator::turn_arm(int bone, float degrees, const Vec3& shift, Pose& out) const {
+    if (bone < 0 || (degrees == 0.0f && shift.length_sq() == 0.0f)) return;
+    auto place = [&](int b, Vec3& pos, Quat4& rot) {
+        // The bone's place and turn in the mesh's space, by its chain up to the root.
+        std::vector<int> chain;
+        for (int k = b; k >= 0; k = (k == 0 ? -1 : mesh_->bones[static_cast<size_t>(k)].parent_index)) chain.push_back(k);
+        pos = Vec3(0.0f, 0.0f, 0.0f);
+        rot = Quat4();
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+            const size_t k = static_cast<size_t>(*it);
+            pos = pos + rot.rotate(out.pos[k]);
+            rot = Quat4::multiply(rot, out.rot[k]).normalized();
+        }
+    };
+    const int up = mesh_->bones[static_cast<size_t>(bone)].parent_index;
+    Vec3 parent_pos, eye_pos;
+    Quat4 parent, eye_rot;
+    place(up, parent_pos, parent);
+    place(eye_, eye_pos, eye_rot);
     // About the pawn's side axis, forward towards up.
     const Vec3 axis = fwd_.cross(up_).normalized();
     const float half = degrees * DEG2RAD * 0.5f;
     const Quat4 turn(axis.x * std::sin(half), axis.y * std::sin(half), axis.z * std::sin(half), std::cos(half));
     const size_t i = static_cast<size_t>(bone);
+    const Vec3 at = parent_pos + parent.rotate(out.pos[i]);
+    const Vec3 moved = eye_pos + turn.rotate(at - eye_pos) + shift;
+    out.pos[i] = parent.conjugate().rotate(moved - parent_pos);
     out.rot[i] = Quat4::multiply(parent.conjugate(), Quat4::multiply(turn, Quat4::multiply(parent, out.rot[i]))).normalized();
 }
 
@@ -298,8 +316,9 @@ void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) co
         const size_t b = static_cast<size_t>(hips_);
         out.pos[b] += out.rot[0].conjugate().rotate(fwd_ * aim.hips.x + right_ * aim.hips.y + up_ * aim.hips.z);
     }
-    turn_arm(spine_right_, aim.pitch_deg * aim.right, out);
-    turn_arm(spine_left_, aim.pitch_deg * aim.left, out);
+    const Vec3 swan = fwd_ * aim.swan_forward - up_ * aim.swan_down;
+    turn_arm(spine_right_, aim.pitch_deg * aim.right, swan * aim.right, out);
+    turn_arm(spine_left_, aim.pitch_deg * aim.left, swan * aim.left, out);
 }
 
 void PoseEvaluator::component_space(const Pose& pose, std::vector<Vec3>& pos, std::vector<Quat4>& rot) const {

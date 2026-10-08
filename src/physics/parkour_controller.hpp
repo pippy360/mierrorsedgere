@@ -389,6 +389,10 @@ private:
     bool m_look_at_active = false;          // TdMove.SetLookAtTargetAngle
     Vec3 m_cam_mesh_offset{0.0f, 0.0f, 0.0f};  // what OffsetMeshXY has the mesh at
     float m_balance_danger_time = 0.0f;     // how long she has been losing her balance on a beam
+    int m_against_wall = 0;                 // TdPlayerPawn.AgainstWallState
+    float m_against_wall_yaw = 0.0f;        // the way into that wall
+    float m_against_wall_off = 0.0f;        // how long the check has found no wall (StopAgainstWall)
+    void update_against_wall(float dt, const LevelScene& scene);
     bool m_cam_constrain_look = false;      // TdMove_Walking.bConstrainLook from its camera check
     float m_cam_min_pitch = 0.0f;           // and its MinLookConstraint.Pitch, in Unreal units
     float m_look_at_yaw = 0.0f;

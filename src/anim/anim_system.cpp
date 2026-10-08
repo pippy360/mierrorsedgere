@@ -1601,6 +1601,8 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready();
         aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready();
         aim.hips = fp.director.hips_offset();
+        aim.swan_forward = fp.director.swan_forward();
+        aim.swan_down = fp.director.swan_down();
         // The two light weapons whose class sets a shoulder offset (TdSharedContent.u).
         if (fp.weapon_name == "BerettaM93R") aim.shoulder = Vec3(0.0f, 0.8f, -1.43f);
         else if (fp.weapon_name == "SteyrTMP") aim.shoulder = Vec3(0.0f, 4.0f, -1.0f);

@@ -52,6 +52,9 @@ public:
         float pitch_deg = 0.0f;
         float right = 0.0f;
         float left = 0.0f;
+        // Where the swan neck has the camera off the eye (forward, down): the armed arm goes with it.
+        float swan_forward = 0.0f;
+        float swan_down = 0.0f;
         // OneHandedRightShoulderOffset: the weapon's own nudge of the right shoulder, in the bone's
         // space, at the ready (TdWeapon.OneHandedRightShoulderTranslationOffset).
         Vec3 shoulder{0.0f, 0.0f, 0.0f};
@@ -82,7 +85,7 @@ private:
     void apply_aim(const TreeNode& n, size_t node_index, Pose& out) const;
 
     const std::vector<int>& tracks(const AnimSetAsset* set) const;
-    void turn_arm(int bone, float degrees, Pose& out) const;
+    void turn_arm(int bone, float degrees, const Vec3& shift, Pose& out) const;
 
     const SkeletalMeshAsset* mesh_ = nullptr;
     const AnimSetAsset* base_set_ = nullptr;

@@ -785,6 +785,13 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                     const float step = dt / 0.1f;  // DirInterpTime
                     n.aim_x = n.aim_x < want ? std::min(n.aim_x + step, want) : std::max(n.aim_x - step, want);
                 }
+                if (n.cls == "TdAnimNodeDirBone" && n.name == "AgainstWallCam") {
+                    // bUsePitch, and the one pose that is not empty is centre-down: the EyeJoint 12
+                    // back. Against a wall retail's camera is 1.2 back looking 15 degrees down and
+                    // 3.4 back at 27, where the look stops: the pitch over a quarter turn.
+                    n.aim_x = 0.0f;
+                    n.aim_y = std::clamp(pawn.view_pitch_deg / 90.0f, -1.0f, 1.0f);
+                }
                 if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;
             case TreeNode::Kind::Directional:
