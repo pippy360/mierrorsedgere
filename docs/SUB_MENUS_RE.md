@@ -224,7 +224,7 @@ Not established: the RACE column's camera still differs from retail's (see the m
 
 Built so far: the message box, NEW GAME, PLAY CHAPTER with its checkpoint screen, VIDEO, AUDIO, GAME SETTINGS, QUIT, and the connection boxes TIME TRIAL and LEADERBOARDS show without EA's servers. Not built yet: CONTROLS, the TIME TRIAL course list, SPEED RUN, GAMEPAD SETUP, UNLOCKABLES, CREDITS; the mouse on these screens (keyboard and D-pad only); DEFAULTS, which on PC is only reachable with the mouse.
 
-`Frontend::take_action()` tells the host what to do: `Continue`, `NewGame`, `StartLevel <map> [checkpoint]`, `ApplySettings`, `Quit`. The macOS app starts the chapter (and stands the player at the checkpoint) for `StartLevel`; it does not act on `ApplySettings` yet, so the option screens keep their values for the session and change nothing in the game.
+`Frontend::take_action()` tells the host what to do: `Continue`, `NewGame`, `StartLevel <map> [checkpoint]`, `ApplySettings`, `Quit`. The game (`src/main.cpp`) starts the chapter and stands the player at the checkpoint for `StartLevel`; it does not act on `ApplySettings` yet, so the option screens keep their values for the session and change nothing in the game. Run in the Windows build: PLAY CHAPTER, PROLOGUE - THE EDGE, CHECKPOINT B loads `Edge_p` with `After_Intro` active.
 
 ```bash
 ./build/me_menu --out shots --chapters 1 --script "wait 6; key any; wait 3; key down; key enter; wait 4; shot chapter.png; key escape; \

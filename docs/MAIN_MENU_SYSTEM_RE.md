@@ -349,9 +349,9 @@ Retail on the left, the port on the right, same camera pose:
 ![OPTIONS](../screenshots/menu/main_menu_options.png)
 ![EXTRAS](../screenshots/menu/main_menu_extras.png)
 
-### In the macOS app
+### In the game
 
-`mirrorsedge_macos` boots into the front end (`run_interactive_app` in `src/main.mm`). While it is up it owns the frame: keyboard (arrows, Enter or Space, Escape), mouse and D-pad go to `Frontend`; its cue names become the skin's sounds from `Audio/A_HUD.upk` (`Tab_Change`, `D-Pad`, `A_Pos`) and the menu music; `SoftRenderer` draws the frame at 1280x720 and `MetalRenderer::set_frontend_frame` shows it full screen, aspect-fitted, the way a Bink frame is shown.
+`mirrorsedge_macos` and `mirrorsedge_windows` boot into the front end (`run_interactive_app` in `src/main.cpp`, which both share). While it is up it owns the frame: keyboard (arrows, Enter or Space, Escape), mouse and D-pad go to `Frontend`; its cue names become the skin's sounds from `Audio/A_HUD.upk` (`Tab_Change`, `D-Pad`, `A_Pos`, `B_Neg`) and the menu music; `SoftRenderer` draws the frame at 1280x720 and the renderer's `set_frontend_frame` shows it full screen, aspect-fitted, the way a Bink frame is shown.
 
 | Chosen | Does |
 |---|---|
@@ -365,6 +365,6 @@ The sub-menu screens are in [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), which also lis
 
 `--chapter` and `--level` start in the level and skip the front end, as they skipped the old menu.
 
-This part was written on the Windows machine that has retail installed. It compiles and links on a macOS 15 Apple Silicon runner; it has not been run on a Mac, so the first launch there is its first test. The pictures above are the same `Frontend` and `SoftRenderer` the app uses, so what can differ on a Mac is the hand-off (input, sound, the texture upload), not the menu.
+This part was written on the Windows machine that has retail installed. It has been run there in `mirrorsedge_windows`: start screen, main menu, PLAY CHAPTER, a checkpoint, and into the level at that checkpoint. On macOS it compiles and links on a macOS 15 Apple Silicon runner and has not been run, so the first launch there is its first test. The pictures above are the same `Frontend` and `SoftRenderer` the game uses, so what can differ on a Mac is the hand-off (input, sound, the texture upload), not the menu.
 
 Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the save-system spinner between the start screen and the menu, and the attract movie. The front end is drawn at 720 lines whatever the window's size; on a Retina display that is upscaled.
