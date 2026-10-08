@@ -538,7 +538,11 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s7_disarm = (controller.get_move_state() == EMovement::MOVE_Snatch && controller.get_telemetry().weapon.equipped);
     bool s7_reaction = controller.get_telemetry().reaction_active;
 
-    renderer.render_frame(sim_scene, controller.get_telemetry());
+    // The picture is taken part way through the disarm's animation, not on its first frame.
+    for (int f = 0; f < 45 && controller.get_move_state() == EMovement::MOVE_Snatch; ++f) {
+        controller.step(InputFrame{}, kDt, sim_scene);
+        renderer.render_frame(sim_scene, controller.get_telemetry());
+    }
     save_and_publish_png("oracle_5_combat_disarm_reaction.png");
 
     // Verify all 11 retail firearms equip, fire with 3D tracers, and render 1P/3P animations

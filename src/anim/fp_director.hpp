@@ -44,6 +44,9 @@ struct PawnFrame {
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     int balance_danger = 0;      // losing her balance to the left (-1) or the right (1)
     int against_wall = 0;        // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
+    float against_wall_left = -1.0f;   // how far ahead of her centre the wall is, by shoulder (-1 none)
+    float against_wall_right = -1.0f;
+    float against_wall_height = 0.0f;  // and how high above her feet
     bool climbing_pipe = false;  // on a pipe, not a ladder
     float climb_top = -1.0f;     // uu up to the ladder's last step, down to its first (-1 not known)
     float climb_bottom = -1.0f;

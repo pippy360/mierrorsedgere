@@ -147,6 +147,9 @@ public:
     [[nodiscard]] float leg_yaw() const { return leg_yaw_; }
     // How much of the ready stance the weapon state node shows (its Default child's weight).
     [[nodiscard]] float weapon_ready() const { return weapon_ready_; }
+    // How far each arm's against-wall node has it on `againstwall`.
+    [[nodiscard]] float wall_left() const { return wall_left_; }
+    [[nodiscard]] float wall_right() const { return wall_right_; }
     [[nodiscard]] bool loaded() const { return root_ >= 0; }
 
     // Everything back to how the package saved it.
@@ -200,6 +203,7 @@ private:
     SequenceLookup lookup_;
     std::vector<std::pair<std::string, std::vector<int>>> weapon_pose_profiles_;
     float weapon_ready_ = 0.0f;
+    float wall_left_ = 0.0f, wall_right_ = 0.0f;
     // The "Walk" synch group: its members, and the one leading it this frame.
     std::vector<int> walk_group_;
     std::vector<char> in_walk_group_;

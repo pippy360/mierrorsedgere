@@ -1152,6 +1152,9 @@ struct PlayerTelemetry {
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
     int balance_danger = 0;         // losing her balance to the left (-1) or the right (1)
     int against_wall = 0;           // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
+    float against_wall_left = -1.0f;   // how far ahead of her centre the wall is in front of each shoulder
+    float against_wall_right = -1.0f;  // (TdPawn.AgainstWallLeftHand / RightHand; -1 none)
+    float against_wall_height = 0.0f;  // and how high above her feet those points are
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

@@ -393,6 +393,8 @@ private:
     float m_balance_danger_time = 0.0f;     // how long she has been losing her balance on a beam
     float m_balance_fall_time = -1.0f;      // since TdMove_Balance.Falloff, while she is still on it
     float m_balance_fall_side = 0.0f;
+    float m_balance_time = 0.0f;            // since she stepped on to the beam
+    float m_balance_sway = 0.0f;            // the lean's own wander, as shown
     float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
     float m_smooth_last_z = 0.0f;
     bool m_smooth_was_walking = false;

@@ -913,11 +913,13 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         bot.disarm_weapon_time -= effective_dt;
         if (bot.disarm_weapon_time <= 0.0f || m_telemetry.move_state != EMovement::MOVE_Snatch) bot.disarm_weapon.clear();
     }
-    m_telemetry.balance_lean = m_balance_lean;
+    m_telemetry.balance_lean = std::clamp(m_balance_lean + m_balance_sway, -1.0f, 1.0f);
     if (m_telemetry.move_state != EMovement::MOVE_Balance) {
         m_telemetry.balance_danger = 0;
         m_balance_danger_time = 0.0f;
         m_balance_fall_time = -1.0f;
+        m_balance_time = 0.0f;
+        m_balance_sway = 0.0f;
     }
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
@@ -1099,15 +1101,20 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         const float reach = kPawnRadius + 8.0f + 0.14f * toward;
         const float shoulder = 0.78f * (m == EMovement::MOVE_Crouch ? kCrouchHeight : kPawnHeight);
         bool hand[2] = {false, false};
+        float ahead[2] = {-1.0f, -1.0f};
         Vec3 normal(0.0f, 0.0f, 0.0f);
         for (int k = 0; k < 2; ++k) {
             const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, shoulder) + right * (k == 0 ? -15.0f : 15.0f);
             const TraceHit hit = trace_ray(start, start + fwd * reach, scene);
             if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f) {
                 hand[k] = true;
+                ahead[k] = hit.fraction * reach;
                 normal = normal + horiz(hit.normal);
             }
         }
+        if (hand[0]) m_telemetry.against_wall_left = ahead[0];
+        if (hand[1]) m_telemetry.against_wall_right = ahead[1];
+        m_telemetry.against_wall_height = shoulder;
         state = hand[0] && hand[1] ? 1 : hand[0] ? 2 : hand[1] ? 3 : 0;
         if (state != 0 && normal.length_sq() > 1e-4f) m_against_wall_yaw = yaw_of(-normal);
     }
@@ -1118,6 +1125,7 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         m_against_wall_off += dt;
         if (m_against_wall_off >= 0.15f) m_against_wall = 0;
     }
+    if (m_against_wall == 0) m_telemetry.against_wall_left = m_telemetry.against_wall_right = -1.0f;
     m_telemetry.against_wall = m_against_wall;
 }
 
@@ -4440,8 +4448,10 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     //  - past about 0.65 with no key against it she is losing her balance: the key against it ends
     //    that at once, and TimeToCounter (0.8 s) of it has her off the beam on that side. Holding a
     //    key from the middle of the beam, that is 1.09 s from the key to the fall.
-    // Retail's lean also wanders by itself as she walks (0.2 to 0.7 over a beam's length, either
-    // way); that is left out.
+    // Retail's lean also wanders by itself as she walks, 0.2 to 0.7 either way over a beam's
+    // length and back, without that ever being the lose-balance state (it showed 0.72 and she
+    // walked on). What makes it is native; here a slow sway of that size is laid over what the
+    // tree is shown, and plays no part in whether she falls.
     const float beam_yaw = yaw_of(beam_fwd);
     const float yaw_diff = wrap_deg(m_telemetry.yaw_deg - beam_yaw);
     const float key = std::abs(input.strafe) > 0.3f ? sign_of(input.strafe) : 0.0f;
@@ -4453,6 +4463,13 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     m_balance_danger_time = losing ? m_balance_danger_time + dt : 0.0f;
     m_telemetry.balance_danger = losing ? static_cast<int>(side) : 0;
     m_telemetry.camera_roll_deg = m_balance_lean * 9.0f;
+    m_balance_time += dt;
+    {
+        const float pace = std::clamp(std::abs(cur_along) / 245.0f, 0.0f, 1.0f);
+        const float phase = 0.37f * (m_balance_start.x + m_balance_start.y);  // not the same on every beam
+        const float sway = 0.30f * std::sin(m_balance_time * 1.03f + phase) + 0.15f * std::sin(m_balance_time * 2.33f + 2.0f * phase);
+        m_balance_sway += (sway * pace * std::min(1.0f, m_balance_time) - m_balance_sway) * std::min(1.0f, dt / 0.5f);
+    }
     if (m_balance_fall_time < 0.0f && m_balance_danger_time >= 0.8f) {
         // TdMove_Balance.Falloff: the fall off animation of that side starts while she is still
         // on the beam, stopped; she is falling 0.27 to 0.30 s later.
@@ -4939,8 +4956,11 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         ws.trigger_released = true;
     }
 
+    // TdWeapon.ShouldRefire / the fire states: no shot with both hands on a wall, nor with a light
+    // weapon while the one hand is (AgainstWallState 1, or 2 with WeaponType 2).
+    const bool wall_stops_fire = m_against_wall == 1 || (m_against_wall == 2 && !ws.is_heavy);
     auto fire_single_shot = [&]() {
-        if (ws.ammo <= 0) return;
+        if (ws.ammo <= 0 || wall_stops_fire) return;
         ws.ammo--;
         ws.fired_this_tick = true;
         if (ws.fire_mode == EWeaponFireMode::BoltAction) {
