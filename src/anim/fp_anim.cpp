@@ -217,6 +217,10 @@ void AnimTree::reset() {
         n.blend_to_go = 0.0f;
         n.pending_blend_out = -1.0f;
         n.hold = -1.0f;
+        n.last_state = -1;
+        n.dir_side = 0.0f;
+        n.dir_forward = 1.0f;
+        n.going_forward = true;
         n.time = 0.0f;
         n.seq = nullptr;
         if (n.kind == TreeNode::Kind::List || n.kind == TreeNode::Kind::Slot) {
@@ -406,11 +410,41 @@ void AnimTree::tick_walk_group(const PawnAnimState& pawn, float dt) {
     }
 }
 
+namespace {
+// TdMove.AnimBlendTime of the move a movement state belongs to (Default__TdMove_*; 0 where the class leaves it).
+float move_blend_time(int state) {
+    switch (static_cast<EMovement>(state)) {
+        case EMovement::MOVE_Slide:
+        case EMovement::MOVE_RumpSlide:
+            return 0.5f;
+        case EMovement::MOVE_Balance:
+            return 0.4f;
+        case EMovement::MOVE_Crouch:
+            return 0.25f;
+        case EMovement::MOVE_Falling:
+        case EMovement::MOVE_WallRunningLeft:
+        case EMovement::MOVE_WallRunningRight:
+            return 0.2f;
+        case EMovement::MOVE_Swing:
+            return 0.15f;
+        case EMovement::MOVE_Grabbing:
+            return 0.1f;
+        default:
+            return 0.0f;
+    }
+}
+}  // namespace
+
 // A state node's choice of child for this frame.
 void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_relevant) {
     int want = n.active;
     float blend = 0.2f;
-    if (n.cls == "TdAnimNodeCustomBlend") return;  // moved only by Activate and its timer
+    if (n.cls == "TdAnimNodeCustomBlend") {
+        // Moved only by Activate and its timer. TdAnimNodeCustomBlend.OnBecomeRelevant: with no
+        // Duration left it is back on its first child at once.
+        if (became_relevant && n.hold <= 0.0f) set_active(n, 0, 0.0f);
+        return;
+    }
     if (n.cls == "TdAnimNodeMovementState") {
         // The state SetAnimationMovementState forces, else the pawn's own (its last one for bUseOldState).
         int state = static_cast<int>(n.use_old_state ? pawn.old_movement : pawn.movement);
@@ -419,6 +453,21 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         for (size_t k = 0; k < n.state_mapping.size(); ++k) {
             if (n.state_mapping[k] == state) want = static_cast<int>(k) + 1;
         }
+        // bUseCustomBlend: the time is GetBlendValue(new state, previous state), which is native,
+        // not BlendWeight (whose 0.5 would fall on the right wall run and not on the left).
+        // Measured on the recordings: 0.4 s on to a beam (TdMove_Balance.AnimBlendTime) and about
+        // that off it, 0.2 into a jump, a fall or either wall run and back to the ground. So: the
+        // longer of the two moves' TdMove.AnimBlendTime, and never under 0.2 s. (Twice the first
+        // blend after a slide, AnimBlendTime 0.5, took 0.5 s with the slide two moves back and the
+        // node without weight all through it. That is not reproduced: the previous state here is
+        // the one the node last blended to.)
+        if (became_relevant) {
+            set_active(n, want, 0.0f);  // TdAnimNodeState.OnBecomeRelevant
+        } else if (want != n.active) {
+            set_active(n, want, std::max({0.2f, move_blend_time(state), move_blend_time(n.last_state)}));
+            n.last_state = state;
+        }
+        return;
     } else if (n.cls == "TdAnimNodeWalkingState") {
         want = 0;
         for (size_t k = 0; k < n.state_mapping.size(); ++k) {
@@ -509,6 +558,10 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         want = 0;
     }
     if (static_cast<size_t>(want) < n.blend_in.size()) blend = n.blend_in[static_cast<size_t>(want)];
+    // Measured (470 changes of walking state): into Idle and Sneak takes 0.2 s where BlendWeight
+    // says 0.15 and 0.1; Walk 0.35, Jog 0.3, Run 0.6 and Sprint 0.8 are BlendWeight's. No blend of
+    // a state node is seen to take less than 0.2 s (TdAnimNodeTurn's 0.1 is 0.2 too).
+    if (n.cls == "TdAnimNodeWalkingState") blend = std::max(blend, 0.2f);
     if (became_relevant) {
         set_active(n, want, 0.0f);  // TdAnimNodeState.OnBecomeRelevant
     } else if (want != n.active) {
@@ -517,21 +570,29 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
 }
 
 // TdAnimNodeBlendDirectional: Forward, ForwardRight, ForwardLeft, Backward, BackWardRight, BackWardLeft.
-// Measured on the recordings: the weight goes from the straight child to the sideways one in
-// proportion to the angle between the velocity and the way the pawn faces (45 degrees is half
-// and half), within the forward three or the backward three, and ForwardBlend moves between the
-// two threes. DirInterpTime 0.1 and ForwardInterpTime 0.4 are the class defaults.
+// Measured on the recordings. Direction is this frame's velocity in the pawn's frame with its two
+// parts scaled to add up to 1 (the package saves it so: 0.639, -0.361), and the sideways child
+// takes the sideways part: half at 45 degrees, 0.156 at 10 (the angle over 90 would be 0.11),
+// 0.712 at 68, never more than 0.9 (straight sideways is 0.9 and 0.1). Which three play,
+// forward or backward, is sticky: it changes only once the forward part is more than 0.163 the
+// other way (9 changes: none at 0.1605, the first at 0.1657; about 11 degrees past sideways), and
+// ForwardBlend then moves over ForwardInterpTime 0.4. OnBecomeRelevant starts it on the sign of
+// Direction.Y. DirInterpTime is 0.1.
 void AnimTree::update_directional(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant) {
     if (n.weight.size() < 6) return;
+    constexpr float kMaxSide = 0.9f, kTurnBack = 0.163f;
     const float yaw = pawn.yaw_deg * DEG2RAD;
     const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
     const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
-    float angle = 0.0f;
-    if (forward * forward + right * right > 1.0f) angle = std::atan2(right, forward) / DEG2RAD;
-    const float off = std::fabs(angle);
-    const bool going_forward = off <= 90.0f;
-    const float side_target = going_forward ? off / 90.0f : (180.0f - off) / 90.0f;
-    const float forward_target = going_forward ? 1.0f : 0.0f;
+    if (forward * forward + right * right > 1.0f) {
+        const float sum = std::fabs(forward) + std::fabs(right);
+        n.dir_side = right / sum;
+        n.dir_forward = forward / sum;
+    }
+    if (became_relevant) n.going_forward = n.dir_forward > 0.0f;
+    else if (n.going_forward ? n.dir_forward < -kTurnBack : n.dir_forward > kTurnBack) n.going_forward = !n.going_forward;
+    const float side_target = std::min(std::fabs(n.dir_side), kMaxSide);
+    const float forward_target = n.going_forward ? 1.0f : 0.0f;
     if (became_relevant) {
         n.forward_blend = forward_target;
         n.side_blend = side_target;
@@ -543,7 +604,7 @@ void AnimTree::update_directional(TreeNode& n, const PawnAnimState& pawn, float 
         n.forward_blend = approach(n.forward_blend, forward_target, 0.4f);
         n.side_blend = approach(n.side_blend, side_target, 0.1f);
     }
-    const int side = right >= 0.0f ? 1 : 2;
+    const int side = n.dir_side >= 0.0f ? 1 : 2;
     std::fill(n.weight.begin(), n.weight.end(), 0.0f);
     n.weight[0] = n.forward_blend * (1.0f - n.side_blend);
     n.weight[static_cast<size_t>(side)] = n.forward_blend * n.side_blend;
@@ -558,7 +619,10 @@ void AnimTree::advance(TreeNode& n, const PawnAnimState& pawn, float dt) {
     if (length <= 0.0f) return;
     float rate = n.rate * n.seq->rate_scale;
     if (n.scale_rate_by_speed && n.base_speed > 0.0f) {
-        const float speed = std::sqrt(pawn.velocity.x * pawn.velocity.x + pawn.velocity.y * pawn.velocity.y);
+        // Measured on the recordings (2,900 frames with the game's own frame time known): the speed
+        // is the frame before's, to 1 uu/s; this frame's is 3 to 25 uu/s out while she speeds up.
+        const Vec3& v = pawn.last_velocity;
+        const float speed = std::sqrt(v.x * v.x + v.y * v.y);
         rate *= std::clamp(speed / n.base_speed, n.rate_min, n.rate_max);
     }
     n.time += rate * dt;

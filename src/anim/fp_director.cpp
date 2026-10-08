@@ -34,6 +34,7 @@ bool is_airborne(EMovement m) {
         case EMovement::MOVE_SwingJump:
         case EMovement::MOVE_AirBarge:
         case EMovement::MOVE_FallingUncontrolled:
+        case EMovement::MOVE_IntoGrab:  // reaching for a ledge she may miss: the fall goes on
             return true;
         default:
             return false;
@@ -479,8 +480,9 @@ void Director::set_animation_state(EMovement state, float delay) {
 
 // TdPawn.UpdateWalkingState is native. The pawn's Tick runs before its physics, so the state
 // follows the velocity of the frame before. The thresholds are measured on the recordings (the
-// recorder logs CurrentWalkingState): Sneak from the first movement, Walk from 50, Jog from 260,
-// Run from 400, Sprint from 630, the same speeding up and slowing down.
+// recorder logs CurrentWalkingState): Sneak from 5 (idle up to 4.86, sneak from 5.05; standing she
+// drifts at 1 to 4 and stays idle), Walk from 50, Jog from 260, Run from 400, Sprint from 630, the
+// same speeding up and slowing down.
 void Director::update_walking_state(const PawnFrame& frame) {
     (void)frame;
     const float speed = std::sqrt(last_velocity_.x * last_velocity_.x + last_velocity_.y * last_velocity_.y);
@@ -489,7 +491,7 @@ void Director::update_walking_state(const PawnFrame& frame) {
     else if (speed >= 400.0f) state = kWasRun;
     else if (speed >= 260.0f) state = kWasJog;
     else if (speed >= 50.0f) state = kWasWalk;
-    else if (speed >= 1.0f) state = kWasSneak;
+    else if (speed >= 5.0f) state = kWasSneak;
     pawn_.walking_state = state;
 }
 
@@ -553,9 +555,10 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBody, 0.25f);
             break;
         case EMovement::MOVE_Slide:
-            // TdMove_Slide.StopMove: out of the slide, and into the crouch if that is what follows.
+            // TdMove_Slide.StopMove: out of the slide through CrouchSlideToCrouch, whatever follows
+            // (every slide recorded shows it, the two that end standing as well).
             tree_.stop_custom_anim(Slot::FullBody, 0.2f);
-            if (pending == EMovement::MOVE_Crouch) play(Slot::FullBody, "CrouchSlideToCrouch", 1.0f, 0.1f, 0.2f);
+            play(Slot::FullBody, "CrouchSlideToCrouch", 1.0f, 0.1f, 0.2f);
             break;
         case EMovement::MOVE_Crouch:
             play(Slot::Camera, "CrouchIntoStand", 1.0f, 0.2f, 0.2f);
@@ -930,6 +933,7 @@ void Director::tick(const PawnFrame& frame) {
         if (animation_state_timer_ <= 0.0f) pawn_.animation_movement = pending_animation_state_;
     }
     pawn_.velocity = frame.velocity;
+    pawn_.last_velocity = last_velocity_;
     pawn_.yaw_deg = frame.yaw_deg;
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;

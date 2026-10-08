@@ -36,6 +36,9 @@ struct PawnAnimState {
     EMovement animation_movement = EMovement::MOVE_None;    // AnimationMovementState: what SetAnimationMovementState forces
     uint8_t walking_state = kWasIdle;                       // CurrentWalkingState
     Vec3 velocity{0.0f, 0.0f, 0.0f};
+    // The velocity of the frame before: the pawn's Tick runs before its physics, and what it works
+    // out there (the walking state, the speed the play rates scale by) is a frame behind.
+    Vec3 last_velocity{0.0f, 0.0f, 0.0f};
     float yaw_deg = 0.0f;         // the pawn's Rotation.Yaw
     float view_yaw_deg = 0.0f;    // the controller's view
     float view_pitch_deg = 0.0f;
@@ -105,6 +108,7 @@ struct TreeNode {
     std::vector<float> target;
     float blend_to_go = 0.0f;
     int active = 0;
+    int last_state = -1;         // TdAnimNodeMovementState: the state it last blended to (GetBlendValue's previous state)
     float total = 0.0f;          // NodeTotalWeight
     float incoming = 0.0f;       // what the parents ticked so far this frame have passed down
     bool relevant = false;
@@ -113,7 +117,9 @@ struct TreeNode {
     float hold = -1.0f;               // TdAnimNodeCustomBlend.Duration: how long it stays before blending back
     float hold_blend_out = 0.0f;      // TdAnimNodeCustomBlend.BlendOutTime
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
-    float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
+    float side_blend = 0.0f;          // 0 straight ahead (or back), 0.9 straight sideways
+    float dir_side = 0.0f, dir_forward = 1.0f;  // TdAnimNodeBlendDirectional.Direction: |side| + |forward| = 1
+    bool going_forward = true;        // bGoingForward
     float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
     bool root_motion = false;         // a slot's channel: the animation's root movement goes to the pawn
     bool unlisted = false;            // a channel of the Camera or Canned slot: not in the retail recorder's list
