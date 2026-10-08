@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <unordered_map>
 
@@ -291,6 +292,9 @@ struct UiSystem::Impl {
         static const char* const kCoord[4] = {"U", "V", "UL", "VL"};
         for (int k = 0; k < 4; ++k) {
             if (const UProperty* c = v.field("Coordinates", kCoord[k])) out.uv[k] = c->f;
+        }
+        for (int k = 0; k < 2; ++k) {
+            if (const UProperty* pad = v.find("StylePadding", k)) out.padding[k] = pad->f;
         }
         out.valid = true;
     }
@@ -631,9 +635,12 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
         if (w.image.style) scene->bar_image = w.image.style->image_for(UiState::Enabled).image;
         break;
     }
-    // A scene whose templates keep the class default style still draws the red box.
-    if (!scene->bar_image) {
-        if (const UiStyle* style = style_by_tag("TdImageButtonBarBackground")) scene->bar_image = style->image_for(UiState::Enabled).image;
+    // Every bar draws TdImageButtonBarBackground, whatever style its templates were saved with.
+    if (const UiStyle* style = style_by_tag("TdImageButtonBarBackground")) {
+        const UiImageStyle& is = style->image_for(UiState::Enabled);
+        scene->bar_image = is.image;
+        scene->bar_padding[0] = -is.padding[0];
+        scene->bar_padding[1] = -is.padding[1];
     }
     for (size_t wi = 0; wi < scene->widgets.size(); ++wi) {
         if (scene->widgets[wi].cls == "TdUIButtonBar") scene->button_bars.emplace_back(static_cast<int>(wi), std::vector<UiScene::BarButton>{});
@@ -660,7 +667,9 @@ std::vector<std::string> ui_wrap(const Font& font, const std::string& text, floa
                 const std::string word = para.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
                 const std::string trial = line.empty() ? word : line + " " + word;
                 if (!line.empty() && font.width(trial) > width) {
-                    lines.push_back(line);
+                    // The space the line was broken at stays on it: a right-aligned line ends one
+                    // space short of the edge (measured on retail frames).
+                    lines.push_back(line + " ");
                     line = word;
                 } else {
                     line = trial;
@@ -768,6 +777,41 @@ void ui_draw_image(Frame& f, const Image& image, const Rect& box, const float uv
     f.ui.push_back(std::move(op));
 }
 
+void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma,
+                             const Rect* clip) {
+    if (!image.valid() || color[3] <= 0.0f || box.w() <= 0.0f || box.h() <= 0.0f) return;
+    DrawOp op;
+    op.kind = DrawOp::Kind::Image;
+    op.image = &image;
+    encode_color(color, gamma, op.color);
+    if (clip) {
+        op.clipped = true;
+        op.clip = *clip;
+    }
+    const float tw = static_cast<float>(image.w), th = static_cast<float>(image.h);
+    const float ul = uv[2] > 0.0f ? uv[2] : tw, vl = uv[3] > 0.0f ? uv[3] : th;
+    // The canvas draws on whole pixels: texels land on screen pixels.
+    const float left = std::floor(box.l), top = std::floor(box.t);
+    const float width = box.w(), height = box.h();
+    const float mid_u = std::floor(ul * 0.5f), mid_v = std::floor(vl * 0.5f);
+    const float fx = std::min(mid_u, width * 0.5f);  // the width of a corner, on screen and in texels
+    const float fy = std::min(mid_v, height * 0.5f);
+    const float xs[4] = {left, left + fx, std::floor(left + width - fx), std::floor(left + width - fx) + fx};
+    const float ys[4] = {top, top + fy, std::floor(top + height - fy), std::floor(top + height - fy) + fy};
+    const float us[4] = {uv[0], uv[0] + fx, uv[0] + ul - fx, uv[0] + ul};
+    const float vs[4] = {uv[1], uv[1] + fy, uv[1] + vl - fy, uv[1] + vl};
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            if (xs[col + 1] <= xs[col] || ys[row + 1] <= ys[row]) continue;
+            // The middle column and row are one texel from the centre of the image, stretched.
+            const float u0 = col == 1 ? uv[0] + mid_u : us[col], u1 = col == 1 ? uv[0] + mid_u + 1.0f : us[col + 1];
+            const float v0 = row == 1 ? uv[1] + mid_v : vs[row], v1 = row == 1 ? uv[1] + mid_v + 1.0f : vs[row + 1];
+            op.quads.push_back(Quad{xs[col], ys[row], xs[col + 1], ys[row + 1], u0 / tw, v0 / th, u1 / tw, v1 / th});
+        }
+    }
+    f.ui.push_back(std::move(op));
+}
+
 // --- the scene ------------------------------------------------------------------------------
 
 int UiScene::find(const std::string& widget) const {
@@ -805,95 +849,125 @@ std::vector<UiScene::BarButton>& UiScene::bar(const std::string& widget) {
     return none;
 }
 
-// UUIScreenObject::ResolveFacePosition for every widget, repeated until the docking settles.
+// UUIScene::ResolveScenePositions. Faces are resolved in the docking stack's order: widgets in
+// tree order, each face after the face it is docked to. What a percentage padding measures is
+// read as it stands at that moment: a face that has not been resolved yet reads as the face it
+// is docked to, without its padding (which is why the same docking gives SettingsPanel a
+// different top in TdAudioSettings, where it comes before the label it hangs from, than in
+// TdGameSettings, where it comes after).
 void UiScene::layout() {
     if (widgets.empty()) return;
     const Rect scene{0.0f, 0.0f, kSceneWidth, kSceneHeight};
-    widgets[0].rect = scene;
+    const size_t n = widgets.size();
+    std::vector<float> value(n * 4, 0.0f);
+    std::vector<uint8_t> state(n * 4, 0);  // 0 not resolved, 1 being resolved, 2 resolved
+    value[2] = kSceneWidth;
+    value[3] = kSceneHeight;
+    for (int f = 0; f < 4; ++f) state[static_cast<size_t>(f)] = 2;
 
-    auto extent = [](const Rect& r, int f) { return (f & 1) ? r.h() : r.w(); };
+    std::function<float(int, int)> resolve;
+    std::function<float(int, int)> read;
+
     // A Position value as viewport pixels. Right and Bottom are a width and a height from the
     // widget's own Left and Top unless they are in viewport pixels.
-    auto evaluate = [&](const UiWidget& w, int f, const Rect& owner, float own_origin) {
+    auto evaluate = [&](int wi, int f) {
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
         const float v = w.pos[f];
         const bool far_face = f >= 2;
+        const int owner = w.parent < 0 ? 0 : w.parent;
+        auto own_origin = [&] { return resolve(wi, f - 2); };
+        auto owner_near = [&] { return resolve(owner, f & 1); };
+        auto owner_extent = [&] { return resolve(owner, (f & 1) + 2) - resolve(owner, f & 1); };
         switch (w.pos_type[f]) {
             case kPosPixelViewport: return v;
-            case kPosPixelScene: return far_face ? own_origin + v : v;
-            case kPosPixelOwner: return (far_face ? own_origin : face(owner, f)) + v;
+            case kPosPixelScene: return far_face ? own_origin() + v : v;
+            case kPosPixelOwner: return (far_face ? own_origin() : owner_near()) + v;
             case kPosPercentViewport:
-            case kPosPercentScene: return (far_face ? own_origin : 0.0f) + v * extent(scene, f);
-            default: return (far_face ? own_origin : face(owner, f)) + v * extent(owner, f);
+            case kPosPercentScene: return (far_face ? own_origin() : 0.0f) + v * ((f & 1) ? scene.h() : scene.w());
+            default: return (far_face ? own_origin() : owner_near()) + v * owner_extent();
         }
     };
+    auto target_of = [&](const UiWidget& w, int f) { return w.dock_widget[f] >= 0 ? w.dock_widget[f] : 0; };
 
-    for (int pass = 0; pass < 10; ++pass) {
-        float moved = 0.0f;
-        for (size_t i = 1; i < widgets.size(); ++i) {
-            UiWidget& w = widgets[i];
-            const Rect owner = widgets[static_cast<size_t>(w.parent)].rect;
-            float base[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // each face before its dock padding
-            Rect targets[4];
-            for (int f = 0; f < 4; ++f) {
-                if (w.dock_face[f] >= 4) continue;
-                targets[f] = w.dock_widget[f] >= 0 ? widgets[static_cast<size_t>(w.dock_widget[f])].rect : scene;
-                base[f] = face(targets[f], w.dock_face[f]);
-            }
-            for (int f = 0; f < 2; ++f) {
-                if (w.dock_face[f] >= 4) base[f] = evaluate(w, f, owner, 0.0f);
-            }
-            for (int f = 2; f < 4; ++f) {
-                if (w.dock_face[f] >= 4) base[f] = evaluate(w, f, owner, base[f - 2]);
-            }
-            float out[4];
-            for (int f = 0; f < 4; ++f) {
-                if (w.dock_face[f] >= 4) continue;
-                float pad = w.dock_pad[f];
-                switch (w.dock_pad_type[f]) {
-                    case kPadPercentTarget: pad *= extent(targets[f], f); break;
-                    // The widget's own extent, taken between its faces before any padding.
-                    case kPadPercentOwner: pad *= (f & 1) ? base[3] - base[1] : base[2] - base[0]; break;
-                    case kPadPercentScene:
-                    case kPadPercentViewport: pad *= extent(scene, f); break;
-                    default: break;
-                }
-                out[f] = base[f] + pad;
-            }
-            for (int f = 0; f < 2; ++f) {
-                if (w.dock_face[f] >= 4) out[f] = base[f];
-            }
-            for (int f = 2; f < 4; ++f) {
-                if (w.dock_face[f] >= 4) out[f] = evaluate(w, f, owner, out[f - 2]);
-            }
+    read = [&](int wi, int f) -> float {
+        const size_t k = static_cast<size_t>(wi) * 4 + static_cast<size_t>(f);
+        if (state[k] == 2) return value[k];
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
+        if (w.dock_face[f] < 4) return resolve(target_of(w, f), w.dock_face[f]);
+        return resolve(wi, f);
+    };
 
-            // UIComp_DrawString auto-sizing: the string sets the widget's width or height, unless
-            // both faces that way are docked.
-            const Font* font = w.string.present && w.string.style ? w.string.style->text_for(UiState::Enabled).font : nullptr;
-            const bool size_x = w.string.autosize[0] && !(w.dock_face[0] < 4 && w.dock_face[2] < 4);
-            const bool size_y = w.string.autosize[1] && !(w.dock_face[1] < 4 && w.dock_face[3] < 4);
-            if (font && font->valid() && (size_x || size_y) && w.cls != "TdUIButtonBarButton") {
-                const bool wrap = w.string.style->text_for(UiState::Enabled).wrap;
-                // Font metrics are in viewport pixels; the layout is in scene pixels.
-                const float line = static_cast<float>(font->line_height) * font->scale / view_scale;
-                if (size_x) {
-                    float width = 0.0f;
-                    for (const std::string& l : ui_wrap(*font, w.text, 0.0f, false)) width = std::max(width, font->width(l) / view_scale);
-                    if (w.dock_face[2] < 4 && w.dock_face[0] >= 4) out[0] = out[2] - width;
-                    else out[2] = out[0] + width;
-                }
-                if (size_y) {
-                    const size_t lines = ui_wrap(*font, w.text, (out[2] - out[0]) * view_scale, wrap).size();
-                    const float height = line * static_cast<float>(std::max<size_t>(lines, 1));
-                    if (w.dock_face[3] < 4 && w.dock_face[1] >= 4) out[1] = out[3] - height;
-                    else out[3] = out[1] + height;
-                }
-            }
-            const Rect r{out[0], out[1], out[2], out[3]};
-            moved = std::max({moved, std::fabs(r.l - w.rect.l), std::fabs(r.t - w.rect.t), std::fabs(r.r - w.rect.r), std::fabs(r.b - w.rect.b)});
-            w.rect = r;
+    // The height or width the string wants, in scene pixels; negative if it does not size the widget.
+    auto string_extent = [&](int wi, int orientation) -> float {
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
+        if (!w.string.present || !w.string.style || !w.string.autosize[orientation] || w.cls == "TdUIButtonBarButton") return -1.0f;
+        if (w.dock_face[orientation] < 4 && w.dock_face[orientation + 2] < 4) return -1.0f;  // both faces docked
+        const UiTextStyle& ts = w.string.style->text_for(UiState::Enabled);
+        if (!ts.font || !ts.font->valid()) return -1.0f;
+        if (orientation == 0) {
+            float width = 0.0f;
+            for (const std::string& l : ui_wrap(*ts.font, w.text, 0.0f, false)) width = std::max(width, ts.font->width(l) / view_scale);
+            return width;
         }
-        if (moved < 0.01f) break;
+        const float width = (resolve(wi, 2) - resolve(wi, 0)) * view_scale;
+        const size_t lines = ui_wrap(*ts.font, w.text, width, ts.wrap).size();
+        return static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale * static_cast<float>(std::max<size_t>(lines, 1));
+    };
+
+    resolve = [&](int wi, int f) -> float {
+        const size_t k = static_cast<size_t>(wi) * 4 + static_cast<size_t>(f);
+        if (state[k] != 0) return value[k];
+        state[k] = 1;
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
+        const int orientation = f & 1;
+        const float wanted = string_extent(wi, orientation);
+        // Auto-sizing moves the far face, or the near one when only the far one is docked.
+        const bool sizes_near = wanted >= 0.0f && w.dock_face[orientation + 2] < 4 && w.dock_face[orientation] >= 4;
+        float out;
+        if (wanted >= 0.0f && f < 2 && sizes_near) {
+            out = resolve(wi, f + 2) - wanted;
+        } else if (wanted >= 0.0f && f >= 2 && !sizes_near) {
+            out = resolve(wi, f - 2) + wanted;
+        } else if (w.dock_face[f] < 4) {
+            const int target = target_of(w, f);
+            const float base = resolve(target, w.dock_face[f]);
+            value[k] = base;  // what this face reads as while its padding is worked out
+            float pad = w.dock_pad[f];
+            switch (w.dock_pad_type[f]) {
+                case kPadPercentTarget: pad *= read(target, orientation + 2) - read(target, orientation); break;
+                case kPadPercentOwner: {
+                    const float lo = f < 2 ? base : read(wi, orientation);
+                    const float hi = f < 2 ? read(wi, orientation + 2) : base;
+                    pad *= hi - lo;
+                    break;
+                }
+                case kPadPercentScene:
+                case kPadPercentViewport: pad *= orientation ? scene.h() : scene.w(); break;
+                default: break;
+            }
+            out = base + pad;
+        } else {
+            out = evaluate(wi, f);
+        }
+        value[k] = out;
+        state[k] = 2;
+        return out;
+    };
+
+    // Tree order: the widgets were loaded depth first in Children order.
+    std::vector<int> order;
+    std::vector<int> stack{0};
+    while (!stack.empty()) {
+        const int i = stack.back();
+        stack.pop_back();
+        order.push_back(i);
+        const std::vector<int>& children = widgets[static_cast<size_t>(i)].children;
+        for (size_t c = children.size(); c-- > 0;) stack.push_back(children[c]);
     }
+    for (int wi : order) {
+        for (int f = 0; f < 4; ++f) resolve(wi, f);
+    }
+    for (size_t i = 0; i < n; ++i) widgets[i].rect = Rect{value[i * 4], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]};
 }
 
 namespace {
@@ -925,9 +999,14 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
         const Image* image = comp.texture ? comp.texture : is.image;
         if (!image || !image->valid()) return;
         float color[4] = {is.color[0], is.color[1], is.color[2], is.color[3] * comp.opacity * opacity};
-        Rect r = where;
-        // EMaterialAdjustmentType: Normal and Stretch scale the image to the widget (Stretch around
-        // protected regions, which no style here sets), Justified keeps its shape, None its size.
+        // StylePadding is taken off each side of the widget (it is negative on the panel styles).
+        Rect r{where.l + is.padding[0], where.t + is.padding[1], where.r - is.padding[0], where.b - is.padding[1]};
+        if (is.adjust[0] == kAdjustStretch && is.adjust[1] == kAdjustStretch) {
+            ui_draw_image_stretched(f, *image, r, is.uv, color, gamma);
+            return;
+        }
+        // EMaterialAdjustmentType: Normal scales the image to the widget, Justified keeps its
+        // shape, None its size.
         float size[2] = {static_cast<float>(image->w) * scale, static_cast<float>(image->h) * scale};
         if (is.adjust[0] == kAdjustJustified || is.adjust[1] == kAdjustJustified) {
             const float fit = std::min(where.w() / size[0], where.h() / size[1]);
@@ -956,12 +1035,11 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
                 const float width = bar_font->width(b.label);
                 const Rect text{right - width, box.t, right, box.b};
                 if (bar_image && bar_image->valid()) {
-                    // TdImageButtonBarBackground stretched around the auto-sized label: 20 px a side,
-                    // 4.7 px above and below at 720 lines (measured on retail frames).
+                    // TdImageButtonBarBackground around the auto-sized label: StylePadding (-20, -3).
                     const float white[4] = {1.0f, 1.0f, 1.0f, opacity};
                     const float full[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    ui_draw_image(f, *bar_image, Rect{text.l - 20.0f * scale, text.t - 4.7f * scale, text.r + 20.0f * scale, text.b + 4.7f * scale},
-                                  full, white, gamma);
+                    ui_draw_image_stretched(f, *bar_image, Rect{text.l - bar_padding[0], text.t - bar_padding[1], text.r + bar_padding[0], text.b + bar_padding[1]},
+                                            full, white, gamma);
                 }
                 float color[4] = {bar_text[0], bar_text[1], bar_text[2], bar_text[3] * opacity * (b.disabled ? 0.5f : 1.0f)};
                 float shadow[4] = {bar_shadow[0], bar_shadow[1], bar_shadow[2], bar_shadow[3] * opacity};

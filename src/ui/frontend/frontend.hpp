@@ -88,6 +88,8 @@ public:
     [[nodiscard]] ProfileSettings& settings() { return settings_; }
     [[nodiscard]] StringList& string_list(const std::string& tag) { return string_lists_[tag]; }
     [[nodiscard]] const Assets& assets() const { return assets_; }
+    // A Texture2D of the retail packages by object path, read on first use (Assets::image).
+    const Image* image(const std::string& object_path) { return assets_.image(object_path); }
     [[nodiscard]] const KismetRunner& kismet() const { return kismet_; }
 
     // UI sound cue names played since the last call ("TabChangeRight", "NavigateDown", "Accept"),

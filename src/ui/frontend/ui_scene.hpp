@@ -44,6 +44,7 @@ struct UiImageStyle {
     uint8_t adjust[2] = {kAdjustNormal, kAdjustNormal};
     uint8_t align[2] = {kAlignLeft, kAlignLeft};
     float uv[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Coordinates: U, V, UL, VL in texels; UL/VL 0 = the whole texture
+    float padding[2] = {0.0f, 0.0f};         // StylePadding: pixels taken off each side; negative grows the image
 };
 
 // One UIStyle of the skin, resolved for every state.
@@ -194,6 +195,7 @@ public:
     float view_scale = 1.0f;           // viewport pixels per scene pixel: fonts are measured in viewport pixels
     const Font* bar_font = nullptr;    // TdUIButtonBarButton's string style
     const Image* bar_image = nullptr;  // TdImageButtonBarBackground
+    float bar_padding[2] = {20.0f, 3.0f};  // how far the box reaches past the label (the StylePadding of that style)
     float bar_text[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float bar_shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -230,7 +232,11 @@ std::vector<std::string> ui_wrap(const Font& font, const std::string& text, floa
 // Draws `text` in `box` (viewport pixels): alignment 0 left/top, 1 centre, 2 right/bottom. `color` is linear.
 void ui_draw_text(Frame& f, const Font& font, const std::string& text, const Rect& box, int halign, int valign, bool wrap,
                   const float color[4], const float* shadow_color, float shadow_h, float shadow_v, float gamma, const Rect* clip = nullptr);
-// Draws `image` over `box` (viewport pixels) stretched, tinted with a linear colour.
+// Draws `image` over `box` (viewport pixels) scaled to fit, tinted with a linear colour.
 void ui_draw_image(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma, const Rect* clip = nullptr);
+// UCanvas::DrawTileStretched: the four quarters of the image keep their size in the corners of
+// `box` and its middle row and column are stretched between them.
+void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma,
+                             const Rect* clip = nullptr);
 
 }  // namespace me::fe

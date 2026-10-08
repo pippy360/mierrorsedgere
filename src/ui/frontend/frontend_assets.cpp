@@ -338,7 +338,9 @@ bool decode_texture_mip(const TextureMip& mip, TexFormat fmt, Image& out) {
 }
 
 float Font::advance(unsigned char c, unsigned char next) const {
-    float a = static_cast<float>(glyphs[c].w + spacing);
+    // Font.Kerning is added after every glyph but a space: the gap between two words of a
+    // Small font is 8 px on a retail frame, the space glyph plus one.
+    float a = static_cast<float>(glyphs[c].w + (c == ' ' ? 0 : spacing));
     if (next != 0) {
         auto it = pairs.find((static_cast<uint32_t>(c) << 16) | next);
         if (it != pairs.end()) a += it->second;

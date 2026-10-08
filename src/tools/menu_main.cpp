@@ -226,6 +226,23 @@ int main(int argc, char** argv) {
                       << fe.focused_button() << (fe.animating() ? " (animating)" : "");
             if (!fe.scene_name().empty()) std::cout << " scene " << fe.scene_name() << " focus " << fe.scene_focus();
             std::cout << "\n";
+        } else if (verb == "texture") {
+            // texture <object path> <name>: a Texture2D of the retail packages as <name>.png and its alpha as <name>_a.png
+            std::string path, name;
+            cs >> path >> name;
+            const me::fe::Image* img = fe.image(path);
+            if (!img || !img->valid()) {
+                std::cout << "texture " << path << ": not found\n";
+            } else {
+                std::vector<uint8_t> alpha(img->px.size());
+                for (size_t i = 0; i < img->px.size(); i += 4) {
+                    alpha[i] = alpha[i + 1] = alpha[i + 2] = img->px[i + 3];
+                    alpha[i + 3] = 255;
+                }
+                me::fe::write_png(out_dir + "/" + name + ".png", img->w, img->h, img->px.data());
+                me::fe::write_png(out_dir + "/" + name + "_a.png", img->w, img->h, alpha.data());
+                std::cout << "texture " << path << ": " << img->w << "x" << img->h << "\n";
+            }
         } else if (verb == "rects") {
             // The open scene's widgets with their resolved rectangles (scene pixels) and text.
             if (const me::fe::UiScene* scene = fe.scene()) {
