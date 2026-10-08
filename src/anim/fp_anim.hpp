@@ -102,6 +102,7 @@ struct TreeNode {
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
     float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
     float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
+    bool root_motion = false;         // a slot's channel: the animation's root movement goes to the pawn
     const AnimSequenceAsset* seq = nullptr;
 };
 
@@ -119,7 +120,8 @@ public:
     void tick(const PawnAnimState& pawn, float dt);
 
     // TdPawn.PlayCustomAnim / StopCustomAnim.
-    void play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping, bool override_playing);
+    void play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping, bool override_playing,
+                          bool root_motion = false);
     void stop_custom_anim(Slot slot, float blend_out);
     [[nodiscard]] bool custom_anim_playing(Slot slot, std::string* name = nullptr) const;
     // How far into its animation the slot's active channel is (0 with none).

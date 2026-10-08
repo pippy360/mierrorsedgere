@@ -62,7 +62,10 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
         const std::string key = mesh.bones[b].name_lower.empty() ? lower(mesh.bones[b].name) : mesh.bones[b].name_lower;
         auto it = set.bone_to_track.find(key);
         if (it != set.bone_to_track.end()) track_of_[b] = it->second;
-        if (key == "eyejoint") eye_ = static_cast<int>(b);
+        if (key == "eyejoint") eye_ = camera_ = static_cast<int>(b);
+    }
+    for (size_t b = 0; b < bones; ++b) {
+        if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
     }
     aim_bone_.assign(tree.nodes().size(), {});
     for (size_t i = 0; i < tree.nodes().size(); ++i) {
@@ -112,6 +115,8 @@ void PoseEvaluator::sample(const TreeNode& n, Pose& out) const {
             out.rot[b] = key_at(tr.rotations, u, n.looping, [](const Quat4& a, const Quat4& c, float t) { return Quat4::slerp(a, c, t); });
         }
     }
+    // Root motion: what the animation moves the root bone by moves the pawn instead (TdPawn.UseRootMotion).
+    if (n.root_motion) out.pos[0] = mesh_->bones[0].bind_pos;
 }
 
 // AnimNodeAimOffset.GetBoneAtoms: each bone of the profile is turned and moved in the mesh's
@@ -251,16 +256,24 @@ ViewFrame PoseEvaluator::view(const std::vector<Vec3>& comp_pos, const std::vect
     }
     v.eye_pawn = Vec3(v.eye.dot(fwd_), v.eye.dot(right_), v.eye.dot(up_));
 
-    // Where the animation has the eye looking, against the pawn: its axes in the pawn's.
-    auto to_pawn = [&](const Vec3& c) { return Vec3(c.dot(fwd_), c.dot(right_), c.dot(up_)); };
-    const Vec3 ax = to_pawn(comp_rot[eye].rotate(Vec3(0.0f, 0.0f, 1.0f)));
-    const Vec3 ay = to_pawn(comp_rot[eye].rotate(Vec3(-1.0f, 0.0f, 0.0f)));
-    const Vec3 az = to_pawn(comp_rot[eye].rotate(Vec3(0.0f, -1.0f, 0.0f)));
-    // FMatrix::Rotator.
-    v.anim_pitch = std::atan2(ax.z, std::sqrt(ax.x * ax.x + ax.y * ax.y)) * RAD2DEG;
-    v.anim_yaw = std::atan2(ax.y, ax.x) * RAD2DEG;
-    const Vec3 flat_right = Rotator::from_degrees(v.anim_pitch, v.anim_yaw, 0.0f).right();
-    v.anim_roll = std::atan2(az.dot(flat_right), ay.dot(flat_right)) * RAD2DEG;
+    // TdPawn.GetCameraAnimation (native): the camera bone's rotation in the mesh's space, as
+    // FMatrix::Rotator reads it. The mesh's axes are +X left, -Y up, +Z forward, so the rotator's
+    // roll is the view's pitch, its pitch the view's yaw and its yaw the view's roll, which is the
+    // swizzle CalcCamera does: Pitch += -Roll, Yaw += Pitch, Roll += -Yaw. Read this way the pitch
+    // keeps going past straight down, which is how a roll turns the view right over.
+    {
+        const Quat4& q = comp_rot[static_cast<size_t>(camera_)];
+        const Vec3 x_axis = q.rotate(Vec3(1.0f, 0.0f, 0.0f));
+        const Vec3 y_axis = q.rotate(Vec3(0.0f, 1.0f, 0.0f));
+        const Vec3 z_axis = q.rotate(Vec3(0.0f, 0.0f, 1.0f));
+        const float pitch = std::atan2(x_axis.z, std::sqrt(x_axis.x * x_axis.x + x_axis.y * x_axis.y));
+        const float yaw = std::atan2(x_axis.y, x_axis.x);
+        const Vec3 flat_y(-std::sin(yaw), std::cos(yaw), 0.0f);
+        const float roll = std::atan2(z_axis.dot(flat_y), y_axis.dot(flat_y));
+        v.anim_pitch = -roll * RAD2DEG;
+        v.anim_yaw = pitch * RAD2DEG;
+        v.anim_roll = -yaw * RAD2DEG;
+    }
 
     // CalcCamera adds the animation's turn to the view rotation, angle by angle.
     const Rotator rot = Rotator::from_degrees(view_pitch_deg + v.anim_pitch, yaw_offset_deg + v.anim_yaw, v.anim_roll);

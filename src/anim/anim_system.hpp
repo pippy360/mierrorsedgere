@@ -293,7 +293,14 @@ private:
     // (fp_anim / fp_director / fp_pose). Ticked once per simulation time from evaluate_faith_1p.
     struct FirstPerson;
     mutable std::shared_ptr<FirstPerson> fp_;
-    bool tick_first_person(const PlayerTelemetry& telemetry) const;
+    // What of the tree is used this frame: its eye for the world camera, its whole body for the
+    // viewmodel, or only its legs under arms that are still posed by hand (a weapon in hand).
+    struct FirstPersonUse {
+        bool camera = false;
+        bool body = false;
+        bool legs = false;
+    };
+    FirstPersonUse tick_first_person(const PlayerTelemetry& telemetry) const;
 
     SkeletalMeshAsset faith_upper_;
     SkeletalMeshAsset faith_lower_;

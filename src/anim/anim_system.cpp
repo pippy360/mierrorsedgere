@@ -1438,16 +1438,20 @@ struct AnimSystem::FirstPerson {
     fp::Director director;
     fp::PoseEvaluator poser;
     fp::Pose pose;
+    std::vector<Vec3> comp_pos;
+    std::vector<Quat4> comp_rot;
+    fp::ViewFrame view;
     bool tried = false;
     bool ok = false;
     float last_time = -1.0f;
     EMovement last_move = EMovement::MOVE_None;
+    fp::PawnFrame last_frame;
 };
 
-// Runs the first-person tree up to this frame. True when the tree's pose is the one to draw:
-// unarmed, in play, and in a move the director plays (the armed and the melee poses are still
-// picked by hand below).
-bool AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
+// Runs the first-person tree up to this frame and says what of it to use.
+AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
+    FirstPersonUse use;
+    if (!loaded_ || !faith_upper_.is_valid()) return use;
     if (!fp_) fp_ = std::make_shared<FirstPerson>();
     FirstPerson& fp = *fp_;
     if (!fp.tried) {
@@ -1458,7 +1462,7 @@ bool AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
         if (fp.ok) fp.poser.init(faith_upper_, faith_unarmed_set_, fp.director.tree());
         else std::cerr << "[anim] first-person tree: " << error << "\n";
     }
-    if (!fp.ok) return false;
+    if (!fp.ok) return use;
 
     float dt = telemetry.sim_time - fp.last_time;
     const bool restart = fp.last_time < 0.0f || dt < 0.0f || dt > 0.5f;
@@ -1478,32 +1482,42 @@ bool AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
         frame.accelerating = telemetry.move_input;
         // The controller springs off the board the frame the move starts.
         if (telemetry.move_state == EMovement::MOVE_SpringBoarding && fp.last_move != EMovement::MOVE_SpringBoarding) frame.move_anim = "@reached";
+        // Called once a rendered frame, which can be several simulated ones (the headless oracle
+        // steps without drawing). A move that started in the gap started `combat_anim_time` ago (the
+        // controller's clock of the move), not at the last frame drawn.
+        if (!restart && frame.movement != fp.last_move && dt > 1.5f / 60.0f) {
+            const float in_move = std::clamp(telemetry.combat_anim_time, 0.0f, dt);
+            fp::PawnFrame before = fp.last_frame;
+            before.dt = dt - in_move;
+            before.move_anim.clear();
+            fp.director.tick(before);
+            frame.dt = in_move;
+        }
         fp.director.tick(frame);
+        fp.last_frame = frame;
         fp.poser.evaluate(fp.director.tree(), fp.pose);
+        fp.poser.component_space(fp.pose, fp.comp_pos, fp.comp_rot);
+        fp.view = fp.poser.view(fp.comp_pos, fp.comp_rot, telemetry.pitch_deg, 0.0f);
         fp.last_time = telemetry.sim_time;
         fp.last_move = telemetry.move_state;
     }
 
-    if (telemetry.weapon.equipped || telemetry.intro_active || telemetry.falling_to_death) return false;
-    switch (telemetry.move_state) {
-        case EMovement::MOVE_Melee:
-        case EMovement::MOVE_MeleeAir:
-        case EMovement::MOVE_MeleeSlide:
-        case EMovement::MOVE_MeleeWallrun:
-        case EMovement::MOVE_MeleeCrouch:
-        case EMovement::MOVE_Snatch:
-        // The skill roll's body and camera are timed together below and in camera_animation().
-        case EMovement::MOVE_SkillRoll:
-            return false;
-        default:
-            return !fp.pose.pos.empty();
-    }
+    // A level intro and the death fall carry their own camera and body.
+    if (fp.pose.pos.empty() || telemetry.intro_active || telemetry.falling_to_death) return use;
+    use.camera = true;
+    // With a weapon in hand, or snatching one, the arms are still posed by hand (evaluate_faith_1p);
+    // the legs and the eye are the tree's.
+    const bool armed = telemetry.weapon.equipped || telemetry.move_state == EMovement::MOVE_Snatch;
+    use.body = !armed;
+    use.legs = armed;
+    return use;
 }
 
 void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector<Vertex>& out_triangles) const {
     out_triangles.clear();
     if (!loaded_ || !faith_upper_.is_valid()) return;
-    const bool use_tree = tick_first_person(telemetry);
+    const FirstPersonUse fp_use = tick_first_person(telemetry);
+    const bool use_tree = fp_use.body;
 
     const AnimSetAsset* active_set = &faith_unarmed_set_;
     const AnimSetAsset* set_b_ptr = &faith_unarmed_set_;
@@ -2126,8 +2140,15 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
 
     // Forward kinematics in component space
     compute_skeleton_fk(faith_upper_.bones, local_pos, local_quat, comp_pos, comp_quat);
+    // `tree_now` says which pose and view the mesh being appended uses: the tree's, or the one above.
+    bool tree_now = use_tree;
     fp::ViewFrame tree_view;
-    if (use_tree) tree_view = fp_->poser.view(comp_pos, comp_quat, telemetry.pitch_deg, 0.0f);
+    thread_local std::vector<Vec3> tree_delta_pos;
+    thread_local std::vector<Quat4> tree_delta_quat;
+    if (fp_use.body || fp_use.legs) {
+        tree_view = fp_->view;
+        compute_skin_deltas(faith_upper_, fp_->comp_pos, fp_->comp_rot, tree_delta_pos, tree_delta_quat);
+    }
 
     // Compute per-bone Linear Blend Skinning deltas
     compute_skin_deltas(faith_upper_, comp_pos, comp_quat, delta_pos, delta_quat);
@@ -2150,7 +2171,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     // (rel.x, rel.z, -rel.y) is a proper right-handed 90-deg rotation (det = +1).
     float kick_arc = std::sin(combat_progress * PI);
     auto raw_to_vm_pos = [&](const Vec3& raw_p, bool is_lower) -> Vec3 {
-        if (use_tree) {
+        if (tree_now) {
             // TdPlayerPawn.Mesh1p draws with its own field of view, 90 degrees across
             // (TdSkeletalMeshComponent.FOV). The renderers project the viewmodel at 100, which the
             // armed and intro poses below were placed for, so the body is widened to come out at 90.
@@ -2185,7 +2206,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         return Vec3(lx, ly * cos_p - lz * sin_p, ly * sin_p + lz * cos_p - 8.0f);
     };
     auto raw_to_vm_dir = [&](const Vec3& raw_d) -> Vec3 {
-        if (use_tree) return Vec3(raw_d.dot(tree_view.left), raw_d.dot(tree_view.forward), raw_d.dot(tree_view.up)).normalized();
+        if (tree_now) return Vec3(raw_d.dot(tree_view.left), raw_d.dot(tree_view.forward), raw_d.dot(tree_view.up)).normalized();
         Vec3 rel = eye_inv_quat.rotate(raw_d);
         float vy = rel.z;
         float vz = -rel.y;
@@ -2204,7 +2225,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         for (size_t i = 0; i < mesh.vertices.size(); ++i) {
             const SkinnedVertex& sv = mesh.vertices[i];
             uint8_t dom_bone = sv.bones[0];
-            if (use_tree) {
+            if (tree_now) {
                 // The whole body, as retail draws it; only what the lower body's own material covers.
                 if (is_lower && sv.chunk_index != 1) {
                     vert_valid[i] = 0;
@@ -2240,13 +2261,15 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             for (int k = 0; k < 4; ++k) {
                 if (sv.weights[k] == 0) continue;
                 float w = static_cast<float>(sv.weights[k]) * (1.0f / 255.0f);
-                size_t b = std::min(static_cast<size_t>(sv.bones[k]), delta_pos.size() - 1);
-                p_acc += (delta_quat[b].rotate(sv.bind_pos) + delta_pos[b]) * w;
-                n_acc += delta_quat[b].rotate(sv.bind_norm) * w;
+                const std::vector<Vec3>& dpos = tree_now ? tree_delta_pos : delta_pos;
+                const std::vector<Quat4>& dquat = tree_now ? tree_delta_quat : delta_quat;
+                size_t b = std::min(static_cast<size_t>(sv.bones[k]), dpos.size() - 1);
+                p_acc += (dquat[b].rotate(sv.bind_pos) + dpos[b]) * w;
+                n_acc += dquat[b].rotate(sv.bind_norm) * w;
             }
             skinned_pos[i] = raw_to_vm_pos(p_acc, is_lower);
             skinned_norm[i] = raw_to_vm_dir(n_acc);
-            if (skinned_pos[i].y < (use_tree ? 4.0f : (is_lower ? 10.0f : 2.0f))) {
+            if (skinned_pos[i].y < (tree_now ? 4.0f : (is_lower ? 10.0f : 2.0f))) {
                 vert_valid[i] = 0; // Behind near plane
             }
         }
@@ -2282,6 +2305,13 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     out_triangles.reserve(faith_upper_.indices.size() + faith_lower_.indices.size() + w_idx_cnt + 48);
 
     append_skinned_mesh(faith_upper_, false);
+    // The legs under hand-posed arms are the tree's, seen from the tree's eye.
+    if (fp_use.legs) {
+        tree_now = true;
+        append_skinned_mesh(faith_lower_, true);
+        tree_now = false;
+        show_lower_body = false;
+    }
     if (show_lower_body && faith_lower_.is_valid()) {
         append_skinned_mesh(faith_lower_, true);
     }
@@ -2492,10 +2522,24 @@ CameraAnimation AnimSystem::camera_animation(const PlayerTelemetry& telemetry) c
     return out;
 }
 
+// TdPlayerPawn.Mesh1p sits 94 below the capsule's centre: 4 below the feet (measured, standing and crouched).
+constexpr float kMeshOriginBelowFeet = 4.0f;
+
 void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
     const Vec3 still_eye(0.0f, 0.0f, telemetry.eye_height);
     out_pos = telemetry.position + still_eye;
     out_rot = Rotator::from_degrees(telemetry.pitch_deg, telemetry.yaw_deg, telemetry.camera_roll_deg);
+    // In play the camera is the first-person tree's: at its EyeJoint (the mesh's origin is 4 below
+    // the feet), looking where the controller looks, turned by what the animation does to the
+    // camera bone. The wall run's tilt, the landing's dip and the roll's somersault are all that.
+    if (tick_first_person(telemetry).camera) {
+        const fp::ViewFrame& v = fp_->view;
+        const Rotator body = Rotator::from_degrees(0.0f, telemetry.yaw_deg, 0.0f);
+        out_pos = telemetry.position + Vec3(0.0f, 0.0f, v.eye_pawn.z - kMeshOriginBelowFeet) + body.forward() * v.eye_pawn.x +
+                  body.right() * v.eye_pawn.y;
+        out_rot = Rotator::from_degrees(telemetry.pitch_deg + v.anim_pitch, telemetry.yaw_deg + v.anim_yaw, v.anim_roll);
+        return;
+    }
     const CameraAnimation ca = camera_animation(telemetry);
     if (ca.weight <= 0.0f) return;
     // The roll locks the view to the body (SetIgnoreLookInput, ResetCameraLook), so the view's yaw is

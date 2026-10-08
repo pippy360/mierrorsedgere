@@ -226,7 +226,7 @@ void AnimTree::set_active(TreeNode& n, int child, float blend_time) {
 }
 
 void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping,
-                                bool override_playing) {
+                                bool override_playing, bool root_motion) {
     const int index = slot_node(slot);
     if (index < 0) return;
     TreeNode& n = nodes_[static_cast<size_t>(index)];
@@ -244,6 +244,7 @@ void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, 
     seq.looping = looping;
     seq.playing = true;
     seq.time = 0.0f;
+    seq.root_motion = root_motion;
     set_active(n, channel, blend_in);
     n.pending_blend_out = looping ? -1.0f : blend_out;
 }

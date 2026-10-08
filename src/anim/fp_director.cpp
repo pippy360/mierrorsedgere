@@ -410,7 +410,8 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             if (frame.move_anim.empty()) play(Slot::FullBody, "FallingLandHard", 1.0f, 0.05f, 0.2f);
             break;
         case EMovement::MOVE_SkillRoll:
-            play(Slot::FullBody, "fallinglandroll", 1.0f, 0.2f, 0.2f);
+            // PlayMoveAnim(CNT_FullBody, 'fallinglandroll', 1.0, 0.2, 0.2, bRootMotion).
+            tree_.play_custom_anim(Slot::FullBody, "fallinglandroll", 1.0f, 0.2f, 0.2f, false, true, true);
             set_animation_state(EMovement::MOVE_Walking, 0.2f);
             break;
         case EMovement::MOVE_SoftLanding:
