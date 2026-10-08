@@ -267,7 +267,9 @@ void Director::tick_weapon(const PawnFrame& frame) {
         // marks the node as a firing animation for native code to clear; here it goes back to the
         // ready stance over 0.2 s as it ends.)
         tree_.stop_custom_anim(Slot::Weapon, 0.0f);
-        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.2f, false, true);
+        // Retail: in over 0.1 s, whole until its end (0.72 s after a pistol's shot), and the ready
+        // stance back over about 0.08 s.
+        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.08f, false, true);
         make_ready();
     }
     ready_for_ += frame.dt;

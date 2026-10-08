@@ -892,6 +892,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     if (m_telemetry.move_state != EMovement::MOVE_Balance) {
         m_telemetry.balance_danger = 0;
         m_balance_danger_time = 0.0f;
+        m_balance_fall_time = -1.0f;
     }
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
@@ -1339,6 +1340,14 @@ void ParkourController::camera_move_changed(EMovement from, EMovement to) {
 
 void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float dt) {
     const EMovement m = m_cam_move;
+
+    // TdPlayerInput.PlayerInput: aTurn and aLookUp are scaled by the pawn's GetMobilityMultiplier
+    // (native). With a weapon in hand retail's view turns half as far for the same mouse travel,
+    // pistol or rifle, at the ready or not (360 degrees' worth of counts gave 180.5).
+    if (m_telemetry.weapon.equipped) {
+        yaw_d *= 0.5f;
+        pitch_d *= 0.5f;
+    }
 
     // Camera changes inside a move.
     if ((m == EMovement::MOVE_VaultOver || m == EMovement::MOVE_SpeedVaulting) && !m_vault_down &&
@@ -4398,9 +4407,10 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     // The balance itself is native. From a retail recording made for it (the lean is what the
     // tree's BalanceDir node shows, the lose-balance state its Danger children):
     //  - a key held leans her that way at about 2.4 a second (2.0 to 2.7), from either side;
-    //  - left alone the lean grows on itself (GravityInfluence 0.3) and with the view turned off
-    //    the beam (CameraInfluence 0.3 of the turn over the 33 degree look limit): 8 degrees off
-    //    had her over in 5.4 s, 4 degrees in 8.2;
+    //  - stepping on with the view off the beam's line, by 0.7 degrees or by 8, she is over in 3.2
+    //    to 3.6 s, mostly to the side away from the turn; dead in line she reaches the far end of
+    //    a 1,740 uu beam every time. Here: a steady push while the view is off the line, growing
+    //    on itself (GravityInfluence 0.3), sized to that time;
     //  - past about 0.65 with no key against it she is losing her balance: the key against it ends
     //    that at once, and TimeToCounter (0.8 s) of it has her off the beam on that side. Holding a
     //    key from the middle of the beam, that is 1.09 s from the key to the fall.
@@ -4409,25 +4419,37 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     const float beam_yaw = yaw_of(beam_fwd);
     const float yaw_diff = wrap_deg(m_telemetry.yaw_deg - beam_yaw);
     const float key = std::abs(input.strafe) > 0.3f ? sign_of(input.strafe) : 0.0f;
-    const float drive = key * 2.4f + 0.3f * m_balance_lean + 0.3f * std::clamp(yaw_diff / 33.0f, -1.0f, 1.0f);
+    const float skew = std::abs(yaw_diff) > 0.5f ? -sign_of(yaw_diff) * 0.175f : 0.0f;
+    const float drive = key * 2.4f + 0.3f * m_balance_lean + skew;
     m_balance_lean = std::clamp(m_balance_lean + drive * dt, -1.0f, 1.0f);
     const float side = sign_of(m_balance_lean);
     const bool losing = std::abs(m_balance_lean) >= 0.65f && key * side >= 0.0f;
     m_balance_danger_time = losing ? m_balance_danger_time + dt : 0.0f;
     m_telemetry.balance_danger = losing ? static_cast<int>(side) : 0;
     m_telemetry.camera_roll_deg = m_balance_lean * 9.0f;
-    if (m_balance_danger_time >= 0.8f) {
-        // TdMove_Balance.Falloff: the fall off animation of that side, and off the beam she goes.
+    if (m_balance_fall_time < 0.0f && m_balance_danger_time >= 0.8f) {
+        // TdMove_Balance.Falloff: the fall off animation of that side starts while she is still
+        // on the beam, stopped; she is falling 0.27 to 0.30 s later.
         set_move_anim(side < 0.0f ? "walkbalancefalloffleft" : "walkbalancefalloffright");
-        const Vec3 beam_right(beam_fwd.y, -beam_fwd.x, 0.0f);
-        m_telemetry.velocity = beam_right * (side * 200.0f);
-        m_telemetry.position = m_telemetry.position + beam_right * (side * (kPawnRadius + 6.0f));
-        m_telemetry.camera_roll_deg = 0.0f;
-        m_telemetry.balance_danger = 0;
-        m_balance_danger_time = 0.0f;
-        m_balance_lean = 0.0f;
-        m_balance_cooldown = 0.6f;
-        leave_ground(EMovement::MOVE_Falling);
+        m_balance_fall_time = 0.0f;
+        m_balance_fall_side = side;
+    }
+    if (m_balance_fall_time >= 0.0f) {
+        m_balance_fall_time += dt;
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        m_telemetry.balance_danger = static_cast<int>(m_balance_fall_side);
+        if (m_balance_fall_time >= 0.28f) {
+            const Vec3 beam_right(-beam_fwd.y, beam_fwd.x, 0.0f);  // her right, walking the beam
+            m_telemetry.velocity = beam_right * (m_balance_fall_side * 200.0f);
+            m_telemetry.position = m_telemetry.position + beam_right * (m_balance_fall_side * (kPawnRadius + 6.0f));
+            m_telemetry.camera_roll_deg = 0.0f;
+            m_telemetry.balance_danger = 0;
+            m_balance_danger_time = 0.0f;
+            m_balance_fall_time = -1.0f;
+            m_balance_lean = 0.0f;
+            m_balance_cooldown = 0.6f;
+            leave_ground(EMovement::MOVE_Falling);
+        }
         return;
     }
 
