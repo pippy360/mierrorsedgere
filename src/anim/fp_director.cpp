@@ -237,6 +237,11 @@ void Director::tick_weapon(const PawnFrame& frame) {
     }
     const bool light = !frame.heavy_weapon;
     auto make_ready = [&]() {
+        // TdPawn.SetWeaponAnimState does nothing when the state is already the one asked for, so a
+        // shot fired at the ready does not start the time and the distance over again. (Retail, a
+        // pistol: ready, 250 uu walked, a shot, 8 s still, then it began to come down 750 uu into
+        // a run.)
+        if (pawn_.weapon_state == 2) return;
         pawn_.weapon_state = 2;
         ready_for_ = 0.0f;
         amount_til_unarmed_ = light ? 1000.0f : 0.0f;
