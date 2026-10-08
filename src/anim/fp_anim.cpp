@@ -304,6 +304,11 @@ void AnimTree::set_active(TreeNode& n, int child, float blend_time) {
     if (child < 0 || static_cast<size_t>(child) >= n.weight.size()) child = 0;
     for (size_t c = 0; c < n.target.size(); ++c) n.target[c] = static_cast<int>(c) == child ? 1.0f : 0.0f;
     n.active = child;
+    // A slot's time is for a whole blend, and a channel that already has weight has that much less
+    // to go. Measured: StopCustomAnim(FullBody_Dir, 0.3) on an animation 0.56 of the way in took
+    // 0.167 s. The state nodes do not shorten theirs (scaling them too loses 0.3% of the
+    // walking frames).
+    if (blend_time > 0.0f && n.kind == TreeNode::Kind::Slot) blend_time *= 1.0f - std::clamp(n.weight[static_cast<size_t>(child)], 0.0f, 1.0f);
     n.blend_to_go = blend_time;
     if (blend_time <= 0.0f) n.weight = n.target;
 }

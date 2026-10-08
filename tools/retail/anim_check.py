@@ -99,11 +99,26 @@ def level_hints(run, names):
     end = [0] * n
     for i in range(n - 1, -1, -1):
         end[i] = i + 1 if i == n - 1 or run[i + 1]["move"] != run[i]["move"] else end[i + 1]
+    # The sample a fall meets a wall at, for every sample of the fall before it.
+    wall = [None] * n
+    for i in range(n - 1, 0, -1):
+        a, b = run[i - 1], run[i]
+        if a["move"] != MOVE_FALLING or b["move"] != MOVE_FALLING:
+            continue
+        sa, sb = math.hypot(a["vx"], a["vy"]), math.hypot(b["vx"], b["vy"])
+        wall[i - 1] = i if sa > 150.0 and sb < 0.4 * sa else wall[i]
     for i, d in enumerate(run):
         j = end[i]
         move = d["move"]
-        if move == MOVE_FALLING and j < n and run[j]["move"] in GROUND_MOVES:
-            out[i][0] = max(0.0, d["pz"] - run[j]["pz"])
+        # How far along the velocity the first thing in the way is: the ground the fall ends on,
+        # or a wall she flies into (her speed over the ground gone from one sample to the next).
+        if move == MOVE_FALLING and d["vz"] < -1.0:
+            speed = math.sqrt(d["vx"] ** 2 + d["vy"] ** 2 + d["vz"] ** 2)
+            if j < n and run[j]["move"] in GROUND_MOVES:
+                out[i][0] = max(0.0, d["pz"] - run[j]["pz"]) * speed / -d["vz"]
+            if wall[i] is not None:
+                along = speed * (run[wall[i]]["t"] - d["t"])
+                out[i][0] = along if out[i][0] < 0.0 else min(out[i][0], along)
         seen = set()
         for k in range(i, min(j, i + 40)):
             seen.update(leaf_names[k])

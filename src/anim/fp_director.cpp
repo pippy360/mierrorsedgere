@@ -611,18 +611,28 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
 void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame) {
     switch (move) {
         case EMovement::MOVE_Jump: {
-            // TdMove_Jump.StartJump.
-            const float forward = forward_speed(frame);
+            // TdMove_Jump.StartJump: vector(Rotation) Dot Velocity as the move starts, which is before
+            // this frame's physics, so the velocity is the frame before's. (Out of a vault on to a
+            // ledge she is still slowing down: 66 uu/s then, 29 a frame later.)
+            const float yaw = frame.yaw_deg * DEG2RAD;
+            const float forward = std::cos(yaw) * last_velocity_.x + std::sin(yaw) * last_velocity_.y;
             if (forward < 5.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.15f, 0.15f);
             else if (forward < kLongJumpNormalThreshold || !frame.long_jump_over_gap) play(Slot::FullBodyDir, "JumpSlow", 1.0f, kJumpBlendInTime, kJumpBlendOutTime);
             else play(Slot::FullBodyDir, "JumpFast", 1.0f, kJumpBlendInTime, kJumpBlendOutTime);
             break;
         }
         case EMovement::MOVE_Falling:
-            // TdMove_Falling.StartMove: walking off an edge.
+            // TdMove_Falling.StartMove: walking off an edge. Backing off one with room for her
+            // below it (CanStand a body's height down), the move stops her dead and plays JumpStill;
+            // backing off a lower one it plays nothing. The velocity it reads is the one she walked
+            // off with, and a stop shows as her speed gone by this frame.
             if (old == EMovement::MOVE_Walking) {
-                if (forward_speed(frame) < 0.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.3f, 0.2f);
-                else play(Slot::FullBodyDir, "JumpAir", 1.0f, 0.3f, 0.2f);
+                const float yaw = frame.yaw_deg * DEG2RAD;
+                const float forward = std::cos(yaw) * last_velocity_.x + std::sin(yaw) * last_velocity_.y;
+                const float was = std::hypot(last_velocity_.x, last_velocity_.y);
+                const float now = std::hypot(frame.velocity.x, frame.velocity.y);
+                if (forward >= 0.0f) play(Slot::FullBodyDir, "JumpAir", 1.0f, 0.3f, 0.2f);
+                else if (now < 0.5f * was || now < 30.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.3f, 0.2f);
             } else if (old == EMovement::MOVE_DodgeJump) {
                 set_animation_state(EMovement::MOVE_DodgeJump);
             }
@@ -919,11 +929,12 @@ void Director::tick(const PawnFrame& frame) {
     else pawn_.grab_turn_type = 0;
     if (frame.movement == EMovement::MOVE_Melee || frame.movement == EMovement::MOVE_MeleeCrouch) tick_melee(frame);
 
-    // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before the
-    // feet arrive. Measured: it fires while falling faster than 400 with the ground less than 0.4 s
-    // away at the speed she is falling.
-    if (frame.movement == EMovement::MOVE_Falling && !close_to_ground_ && frame.ground_distance >= 0.0f && frame.velocity.z < -400.0f &&
-        frame.ground_distance <= -frame.velocity.z * 0.4f) {
+    // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before
+    // she arrives. Measured: it fires in a fall with something less than 0.4 s away along the
+    // velocity, the ground or a wall (ground_distance is the distance along it), at any speed: a
+    // step off a low ledge fires it 0.17 s in, falling at 240.
+    if (frame.movement == EMovement::MOVE_Falling && !close_to_ground_ && frame.ground_distance >= 0.0f && frame.velocity.z < 0.0f &&
+        frame.ground_distance <= frame.velocity.length() * 0.4f) {
         close_to_ground_ = true;
         tree_.stop_custom_anim(Slot::FullBodyDir, 0.3f);
     }

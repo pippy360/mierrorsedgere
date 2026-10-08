@@ -800,11 +800,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                     m_telemetry.velocity.x *= 0.5f;
                     m_telemetry.velocity.y *= 0.5f;
                 } else if (from == EMovement::MOVE_Walking && m_telemetry.velocity.dot(fwd) < 0.0f) {
-                    // Backing off a drop of two body heights or more: the horizontal velocity is
-                    // zeroed so the pawn drops straight down.
-                    const Vec3 s = m_telemetry.position;
-                    const TraceHit drop = trace_ray(s, s - Vec3(0.0f, 0.0f, 2.0f * kPawnHeight), scene);
-                    if (!drop.hit) {
+                    // TdMove_Falling.StartMove: backing off a drop with room for her below the
+                    // edge (CanStand two half heights under her centre), the horizontal velocity
+                    // is zeroed so the pawn drops straight down.
+                    if (has_room_at(m_telemetry.position - Vec3(0.0f, 0.0f, kPawnHeight), kPawnHeight, scene)) {
                         m_telemetry.velocity.x = 0.0f;
                         m_telemetry.velocity.y = 0.0f;
                     }
@@ -2430,12 +2429,17 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     if (m_telemetry.velocity.z > 0.0f && m_telemetry.position.z > m_fall_peak_z) {
         m_fall_peak_z = m_telemetry.position.z;
     }
-    // TdMove_Falling.CloseToGround lets the jump animation go a little before the feet arrive.
+    // TdMove_Falling.CloseToGround lets the jump animation go a little before she arrives. Native
+    // code calls it; measured, it is her own box swept 0.4 s along the velocity meeting something:
+    // the ground she lands on (ten landings, the drop left 0.38 to 0.42 of the fall speed), and as
+    // well a wall she is about to fly into (0.39 s before she hit it). At any falling speed.
     m_telemetry.ground_distance = -1.0f;
-    if (m_telemetry.velocity.z < -400.0f) {
-        const Vec3 from = m_telemetry.position + Vec3(0.0f, 0.0f, 5.0f);
-        const TraceHit below = trace_ray(from, from - Vec3(0.0f, 0.0f, 1200.0f), scene);
-        if (below.hit) m_telemetry.ground_distance = std::max(0.0f, m_telemetry.position.z - below.point.z);
+    if (m_telemetry.velocity.z < 0.0f) {
+        const Vec3 delta = m_telemetry.velocity * 0.4f;
+        const float half_z = 0.5f * (kPawnHeight - 1.0f);
+        const Vec3 extent(kPawnRadius - 1.0f, kPawnRadius - 1.0f, half_z);
+        const TraceHit ahead = sweep_box(m_telemetry.position + Vec3(0.0f, 0.0f, 1.0f + half_z), extent, delta, scene);
+        if (ahead.hit && !ahead.start_penetrating) m_telemetry.ground_distance = ahead.fraction * delta.length();
     }
     update_fall_height_volumes(scene);
 
