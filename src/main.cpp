@@ -2236,6 +2236,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             footstep_timer = 0.0f;
         }
 
+        // Trigger helicopter rotor & FNMinimi gunfire audio cues
+        for (const auto& heli : active_scene.helicopters) {
+            if (heli.just_spawned) {
+                audio.load_sound_bank(game_root, "A_Vehicle_Helicopter");
+                audio.play_cue("Helicopter.Helicopter", false, 0.85f);
+            }
+            if (heli.just_fired) {
+                audio.play_sound_3d("FNMinimi_Fire", heli.position, 0.55f);
+            }
+        }
+
         // Update 3D listener and dynamic audio stems
         audio.set_menu_music(renderer.is_menu_open());
         Vec3 ear = tel.position + Vec3(0, 0, tel.eye_height);

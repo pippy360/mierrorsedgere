@@ -971,6 +971,96 @@ struct BargeDoorInstance {
 };
 
 // -----------------------------------------------------------------------------
+// Reverse-Engineered Helicopter & Scripted Gunfire Encounters
+// (TdVehicle_Helicopter, TdAI_HeliController, TdAttackPathNode, SeqAct_TdHelicopterFactory,
+//  SeqAct_SetHeliTarget, SeqAct_SetHeliSpeed, SeqAct_TdDummyWeaponFire in TdGame.u)
+// -----------------------------------------------------------------------------
+enum class EHeliAttackSide : uint8_t {
+    Right = 0,               // ESide_Right
+    Left = 1,                // ESide_Left
+    UseLeftWhenHovering = 2, // ESide_UseLeftWhenHovering
+    UseRightWhenHovering = 3,// ESide_UseRightWhenHovering
+    Both = 4,                // ESide_Both
+    None = 5                 // ESide_None
+};
+
+enum class EHeliSpeed : uint8_t {
+    FastestDefault = 0,      // EHSpeed_Fastest_Default (2000 uu/s)
+    Fast = 1,                // EHSpeed_Fast (1500 uu/s)
+    Slow = 2,                // EHSpeed_Slow (1000 uu/s)
+    Slower = 3,              // EHSpeed_Slower (650 uu/s)
+    Slowest = 4              // EHSpeed_Slowest (350 uu/s)
+};
+
+enum class EHeliState : uint8_t {
+    Dormant = 0,             // Waiting for Kismet SeqEvent_TdTouch / checkpoint trigger
+    Arriving = 1,            // Flying in; HoldFire delay active (e.g. 6.0s in Escape_R1_Spt)
+    Engaging = 2,            // Selecting TdAttackPathNode & firing FNMinimi bursts at Faith
+    Retreating = 3,          // SeqAct_AIHoldFire + SeqAct_AIMoveToActor retreat when Faith reaches cover
+    Destroyed = 4            // SeqAct_Destroy completed
+};
+
+struct HeliAttackNode {
+    std::string object_name;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    float yaw_deg = 0.0f;
+    float attack_radius = 3000.0f;  // TdAttackPathNode.AttackVolumeRadius
+    float attack_height = 2000.0f;  // TdAttackPathNode.AttackVolumeHeight
+    float attack_angle = 45.0f;     // TdAttackPathNode.AttackVolumeAngle
+    int32_t exposure = 80;          // TdAttackPathNode.Exposure
+    float last_visit_time = -1000.0f;
+};
+
+struct DummyFireBarrage {
+    std::string object_name;
+    Vec3 origin{0.0f, 0.0f, 0.0f};  // SeqAct_TdDummyWeaponFire.Origin actor world location
+    Vec3 target{0.0f, 0.0f, 0.0f};  // SeqAct_TdDummyWeaponFire.Target actor world location
+    Vec3 trigger_pos{0.0f, 0.0f, 0.0f};
+    float trigger_radius = 1200.0f;
+    int32_t shots_to_fire = 18;
+    float spread_deg = 12.0f;       // MaxSpread FRotator units converted to degrees
+    float delay_sec = 0.25f;
+    bool activated = false;
+    float timer = 0.0f;
+    int32_t shots_fired = 0;
+};
+
+struct HelicopterInstance {
+    std::string object_name;
+    std::string mesh_name = "SK_SWAT_Blackhawk_01";
+    Vec3 spawn_pos{0.0f, 0.0f, 0.0f};
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 velocity{0.0f, 0.0f, 0.0f};
+    float yaw_deg = 0.0f;
+    float pitch_deg = 0.0f;
+    float roll_deg = 0.0f;
+
+    Vec3 trigger_pos{0.0f, 0.0f, 0.0f};
+    float trigger_radius = 2800.0f;
+    bool has_escape_trigger = false;
+    Vec3 escape_pos{0.0f, 0.0f, 0.0f};
+    float escape_radius = 1200.0f;
+    Vec3 retreat_dest{0.0f, 0.0f, 0.0f};
+
+    float hold_fire_delay = 6.0f;    // SeqAct_Delay before releasing SeqAct_AIHoldFire
+    float perfect_aim_delay = 30.0f; // Anti-camping SeqAct_Delay -> SeqAct_TdAIPerfectAim
+    int32_t gunner_count = 1;
+    EHeliAttackSide side_preference = EHeliAttackSide::UseLeftWhenHovering;
+    EHeliSpeed speed_setting = EHeliSpeed::FastestDefault;
+
+    EHeliState state = EHeliState::Dormant;
+    float active_timer = 0.0f;
+    float main_rotor_rad = 0.0f;
+    float tail_rotor_rad = 0.0f;
+    float burst_timer = 0.0f;
+    float muzzle_flash_timer = 0.0f;
+    int32_t current_node_idx = -1;
+    bool perfect_aim_active = false;
+    bool just_spawned = false;
+    bool just_fired = false;
+};
+
+// -----------------------------------------------------------------------------
 // Input Frame (Mapped from Keyboard, Mouse, or Gamepad)
 // -----------------------------------------------------------------------------
 struct InputFrame {
@@ -1151,6 +1241,9 @@ struct LevelScene {
     std::vector<EnemyBot> enemies;
     std::vector<BulletTracer> active_tracers;
     std::vector<DroppedWeapon> dropped_weapons;
+    std::vector<HeliAttackNode> heli_attack_nodes;
+    std::vector<HelicopterInstance> helicopters;
+    std::vector<DummyFireBarrage> dummy_fire_barrages;
     std::vector<Vec3> checkpoints;
     std::vector<LevelCheckpointInfo> checkpoint_infos;
     std::vector<LevelStreamingActionInfo> streaming_actions;

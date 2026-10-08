@@ -4972,6 +4972,175 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
             }
         }
     }
+
+    // -------------------------------------------------------------------------
+    // TdAI_HeliController + TdVehicle_Helicopter + SeqAct_TdDummyWeaponFire
+    // -------------------------------------------------------------------------
+    for (auto& heli : scene.helicopters) {
+        heli.just_spawned = false;
+        heli.just_fired = false;
+        heli.muzzle_flash_timer = std::max(0.0f, heli.muzzle_flash_timer - dt);
+
+        if (heli.state == EHeliState::Destroyed) continue;
+
+        float dist_trig = (m_telemetry.position - heli.trigger_pos).length();
+        float dist_spawn = (m_telemetry.position - heli.spawn_pos).length();
+        if (heli.state == EHeliState::Dormant) {
+            if (dist_trig <= heli.trigger_radius || dist_spawn <= 5200.0f) {
+                heli.state = (heli.hold_fire_delay > 0.05f) ? EHeliState::Arriving : EHeliState::Engaging;
+                heli.active_timer = 0.0f;
+                heli.just_spawned = true;
+            } else {
+                continue;
+            }
+        }
+
+        heli.active_timer += dt;
+        heli.main_rotor_rad = std::fmod(heli.main_rotor_rad + 18.0f * dt, 6.2831853f);
+        heli.tail_rotor_rad = std::fmod(heli.tail_rotor_rad + 42.0f * dt, 6.2831853f);
+
+        if (heli.state == EHeliState::Arriving && heli.active_timer >= heli.hold_fire_delay) {
+            heli.state = EHeliState::Engaging;
+        }
+        if (heli.active_timer >= heli.perfect_aim_delay) {
+            heli.perfect_aim_active = true;
+        }
+
+        // TdAI_HeliController.FindBestAttackPoint() priority scoring across TdAttackPathNodes:
+        // DistanceNodeHeliWeight = 1.0, DistanceNodePlayerWeight = 1.5, LastVisitWeight = 2000.0
+        Vec3 goal_pos = m_telemetry.position + Vec3(-1400.0f, 900.0f, 950.0f);
+        if (!scene.heli_attack_nodes.empty()) {
+            float best_score = 1e18f;
+            int best_idx = heli.current_node_idx;
+            for (size_t ni = 0; ni < scene.heli_attack_nodes.size(); ++ni) {
+                const auto& node = scene.heli_attack_nodes[ni];
+                float d_player = (node.location - m_telemetry.position).length();
+                if (d_player < 550.0f || d_player > 6800.0f) continue;
+                float d_heli = (node.location - heli.position).length();
+                float visit_age = std::clamp((m_telemetry.sim_time - node.last_visit_time) / 30.0f, 0.0f, 1.0f);
+                float visit_penalty = (1.0f - visit_age) * 2000.0f;
+                float score = 1.0f * d_heli + 1.5f * d_player + visit_penalty;
+                if (score < best_score) {
+                    best_score = score;
+                    best_idx = static_cast<int>(ni);
+                }
+            }
+            if (best_idx >= 0 && static_cast<size_t>(best_idx) < scene.heli_attack_nodes.size()) {
+                heli.current_node_idx = best_idx;
+                goal_pos = scene.heli_attack_nodes[static_cast<size_t>(best_idx)].location;
+                if ((heli.position - goal_pos).length() < 320.0f) {
+                    scene.heli_attack_nodes[static_cast<size_t>(best_idx)].last_visit_time = m_telemetry.sim_time;
+                }
+            }
+        }
+        // Subtle hover oscillation (TdVehicle_Helicopter.HoveringNoiceDirection)
+        goal_pos.z += std::sin(m_telemetry.sim_time * 1.4f) * 35.0f;
+
+        Vec3 to_goal = goal_pos - heli.position;
+        float dist_goal = to_goal.length();
+        float max_spd = (heli.speed_setting == EHeliSpeed::Slow) ? 1000.0f : 1850.0f;
+        Vec3 desired_vel = (dist_goal > 20.0f)
+            ? to_goal * (std::min(max_spd, dist_goal * 1.6f) / dist_goal)
+            : Vec3(0.0f, 0.0f, 0.0f);
+        Vec3 dv = desired_vel - heli.velocity;
+        float max_dv = 1000.0f * dt;
+        if (dv.length() > max_dv && dv.length() > 1e-4f) {
+            dv = dv.normalized() * max_dv;
+        }
+        heli.velocity += dv;
+        heli.position += heli.velocity * dt;
+
+        // Broadside orientation (EHeliAttackSide): present Left (+90 yaw) or Right (-90 yaw) door gunner to Faith
+        Vec3 to_player = m_telemetry.position - heli.position;
+        float bearing_deg = std::atan2(to_player.y, to_player.x) * RAD2DEG;
+        float side_offset = (heli.side_preference == EHeliAttackSide::Right ||
+                             heli.side_preference == EHeliAttackSide::UseRightWhenHovering) ? -90.0f : 90.0f;
+        float target_yaw = bearing_deg + side_offset;
+        float yaw_diff = std::fmod(target_yaw - heli.yaw_deg + 540.0f, 360.0f) - 180.0f;
+        heli.yaw_deg += std::clamp(yaw_diff, -75.0f * dt, 75.0f * dt);
+
+        // Banking pitch & roll (StayUprightPitchResistAngle = 6.0, StayUprightRollResistAngle = 6.0)
+        float cy = std::cos(heli.yaw_deg * DEG2RAD);
+        float sy = std::sin(heli.yaw_deg * DEG2RAD);
+        float fwd_spd = heli.velocity.x * cy + heli.velocity.y * sy;
+        float side_spd = -heli.velocity.x * sy + heli.velocity.y * cy;
+        heli.pitch_deg = std::clamp(-fwd_spd * 0.008f, -12.0f, 12.0f);
+        heli.roll_deg = std::clamp(side_spd * 0.010f, -15.0f, 15.0f);
+
+        // Door gunner FNMinimi bursts when Engaging
+        if (heli.state == EHeliState::Engaging && to_player.length() < 6500.0f) {
+            heli.burst_timer += dt;
+            if (heli.burst_timer >= 0.14f) {
+                heli.burst_timer = 0.0f;
+                heli.muzzle_flash_timer = 0.07f;
+                heli.just_fired = true;
+
+                Vec3 right(-sy, cy, 0.0f);
+                float side_sign = (side_offset < 0.0f) ? 1.0f : -1.0f;
+                Vec3 gun_muzzle = heli.position + right * (side_sign * 165.0f) - Vec3(0.0f, 0.0f, 45.0f);
+                float spread_scale = heli.perfect_aim_active ? 18.0f : 95.0f;
+                float phase = m_telemetry.sim_time * 13.7f;
+                Vec3 aim_pt = m_telemetry.position + Vec3(std::sin(phase) * spread_scale,
+                                                          std::cos(phase * 1.3f) * spread_scale,
+                                                          m_telemetry.eye_height * 0.65f);
+                TraceHit los = trace_ray(gun_muzzle, aim_pt, scene, COLL_BlockZeroExtent);
+                BulletTracer tr{};
+                tr.start_pos = gun_muzzle;
+                tr.end_pos = los.hit ? los.point : aim_pt;
+                tr.timer = 0.09f;
+                tr.max_time = 0.09f;
+                tr.hit_enemy = false;
+                tr.from_player = false;
+                scene.active_tracers.push_back(tr);
+
+                // SequenceFrame_30 [Reduce Gunner Accuracy During Slide] + high-speed parkour evasion
+                bool evading = !heli.perfect_aim_active &&
+                               (m_telemetry.move_state == EMovement::MOVE_Slide ||
+                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
+                                m_telemetry.speed_2d > 560.0f);
+                if (!los.hit && !evading) {
+                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 5.5f);
+                    m_telemetry.damage_flash_timer = 0.20f;
+                    m_damage_cooldown = m_config.health_regen_delay;
+                }
+            }
+        }
+    }
+
+    // Scripted window/corridor gunfire setpieces (SeqAct_TdDummyWeaponFire, e.g. Escape_Off-R1_Spt)
+    for (auto& bar : scene.dummy_fire_barrages) {
+        if (!bar.activated) {
+            if ((m_telemetry.position - bar.trigger_pos).length() <= bar.trigger_radius) {
+                bar.activated = true;
+                bar.timer = -bar.delay_sec;
+            } else {
+                continue;
+            }
+        }
+        if (bar.shots_fired >= bar.shots_to_fire) continue;
+        bar.timer += dt;
+        if (bar.timer >= 0.09f) {
+            bar.timer = 0.0f;
+            float angle = bar.spread_deg * DEG2RAD * std::sin(static_cast<float>(bar.shots_fired) * 1.9f);
+            Vec3 base_dir = (bar.target - bar.origin);
+            float dist = base_dir.length();
+            Vec3 end_pt = bar.target + Vec3(std::sin(angle) * dist * 0.12f,
+                                            std::cos(angle * 1.4f) * dist * 0.12f,
+                                            std::sin(angle * 0.7f) * 65.0f);
+            TraceHit hit = trace_ray(bar.origin, end_pt, scene, COLL_BlockZeroExtent);
+            BulletTracer tr{};
+            tr.start_pos = bar.origin;
+            tr.end_pos = hit.hit ? hit.point : end_pt;
+            tr.timer = 0.09f;
+            tr.max_time = 0.09f;
+            tr.hit_enemy = false;
+            tr.from_player = false;
+            scene.active_tracers.push_back(tr);
+            bar.shots_fired++;
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
