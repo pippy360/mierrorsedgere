@@ -575,3 +575,54 @@ design and the full list of what was and was not run are in `docs/WINDOWS_PORT.m
 - The front end runs at about 21 fps on the test laptop: it is drawn by the CPU reference renderer.
 - Not exercised on Windows: a gamepad, the fullscreen toggle, a play-through of a level, the Direct3D
   debug layer, AMD GPUs.
+
+---
+
+## 12. Level intros match retail (agent/level-intros, 2026-10-08)
+
+The start-of-level intro of each chapter, the first-person animation that moves Faith into place before the
+player gets control, was checked against recordings of the retail game and rebuilt to match. What retail does,
+the method and the per-chapter figures are in `docs/LEVEL_INTROS.md`.
+
+### 12.1 What was wrong
+- The view pitched and turned the opposite way to retail's in all eight intros the port found.
+- Ropeburn's and The Boat's were not found; a made-up camera fly-in played instead, and it played for the
+  training level too, which has no intro in the data.
+- Edge's animation started 3 s early, and the port followed the first-person sequence's root where retail
+  moves the pawn on the full-body one's.
+- No sound was the intro's: footsteps came from a cadence timer, there was wind, a checkpoint chime at the
+  hand-over, and no voice line.
+- Black bars and a "CUTSCENE" header over the picture; a 100 uu drop at the hand-over.
+
+### 12.2 Changes
+- **`src/assets/level_intro.*`** (new, out of `upk_loader.cpp`): finds the intro's Matinee, bakes the camera per
+  animation frame, collects the sounds from the animation's notifies and from the Kismet behind the Matinee's
+  events (through delays, remote events and the doors' own Matinees, honouring disabled links and both ends'
+  delays), the cues its end stops, and the doors it turns.
+- **`AnimSystem::bake_canned_camera`**: forward kinematics through the first-person skeleton to the camera
+  joint, the root's rotation the right way round, on the full-body root where a level ships one.
+- **`CutscenePlayer`**: plays the baked camera for the Matinee's length, hands the due sounds to the game and
+  poses the doors. No letterbox; the skip prompt retail shows.
+- **`AudioEngine`**: `play_cue`, `play_footstep_number`, `load_cue_bank` (a cue's package and the packages its
+  waves are imported from, on demand), `stop_cue`, and a play log.
+- **`--trace <file>`** and **`tools/retail/intro_capture.py`, `intro_check.py`**: the recording and the
+  comparison.
+
+### 12.3 Result
+Through all ten intros the port's eye is a median of 0.0 to 0.5 uu from retail's, and the view direction a
+median of 0.01 to 0.14 degrees off where retail's can be read. Of the 212 cues retail's log holds inside the
+intros, 207 pair with a port start of the same cue, a median of 1 to 6 ms apart; the other five are one
+clothing rustle each at the end of five intros, part of a turn in place the port does not have.
+
+### 12.4 Verification
+- `mirrorsedge_windows.exe --verify-all`: all stages pass (Windows, Direct3D 11).
+- `tools.retail.intro_check play` + `compare` on the same build: the table in `docs/LEVEL_INTROS.md`.
+- Frames of the port's window beside retail's at the same moments, by eye, for Edge, Jacknife, Heat, Ropeburn,
+  New Eden and The Boat.
+- macOS: compiled and linked on a `macos-15` runner. Not run there: the runner has no game assets.
+
+### 12.5 Known differences left
+The hand-over still pops 12 uu, because the gameplay camera rests 8 uu higher and 8.6 uu further back than the
+standing pose the animation ends in; retail turns Faith in place as control returns in five chapters; one
+second of Edge tilts twice as far as retail's view; the opening's title lettering and the chapter name are not
+drawn. Section 5 of `docs/LEVEL_INTROS.md` has the list.

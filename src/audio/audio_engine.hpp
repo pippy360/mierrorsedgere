@@ -2,8 +2,10 @@
 
 #include "../math/types.hpp"
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <cstdint>
 
@@ -95,6 +97,12 @@ public:
 
     // Surface-aware TdPhysicalMaterialFootSteps / HandSteps playback
     void play_footstep(ESurfaceMaterial surface, float speed, bool crouch, float volume = 0.75f);
+    // The footstep an AnimNotify_Footstep asks for by number: 1 Sneak, 2 Walk, 3 Run, 4 Sprint,
+    // 5 SprintRelease, 6 WallRun, 7 WallrunRelease, 8 LandSoft, 9 LandMedium, 10 LandHard, 11 Slide.
+    void play_footstep_number(ESurfaceMaterial surface, int number, float volume = 0.75f);
+    // A SoundCue named as the level data names it, "Group.Name" (or just "Name"); `voice` plays it
+    // as dialogue, with its subtitle. Returns false if no such cue is loaded.
+    bool play_cue(const std::string& group_and_name, bool voice = false, float volume = 1.0f);
     void play_handstep(ESurfaceMaterial surface, bool hard_impact, float volume = 0.75f);
 
     // Global SoundGroupEffects mix state (DefaultEngine.ini modes 0..10)
@@ -110,6 +118,24 @@ public:
 
     // Stop all playing sound sources
     void stop_all();
+
+    // SoundCues by "Group.Name" (or bare name), as Kismet and animation notifies refer to them.
+    [[nodiscard]] bool has_cue(const std::string& group_and_name) const;
+    // Loads the content package a cue lives in ("A_Props_Interactive", "A_VO_CS01_CUE") from
+    // CookedPC/Audio or its int/ voice folder, once. A voice cue package brings its waves along.
+    bool load_cue_bank(const std::string& game_root, const std::string& package);
+    // Stops every source that is playing that cue.
+    void stop_cue(const std::string& group_and_name);
+
+    // A log of every sound asked to play (the cue or wave name it resolved from), for --trace.
+    // It records the request, so it is the same with and without an audio device.
+    struct PlayEvent {
+        std::string name;
+        const char* kind = "sound";  // "sound", "sound3d" or "vo"
+        float duration = 0.0f;       // of the wave that was picked
+    };
+    void set_play_log(bool on) { play_log_on_ = on; }
+    [[nodiscard]] std::vector<PlayEvent> take_play_log() { return std::exchange(play_log_, {}); }
 
     // Access loaded clips, cues, level-loaded VO cues, and spatial ambient emitters
     [[nodiscard]] const SoundClip* get_clip(const std::string& name) const;
@@ -144,6 +170,9 @@ private:
 
     bool initialized_ = false;
     bool headless_ = false;
+    bool play_log_on_ = false;
+    std::unordered_set<std::string> cue_banks_tried_;
+    std::vector<PlayEvent> play_log_;
     bool is_menu_music_ = false;
     std::string active_music_bank_;
     std::vector<std::string> active_music_clip_keys_;

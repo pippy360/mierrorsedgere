@@ -2,6 +2,7 @@
 
 #include "../math/types.hpp"
 #include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
@@ -47,7 +48,9 @@ public:
     // Start playing a Bink (.bik) movie by name (e.g. "Scene_01", "StartupMovie", "Attract_Movie")
     bool play_bink_movie(const std::string& movie_name, bool chain_in_engine_intro = false);
 
-    // Start playing an in-engine 3D Matinee camera fly-in ending at Faith's spawn viewpoint
+    // Start the level's own start-of-level intro (LevelScene::level_intro): the first-person view
+    // through its animation, for the length of its Matinee. A level without one gets the camera
+    // fly-in the EXTRAS menu offers, ending at Faith's spawn viewpoint after duration_sec.
     void play_in_engine_intro(const LevelScene& scene, const PlayerTelemetry& telemetry, float duration_sec = 5.5f);
 
     // Stop / skip current cutscene immediately (if Bink movie has chain_in_engine_intro, transitions or skips cleanly)
@@ -67,6 +70,17 @@ public:
     [[nodiscard]] float get_duration() const { return duration_sec_; }
     [[nodiscard]] const std::string& get_active_subtitle() const { return active_subtitle_; }
     [[nodiscard]] float get_letterbox_amount() const { return letterbox_amount_; }
+
+    // True while what is playing is the level's own intro rather than the fly-in.
+    [[nodiscard]] bool is_level_intro() const { return mode_ == ECutsceneMode::InEngineMatinee && level_intro_; }
+    // The sounds the level intro reached during the last update(), in order, for the game to play.
+    [[nodiscard]] std::vector<IntroSoundEvent> take_intro_sounds() { return std::exchange(intro_sounds_, {}); }
+    // Turns the doors the level's intro swings (LevelIntroSequence::door_swings) to where its
+    // Matinee has them `elapsed_sec` in. Past the last key they rest where it leaves them, which is
+    // also where a skipped intro puts them.
+    static void pose_intro_doors(LevelScene& scene, float elapsed_sec);
+    // Where the level intro's animation has its root this frame (Faith's feet).
+    [[nodiscard]] Vec3 intro_root_pos() const { return intro_root_pos_; }
 
     // Decoded RGBA8 video frame access for MetalRenderer upload
     [[nodiscard]] int get_video_width() const { return video_width_; }
@@ -116,6 +130,12 @@ private:
     double last_video_pts_sec_ = -1.0;
     std::vector<uint8_t> rgba_buffer_;
     uint64_t total_audio_samples_ = 0;
+
+    // The level intro being played: which of its sounds are still to come, and those just reached
+    bool level_intro_ = false;
+    size_t intro_next_sound_ = 0;
+    std::vector<IntroSoundEvent> intro_sounds_;
+    Vec3 intro_root_pos_{0.0f, 0.0f, 0.0f};
 
     // In-engine 3D Matinee camera keyframes
     std::vector<MatineeKeyframe> matinee_keys_;

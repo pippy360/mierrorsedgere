@@ -1077,6 +1077,23 @@ struct ReflectionVolumeInfo {
     bool enabled = true;
 };
 
+// One sound a level intro asks for: a Kismet action behind one of the Matinee's event keys, or a
+// notify of its animation.
+struct IntroSoundEvent {
+    float time = 0.0f;   // seconds from the start of the Matinee
+    std::string cue;     // SoundCue, with its group ("Cloth.Run", "Movement.Vault")
+    std::string bank;    // the content package the cue lives in ("A_Props_Interactive"); empty for a footstep
+    int footstep = 0;    // AnimNotify_Footstep: the footstep cue's number (1 Sneak .. 10 LandHard); 0 = play `cue`
+    bool voice = false;  // a dialogue line
+};
+
+// A door the intro swings: the InterpActor one of its movement tracks turns (the door Faith kicks
+// open in Boat, barges through in Subway and the Mall), as its yaw from closed through the Matinee.
+struct IntroDoorSwing {
+    Vec3 hinge{0.0f, 0.0f, 0.0f};                    // the InterpActor's Location
+    std::vector<std::pair<float, float>> yaw_keys;   // (seconds from the start of the Matinee, degrees from closed)
+};
+
 struct LevelIntroSequence {
     bool valid = false;
     std::string seq_name;                  // e.g. "sp01_intro", "sp02_intro", ..., "sp09_intro"
@@ -1089,6 +1106,19 @@ struct LevelIntroSequence {
     Vec3 start_feet_pos{0.0f, 0.0f, 0.0f}; // World-space root position at t = 0
     Vec3 end_feet_pos{0.0f, 0.0f, 0.0f};   // World-space root position at end of intro (post-intro floor)
     float end_yaw_deg = 0.0f;              // World-space camera/body facing yaw at end of intro
+    float matinee_length_sec = 0.0f;       // InterpData.InterpLength: how long the intro holds the player
+
+    // The first-person view through the animation, in world space, one entry per animation frame
+    // (evenly spaced over duration_sec): the EyeJoint's position, its view direction and up vector,
+    // and the root bone (the feet).
+    std::vector<Vec3> cam_pos;
+    std::vector<Vec3> cam_forward;
+    std::vector<Vec3> cam_up;
+    std::vector<Vec3> root_pos;
+
+    std::vector<IntroSoundEvent> sounds;   // sorted by time
+    std::vector<std::string> stop_cues;    // cues the Matinee stops when it completes or is skipped
+    std::vector<IntroDoorSwing> door_swings;
 };
 
 // -----------------------------------------------------------------------------

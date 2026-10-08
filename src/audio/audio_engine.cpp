@@ -1,6 +1,7 @@
 #include "audio_engine.hpp"
 #include "../assets/upk_loader.hpp"
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -1143,6 +1144,7 @@ void AudioEngine::play_sound(const std::string& name, float volume, float pitch)
     float final_pitch = pitch * slomo_pitch_scale_;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
     if (!clip) return;
+    if (play_log_on_) play_log_.push_back({name, "sound", clip->duration});
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
@@ -1168,6 +1170,7 @@ void AudioEngine::play_vo(const std::string& name, float volume) {
     float final_pitch = 1.0f;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
     if (!clip) return;
+    if (play_log_on_) play_log_.push_back({name, "vo", clip->duration});
 
     active_vo_clip_ = clip->name;
     vo_duration_ = clip->duration;
@@ -1207,6 +1210,7 @@ void AudioEngine::play_sound_3d(const std::string& name, const Vec3& world_pos, 
     float final_pitch = pitch * slomo_pitch_scale_;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
     if (!clip) return;
+    if (play_log_on_) play_log_.push_back({name, "sound3d", clip->duration});
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
@@ -1245,6 +1249,108 @@ void AudioEngine::play_footstep(ESurfaceMaterial surface, float speed, bool crou
     } else {
         play_sound("FX_Footstep", volume, 0.95f + 0.1f * rand_normalized());
     }
+}
+
+void AudioEngine::play_footstep_number(ESurfaceMaterial surface, int number, float volume) {
+    // A_Material_Footstep names its cues <Surface>._NN_Female_FootStep<Kind>.
+    static const char* const kKinds[] = {nullptr, "Sneak", "Walk", "Run", "Sprint", "SprintRelease", "WallRun",
+                                         "WallrunRelease", "LandSoft", "LandMedium", "LandHard", "Slide"};
+    if (number < 1 || number > 11) return;
+    char action[64];
+    std::snprintf(action, sizeof(action), "_%02d_Female_FootStep%s", number, kKinds[number]);
+    const std::string full_cue = std::string(surface_prefix(surface)) + "." + action;
+    float v = volume, p = 1.0f;
+    if (resolve_cue_or_clip(full_cue, v, p)) {
+        play_sound(full_cue, volume, 1.0f);
+    } else if (resolve_cue_or_clip(action, v, p)) {
+        play_sound(action, volume, 1.0f);
+    }
+}
+
+bool AudioEngine::play_cue(const std::string& group_and_name, bool voice, float volume) {
+    const size_t dot = group_and_name.rfind('.');
+    const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    for (const std::string& name : {group_and_name, bare}) {
+        float v = volume, p = 1.0f;
+        if (!resolve_cue_or_clip(name, v, p)) continue;
+        if (voice) {
+            play_vo(name, volume);
+        } else {
+            play_sound(name, volume, 1.0f);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool AudioEngine::has_cue(const std::string& group_and_name) const {
+    const size_t dot = group_and_name.rfind('.');
+    const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    for (const std::string& name : {group_and_name, bare}) {
+        float v = 1.0f, p = 1.0f;
+        if (resolve_cue_or_clip(name, v, p)) return true;
+    }
+    return false;
+}
+
+bool AudioEngine::load_cue_bank(const std::string& game_root, const std::string& package) {
+    namespace fs = std::filesystem;
+    if (package.empty() || !cue_banks_tried_.insert(package).second) return false;
+    const fs::path audio = fs::path(game_root) / "TdGame" / "CookedPC" / "Audio";
+    fs::path file = audio / (package + ".upk");
+    if (!fs::exists(file)) file = audio / "int" / (package + ".upk");
+    if (!fs::exists(file)) return false;
+    bool any = load_package_audio_and_cues(file.string());
+
+    // A cue can play waves that live in another package: dialogue keeps its cues in <name>_CUE.upk
+    // and the waves in <name>.upk, and A_Props_Interactive's door hits are A_CXP_Plaza's. Whichever
+    // of those is not loaded yet comes along.
+    std::vector<std::string> wave_packages;
+    if (const UPKPackage pkg(file.string()); pkg.is_valid()) {
+        const auto& imports = pkg.get_imports();
+        for (const FObjectImport& imp : imports) {
+            if (imp.class_name != "SoundNodeWave" || sound_clips_.count(imp.object_name)) continue;
+            const FObjectImport* top = &imp;
+            for (int guard = 0; top->outer_index < 0 && guard < 16; ++guard) {
+                const size_t outer = static_cast<size_t>(-top->outer_index - 1);
+                if (outer >= imports.size()) break;
+                top = &imports[outer];
+            }
+            if (top != &imp) wave_packages.push_back(top->object_name);
+        }
+    }
+    for (const std::string& name : wave_packages) any |= load_cue_bank(game_root, name);
+    if (any) {
+        stitch_concatenator_cues();
+        rebind_music_stem_buffers();
+    }
+    return any;
+}
+
+void AudioEngine::stop_cue(const std::string& group_and_name) {
+#ifndef ME_NO_OPENAL
+    if (headless_ || !alc_context_) return;
+    const size_t dot = group_and_name.rfind('.');
+    const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    for (const std::string& name : {group_and_name, bare}) {
+        float v = 1.0f, p = 1.0f;
+        const SoundClip* clip = resolve_cue_or_clip(name, v, p);
+        if (!clip) continue;
+        const std::string key = !clip->full_path.empty() ? clip->full_path : clip->name;
+        for (const std::string& variant : {key, key + ":mono3d"}) {
+            const auto it = al_buffers_.find(variant);
+            if (it == al_buffers_.end() || !it->second) continue;
+            for (size_t i = 0; i < kSourcePoolSize; ++i) {
+                ALint buffer = 0;
+                alGetSourcei(sources_[i], AL_BUFFER, &buffer);
+                if (static_cast<ALuint>(buffer) == it->second) alSourceStop(sources_[i]);
+            }
+        }
+        return;
+    }
+#else
+    (void)group_and_name;
+#endif
 }
 
 void AudioEngine::play_handstep(ESurfaceMaterial surface, bool hard_impact, float volume) {

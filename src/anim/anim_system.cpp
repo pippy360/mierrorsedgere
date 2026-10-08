@@ -1,4 +1,5 @@
 #include "anim_system.hpp"
+#include <mutex>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -828,6 +829,91 @@ bool AnimSystem::parse_anim_set_package(const UPKPackage& pkg, AnimSetAsset& out
     }
 
     return !out_anim_set.sequences.empty();
+}
+
+// Faith's first-person skeleton, parsed once per game root.
+static const SkeletalMeshAsset* first_person_skeleton(const std::string& game_root) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, SkeletalMeshAsset> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = cache.find(game_root);
+    if (it == cache.end()) {
+        SkeletalMeshAsset mesh;
+        UPKPackage pkg(game_root + "/TdGame/CookedPC/Characters/CH_TKY_Crim_Fixer_1P.upk");
+        if (pkg.is_valid()) {
+            for (const auto& exp : pkg.get_exports()) {
+                if (pkg.get_export_class(exp) == "SkeletalMesh" && exp.object_name == "SK_UpperBody") {
+                    AnimSystem::parse_skeletal_mesh(pkg, exp, mesh);
+                    break;
+                }
+            }
+        }
+        it = cache.emplace(game_root, std::move(mesh)).first;
+    }
+    return it->second.bones.empty() ? nullptr : &it->second;
+}
+
+int AnimSystem::count_first_person_tracks(const std::string& game_root, const AnimSetAsset& set, bool* has_eye_joint) {
+    if (has_eye_joint) *has_eye_joint = false;
+    const SkeletalMeshAsset* mesh = first_person_skeleton(game_root);
+    if (!mesh) return 0;
+    int count = 0;
+    for (const std::string& bone : set.track_bone_names) {
+        const std::string key = to_lower_str(bone);
+        if (mesh->bone_name_to_index.count(key) == 0) continue;
+        ++count;
+        if (has_eye_joint && key == "eyejoint") *has_eye_joint = true;
+    }
+    return count;
+}
+
+bool AnimSystem::bake_canned_camera(const std::string& game_root, const AnimSetAsset& set, const AnimSequenceAsset& seq,
+                                    std::vector<CannedCameraFrame>& out_frames, const AnimTrack* pawn_root) {
+    out_frames.clear();
+    const SkeletalMeshAsset* mesh = first_person_skeleton(game_root);
+    if (!mesh || seq.tracks.empty()) return false;
+    // The view is the CameraJoint, the EyeJoint's child (it faces the other way along the eye's axis).
+    auto eye_it = mesh->bone_name_to_index.find("camerajoint");
+    if (eye_it == mesh->bone_name_to_index.end()) eye_it = mesh->bone_name_to_index.find("eyejoint");
+    if (eye_it == mesh->bone_name_to_index.end()) return false;
+    const size_t eye = static_cast<size_t>(eye_it->second);
+
+    const int frames = std::max(2, seq.num_frames);
+    out_frames.resize(static_cast<size_t>(frames));
+    std::vector<Vec3> local_pos, comp_pos;
+    std::vector<Quat4> local_quat, comp_quat;
+    for (int f = 0; f < frames; ++f) {
+        // sample_sequence_pose wraps 1.0 back to the first key, as a looping animation wants.
+        const float norm = std::min(static_cast<float>(f) / static_cast<float>(frames - 1), 0.999999f);
+        sample_sequence_pose(*mesh, set, &seq, norm, local_pos, local_quat);
+        if (pawn_root) {
+            // The same keys-over-the-length reading sample_sequence_pose gives every track.
+            if (const size_t n = pawn_root->positions.size(); n > 0) {
+                const float fi = norm * static_cast<float>(n - 1);
+                const size_t i0 = static_cast<size_t>(fi);
+                const size_t i1 = std::min(i0 + 1, n - 1);
+                local_pos[0] = pawn_root->positions[i0] + (pawn_root->positions[i1] - pawn_root->positions[i0]) * (fi - static_cast<float>(i0));
+            }
+            if (const size_t n = pawn_root->rotations.size(); n > 0) {
+                const float fi = norm * static_cast<float>(n - 1);
+                const size_t i0 = static_cast<size_t>(fi);
+                const size_t i1 = std::min(i0 + 1, n - 1);
+                local_quat[0] = Quat4::slerp(pawn_root->rotations[i0], pawn_root->rotations[i1], fi - static_cast<float>(i0));
+            }
+        }
+        // UE3 stores every bone's rotation but the root's with W negated, so in the convention the
+        // other tracks are read in, the root's is the inverse. Poses taken relative to a bone (the
+        // first-person body around the eye) never notice; a pose placed in the world does.
+        local_quat[0] = local_quat[0].conjugate();
+        compute_skeleton_fk(mesh->bones, local_pos, local_quat, comp_pos, comp_quat);
+        // The camera looks along its +Z with -Y up.
+        CannedCameraFrame& out = out_frames[static_cast<size_t>(f)];
+        out.eye_pos = comp_pos[eye];
+        out.forward = comp_quat[eye].rotate(Vec3(0.0f, 0.0f, 1.0f));
+        out.up = comp_quat[eye].rotate(Vec3(0.0f, -1.0f, 0.0f));
+        out.root_pos = comp_pos[0];
+    }
+    return true;
 }
 
 bool AnimSystem::parse_single_anim_sequence(const UPKPackage& pkg, int32_t seq_export_index_1,

@@ -220,6 +220,23 @@ public:
 
     // Standalone binary parsers exposed for inspection and unit verification
     static bool parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport& exp, SkeletalMeshAsset& out_mesh);
+
+    // The first-person view through a canned full-body animation (a level intro). For each frame of
+    // `seq`: the EyeJoint's position, view direction and up vector and the root bone's position, in
+    // the animation's own space, from the pose of Faith's first-person skeleton (SK_UpperBody).
+    struct CannedCameraFrame {
+        Vec3 eye_pos{0.0f, 0.0f, 0.0f};
+        Vec3 forward{0.0f, 0.0f, 1.0f};
+        Vec3 up{0.0f, -1.0f, 0.0f};
+        Vec3 root_pos{0.0f, 0.0f, 0.0f};
+    };
+    // `pawn_root`, when given, is the root track the pawn itself follows (the full-body version of
+    // the animation, which drives the pawn's own mesh): the first-person pose is carried on it in
+    // place of its own root.
+    static bool bake_canned_camera(const std::string& game_root, const AnimSetAsset& set, const AnimSequenceAsset& seq,
+                                   std::vector<CannedCameraFrame>& out_frames, const AnimTrack* pawn_root = nullptr);
+    // How many of `set`'s tracks drive a bone of that skeleton, and whether EyeJoint is one of them.
+    static int count_first_person_tracks(const std::string& game_root, const AnimSetAsset& set, bool* has_eye_joint);
     static bool parse_anim_set_package(const UPKPackage& pkg, AnimSetAsset& out_anim_set);
     static bool parse_single_anim_sequence(const UPKPackage& pkg, int32_t seq_export_index_1, AnimSetAsset& out_anim_set);
     static bool parse_dxt1_texture(const UPKPackage& pkg, const std::string& tex_name, DXT1Texture& out_tex);

@@ -2298,16 +2298,22 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             impl->draw_ui_quad(cs_hud, 0.0f, h - bar_h, w, bar_h, ui_color(0.0f, 0.0f, 0.0f, 0.88f));
         }
 
-        // Top-right Skip / Next Cutscene controls + progress bar
-        std::string ctrl_str = "[SPACE / ENTER] SKIP CUTSCENE   |   [C] NEXT CUTSCENE";
-        impl->draw_ui_text(cs_hud, ctrl_str, w - 535.0f, 14.0f, 1.55f, ui_color(0.88f, 0.90f, 0.94f, 0.88f));
-        float prog = (cp->get_duration() > 0.0f)
-                         ? std::clamp(cp->get_current_time() / cp->get_duration(), 0.0f, 1.0f)
-                         : 0.0f;
-        impl->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f, 6.0f, ui_color(0.18f, 0.20f, 0.24f, 0.75f));
-        impl->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f * prog, 6.0f, ui_color(0.902f, 0.078f, 0.078f, 0.95f));
-        impl->draw_ui_text(cs_hud, "CUTSCENE: " + cp->get_movie_name(), 28.0f, 26.0f, 1.5f,
-                           ui_color(0.85f, 0.88f, 0.92f, 0.85f));
+        if (cp->is_level_intro()) {
+            // A level's own intro carries what retail shows over it: the skip prompt, top left.
+            impl->draw_ui_text(cs_hud, "Press SPACE to skip", w * 0.074f, h * 0.105f, 1.9f,
+                               ui_color(0.86f, 0.88f, 0.90f, 0.85f));
+        } else {
+            // Top-right Skip / Next Cutscene controls + progress bar
+            std::string ctrl_str = "[SPACE / ENTER] SKIP CUTSCENE   |   [C] NEXT CUTSCENE";
+            impl->draw_ui_text(cs_hud, ctrl_str, w - 535.0f, 14.0f, 1.55f, ui_color(0.88f, 0.90f, 0.94f, 0.88f));
+            float prog = (cp->get_duration() > 0.0f)
+                             ? std::clamp(cp->get_current_time() / cp->get_duration(), 0.0f, 1.0f)
+                             : 0.0f;
+            impl->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f, 6.0f, ui_color(0.18f, 0.20f, 0.24f, 0.75f));
+            impl->draw_ui_quad(cs_hud, 28.0f, 16.0f, 220.0f * prog, 6.0f, ui_color(0.902f, 0.078f, 0.078f, 0.95f));
+            impl->draw_ui_text(cs_hud, "CUTSCENE: " + cp->get_movie_name(), 28.0f, 26.0f, 1.5f,
+                               ui_color(0.85f, 0.88f, 0.92f, 0.85f));
+        }
 
         // Synchronized localized dialogue subtitle
         const std::string& sub = cp->get_active_subtitle();
