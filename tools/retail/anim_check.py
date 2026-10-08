@@ -65,6 +65,9 @@ def read_samples(path):
 
 
 MOVE_FALLING, MOVE_JUMP = 2, 11
+# Moves whose StartMove picks the animation: vaults, the pull up, the wall run jump, landing, swing,
+# zip line, barges and the melee moves.
+PICKS_AT_START = {8, 9, 10, 12, 17, 19, 20, 27, 32, 48, 60, 62, 63, 85}
 # Moves a fall ends in with the feet on the ground.
 GROUND_MOVES = {1, 15, 16, 20, 26, 78, 91}
 
@@ -83,11 +86,18 @@ def level_hints(run, names):
     out = [[-1.0, 0, 0, 0, 1, "-"] for _ in range(n)]
     # Braking is the ground friction alone, 8 a second off the speed; anything gentler is the player
     # still pushing.
+    # (The recorder sometimes samples one game frame twice: no change in speed says nothing.)
     speed = [math.hypot(d["vx"], d["vy"]) for d in run]
+    pushing = 0
     for i in range(n):
         dt = run[i]["t"] - run[i - 1]["t"] if i else 0.0
-        braking = i > 0 and dt > 0.0 and speed[i] < speed[i - 1] * (1.0 - 6.0 * dt)
-        out[i][4] = 0 if (speed[i] < 1.0 or braking) else 1
+        if speed[i] < 1.0:
+            pushing = 0
+        elif i > 0 and dt > 0.0 and abs(speed[i] - speed[i - 1]) > 0.05:
+            pushing = 0 if speed[i] < speed[i - 1] * 0.93 else 1
+        elif i == 0:
+            pushing = 1
+        out[i][4] = pushing
     leaf_names = [[a[0].lower() for a in d["anim1p"]] for d in run]
     # Where each stretch of one movement state ends.
     end = [0] * n
@@ -108,8 +118,8 @@ def level_hints(run, names):
         if any(s.startswith("hangfree") for s in seen):
             out[i][3] = 1
     # The animation a move picked: the frame retail first shows one of the director's named
-    # animations (or shows it started over), moved back to the start of the move when that is no
-    # more than 2 frames before.
+    # animations (or shows it started over). A move that picks its animation as it starts gets it
+    # on its first frame when retail shows it within 2 frames of that.
     for i in range(n):
         recent = set()
         for k in range(max(0, i - 3), i):
@@ -124,12 +134,11 @@ def level_hints(run, names):
         if name.startswith("springboard"):
             name = "@reached"
         at = i
-        for k in range(i, max(-1, i - 3), -1):
-            if k == 0 or run[k - 1]["move"] != run[k]["move"]:
-                at = k
-                break
-        if name == "@reached":
-            at = max(0, i - 1)
+        if name != "@reached" and run[i]["move"] in PICKS_AT_START:
+            for k in range(i, max(-1, i - 3), -1):
+                if k == 0 or run[k - 1]["move"] != run[k]["move"]:
+                    at = k
+                    break
         if out[at][5] == "-":
             out[at][5] = name
         elif out[i][5] == "-":

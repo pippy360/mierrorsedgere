@@ -533,7 +533,7 @@ void Director::tick(const PawnFrame& frame) {
     if (frame.movement == EMovement::MOVE_Walking && was_accelerating_ && !frame.accelerating) {
         const float at = tree_.walk_cycle();
         const bool right = at > 0.21f && at < 0.71f;
-        play(Slot::LowerBody, right ? "walktostandpassright" : "walktostandpassleft", 1.0f, 0.1f, 0.2f);
+        play(Slot::LowerBody, right ? "walktostandpassright" : "walktostandpassleft", 1.0f, 0.1f, 0.15f);
     }
     was_accelerating_ = frame.accelerating;
 
