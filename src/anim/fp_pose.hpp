@@ -44,6 +44,8 @@ public:
     // its own `weaponpose` differs by from the common set's, so one set of armed animations grips
     // every weapon. Null sets clear it.
     void set_weapon_pose(const AnimSetAsset* weapon_set, const AnimSetAsset* common_set, const std::vector<int>& bones);
+    // TdAnimNodeWeaponPoseOffset.bDisable: a disarm turns the grip offsets off while it plays.
+    void set_grip_enabled(bool on) { grip_ = on; }
 
     // TdSkelControlAim1p on SpineXRight / SpineXLeft: how far each arm is turned with the view's pitch.
     struct Aim {
@@ -89,6 +91,7 @@ private:
     std::vector<int> pose_bones_;             // the weapon pose profile's bones, with what each is turned and moved by
     std::vector<Quat4> pose_rot_;
     std::vector<Vec3> pose_pos_;
+    bool grip_ = true;
     int spine_right_ = -1, spine_left_ = -1, shoulder_right_ = -1, hips_ = -1;
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;

@@ -63,6 +63,12 @@ struct MoveAnim {
 // (which vault, which ledge, which rung), with the arguments its script gives. The controller
 // names the animation (PawnFrame::move_anim); how it is played is here.
 const MoveAnim kMoveAnims[] = {
+    // TdMove_Disarm.PlayDisarmStart: PlayMoveAnim(Canned, DisarmAnim, 1.0, 0.1, 0.0) out of the
+    // weapon's set (UpdateAnimSets(DisarmedWeapon) comes first).
+    {"snatchfwd", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchfwd2", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchfwd3", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchback", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
     // TdMove_SpeedVault / TdMove_VaultOver: VaultTypes[].AnimName, PlayMoveAnim(FullBody, AnimToPlay, 1.0, 0.15, 0.2).
     {"autostepuprightleg", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
     {"stepuprightleg88", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
@@ -235,11 +241,22 @@ void Director::tick_weapon(const PawnFrame& frame) {
         ready_for_ = 0.0f;
         amount_til_unarmed_ = light ? 1000.0f : 0.0f;
     };
+    if (frame.movement == EMovement::MOVE_Snatch) {
+        // TdMove_Disarm.TakeDisarmedPawnsWeapon: the weapon's sets are in but the state is unarmed
+        // (SetWeaponAnimState(0)) while the canned animation takes it off the enemy; it is hers at
+        // the ready as the move ends, with nothing drawn from a holster.
+        was_armed_ = true;
+        make_ready();
+        pawn_.weapon_state = 0;
+        pawn_.armed_right = pawn_.armed_left = 0.0f;
+        return;
+    }
     if (!was_armed_) {
         was_armed_ = true;
         tree_.play_custom_anim(Slot::CannedUpperBody, "unholster", 1.0f, 0.0f, 0.2f, false, true);
         make_ready();
     }
+    if (pawn_.weapon_state == 0) make_ready();
     if (frame.fired) {
         // PlayCustomAnim(CNT_Weapon, 'standfire', 1.0, 0.1, 0.0). (The script gives no blend out and
         // marks the node as a firing animation for native code to clear; here it goes back to the
@@ -605,6 +622,13 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBody, 0.15f);
             tree_.stop_custom_anim(Slot::UpperBody, 0.2f);
             set_animation_state(EMovement::MOVE_None);
+            break;
+        case EMovement::MOVE_Snatch:
+            // The disarm's animation is played with no blend out, so it holds its last frame, the
+            // weapon in her hands, and the move ends with it (OnCustomAnimEnd). Nothing in the
+            // script lets the slot go; here it gives way to the weapon's stance over 0.2 s, the time
+            // AbortDisarm takes it off in.
+            tree_.stop_custom_anim(Slot::Canned, 0.2f);
             break;
         case EMovement::MOVE_MeleeAir:
         case EMovement::MOVE_MeleeWallrun:

@@ -13,6 +13,24 @@ namespace {
 // cylinder ("sweep out the axis aligned bounding box of just the CollisionComponent").
 constexpr float kPawnRadius = 30.0f;
 constexpr float kPawnHeight = 180.0f;
+
+// SequenceLength of the first-person disarm animations: the weapon's own set where it has them
+// (AS_C1P_TwoHanded_*), else AS_C1P_OneHanded_Common's.
+float snatch_length(const std::string& weapon, const std::string& anim) {
+    struct Row { const char* weapon; float fwd, back; };
+    static const Row kOwn[] = {
+        {"FNMinimi", 3.8667f, 4.6667f}, {"FNSCARL", 2.3333f, 1.5f}, {"G36C", 2.3333f, 1.5f}, {"M95", 2.1f, 1.5f},
+        {"MP5K", 2.5333f, 1.5f}, {"Neostead", 2.4333f, 1.5f}, {"Remington", 1.5f, 1.9333f},
+    };
+    const bool back = anim == "SnatchBack";
+    for (const Row& r : kOwn) {
+        if (weapon.find(r.weapon) != std::string::npos) return back ? r.back : r.fwd;
+    }
+    if (back) return 1.9667f;
+    if (anim == "SnatchFwd2") return 2.1f;
+    if (anim == "SnatchFwd3") return 2.0333f;
+    return 2.5333f;
+}
 constexpr float kCrouchHeight = 122.0f;
 // Camera heights above the feet: BaseEyeHeight 76 above the cylinder centre (90) when standing;
 // the crouch / slide cameras ride the lowered first-person skeleton.
@@ -685,9 +703,21 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             }
 
             case EMovement::MOVE_Snatch: {
-                // Smoothly damp velocity during weapon disarm animation (SnatchFwd / SnatchBack)
-                m_telemetry.velocity.x *= std::max(0.0f, 1.0f - 10.0f * step_dt);
-                m_telemetry.velocity.y *= std::max(0.0f, 1.0f - 10.0f * step_dt);
+                // TdMove_Disarm: she has no velocity of her own; AlignPawn flies her to DisarmOffset
+                // from the enemy (SetPreciseLocation), where the two canned animations meet.
+                m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+                if (m_snatch_align) {
+                    Vec3 to = m_snatch_target - m_telemetry.position;
+                    to.z = 0.0f;
+                    const float dist = to.length();
+                    const float step = m_snatch_speed * step_dt;
+                    if (dist <= step) {
+                        if (dist > 1e-3f) move_swept(to, kPawnHeight, 0.0f, scene);
+                        m_snatch_align = false;
+                    } else if (move_swept(to * (step / dist), kPawnHeight, 0.0f, scene).hit) {
+                        m_snatch_align = false;  // something in the way (retail moves the enemy instead)
+                    }
+                }
                 if (m_state_timer >= m_telemetry.combat_anim_duration) {
                     m_telemetry.move_state = m_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
                 }
@@ -4558,14 +4588,21 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             m_telemetry.move_state = EMovement::MOVE_Snatch;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_time = 0.0f;
-            m_telemetry.combat_anim_duration = 0.68f;
             m_telemetry.snatch_from_back = candidate_from_back;
             m_telemetry.hit_marker_timer = 0.35f;
 
-            // Orient Faith toward the enemy being disarmed
+            // TdMove_Disarm.StartMove: she faces the enemy with a level view (TargetRotation,
+            // ResetCameraLook(0.2)) and is flown to DisarmOffset (ChooseDisarmType: 125.899) short
+            // of them at 400 uu/s, or her own speed if that is more, when they stand level.
             Vec3 to_bot = (bot.position - m_telemetry.position).normalized_xy();
+            m_snatch_align = false;
             if (to_bot.length_sq() > 1e-4f) {
                 m_telemetry.yaw_deg = std::atan2(to_bot.y, to_bot.x) * RAD2DEG;
+                m_pawn_yaw = m_telemetry.yaw_deg;
+                camera_look_at(m_telemetry.yaw_deg, 0.0f, 0.2f, -1.0f);
+                m_snatch_target = bot.position - to_bot * 125.899f;
+                m_snatch_speed = std::max(400.0f, m_telemetry.velocity.length_xy());
+                m_snatch_align = std::abs(bot.position.z - m_telemetry.position.z) <= 3.0f;
             }
 
             std::string snatched_wep = bot.weapon_name;
@@ -4590,6 +4627,18 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             }
 
             equip_weapon(snatched_wep);
+            // TdMove_Disarm.ChooseDisarmType: from behind SnatchBack; from the front SnatchFwd, and
+            // for a patrol cop's light weapon one of three (of two for the TMP; Rand in the game,
+            // in turn here). The move lasts as long as the animation (OnCustomAnimEnd).
+            const char* snatch = candidate_from_back ? "SnatchBack" : "SnatchFwd";
+            if (!candidate_from_back && !ws.is_two_handed && bot.archetype.find("PatrolCop") != std::string::npos) {
+                static const char* const kFront[] = {"SnatchFwd", "SnatchFwd2", "SnatchFwd3"};
+                const bool tmp = snatched_wep.find("TMP") != std::string::npos || snatched_wep.find("Steyr") != std::string::npos;
+                snatch = tmp ? kFront[1 + m_disarm_count % 2] : kFront[m_disarm_count % 3];
+            }
+            ++m_disarm_count;
+            m_telemetry.combat_anim_duration = snatch_length(snatched_wep, snatch);
+            set_move_anim(snatch);
             m_telemetry.active_subtitle = std::string(candidate_from_back ? "Stealth Disarm (" : "Weapon Disarmed (") +
                                           ws.display_name + ")!";
         } else if (ws.equipped && ws.drop_timer <= 0.0f && !input.use) {

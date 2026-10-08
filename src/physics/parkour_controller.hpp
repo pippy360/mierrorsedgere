@@ -304,6 +304,11 @@ private:
     int m_melee_combo_index = 0;
     float m_melee_combo_reset_timer = 0.0f;
     int m_weapon_cycle_index = 0;
+    // TdMove_Disarm: where AlignPawn flies her (DisarmOffset from the enemy) and how fast.
+    Vec3 m_snatch_target{0.0f, 0.0f, 0.0f};
+    float m_snatch_speed = 0.0f;
+    bool m_snatch_align = false;
+    int m_disarm_count = 0;
     bool m_jump_consumed = false;
     bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
 

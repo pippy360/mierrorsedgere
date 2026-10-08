@@ -272,7 +272,7 @@ void PoseEvaluator::atoms(const AnimTree& tree, int index, Pose& out, size_t dep
     }
     apply_aim(n, static_cast<size_t>(index), out);
     // TdAnimNodeWeaponPoseOffset: the grip of the weapon in hand.
-    if (!pose_bones_.empty() && n.cls == "TdAnimNodeWeaponPoseOffset") {
+    if (grip_ && !pose_bones_.empty() && n.cls == "TdAnimNodeWeaponPoseOffset") {
         for (size_t k = 0; k < pose_bones_.size(); ++k) {
             const size_t b = static_cast<size_t>(pose_bones_[k]);
             out.rot[b] = Quat4::multiply(pose_rot_[k], out.rot[b]).normalized();

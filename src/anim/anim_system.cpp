@@ -1592,6 +1592,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         fp.last_frame = frame;
         // At the ready the weapon arm follows the view (TdSkelControlAim1p), both arms with a two-handed weapon.
         fp::PoseEvaluator::Aim aim;
+        fp.poser.set_grip_enabled(telemetry.move_state != EMovement::MOVE_Snatch);
         aim.pitch_deg = telemetry.pitch_deg;
         aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready();
         aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready();
@@ -1613,11 +1614,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
     // A level intro and the death fall carry their own camera and body.
     if (fp.pose.pos.empty() || telemetry.intro_active || telemetry.falling_to_death) return use;
     use.camera = true;
-    // Snatching a weapon the arms are still posed by hand (evaluate_faith_1p); the legs and the eye
-    // are the tree's.
-    const bool by_hand = telemetry.move_state == EMovement::MOVE_Snatch;
-    use.body = !by_hand;
-    use.legs = by_hand;
+    use.body = true;
     return use;
 }
 
