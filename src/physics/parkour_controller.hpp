@@ -55,6 +55,9 @@ public:
 
     // Telemetry and State Accessors
     [[nodiscard]] const PlayerTelemetry& get_telemetry() const { return m_telemetry; }
+    // TdPlayerPawn.CalcCamera's last step, once a frame after the step: the move's
+    // CheckForCameraCollision with the eye of the first-person mesh as it is without any offset.
+    void update_camera_collision(const Vec3& eye, float dt, const LevelScene& scene);
     [[nodiscard]] PlayerTelemetry& get_telemetry() { return m_telemetry; }
 
     [[nodiscard]] const MovementConfig& get_config() const { return m_config; }
@@ -384,6 +387,9 @@ private:
     float m_ignore_look_time = 0.0f;        // TdPawn.bIgnoreLookInput: > 0 seconds left, < 0 until the move ends
     float m_reset_look_time = -1.0f;        // TdMove.ResetCameraLook: seconds left (< 0 = inactive)
     bool m_look_at_active = false;          // TdMove.SetLookAtTargetAngle
+    Vec3 m_cam_mesh_offset{0.0f, 0.0f, 0.0f};  // what OffsetMeshXY has the mesh at
+    bool m_cam_constrain_look = false;      // TdMove_Walking.bConstrainLook from its camera check
+    float m_cam_min_pitch = 0.0f;           // and its MinLookConstraint.Pitch, in Unreal units
     float m_look_at_yaw = 0.0f;
     float m_look_at_pitch = 0.0f;
     float m_look_at_interp = 0.2f;          // LookAtTargetInterpolationTime

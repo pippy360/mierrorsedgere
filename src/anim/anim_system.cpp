@@ -2642,8 +2642,9 @@ void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, 
     if (tick_first_person(telemetry).camera) {
         const fp::ViewFrame& v = fp_->view;
         const Rotator body = Rotator::from_degrees(0.0f, telemetry.body_yaw_deg, 0.0f);
+        // ... moved with the mesh where a wall is too close in front of it (TdPawn.OffsetMeshXY).
         out_pos = telemetry.position + Vec3(0.0f, 0.0f, v.eye_pawn.z - kMeshOriginBelowFeet) + body.forward() * v.eye_pawn.x +
-                  body.right() * v.eye_pawn.y;
+                  body.right() * v.eye_pawn.y + telemetry.camera_mesh_offset;
         out_rot = Rotator::from_degrees(telemetry.pitch_deg + v.anim_pitch, telemetry.yaw_deg + v.anim_yaw, v.anim_roll);
         return;
     }

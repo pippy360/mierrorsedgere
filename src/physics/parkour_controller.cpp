@@ -363,6 +363,10 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.combat_anim_duration = 0.45f;
     m_telemetry.melee_variant = 0;
     m_telemetry.snatch_from_back = false;
+    m_cam_mesh_offset = Vec3(0.0f, 0.0f, 0.0f);
+    m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+    m_cam_constrain_look = false;
+    m_snatch_align = false;
     m_telemetry.melee_hit_confirmed = false;
     m_telemetry.disarm_prompt_visible = false;
     m_telemetry.hit_marker_timer = 0.0f;
@@ -1034,6 +1038,94 @@ void ParkourController::camera_reset_look(float seconds) {
     m_reset_look_time = std::max(0.0f, seconds);  // CancelResetCameraLookTime = Now + seconds
 }
 
+// TdMove.CheckForCameraCollision and the moves' own (Walking, Crouch, Slide, GrabPullUp, SpeedVault):
+// a 2 uu box swept from 5 behind the camera to a little ahead of it, and where it meets something
+// TdPawn.OffsetMeshXY moves the first-person mesh, and so the eye, back by what is missing. The
+// script adds the miss each frame to a mesh that is already offset, which settles with the box's
+// end just clear; here the eye comes in without the offset, so one sweep gives that place.
+void ParkourController::update_camera_collision(const Vec3& eye, float dt, const LevelScene& scene) {
+    const EMovement m = m_telemetry.move_state;
+    const Vec3 extent(2.0f, 2.0f, 2.0f);
+    // How far short of `reach` ahead of the camera the box stops, in the plane (0 with nothing there).
+    auto miss = [&](const Vec3& dir, float reach, float lift, Vec3* back) {
+        const Vec3 start = eye - dir * 5.0f;
+        const Vec3 end = eye + dir * reach + Vec3(0.0f, 0.0f, lift);
+        const TraceHit hit = sweep_box(start, extent, end - start, scene);
+        if (!hit.hit) return 0.0f;
+        const Vec3 at = start + (end - start) * hit.fraction;  // HitLocation: the box's centre
+        if (back) *back = Vec3(at.x - end.x, at.y - end.y, 0.0f);
+        return (end - at).length_xy();
+    };
+    const Vec3 facing = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();
+    Vec3 want(0.0f, 0.0f, 0.0f);
+    bool base = false;
+    switch (m) {
+        case EMovement::MOVE_Walking:
+        case EMovement::MOVE_Jump:
+        case EMovement::MOVE_Melee:
+        case EMovement::MOVE_180Turn:
+        case EMovement::MOVE_Vertigo:
+        case EMovement::MOVE_WallRunningLeft:
+        case EMovement::MOVE_WallRunningRight:
+            base = true;  // bUseCameraCollision with TdMove's own check
+            break;
+        case EMovement::MOVE_Crouch:
+        case EMovement::MOVE_Slide:
+            // The first 0.2 s of both: 15 ahead and 5 up, and a unit more than the miss.
+            if (m_state_timer < 0.2f) {
+                const float d = miss(facing, 15.0f, 5.0f, nullptr);
+                if (d > 0.0f) want = facing * -(d + 1.0f);
+            } else if (m == EMovement::MOVE_Crouch) {
+                base = true;
+            }
+            break;
+        case EMovement::MOVE_GrabPullUp: {
+            // Along the view, 20 ahead; the offset is HitLocation - TraceEnd in the world.
+            const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+            miss(view, 20.0f, 0.0f, &want);
+            break;
+        }
+        case EMovement::MOVE_SpeedVaulting:
+        case EMovement::MOVE_VaultOver: {
+            // CameraCollisionDirection = MoveNormal cross (0, 0, -1): to the side she vaults on.
+            const Vec3 n = horiz(m_telemetry.wall_normal);
+            if (n.length_sq() > 0.25f) miss(n.normalized().cross(Vec3(0.0f, 0.0f, -1.0f)), 15.0f, 0.0f, &want);
+            break;
+        }
+        default:
+            break;
+    }
+    if (base) want = facing * -miss(facing, 11.0f, 0.0f, nullptr);
+
+    // OffsetMeshXY is native. Taken here as: back at once, and let out again at kCameraMeshReturn.
+    constexpr float kCameraMeshReturn = 60.0f;  // uu/s
+    if (want.length_xy() >= m_cam_mesh_offset.length_xy()) {
+        m_cam_mesh_offset = want;
+    } else {
+        const Vec3 d = want - m_cam_mesh_offset;
+        const float step = kCameraMeshReturn * dt;
+        m_cam_mesh_offset = d.length_xy() <= step ? want : m_cam_mesh_offset + d * (step / d.length_xy());
+    }
+    m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+
+    // TdMove_Walking.CheckForCameraCollision goes on (AgainstWallState 0): the same box along the
+    // view, 15 ahead. Met, the view cannot go further down than it is, and met inside the last
+    // fifth of the sweep, or as the limit comes on, it is brought up by how soon it was met.
+    const bool was = m_cam_constrain_look;
+    m_cam_constrain_look = false;
+    if (m == EMovement::MOVE_Walking) {
+        const Vec3 camera = eye + m_cam_mesh_offset;
+        const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+        const Vec3 start = camera - view * 5.0f;
+        const TraceHit hit = sweep_box(start, extent, view * 20.0f, scene);
+        if (hit.hit) {
+            const float pitch = m_telemetry.pitch_deg * kUUPerDeg;
+            m_cam_min_pitch = (!was || hit.fraction < 0.8f) ? std::trunc(pitch * hit.fraction) : pitch;
+            m_cam_constrain_look = true;
+        }
+    }
+}
+
 void ParkourController::camera_look_at(float yaw, float pitch, float interp_time, float duration) {
     m_look_at_active = true;
     m_look_at_is_location = false;
@@ -1244,7 +1336,16 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
     }
 
     // ... the move's look constraint limits the frame's turn, relative to the body ...
-    const MoveCamera mc = move_camera(m);
+    MoveCamera mc = move_camera(m);
+    if (m == EMovement::MOVE_Walking && m_cam_constrain_look) {
+        // TdMove_Walking.CheckForCameraCollision: with something right in front of the camera she
+        // cannot look further down (bConstrainLook; nothing limits the yaw or looking up).
+        mc.constrain = true;
+        mc.pitch_min = m_cam_min_pitch;
+        mc.pitch_max = 32768.0f;
+        mc.yaw_min = -65536.0f;
+        mc.yaw_max = 65536.0f;
+    }
     if (mc.constrain) {
         const float speed = dt / 0.2f;
         float lo = mc.yaw_min, hi = mc.yaw_max;

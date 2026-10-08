@@ -2105,6 +2105,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 }
             } else {
                 controller.step(input, dt, active_scene);
+                // TdPlayerPawn.CalcCamera: the move checks the camera against the walls with the
+                // eye the first-person tree has for this frame.
+                Vec3 eye;
+                Rotator eye_rot;
+                renderer.player_camera(controller.get_telemetry(), eye, eye_rot);
+                controller.update_camera_collision(eye - controller.get_telemetry().camera_mesh_offset, dt, active_scene);
             }
             if (audio.is_vo_playing()) {
                 was_vo_playing = true;
