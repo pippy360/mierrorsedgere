@@ -3186,6 +3186,14 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
             st = EMovement::MOVE_GrabPullUp;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+            {
+                // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
+                // room to stand on top.
+                const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+                const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
+                set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
+                                                       : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
+            }
             return;
         }
         const float push = std::clamp(fwd.dot(n), 0.0f, 1.0f);
@@ -3203,6 +3211,14 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         st = EMovement::MOVE_GrabPullUp;
         m_state_timer = 0.0f;
         m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+        {
+            // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
+            // room to stand on top.
+            const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+            const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
+            set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
+                                                   : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
+        }
         return;
     }
     if (m_crouch_pressed || (input.forward < -0.8f && m_hang_time > 0.2f)) {
