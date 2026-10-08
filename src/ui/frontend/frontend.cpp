@@ -553,7 +553,8 @@ void Frontend::draw_label(Frame& f, const Font& font, const std::string& text, c
     y = std::round(y);
     if (shadow_color && shadow_color[3] > 0.0f) {
         // UIComp_TdDropShadowString: the offsets are fractions of the line height.
-        draw_text(f, font, text, x + std::round(shadow_dx * line), y + std::round(shadow_dy * line), shadow_color);
+        // and are not put back on whole pixels; down, one pixel less (docs/SUB_MENUS_RE.md, 2.5).
+        draw_text(f, font, text, x + shadow_dx * line, y + shadow_dy * line - 1.0f, shadow_color);
     }
     draw_text(f, font, text, x, y, color);
 }
@@ -668,25 +669,10 @@ void Frontend::draw_menu(Frame& f) const {
             float shadow[4];
             ui_color(kNavyRGB[0], kNavyRGB[1], kNavyRGB[2], opacity, navy);
             ui_color(kShadowRGB[0], kShadowRGB[1], kShadowRGB[2], 0.34f * opacity, shadow);
-            // CLIP_Wrap, right-aligned: break on spaces to the label's width.
+            // CLIP_Wrap, right-aligned: broken on spaces to the label's width, each broken line
+            // keeping its space (so it ends one space short of the right edge, as retail's does).
             const Font& font = assets_.small_normal;
-            std::vector<std::string> lines;
-            std::string line;
-            size_t pos = 0;
-            while (pos <= description_.size()) {
-                const size_t sp = description_.find(' ', pos);
-                const std::string word = description_.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
-                const std::string trial = line.empty() ? word : line + " " + word;
-                if (!line.empty() && font.width(trial) > box.w()) {
-                    lines.push_back(line);
-                    line = word;
-                } else {
-                    line = trial;
-                }
-                if (sp == std::string::npos) break;
-                pos = sp + 1;
-            }
-            if (!line.empty()) lines.push_back(line);
+            const std::vector<std::string> lines = ui_wrap(font, description_, box.w(), true);
             const float lh = static_cast<float>(font.line_height) * font.scale;
             for (size_t i = 0; i < lines.size(); ++i) {
                 const Rect row{box.l, box.t + lh * static_cast<float>(i), box.r, box.t + lh * static_cast<float>(i + 1)};
@@ -709,15 +695,14 @@ void Frontend::draw_menu(Frame& f) const {
         const float w = bfont.width(label);
         const Rect text{right - w, bar_view.t, right, bar_view.b};
         if (assets_.button.valid()) {
-            // TdImageButtonBarBackground: button_full stretched around the auto-sized label.
-            // StylePadding is -20; measured on a retail frame that is 20 px a side and 4.7 px
-            // above and below at 720 lines.
-            DrawOp op;
-            op.kind = DrawOp::Kind::Image;
-            op.image = &assets_.button;
-            op.quads.push_back(Quad{text.l - 20.0f * scale_, text.t - 4.7f * scale_, text.r + 20.0f * scale_,
-                                    text.b + 4.7f * scale_, 0.0f, 0.0f, 1.0f, 1.0f});
-            f.ui.push_back(std::move(op));
+            // TdImageButtonBarBackground: button_full drawn with DrawTileStretched around the
+            // auto-sized label, grown by the style's padding, 20 px a side and 3 px above and
+            // below (docs/SUB_MENUS_RE.md, 2.6).
+            const float whole[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            ui_draw_image_stretched(f, assets_.button,
+                                    Rect{text.l - 20.0f * scale_, text.t - 3.0f * scale_, text.r + 20.0f * scale_, text.b + 3.0f * scale_}, whole,
+                                    tint, gamma());
         }
         draw_label(f, bfont, label, text, 0, 1, white, shadow, 0.06f, 0.06f);
         right = text.l - 50.0f * scale_;

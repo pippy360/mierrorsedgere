@@ -1122,6 +1122,62 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     return stages_failed == 0 ? 0 : 1;
 }
 
+// A key by the name the engine gives it, which is what the front end's CONTROLS screen binds and
+// TdGameUI.int names ("GMS_SpaceBar=SPACE"). "" for a key the game has no name for.
+static std::string frontend_key_name(SDL_Keycode sym) {
+    if (sym >= SDLK_a && sym <= SDLK_z) return std::string(1, static_cast<char>('A' + (sym - SDLK_a)));
+    static const char* const kDigits[10] = {"Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine"};
+    if (sym >= SDLK_0 && sym <= SDLK_9) return kDigits[sym - SDLK_0];
+    if (sym >= SDLK_F1 && sym <= SDLK_F12) return "F" + std::to_string(sym - SDLK_F1 + 1);
+    if (sym >= SDLK_KP_1 && sym <= SDLK_KP_9) return std::string("NumPad") + kDigits[sym - SDLK_KP_1 + 1];
+    switch (sym) {
+        case SDLK_KP_0:         return "NumPadZero";
+        case SDLK_SPACE:        return "SpaceBar";
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:     return "Enter";
+        case SDLK_ESCAPE:       return "Escape";
+        case SDLK_TAB:          return "Tab";
+        case SDLK_BACKSPACE:    return "BackSpace";
+        case SDLK_CAPSLOCK:     return "CapsLock";
+        case SDLK_LSHIFT:       return "LeftShift";
+        case SDLK_RSHIFT:       return "RightShift";
+        case SDLK_LCTRL:        return "LeftControl";
+        case SDLK_RCTRL:        return "RightControl";
+        case SDLK_LALT:         return "LeftAlt";
+        case SDLK_RALT:         return "RightAlt";
+        case SDLK_LEFT:         return "Left";
+        case SDLK_RIGHT:        return "Right";
+        case SDLK_UP:           return "Up";
+        case SDLK_DOWN:         return "Down";
+        case SDLK_INSERT:       return "Insert";
+        case SDLK_DELETE:       return "Delete";
+        case SDLK_HOME:         return "Home";
+        case SDLK_END:          return "End";
+        case SDLK_PAGEUP:       return "PageUp";
+        case SDLK_PAGEDOWN:     return "PageDown";
+        case SDLK_PAUSE:        return "Pause";
+        case SDLK_NUMLOCKCLEAR: return "NumLock";
+        case SDLK_SCROLLLOCK:   return "ScrollLock";
+        case SDLK_KP_MULTIPLY:  return "Multiply";
+        case SDLK_KP_PLUS:      return "Add";
+        case SDLK_KP_MINUS:     return "Subtract";
+        case SDLK_KP_PERIOD:    return "Decimal";
+        case SDLK_KP_DIVIDE:    return "Divide";
+        case SDLK_SEMICOLON:    return "Semicolon";
+        case SDLK_EQUALS:       return "Equals";
+        case SDLK_COMMA:        return "Comma";
+        case SDLK_MINUS:        return "Underscore";
+        case SDLK_PERIOD:       return "Period";
+        case SDLK_SLASH:        return "Slash";
+        case SDLK_BACKQUOTE:    return "Tilde";
+        case SDLK_LEFTBRACKET:  return "LeftBracket";
+        case SDLK_BACKSLASH:    return "Backslash";
+        case SDLK_RIGHTBRACKET: return "RightBracket";
+        case SDLK_QUOTE:        return "Quote";
+        default:                return {};
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Interactive SDL2 Window Gameplay Loop (Metal on macOS, Direct3D 11 on Windows)
 // -----------------------------------------------------------------------------
@@ -1414,8 +1470,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         case SDLK_ESCAPE:   key = fe::Key::Escape; break;
                         default: break;
                     }
-                    if (fev.type == SDL_KEYDOWN) frontend->key_down(key);
-                    else frontend->key_up(key);
+                    // The key by the engine's name as well: CONTROLS binds keys by it, and tells the
+                    // space bar from Enter.
+                    const std::string key_name = frontend_key_name(fev.key.keysym.sym);
+                    if (fev.type == SDL_KEYDOWN) frontend->key_down(key, key_name);
+                    else frontend->key_up(key, key_name);
                 } else if (fev.type == SDL_CONTROLLERBUTTONDOWN || fev.type == SDL_CONTROLLERBUTTONUP) {
                     fe::Key key = fe::Key::Other;
                     switch (fev.cbutton.button) {
@@ -1425,6 +1484,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  key = fe::Key::Down; break;
                         case SDL_CONTROLLER_BUTTON_A:
                         case SDL_CONTROLLER_BUTTON_START:      key = fe::Key::Accept; break;
+                        case SDL_CONTROLLER_BUTTON_B:          key = fe::Key::Escape; break;
+                        case SDL_CONTROLLER_BUTTON_X:          key = fe::Key::Reset; break;
+                        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  key = fe::Key::PrevPage; break;
+                        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: key = fe::Key::NextPage; break;
                         default: break;
                     }
                     if (fev.type == SDL_CONTROLLERBUTTONDOWN) frontend->key_down(key);
@@ -1442,6 +1505,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     const float fy = (static_cast<float>(motion ? fev.motion.y : fev.button.y) - off_y) / fit;
                     if (motion) frontend->mouse_move(fx, fy);
                     else frontend->mouse_click(fx, fy);
+                } else if (fev.type == SDL_MOUSEBUTTONUP && fev.button.button != SDL_BUTTON_LEFT) {
+                    // The other mouse buttons are keys to CONTROLS: MOUSE 2, MOUSE 3, MOUSE 4.
+                    const char* button = fev.button.button == SDL_BUTTON_RIGHT ? "RightMouseButton"
+                                       : fev.button.button == SDL_BUTTON_MIDDLE ? "MiddleMouseButton" : "ThumbMouseButton";
+                    frontend->key_up(fe::Key::Other, button);
+                } else if (fev.type == SDL_MOUSEWHEEL && fev.wheel.y != 0) {
+                    frontend->key_up(fe::Key::Other, fev.wheel.y > 0 ? "MouseScrollUp" : "MouseScrollDown");
                 }
             }
 
@@ -1456,7 +1526,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 else if (cue == "Cancel") audio.play_sound("B_Neg");
             }
 
-            const std::string action = frontend->take_action();
+            std::string action = frontend->take_action();
+            // SPEED RUN starts a chapter at its first checkpoint ("SpeedRun edge_p?LoadCheckpoint=Edge_Start"),
+            // TIME TRIAL a course map of its own ("TimeTrial tt_TutorialA01_p"). The race itself (the
+            // clock, the checkpoints, the ghost) is not in the port: the map is loaded to be run.
+            if (action.rfind("SpeedRun ", 0) == 0 || action.rfind("TimeTrial ", 0) == 0) {
+                std::string url = action.substr(action.find(' ') + 1);
+                std::string checkpoint;
+                const size_t query = url.find('?');
+                if (query != std::string::npos) {
+                    const size_t at = url.find("LoadCheckpoint=", query);
+                    if (at != std::string::npos) checkpoint = url.substr(at + 15, url.find('?', at) == std::string::npos ? std::string::npos : url.find('?', at) - at - 15);
+                    url.erase(query);
+                }
+                action = "StartLevel " + url + (checkpoint.empty() ? std::string() : " " + checkpoint);
+            }
             if (action == "Quit") {
                 running = false;
             } else if (action == "Continue") {

@@ -190,11 +190,11 @@ A `MultiFont` is three fonts in one, for 480, 720 and 1080 lines (`ResolutionTes
 * `Characters`: 3 x 256 `FontCharacter`s of 21 bytes: `StartU`, `StartV`, `USize`, `VSize` (int32), `TextureIndex` (byte), `VerticalOffset` (int32). Tier *n* is entries `256n .. 256n+255`, indexed by Latin-1 code.
 * `Textures`: the atlas pages, 256 wide, `PF_DXT5`; the glyph is in the alpha channel.
 * `Kerning` (property, 1 on the `Small` fonts, else 0): pixels added after every glyph.
-* Native tail: `int32 CharRemap count` (0), `int32 N`, then `N` kerning pairs `{uint16 first, uint16 second, float amount}`, then an `int32` array of 4 offsets splitting those pairs between the three tiers (e.g. 0, 209, 524, 933).
+* Native tail: `int32 CharRemap count` (0), `int32 N`, then `N` kerning pairs `{uint16 second, uint16 first, float amount}` (the following character comes first: [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), 2.5), then an `int32` array of 4 offsets splitting those pairs between the three tiers (e.g. 0, 209, 524, 933).
 
 Middle-tier (720p) line heights: `Small_Normal` 24, `Small_Bold` 25, `Medium_Italic` 26, `Headline_Light_Italic` 55. A capital is 15 px tall in the first three and 32 px in the headline font.
 
-`UIComp_TdDropShadowString` draws its string twice, the shadow first, offset by `HorizontalPctOffset` and `VerticalPctOffset` (class defaults 0.06 each) in the shadow style's colour.
+`UIComp_TdDropShadowString` draws its string twice, the shadow first, offset by `HorizontalPctOffset` and `VerticalPctOffset` (class defaults 0.06 each) times the line height, in the shadow style's colour. The offset is not rounded to whole pixels, so the shadow is slightly soft ([`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), 2.5).
 
 ## 6. The camera (Kismet `Main_Sequence` and its Matinees)
 
@@ -361,7 +361,7 @@ Retail on the left, the port on the right, same camera pose:
 | VIDEO, AUDIO, GAME SETTINGS | the screens work and keep their values for the session; the app does not apply them to the game yet |
 | QUIT GAME (Escape), then OK | quits |
 
-The sub-menu screens are in [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), which also lists the ones not built yet; choosing one of those does nothing.
+The sub-menu screens are in [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), which also lists what is not built; choosing GAMEPAD SETUP, the one screen left out, does nothing.
 
 `--chapter` and `--level` start in the level and skip the front end, as they skipped the old menu.
 
