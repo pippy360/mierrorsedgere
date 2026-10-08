@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <functional>
 
 namespace me::fe {
@@ -571,8 +570,7 @@ void KismetRunner::interp_update(int node, float position, bool jump, float prev
             // UInterpTrackMove::GetLocationAtTime: the keyed rotation stands unless the look-at
             // group has an actor, and the direction is taken from where this actor is now, before
             // this update moves it.
-            const char* no_look = std::getenv("ME_KISMET_NOLOOK");
-            if (!g.look_at.empty() && !(no_look && m.name == no_look)) {
+            if (!g.look_at.empty()) {
                 bool has_group = false;
                 for (const MatineeGroup& other : m.groups) has_group = has_group || other.name == g.look_at;
                 const int target = has_group ? actor_for_group(node, g.look_at) : -1;
@@ -760,7 +758,7 @@ void KismetRunner::deactivated(int node) {
     const KismetGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     if (n.cls != "SeqAct_Interp") return;
     State& s = state_[static_cast<size_t>(node)];
-    if ((!s.initialised && !std::getenv("ME_KISMET_QUIRK")) || n.matinee < 0) return;
+    if (!s.initialised || n.matinee < 0) return;
     const float length = graph_->matinees[static_cast<size_t>(n.matinee)].length;
     if (s.position < kSmall) {
         if (n.outputs.size() > 1) s.out |= 2u;

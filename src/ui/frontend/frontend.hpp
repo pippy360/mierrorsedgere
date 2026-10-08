@@ -88,6 +88,8 @@ public:
     [[nodiscard]] ProfileSettings& settings() { return settings_; }
     [[nodiscard]] StringList& string_list(const std::string& tag) { return string_lists_[tag]; }
     [[nodiscard]] const Assets& assets() const { return assets_; }
+    // Where a map of the chapter list is, relative to CookedPC ("edge_p" -> "Maps/SP01/Edge_p.me1"); "" if it is not installed.
+    [[nodiscard]] std::string map_path(const std::string& file) const;
     // A Texture2D of the retail packages by object path, read on first use (Assets::image).
     const Image* image(const std::string& object_path) { return assets_.image(object_path); }
     [[nodiscard]] const KismetRunner& kismet() const { return kismet_; }

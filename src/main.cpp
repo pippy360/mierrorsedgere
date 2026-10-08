@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <iostream>
 #include <memory>
 #include <fstream>
@@ -1317,8 +1318,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     // The front end: "Press Any Key", then the main menu, as retail has them
     // (docs/MAIN_MENU_SYSTEM_RE.md). me::fe::Frontend is the state machine and
     // me::fe::SoftRenderer draws its frames on the CPU, at the 1280x720 the scenes were authored
-    // for; the Metal renderer shows the result full screen. The chapter-select overlay above stays
-    // as the screen PLAY CHAPTER and the not-yet-built sub-menus open.
+    // for; the Metal renderer shows the result full screen. The screens behind the sub-buttons
+    // (docs/SUB_MENUS_RE.md) are part of it; it reports what to do through take_action().
     constexpr int kFrontendW = 1280;
     constexpr int kFrontendH = 720;
     std::unique_ptr<fe::Frontend> frontend;
@@ -1449,35 +1450,67 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 // The skin's UI sound cues, all in Audio/A_HUD.upk.
                 if (cue == "Music") audio.set_menu_music(true);
                 else if (cue == "TabChangeRight" || cue == "TabChangeLeft") audio.play_sound("Tab_Change");
-                else if (cue == "NavigateUp" || cue == "NavigateDown") audio.play_sound("D-Pad");
+                else if (cue == "NavigateUp" || cue == "NavigateDown" || cue == "SliderIncrement" || cue == "SliderDecrement" ||
+                         cue == "ListUp" || cue == "ListDown") audio.play_sound("D-Pad");
                 else if (cue == "Accept") audio.play_sound("A_Pos");
+                else if (cue == "Cancel") audio.play_sound("B_Neg");
             }
 
             const std::string action = frontend->take_action();
             if (action == "Quit") {
                 running = false;
-            } else if (action == "LoadGameButton") {
+            } else if (action == "Continue") {
                 // CONTINUE GAME: the chapter loaded at start-up.
                 leave_frontend();
                 set_menu_active(false);
-            } else if (action == "NewGameButton") {
+            } else if (action == "NewGame") {
                 // NEW GAME: the Prologue, with its opening.
                 leave_frontend();
                 set_menu_active(false);
                 current_chapter_idx = 1;
                 renderer.set_selected_chapter(current_chapter_idx);
                 load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
-            } else if (!action.empty() && action != "Friends") {
-                // PLAY CHAPTER, and the sub-menus that are not built yet: the chapter-select overlay,
-                // on the tab that matches the column.
-                int tab = 0;
-                if (action == "LevelRaceButton" || action == "TimeTrialOnlineButton" || action == "LeaderboardsButton") tab = 1;
-                else if (action == "GamepadButton" || action == "VideoButton" || action == "AudioButton" ||
-                         action == "ControlsButton" || action == "GameSettingsButton") tab = 2;
-                else if (action == "UnlocksButton" || action == "CreditsButton") tab = 3;
-                leave_frontend();
-                renderer.set_selected_menu_tab(tab);
-                set_menu_active(true);
+            } else if (action.rfind("StartLevel ", 0) == 0) {
+                // PLAY CHAPTER: "StartLevel <map> [checkpoint]", the map by its file name ("edge_p").
+                std::string map_name = action.substr(11);
+                std::string checkpoint_name;
+                const size_t space = map_name.find(' ');
+                if (space != std::string::npos) {
+                    checkpoint_name = map_name.substr(space + 1);
+                    map_name.erase(space);
+                }
+                auto lower = [](std::string v) {
+                    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    return v;
+                };
+                static const char* const kChapterFiles[10] = {"tutorial_p", "edge_p", "stormdrain_p", "cranes_p", "subway_p",
+                                                              "mall_p", "factory_p", "boat_p", "convoy_p", "scraper_p"};
+                int chapter = -1;
+                for (int c = 0; c < 10; ++c) {
+                    if (lower(map_name) == kChapterFiles[c]) chapter = c;
+                }
+                // A chapter of the list starts with its opening; any other map (Flight is the second
+                // half of the Prologue's folder) is loaded by path.
+                const std::string map_path = chapter >= 0 ? std::string() : frontend->map_path(map_name);
+                if ((chapter >= 0 || !map_path.empty()) &&
+                    load_chapter_or_level(chapter >= 0 ? chapter : current_chapter_idx, map_path, /*play_intro=*/true)) {
+                    if (chapter >= 0) {
+                        current_chapter_idx = chapter;
+                        renderer.set_selected_chapter(current_chapter_idx);
+                    }
+                    leave_frontend();
+                    set_menu_active(false);
+                    // A checkpoint other than the first: stream its sublevels in and stand there.
+                    for (size_t c = 1; c < active_scene.checkpoint_infos.size() && !checkpoint_name.empty(); ++c) {
+                        const LevelCheckpointInfo& cp = active_scene.checkpoint_infos[c];
+                        if (lower(cp.checkpoint_name) != lower(checkpoint_name)) continue;
+                        stream_level_to_checkpoint(game_root, active_scene, static_cast<int>(c));
+                        cutscene_player.stop();
+                        controller.get_telemetry().intro_active = false;
+                        controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.rotation.to_degrees().y);
+                        break;
+                    }
+                }
             }
 
             if (frontend_active) {

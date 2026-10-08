@@ -154,6 +154,14 @@ int main(int argc, char** argv) {
             profile.all_levels_unlocked = true;
         } else if (a == "--controller") {
             profile.controller = true;
+        } else if (a == "--chapters") {
+            // --chapters <n>: the first n entries of the PLAY CHAPTER list are unlocked (1 = the Training Area only)
+            const int n = std::atoi(next().c_str());
+            profile.unlocked_levels = n >= 32 ? 0xFFFFFFFFu : ((1u << (n < 0 ? 0 : n)) - 1u);
+        } else if (a == "--hard") {
+            profile.hard_unlocked = true;
+        } else if (a == "--player") {
+            profile.player_name = next();
         } else if (a == "--size") {
             const std::string s = next();
             const size_t x = s.find('x');
@@ -163,7 +171,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--help" || a == "-h") {
             std::cout << "me_menu --game-root <install> --out <dir> [--size 1280x720] [--no-background] [--no-ui]\n"
-                         "        [--no-save] [--all-levels] [--controller]   what the save file would unlock\n"
+                         "        [--no-save] [--all-levels] [--controller] [--chapters <n>] [--hard] [--player <name>]\n"
+                         "                                              what the profile and the save file would unlock\n"
                          "        [--dump-assets <dir>] [--script-file <file>] --script \"wait 5; shot start.png; key any; wait 4; shot menu.png\"\n";
             return 0;
         } else {
@@ -226,6 +235,24 @@ int main(int argc, char** argv) {
                       << fe.focused_button() << (fe.animating() ? " (animating)" : "");
             if (!fe.scene_name().empty()) std::cout << " scene " << fe.scene_name() << " focus " << fe.scene_focus();
             std::cout << "\n";
+        } else if (verb == "set") {
+            // set <setting> <value>: a profile setting, before its screen is opened ("set Brightness 10")
+            std::string name;
+            int value = 0;
+            cs >> name >> value;
+            if (me::fe::ProfileSetting* s = fe.settings().find(name)) s->value = value;
+            else std::cout << "set: no profile setting " << name << "\n";
+        } else if (verb == "list") {
+            // list <tag> <a,b,c> <index>: a PC string list, as the host would report it ("list Antialiasing OFF,2X,4X 1")
+            std::string tag, values;
+            int index = 0;
+            cs >> tag >> values >> index;
+            me::fe::StringList& list = fe.string_list(tag);
+            list.values.clear();
+            std::stringstream vs(values);
+            std::string v;
+            while (std::getline(vs, v, ',')) list.values.push_back(v);
+            list.index = index;
         } else if (verb == "texture") {
             // texture <object path> <name>: a Texture2D of the retail packages as <name>.png and its alpha as <name>_a.png
             std::string path, name;

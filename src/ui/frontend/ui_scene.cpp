@@ -498,9 +498,9 @@ std::string UiSystem::resolve_markup(const std::string& markup) const {
                 const std::string tag = markup.substr(i + 1, close - i - 1);
                 const size_t colon = tag.find(':');
                 if (colon != std::string::npos && tag.compare(0, colon, "Strings") == 0 && assets_) {
-                    // A localized string may itself carry tags (a gamepad glyph alias in front of "QUIT GAME").
-                    const std::string value = assets_->localized(tag.substr(colon + 1));
-                    out += value.find('<') != std::string::npos ? resolve_markup(value) : value;
+                    // A localized string may itself carry tags (a gamepad glyph alias in front of
+                    // "QUIT GAME") and line breaks.
+                    out += resolve_markup(assets_->localized(tag.substr(colon + 1)));
                 }
                 i = close + 1;
                 continue;

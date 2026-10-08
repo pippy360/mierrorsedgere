@@ -2,6 +2,8 @@
 
 #include "frontend_menus.hpp"
 
+#include "../../assets/package_manager.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -329,6 +331,20 @@ void Frontend::close_scene(SubMenu* menu, const std::function<void()>& then) {
 }
 
 std::string Frontend::scene_name() const { return scenes_.empty() || !scenes_.back()->scene() ? std::string() : scenes_.back()->scene()->name; }
+std::string Frontend::map_path(const std::string& file) const {
+    const PackageManager* pm = assets_.packages();
+    if (!pm) return {};
+    std::string path = pm->find_package_path(file);
+    const std::string& root = pm->cooked_root();
+    if (path.empty() || path.size() <= root.size() || path.compare(0, root.size(), root) != 0) return {};
+    path.erase(0, root.size());
+    while (!path.empty() && (path.front() == '/' || path.front() == '\\')) path.erase(0, 1);
+    for (char& c : path) {
+        if (c == '\\') c = '/';
+    }
+    return path;
+}
+
 const UiScene* Frontend::scene() const { return scenes_.empty() ? nullptr : scenes_.back()->scene(); }
 std::string Frontend::scene_focus() const { return scenes_.empty() ? std::string() : scenes_.back()->focused_name(); }
 
