@@ -38,6 +38,10 @@ struct PawnFrame {
     float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     bool climbing_pipe = false;  // on a pipe, not a ladder
+    // TdMove_Melee: which blow (0 right, 1 left, 2 the shove that ends a combo, 3 crouched) and
+    // whether it lands. -1: the move names its animations itself (move_anim).
+    int melee_variant = -1;
+    bool melee_hit = false;
 };
 
 class Director {
@@ -57,6 +61,9 @@ private:
     void update_walking_state(const PawnFrame& frame);
     bool play_named(const std::string& name);
     void land_normal(float amount);
+    void tick_climb(const PawnFrame& frame);
+    void tick_grab(const PawnFrame& frame);
+    void tick_melee(const PawnFrame& frame);
     // TdMove.PlayMoveAnim.
     void play(Slot slot, const char* name, float rate, float blend_in, float blend_out) {
         tree_.play_custom_anim(slot, name, rate, blend_in, blend_out, false, true);
@@ -76,6 +83,22 @@ private:
     bool was_accelerating_ = false;
     float fall_top_ = 0.0f;          // TdPawn.EnterFallingHeight: the highest she has been in this fall
     bool airborne_ = false;
+    // TdMove_Climb: bClimbLeftHand, and the step being climbed.
+    bool climb_left_hand_ = false;
+    float climb_step_time_ = -1.0f;
+    float climb_step_length_ = 0.0f;
+    bool climb_hand_switched_ = false;
+    bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
+    // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
+    // hang's turn, and the shimmy step.
+    int grab_turn_ = 0;
+    float grab_timer_ = -1.0f;
+    bool grab_turned_right_ = false;
+    bool grab_free_turn_ = false;
+    bool shimmy_ = false;
+    // TdMove_Melee: 1 while the wind-up plays, 2 after the blow.
+    int melee_phase_ = 0;
+    int melee_variant_ = -1;
 };
 
 }  // namespace me::fp

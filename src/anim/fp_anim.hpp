@@ -48,6 +48,8 @@ struct PawnAnimState {
     bool climbing_pipe = false;
     int climb_hand = 0;           // 0 left hand up, 1 right
     bool climb_sliding = false;
+    int grab_turn = 0;            // hanging and looking back: 0 no, 1 over the left shoulder, 2 the right
+    float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
 };
 
 // One node of the tree: its fixed properties and its state this frame.
@@ -109,6 +111,7 @@ struct TreeNode {
     float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
     float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
     bool root_motion = false;         // a slot's channel: the animation's root movement goes to the pawn
+    bool unlisted = false;            // a channel of the Camera or Canned slot: not in the retail recorder's list
     const AnimSequenceAsset* seq = nullptr;
 };
 

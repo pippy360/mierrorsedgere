@@ -117,6 +117,19 @@ def level_hints(run, names):
             out[i][2] = 1
         if any(s.startswith("hangfree") for s in seen):
             out[i][3] = 1
+    # On a pipe or a ladder: the level says, and here the names of what retail plays on it do.
+    i = 0
+    while i < n:
+        if run[i]["move"] not in (21, 22):
+            i += 1
+            continue
+        j = i
+        while j < n and run[j]["move"] in (21, 22):
+            j += 1
+        pipe = any(name.startswith("pipe") for k in range(i, j) for name in leaf_names[k])
+        for k in range(i, j):
+            out[k].append(("pipe", 1 if pipe else 0))
+        i = j
     # The animation a move picked: the frame retail first shows one of the director's named
     # animations (or shows it started over). A move that picks its animation as it starts gets it
     # on its first frame when retail shows it within 2 frames of that.

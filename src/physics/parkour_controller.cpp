@@ -843,6 +843,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.tick++;
     m_telemetry.sim_time += effective_dt;
     m_telemetry.swing_angle = m_swing_angle;
+    m_telemetry.body_yaw_deg = m_pawn_yaw;
     m_telemetry.balance_lean = m_balance_lean;
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();

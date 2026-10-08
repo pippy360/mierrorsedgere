@@ -1137,6 +1137,7 @@ struct PlayerTelemetry {
     bool move_left = false;         // a dodge jump going left
     bool hanging_free = false;      // hanging with no wall for the legs
     float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
+    float body_yaw_deg = 0.0f;      // TdPawn.Rotation.Yaw: where the body faces while the view looks round
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};

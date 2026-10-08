@@ -1477,7 +1477,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.movement = telemetry.move_state;
         frame.position = telemetry.position;
         frame.velocity = telemetry.velocity;
-        frame.yaw_deg = telemetry.yaw_deg;
+        frame.yaw_deg = telemetry.body_yaw_deg;
         frame.view_yaw_deg = telemetry.yaw_deg;
         frame.view_pitch_deg = telemetry.pitch_deg;
         frame.accelerating = telemetry.move_input;
@@ -1487,6 +1487,9 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.hanging_free = telemetry.hanging_free;
         frame.swing_angle = telemetry.swing_angle;
         frame.balance_lean = telemetry.balance_lean;
+        // The controller's blows: 0 right, 1 left, 2 the combo's third, 3 crouched.
+        frame.melee_variant = telemetry.move_state == EMovement::MOVE_Melee ? telemetry.melee_variant : -1;
+        frame.melee_hit = telemetry.melee_hit_confirmed;
         if (restart) fp.move_anim_serial = telemetry.move_anim_serial;
         if (telemetry.move_anim_serial != fp.move_anim_serial) {
             fp.move_anim_serial = telemetry.move_anim_serial;
@@ -1507,7 +1510,10 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         fp.last_frame = frame;
         fp.poser.evaluate(fp.director.tree(), fp.pose);
         fp.poser.component_space(fp.pose, fp.comp_pos, fp.comp_rot);
-        fp.view = fp.poser.view(fp.comp_pos, fp.comp_rot, telemetry.pitch_deg, 0.0f);
+        float look = telemetry.yaw_deg - telemetry.body_yaw_deg;
+        while (look > 180.0f) look -= 360.0f;
+        while (look < -180.0f) look += 360.0f;
+        fp.view = fp.poser.view(fp.comp_pos, fp.comp_rot, telemetry.pitch_deg, look);
         fp.last_time = telemetry.sim_time;
         fp.last_move = telemetry.move_state;
     }
@@ -2544,7 +2550,7 @@ void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, 
     // camera bone. The wall run's tilt, the landing's dip and the roll's somersault are all that.
     if (tick_first_person(telemetry).camera) {
         const fp::ViewFrame& v = fp_->view;
-        const Rotator body = Rotator::from_degrees(0.0f, telemetry.yaw_deg, 0.0f);
+        const Rotator body = Rotator::from_degrees(0.0f, telemetry.body_yaw_deg, 0.0f);
         out_pos = telemetry.position + Vec3(0.0f, 0.0f, v.eye_pawn.z - kMeshOriginBelowFeet) + body.forward() * v.eye_pawn.x +
                   body.right() * v.eye_pawn.y;
         out_rot = Rotator::from_degrees(telemetry.pitch_deg + v.anim_pitch, telemetry.yaw_deg + v.anim_yaw, v.anim_roll);

@@ -160,6 +160,15 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         }
     }
     root_ = node_of[root_export];
+    // The retail recorder's list leaves out what plays on the Camera and Canned slots.
+    for (Slot hidden : {Slot::Camera, Slot::Canned}) {
+        const int index = slots_[static_cast<size_t>(hidden)];
+        if (index < 0) continue;
+        const TreeNode& slot = nodes_[static_cast<size_t>(index)];
+        for (size_t c = 1; c < slot.children.size(); ++c) {
+            if (slot.children[c] >= 0) nodes_[static_cast<size_t>(slot.children[c])].unlisted = true;
+        }
+    }
     in_walk_group_.assign(nodes_.size(), 0);
     for (int i : walk_group_) in_walk_group_[static_cast<size_t>(i)] = 1;
     for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -243,7 +252,8 @@ void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, 
     seq.rate = rate;
     seq.looping = looping;
     seq.playing = true;
-    seq.time = 0.0f;
+    // TdAnimNodeSequence.OnBecomeRelevant: one played backwards starts at its end.
+    seq.time = (rate < 0.0f && seq.seq) ? seq.seq->length : 0.0f;
     seq.root_motion = root_motion;
     set_active(n, channel, blend_in);
     n.pending_blend_out = looping ? -1.0f : blend_out;
@@ -346,6 +356,16 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;
+    } else if (n.cls == "TdAnimNodeGrabbing") {
+        // Hang, HangFree, then the looking-back idles (left, right, and their extremes).
+        // TdMove_IntoGrab: GrabAnimNode.SetActiveMove(legs on the wall ? 0 : 1).
+        want = pawn.hanging_free ? 1 : 0;
+        if (pawn.grab_turn == 1) want = 2;
+        else if (pawn.grab_turn == 2) want = 3;
+    } else if (n.cls == "TdAnimNodeClimb") {
+        // LadderLeft, LadderRight, LadderSlide, PipeLeft, PipeRight, PipeSlide, TurnLeftIdle, TurnRightIdle.
+        const int base = pawn.climbing_pipe ? 3 : 0;
+        want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
     } else if (n.cls == "TdAnimNodeBalanceWalk") {
         // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
         want = 1;
@@ -476,8 +496,9 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 if (n.active > 0 && n.pending_blend_out >= 0.0f) {
                     const TreeNode& seq = nodes_[static_cast<size_t>(n.children[static_cast<size_t>(n.active)])];
                     if (seq.seq && seq.seq->length > 0.0f) {
-                        const float rate = std::fabs(seq.rate * seq.seq->rate_scale);
-                        const float left = rate > 0.0f ? (seq.seq->length - seq.time) / rate : 0.0f;
+                        const float signed_rate = seq.rate * seq.seq->rate_scale;
+                        const float rate = std::fabs(signed_rate);
+                        const float left = rate > 0.0f ? (signed_rate > 0.0f ? seq.seq->length - seq.time : seq.time) / rate : 0.0f;
                         if (left <= n.pending_blend_out) {
                             set_active(n, 0, left);
                             n.pending_blend_out = -1.0f;
@@ -531,7 +552,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
 void AnimTree::leaves(std::vector<Leaf>& out, size_t limit) const {
     out.clear();
     for (const TreeNode& n : nodes_) {
-        if (n.kind != TreeNode::Kind::Sequence || n.seq_name.empty() || n.total <= 0.005f) continue;
+        if (n.kind != TreeNode::Kind::Sequence || n.seq_name.empty() || n.total <= 0.005f || n.unlisted) continue;
         // The carriers of the footstep and breathing notifies draw nothing.
         if (n.seq_name.compare(0, 13, "notifierdummy") == 0) continue;
         out.push_back(Leaf{n.seq_name, n.time, n.total});
