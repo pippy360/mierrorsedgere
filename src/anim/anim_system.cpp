@@ -1568,6 +1568,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.ledge_slope_deg = telemetry.ledge_slope_deg;
         frame.swing_angle = telemetry.swing_angle;
         frame.balance_lean = telemetry.balance_lean;
+        frame.balance_danger = telemetry.balance_danger;
         frame.climbing_pipe = telemetry.climbing_pipe;
         frame.climb_top = telemetry.climb_top;
         frame.climb_bottom = telemetry.climb_bottom;

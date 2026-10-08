@@ -1146,6 +1146,7 @@ struct PlayerTelemetry {
     float climb_top = -1.0f;        // uu up to the ladder's last step (-1 off a ladder)
     float climb_bottom = -1.0f;     // uu down to its first
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
+    int balance_danger = 0;         // losing her balance to the left (-1) or the right (1)
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

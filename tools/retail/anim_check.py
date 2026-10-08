@@ -148,6 +148,25 @@ def level_hints(run, names):
             along = (d["px"] - x0) * math.cos(yaw) + (d["py"] - y0) * math.sin(yaw)
             out[k].append(("swing", "%.3f" % math.atan2(along, max(1.0, z0 - d["pz"]))))
         i = j
+    # On a beam: how far she leans and whether she is losing her balance are the player's doing
+    # (the keys are not in a recording), so they are read off what retail's own balance nodes show:
+    # the lean from the lean poses' weights, the lose-balance state from its pose gaining weight.
+    # What is left to compare on a beam is how the port blends them.
+    for i, d in enumerate(run):
+        if d["move"] != 29:
+            continue
+        w = {a[0].lower(): a[2] for a in d["anim1p"]}
+        prev = {a[0].lower(): a[2] for a in run[i - 1]["anim1p"]} if i else {}
+        left, right = w.get("walkbalancelosebalanceleft", 0.0), w.get("walkbalancelosebalanceright", 0.0)
+        rest = 1.0 - left - right
+        if rest > 0.05:
+            out[i].append(("lean", "%.3f" % max(-1.0, min(1.0, (w.get("walkbalancefwdleanright", 0.0) - w.get("walkbalancefwdleanleft", 0.0)) / rest))))
+        danger = 0
+        if left > 0.0 and (left >= 0.999 or left > prev.get("walkbalancelosebalanceleft", 0.0) + 1e-4):
+            danger = -1
+        elif right > 0.0 and (right >= 0.999 or right > prev.get("walkbalancelosebalanceright", 0.0) + 1e-4):
+            danger = 1
+        out[i].append(("danger", danger))
     # On a pipe or a ladder: the level says, and here the names of what retail plays on it do.
     i = 0
     while i < n:

@@ -552,8 +552,11 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         else if (pawn.look_deg > 90.0f && n.weight.size() > 7) want = 7;
         else want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
     } else if (n.cls == "TdAnimNodeBalanceWalk") {
-        // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
-        want = 1;
+        // Danger Left, Default, Danger Right, Crouch. Retail on a beam: the lose-balance pose of the
+        // side she is going over comes in over 0.4 s and, countered, goes out over 0.6 (the node's
+        // BlendWeight, as measured); it is at full weight for the last 0.4 s before she falls.
+        want = pawn.balance_danger < 0 ? 0 : pawn.balance_danger > 0 ? 2 : 1;
+        blend = want == 1 ? 0.6f : 0.4f;
     } else if (n.cls == "TdAnimNodeBalanceBlend") {
         // Left, Middle, Right: by how far she leans off the beam.
         if (n.weight.size() >= 3) {

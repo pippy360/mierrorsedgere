@@ -878,6 +878,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.swing_angle = m_swing_angle;
     m_telemetry.body_yaw_deg = m_pawn_yaw;
     m_telemetry.balance_lean = m_balance_lean;
+    if (m_telemetry.move_state != EMovement::MOVE_Balance) {
+        m_telemetry.balance_danger = 0;
+        m_balance_danger_time = 0.0f;
+    }
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
 
@@ -1243,6 +1247,9 @@ void ParkourController::camera_move_changed(EMovement from, EMovement to) {
             break;
         case EMovement::MOVE_Climb:
             camera_reset_look(0.3f);
+            break;
+        case EMovement::MOVE_Snatch:
+            camera_reset_look(0.2f);  // TdMove_Disarm.StartMove
             break;
         case EMovement::MOVE_Barge:
             camera_reset_look(m_barge_kick ? 0.2f : 0.3f);  // TdMove_Barge.StartBargin
@@ -4311,8 +4318,9 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     const Vec3 fwd = facing_forward();
     const Vec3 beam_fwd = (fwd.dot(u) >= 0.0f) ? u : -u;
 
-    // PlayerBalanceWalk: smooth speed control strictly along the balance pipe spline
-    const float target_speed = input.forward * (m_config.run_speed * 0.48f);
+    // PlayerBalanceWalk: along the beam at TdMove_Balance.SpeedModifier (0.34) of the top speed:
+    // retail walks a beam at 245 uu/s.
+    const float target_speed = input.forward * (720.0f * 0.34f);
     float cur_along = horiz(m_telemetry.velocity).dot(beam_fwd);
     const float accel_step = 900.0f * dt;
     if (std::abs(target_speed - cur_along) <= accel_step) {
@@ -4322,13 +4330,41 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     }
     m_telemetry.velocity = beam_fwd * cur_along;
 
-    // UTdMove_Balance BalanceFactor camera roll & A/D counter-steer
+    // The balance itself is native. From a retail recording made for it (the lean is what the
+    // tree's BalanceDir node shows, the lose-balance state its Danger children):
+    //  - a key held leans her that way at about 2.4 a second (2.0 to 2.7), from either side;
+    //  - left alone the lean grows on itself (GravityInfluence 0.3) and with the view turned off
+    //    the beam (CameraInfluence 0.3 of the turn over the 33 degree look limit): 8 degrees off
+    //    had her over in 5.4 s, 4 degrees in 8.2;
+    //  - past about 0.65 with no key against it she is losing her balance: the key against it ends
+    //    that at once, and TimeToCounter (0.8 s) of it has her off the beam on that side. Holding a
+    //    key from the middle of the beam, that is 1.09 s from the key to the fall.
+    // Retail's lean also wanders by itself as she walks (0.2 to 0.7 over a beam's length, either
+    // way); that is left out.
     const float beam_yaw = yaw_of(beam_fwd);
     const float yaw_diff = wrap_deg(m_telemetry.yaw_deg - beam_yaw);
-    const float sway_drive = std::clamp(yaw_diff / 60.0f, -0.5f, 0.5f) * 0.35f +
-                             input.strafe * 1.15f - m_balance_lean * 1.6f;
-    m_balance_lean = std::clamp(m_balance_lean + sway_drive * dt, -1.0f, 1.0f);
+    const float key = std::abs(input.strafe) > 0.3f ? sign_of(input.strafe) : 0.0f;
+    const float drive = key * 2.4f + 0.3f * m_balance_lean + 0.3f * std::clamp(yaw_diff / 33.0f, -1.0f, 1.0f);
+    m_balance_lean = std::clamp(m_balance_lean + drive * dt, -1.0f, 1.0f);
+    const float side = sign_of(m_balance_lean);
+    const bool losing = std::abs(m_balance_lean) >= 0.65f && key * side >= 0.0f;
+    m_balance_danger_time = losing ? m_balance_danger_time + dt : 0.0f;
+    m_telemetry.balance_danger = losing ? static_cast<int>(side) : 0;
     m_telemetry.camera_roll_deg = m_balance_lean * 9.0f;
+    if (m_balance_danger_time >= 0.8f) {
+        // TdMove_Balance.Falloff: the fall off animation of that side, and off the beam she goes.
+        set_move_anim(side < 0.0f ? "walkbalancefalloffleft" : "walkbalancefalloffright");
+        const Vec3 beam_right(beam_fwd.y, -beam_fwd.x, 0.0f);
+        m_telemetry.velocity = beam_right * (side * 200.0f);
+        m_telemetry.position = m_telemetry.position + beam_right * (side * (kPawnRadius + 6.0f));
+        m_telemetry.camera_roll_deg = 0.0f;
+        m_telemetry.balance_danger = 0;
+        m_balance_danger_time = 0.0f;
+        m_balance_lean = 0.0f;
+        m_balance_cooldown = 0.6f;
+        leave_ground(EMovement::MOVE_Falling);
+        return;
+    }
 
     const Vec3 next_pos = m_telemetry.position + m_telemetry.velocity * dt;
     const float s = horiz(next_pos - m_balance_start).dot(u);
@@ -4712,7 +4748,6 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             if (to_bot.length_sq() > 1e-4f) {
                 m_telemetry.yaw_deg = std::atan2(to_bot.y, to_bot.x) * RAD2DEG;
                 m_pawn_yaw = m_telemetry.yaw_deg;
-                camera_look_at(m_telemetry.yaw_deg, 0.0f, 0.2f, -1.0f);
                 m_snatch_target = bot.position - to_bot * 125.899f;
                 m_snatch_speed = std::max(400.0f, m_telemetry.velocity.length_xy());
                 m_snatch_align = std::abs(bot.position.z - m_telemetry.position.z) <= 3.0f;
