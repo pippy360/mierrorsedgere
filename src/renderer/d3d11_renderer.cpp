@@ -9,6 +9,7 @@
 #include "../cutscene/cutscene_player.hpp"
 #include "../platform/platform.hpp"
 #include "../ui/frontend/soft_render.hpp"
+#include "../ui/frontend/soft_sample.hpp"
 #include "../ui/main_menu.hpp"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -137,27 +139,14 @@ std::string hresult_text(HRESULT hr) {
     return ss.str();
 }
 
-// Runs fn(i) for i in [0, count) on up to hardware_concurrency threads.
+// Runs fn(i) for i in [0, count) on the process's worker threads (the front end's row pool). They
+// persist between calls, so thread_local scratch buffers in fn are allocated once, not every frame.
+// Must be called from one thread at a time, and fn must not call it again.
 template <class Fn>
 void parallel_for(size_t count, Fn&& fn) {
-    const size_t threads = std::min<size_t>(count, std::max(1u, std::thread::hardware_concurrency()));
-    if (threads <= 1) {
-        for (size_t i = 0; i < count; ++i) fn(i);
-        return;
-    }
-    std::atomic<size_t> next{0};
-    auto worker = [&]() {
-        for (;;) {
-            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= count) return;
-            fn(i);
-        }
-    };
-    std::vector<std::thread> pool;
-    pool.reserve(threads - 1);
-    for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
-    worker();
-    for (auto& th : pool) th.join();
+    fe::parallel_rows(static_cast<int>(count), [&fn](int first, int last) {
+        for (int i = first; i < last; ++i) fn(static_cast<size_t>(i));
+    });
 }
 
 // -----------------------------------------------------------------------------
@@ -350,15 +339,20 @@ struct D3D11Renderer::Impl {
 
     // First-Person Faith Viewmodel Mesh & 3D Enemy Guard Mesh
     std::vector<Vertex> faith_viewmodel_mesh;
-    // This frame's posed enemies (index = enemy index). Each one's triangle list (exactly evaluate_enemy_swat()'s)
-    // is assembled only when the enemy can reach a pass's render target.
+    // This frame's posed enemies (index = enemy index). An enemy is drawn indexed: its posed unique
+    // vertices go to enemy_vertex_buffers[i], and enemy_index_buffers holds the animation system's static
+    // triangle lists (AnimSystem::enemy_swat_index_lists()). That is the triangle list
+    // evaluate_enemy_swat() returns, without expanding it on the CPU every frame.
     struct EnemyFrameDraw {
-        size_t corner_count = 0;  // triangle-list vertices (0 = nothing to draw)
-        bool in_view = false;     // may cover pixels of the camera view (world pass)
-        bool in_shadow = false;   // may cover texels of the near shadow cascade (shadow pass)
+        size_t index_count = 0;  // leading indices of the list to draw (0 = nothing to draw)
+        size_t index_list = 0;   // enemy_index_buffers entry
+        bool in_view = false;    // may cover pixels of the camera view (world pass)
+        bool in_shadow = false;  // may cover texels of the near shadow cascade (shadow pass)
     };
     std::vector<EnemyFrameDraw> frame_enemy_draws;
-    std::vector<std::vector<Vertex>> enemy_triangles;  // posed on worker threads, uploaded on the render thread
+    std::vector<Vertex*> enemy_mapped;  // this frame's write pointer into each enemy's vertex buffer (null = not posed)
+    std::vector<ComPtr<ID3D11Buffer>> enemy_index_buffers;
+    static constexpr float kEnemyReach = 1024.0f;  // UU: a posed enemy's vertices are within this of its origin
     AnimSystem anim_system;
 
     // Reusable dynamic vertex buffers for per-frame geometry (viewmodel, combat effects, HUD) and the enemies.
@@ -374,7 +368,9 @@ struct D3D11Renderer::Impl {
         return std::max<size_t>((length + 4095u) & ~size_t(4095u), 65536u);
     }
 
-    void fill_dynamic_buffer(DynamicBuffer& b, const void* data, size_t length) {
+    // Maps `b` for writing `length` bytes from the start (its old contents are discarded), growing it
+    // first if needed. Returns null on failure; otherwise the caller unmaps b.buffer.
+    void* map_dynamic_buffer(DynamicBuffer& b, size_t length) {
         if (!b.buffer || b.capacity < length) {
             D3D11_BUFFER_DESC d{};
             d.ByteWidth = static_cast<UINT>(dynamic_buffer_capacity(length));
@@ -384,10 +380,14 @@ struct D3D11Renderer::Impl {
             b.buffer.Reset();
             b.capacity = SUCCEEDED(device->CreateBuffer(&d, nullptr, &b.buffer)) ? d.ByteWidth : 0;
         }
-        if (!b.buffer) return;
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (SUCCEEDED(ctx->Map(b.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            std::memcpy(mapped.pData, data, length);
+        if (!b.buffer || FAILED(ctx->Map(b.buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) return nullptr;
+        return mapped.pData;
+    }
+
+    void fill_dynamic_buffer(DynamicBuffer& b, const void* data, size_t length) {
+        if (void* dst = map_dynamic_buffer(b, length)) {
+            std::memcpy(dst, data, length);
             ctx->Unmap(b.buffer.Get(), 0);
         }
     }
@@ -397,6 +397,22 @@ struct D3D11Renderer::Impl {
         if (idx >= dyn_vertex_buffers.size()) dyn_vertex_buffers.emplace_back();
         fill_dynamic_buffer(dyn_vertex_buffers[idx], data, length);
         return dyn_vertex_buffers[idx].buffer.Get();
+    }
+
+    // ME_RENDER_PROF=1 prints, every 120 frames, where a frame's time goes on this thread, by phase.
+    // "present" is the wait for the GPU and the display.
+    bool profile = std::getenv("ME_RENDER_PROF") != nullptr;
+    enum ProfPhase { kProfPrepare, kProfEnemies, kProfShadows, kProfScene, kProfTranslucent, kProfOverlays, kProfPresent, kProfPhases };
+    static constexpr const char* kProfNames[kProfPhases] = {"prepare", "enemies", "shadows", "scene",
+                                                           "translucent", "viewmodel+post+hud", "present"};
+    uint64_t prof_draws = 0;
+    std::atomic<uint64_t> prof_posed{0};  // enemies skinned
+    double prof_seconds[kProfPhases] = {};
+    int prof_frames = 0;
+
+    void draw(UINT vertex_count, UINT first_vertex) {
+        ctx->Draw(vertex_count, first_vertex);
+        ++prof_draws;
     }
 
     void update_constants(const ComPtr<ID3D11Buffer>& buffer, const void* data, size_t length) {
@@ -1351,6 +1367,21 @@ struct D3D11Renderer::Impl {
             wtex.mask     = upload_dxt1_texture(wmesh.tex_mask, true);
             weapon_gpu_textures[wname] = wtex;
         }
+
+        enemy_index_buffers.clear();
+        for (const std::vector<uint32_t>& list : anim_system.enemy_swat_index_lists()) {
+            ComPtr<ID3D11Buffer> buffer;
+            if (!list.empty()) {
+                D3D11_BUFFER_DESC d{};
+                d.ByteWidth = static_cast<UINT>(list.size() * sizeof(uint32_t));
+                d.Usage = D3D11_USAGE_IMMUTABLE;
+                d.BindFlags = D3D11_BIND_INDEX_BUFFER;
+                D3D11_SUBRESOURCE_DATA init{};
+                init.pSysMem = list.data();
+                device->CreateBuffer(&d, &init, &buffer);
+            }
+            enemy_index_buffers.push_back(buffer);
+        }
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
@@ -1456,6 +1487,14 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     if (!impl_->initialized) return;
     Impl* const impl = impl_.get();
     ID3D11DeviceContext* const ctx = impl->ctx.Get();
+    auto prof_mark = std::chrono::steady_clock::now();
+    // Charges the time since the previous call to `phase` (ME_RENDER_PROF).
+    auto prof = [&](Impl::ProfPhase phase) {
+        if (!impl->profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        impl->prof_seconds[phase] += std::chrono::duration<double>(now - prof_mark).count();
+        prof_mark = now;
+    };
 
     // ---------------------------------------------------------------------
     // Main Menu / Load Chapter State: Switch to TdMainMenu.me1 3D City
@@ -1570,7 +1609,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     };
     auto draw_scene_vertices = [&](const std::vector<Vertex>& verts) {
         set_scene_vertices(impl->acquire_dynamic_vertex_buffer(verts.data(), verts.size() * sizeof(Vertex)));
-        ctx->Draw(static_cast<UINT>(verts.size()), 0);
+        impl->draw(static_cast<UINT>(verts.size()), 0);
     };
     const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     auto set_blend = [&](const ComPtr<ID3D11BlendState>& state) { ctx->OMSetBlendState(state.Get(), blend_factor, 0xFFFFFFFFu); };
@@ -1654,18 +1693,20 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     const bool has_translucent = impl->cached_has_translucent;
     const bool needs_scene_copies = impl->cached_needs_scene_copies;
 
+    prof(Impl::kProfPrepare);
+
     // Pose active SWAT/CPF enemies once per frame and share between Pass 0 (Shadow) and Pass 1 (World).
     // Enemies are independent (evaluate_enemy_swat_indexed is const and keeps its scratch buffers thread_local),
-    // so they are posed in parallel. An enemy's triangle list (exactly evaluate_enemy_swat()'s) is assembled
-    // only if its posed bounds can reach the camera view or the near shadow cascade. The GPU would clip an
-    // enemy outside both away completely, so skipping it leaves both passes' output unchanged.
+    // so they are posed in parallel, and an enemy's vertices are uploaded only if its posed bounds can reach
+    // the camera view or the near shadow cascade. The GPU would clip an enemy outside both away completely,
+    // so skipping it leaves both passes' output unchanged.
     const bool shadow_pass = impl->shadow_depth_tex && impl->shadow_program.vs;
     const bool need_enemies = !scene_hidden && impl->anim_system.is_loaded() && !active_scene.enemies.empty() &&
                               (!impl->menu_open || shadow_pass);
     if (need_enemies) {
         const size_t enemy_count = active_scene.enemies.size();
         if (impl->frame_enemy_draws.size() < enemy_count) impl->frame_enemy_draws.resize(enemy_count);
-        if (impl->enemy_triangles.size() < enemy_count) impl->enemy_triangles.resize(enemy_count);
+        if (impl->enemy_mapped.size() < enemy_count) impl->enemy_mapped.resize(enemy_count);
         if (impl->enemy_vertex_buffers.size() < enemy_count) impl->enemy_vertex_buffers.resize(enemy_count);
         const std::vector<EnemyBot>& bots = active_scene.enemies;
         const ClipVolume view_volume(vp);
@@ -1673,18 +1714,48 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         const float sim_time = telemetry.sim_time;
         const bool reaction_active = telemetry.reaction_active;
         const bool menu_open = impl->menu_open;
-        // Each worker touches only element ei of frame_enemy_draws / enemy_triangles (both sized above).
+        const size_t max_vertices = impl->anim_system.enemy_swat_max_vertices();
+
+        // The device context belongs to this thread, so it decides here which enemies get posed and maps
+        // their vertex buffers; the workers then write through the mapped pointers.
+        for (size_t ei = 0; ei < enemy_count; ++ei) {
+            const auto& bot = bots[ei];
+            impl->frame_enemy_draws[ei] = Impl::EnemyFrameDraw{};
+            impl->enemy_mapped[ei] = nullptr;
+            if (!bot.alive && menu_open) continue;
+
+            // Skinning every enemy of the level costs more than the rest of the frame (there are 29 to 71
+            // of them in a chapter), so one that cannot matter is not posed at all. A posed enemy stays
+            // close to its origin: the furthest vertex across the ten chapters is 224 UU out. If a sphere
+            // several times that size around the origin misses both volumes, so do the posed bounds tested
+            // below, and the enemy would not have been drawn.
+            const double origin_margin = 16.0 + 1e-4 * (static_cast<double>(bot.position.length()) + cam_pos.length());
+            if (!(!menu_open && view_volume.may_cover(bot.position, Impl::kEnemyReach, origin_margin)) &&
+                !(shadow_pass && bot.alive && shadow_volume.may_cover(bot.position, Impl::kEnemyReach, origin_margin))) {
+                continue;
+            }
+            impl->enemy_mapped[ei] =
+                static_cast<Vertex*>(impl->map_dynamic_buffer(impl->enemy_vertex_buffers[ei], max_vertices * sizeof(Vertex)));
+        }
+
+        // Each worker touches only element ei of frame_enemy_draws and enemy ei's mapped vertices.
         parallel_for(enemy_count, [&](size_t ei) {
+            Vertex* const gpu_vertices = impl->enemy_mapped[ei];
+            if (!gpu_vertices) return;
             const auto& bot = bots[ei];
             auto& draw = impl->frame_enemy_draws[ei];
-            draw = Impl::EnemyFrameDraw{};
-            if (!bot.alive && menu_open) return;
 
+            // Posed in ordinary memory first: the bounds below read the vertices back, and reading
+            // mapped GPU memory is slow.
             thread_local std::vector<Vertex> posed;
-            posed.resize(impl->anim_system.enemy_swat_max_vertices());
+            posed.resize(max_vertices);
+            if (impl->profile) impl->prof_posed.fetch_add(1, std::memory_order_relaxed);
             const AnimSystem::EnemySwatDraw mesh =
                 impl->anim_system.evaluate_enemy_swat_indexed(bot, sim_time, reaction_active, posed.data());
-            if (mesh.index_count == 0) return;
+            if (mesh.index_count == 0 || mesh.index_list >= impl->enemy_index_buffers.size() ||
+                !impl->enemy_index_buffers[mesh.index_list]) {
+                return;
+            }
 
             // World-space bounding sphere of the posed vertices (the triangle list is built from them alone).
             // fmin/fmax skip NaN operands, so a NaN coordinate instead makes the bounds NaN explicitly, and
@@ -1715,24 +1786,23 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             draw.in_shadow = shadow_pass && bot.alive && shadow_volume.may_cover(center, radius, margin);
             if (!draw.in_view && !draw.in_shadow) return;
 
-            const std::vector<uint32_t>& corners = impl->anim_system.enemy_swat_index_lists()[mesh.index_list];
-            std::vector<Vertex>& out = impl->enemy_triangles[ei];
-            out.resize(mesh.index_count);
-            for (size_t k = 0; k < mesh.index_count; ++k) out[k] = posed[corners[k]];
-            draw.corner_count = mesh.index_count;
+            std::memcpy(gpu_vertices, posed.data(), mesh.vertex_count * sizeof(Vertex));
+            draw.index_list = mesh.index_list;
+            draw.index_count = mesh.index_count;
         });
-        // The device context belongs to this thread, so the uploads happen here.
+
         for (size_t ei = 0; ei < enemy_count; ++ei) {
-            const size_t corners = impl->frame_enemy_draws[ei].corner_count;
-            if (corners > 0) {
-                impl->fill_dynamic_buffer(impl->enemy_vertex_buffers[ei], impl->enemy_triangles[ei].data(), corners * sizeof(Vertex));
-            }
+            if (impl->enemy_mapped[ei]) ctx->Unmap(impl->enemy_vertex_buffers[ei].buffer.Get(), 0);
         }
     }
+    prof(Impl::kProfEnemies);
     // Draws enemy ei's triangle list; it must be in_view or in_shadow.
     auto draw_enemy_mesh = [&](size_t ei) {
+        const Impl::EnemyFrameDraw& draw = impl->frame_enemy_draws[ei];
         set_scene_vertices(impl->enemy_vertex_buffers[ei].buffer.Get());
-        ctx->Draw(static_cast<UINT>(impl->frame_enemy_draws[ei].corner_count), 0);
+        ctx->IASetIndexBuffer(impl->enemy_index_buffers[draw.index_list].Get(), DXGI_FORMAT_R32_UINT, 0);
+        ctx->DrawIndexed(static_cast<UINT>(draw.index_count), 0, 0);
+        ++impl->prof_draws;
     };
 
     auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
@@ -1794,7 +1864,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 sh_prev_moved = moved;
                 set_scene_vertices(impl->cached_mesh_buffers[i].Get());
                 if (mesh.sections.empty()) {
-                    ctx->Draw(static_cast<UINT>(mesh.vertices.size()), 0);
+                    impl->draw(static_cast<UINT>(mesh.vertices.size()), 0);
                     continue;
                 }
                 const auto& sflags = impl->cached_section_flags[i];
@@ -1802,7 +1872,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     const auto& s = mesh.sections[si];
                     if (!section_in_range(mesh, s)) continue;
                     if ((sflags[si] & Impl::kSecShadowCaster) == 0) continue;
-                    ctx->Draw(s.vertex_count, s.first_vertex);
+                    impl->draw(s.vertex_count, s.first_vertex);
                 }
             }
             set_matrix(uniforms.model, identity);
@@ -1838,6 +1908,8 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         render_shadow_cascade(kSunShadowNearSlice, sun_near_vp, impl->raster_shadow_near, /*dynamic_casters=*/true);
     }
 
+    prof(Impl::kProfShadows);
+
     // ---------------------------------------------------------------------
     // Pass 1: 3D Scene Geometry & Sky -> HDR Texture
     // ---------------------------------------------------------------------
@@ -1857,7 +1929,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         use_program(impl->sky_program);
         ctx->OMSetDepthStencilState(impl->depth_disabled_state.Get(), 0);
         push_uniforms();
-        ctx->Draw(3, 0);
+        impl->draw(3, 0);
 
         // B. Draw World Meshes (BasePass + Beast Radiosity)
         set_viewport(fw, fh, 0.05f, 1.0f);
@@ -1932,7 +2004,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 bind_scene_mesh(i);
                 if (mesh.sections.empty()) {
                     use_world_pipeline();
-                    ctx->Draw(static_cast<UINT>(mesh.vertices.size()), 0);
+                    impl->draw(static_cast<UINT>(mesh.vertices.size()), 0);
                     continue;
                 }
                 // Opaque + masked material sections (UE3 base pass). Translucent ones are deferred.
@@ -1957,7 +2029,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     } else {
                         use_world_pipeline();
                     }
-                    ctx->Draw(s.vertex_count, s.first_vertex);
+                    impl->draw(s.vertex_count, s.first_vertex);
                 }
             }
             set_matrix(uniforms.model, identity);
@@ -2011,6 +2083,8 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
         }
 
+        prof(Impl::kProfScene);
+
         // B3. Translucent / additive / modulated materials (UE3 translucency pass): drawn after
         // all opaque geometry, depth-tested without depth writes. Materials that read the scene
         // (SceneTexture, DestColor, DepthBiasedAlpha) sample copies of the opaque scene.
@@ -2038,7 +2112,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         mesh_bound = true;
                     }
                     use_material_pipeline(ps, *sh, *m, impl->mat_cull_enabled && !sh->two_sided);
-                    ctx->Draw(s.vertex_count, s.first_vertex);
+                    impl->draw(s.vertex_count, s.first_vertex);
                 }
             }
             set_matrix(uniforms.model, identity);
@@ -2046,6 +2120,8 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             ctx->RSSetState(impl->raster_no_cull.Get());
             impl->bind_static_samplers(impl->builtin_shaders);
         }
+
+        prof(Impl::kProfTranslucent);
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
         if (!impl->menu_open && !bink_video_active) {
@@ -2113,7 +2189,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         ctx->PSSetSamplers(0, 1, impl->linear_sampler.GetAddressOf());
         impl->bind_static_samplers(impl->builtin_shaders);
         push_uniforms();
-        ctx->Draw(3, 0);
+        impl->draw(3, 0);
     }
 
     // ---------------------------------------------------------------------
@@ -2132,7 +2208,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         ID3D11Buffer* buffer = impl->acquire_dynamic_vertex_buffer(verts.data(), verts.size() * sizeof(HUDVertex));
         const UINT stride = sizeof(HUDVertex);
         ctx->IASetVertexBuffers(0, 1, &buffer, &stride, &zero_offset);
-        ctx->Draw(static_cast<UINT>(verts.size()), 0);
+        impl->draw(static_cast<UINT>(verts.size()), 0);
     };
     auto draw_ui_tex_vertices = [&](const UITexture& tex, const std::vector<UITexVertex>& verts) {
         if (!tex || verts.empty()) return;
@@ -2141,7 +2217,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         ID3D11Buffer* buffer = impl->acquire_dynamic_vertex_buffer(verts.data(), verts.size() * sizeof(UITexVertex));
         const UINT stride = sizeof(UITexVertex);
         ctx->IASetVertexBuffers(0, 1, &buffer, &stride, &zero_offset);
-        ctx->Draw(static_cast<UINT>(verts.size()), 0);
+        impl->draw(static_cast<UINT>(verts.size()), 0);
     };
     // A full-screen picture (a front end frame, a Bink frame) aspect-fitted over a black backdrop.
     auto draw_fitted_picture = [&](const UITexture& tex, int src_w, int src_h) {
@@ -2269,6 +2345,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     impl->unbind_shader_resources();
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
+    prof(Impl::kProfOverlays);
     if (impl->swapchain) {
         ComPtr<ID3D11Texture2D> back_buffer;
         if (SUCCEEDED(impl->swapchain->GetBuffer(0, IID_PPV_ARGS(&back_buffer)))) {
@@ -2279,6 +2356,19 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         ctx->Flush();
     }
     impl->drain_debug_messages();
+
+    prof(Impl::kProfPresent);
+    if (impl->profile && ++impl->prof_frames == 120) {
+        std::fprintf(stderr, "[D3D11Renderer] 120 frames, ms per frame:");
+        for (int i = 0; i < Impl::kProfPhases; ++i) {
+            std::fprintf(stderr, " %s %.2f", Impl::kProfNames[i], impl->prof_seconds[i] / 120.0 * 1000.0);
+            impl->prof_seconds[i] = 0.0;
+        }
+        std::fprintf(stderr, "; %llu draws, %.1f of %zu enemies posed\n", static_cast<unsigned long long>(impl->prof_draws / 120),
+                     static_cast<double>(impl->prof_posed.exchange(0)) / 120.0, active_scene.enemies.size());
+        impl->prof_frames = 0;
+        impl->prof_draws = 0;
+    }
 
     impl->frame_index++;
 }

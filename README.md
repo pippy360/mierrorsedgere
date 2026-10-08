@@ -2,6 +2,8 @@
 
 A high-performance, clean-room native macOS port and engine reimplementation of *Mirror's Edge* (PC Unreal Engine 3 CookedPC) designed from first principles for Apple Silicon (arm64, M-series) and macOS Metal 3.0.
 
+The same game also builds and runs on Windows, drawn with Direct3D 11: see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md).
+
 Built under the `universal-modder` methodology (Pattern 4: *Reimplement, then Fuse*), `mierrorsedgere` directly loads and runs retail PC assets (UPK/ME1 packages, Ogg Vorbis audio banks, INI physics configs, and INT localization files) from the user's local game installation without redistributing or modifying proprietary game binaries.
 
 ---
@@ -37,6 +39,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
      - `TdToneMapping & TdMotionBlur`: DICE photographic S-curve contrast scaling, radial speed blur, and low-health vignette.
      - `2D Vector HUD & Bitmap Font`: Minimalist built-in ASCII typography overlay, dynamic center reticle, momentum speedometer, health/reaction gauges, subtitle prompts, and interactive Chapter Select modal.
    - Dual-Mode: Seamless switching between interactive windowed mode (SDL2 + `CAMetalLayer` with Retina high-DPI support) and zero-copy shared memory headless mode for automated verification.
+   - On Windows, `src/renderer/d3d11_renderer.*` draws the same passes with Direct3D 11. It has no shaders of its own: the MSL above and the generated material shaders are translated to HLSL at start-up (`src/renderer/msl_to_hlsl.*`).
 
 4. **Dynamic Audio Engine (`src/audio/audio_engine.*`)**:
    - Native OpenAL spatial audio subsystem with Xiph.Org libVorbis streaming.
@@ -44,8 +47,8 @@ The engine fuses five specialized native subsystems into a single executable (`m
    - Procedural sound fallbacks ensuring 100% offline playback reliability.
    - Realistic parkour foley (cadenced footsteps, jump grunts, wallrun friction, vault impacts, slide sweeps, zipline whines, and disarm clicks).
 
-5. **Engine Integration & Oracle Harness (`src/main.mm`)**:
-   - Complete Objective-C++ application combining interactive gameplay with automated headless verification testing.
+5. **Engine Integration & Oracle Harness (`src/main.cpp`)**:
+   - Complete C++ application combining interactive gameplay with automated headless verification testing, the same source on macOS and Windows.
 
 ---
 
@@ -73,6 +76,17 @@ mkdir -p build
 cmake -B build -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
+
+### Windows
+Install [MSYS2](https://www.msys2.org) and, in its shell, the UCRT64 packages:
+```bash
+pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,SDL2,openal,libvorbis,ffmpeg,zlib}
+```
+Then run the launcher from `cmd` or PowerShell:
+```bat
+play_windows.bat
+```
+It builds `build-win/mirrorsedge_windows.exe` and starts it; arguments are passed on (`play_windows.bat --chapter 1`). The retail install is found through Steam, or set `MEDGE_ME_INSTALL` or pass `--game-root`. Details, what was verified and the known gaps are in [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md).
 
 ---
 
@@ -122,7 +136,7 @@ The engine features a built-in verification suite that validates assets and driv
 12. **Stage 10 (Tutorial Screenshots)**: Renders six `SP00/Tutorial_p.me1` training-area screenshots.
 13. **Stage 11 (Cutscenes)**: Decodes a Bink (`.bik`) movie frame and its audio, and checks the synced subtitle.
 
-Telemetry is exported to `/tmp/me_oracle_telemetry.json` and the PNG verification screenshots (`oracle_*.png`, `tutorial_*.png`) are exported to `screenshots/`. The process exits with status 1 if any verified stage (parkour stages 1–8 or the cutscene stage 11) fails.
+Telemetry is exported to `/tmp/me_oracle_telemetry.json` (`%TEMP%` on Windows) and the PNG verification screenshots (`oracle_*.png`, `tutorial_*.png`) are exported to `screenshots/`. The process exits with status 1 if any verified stage (parkour stages 1–8 or the cutscene stage 11) fails.
 
 ---
 
@@ -139,7 +153,8 @@ Options:
   --chapter <0..9>         Start at specified campaign chapter (0: SP00, 1: SP01, etc.)
   --level <path>           Load custom level package (.me1 or .upk)
   --max-frames <N>         Exit cleanly after rendering N frames (useful for smoke tests)
-  --game-root <dir>        Set retail game assets directory (default: /Users/tomnom/mirrorsedge)
+  --game-root <dir>        Set retail game assets directory (default: $MEDGE_ME_INSTALL, else the Steam
+                           install on Windows, else /Users/tomnom/mirrorsedge)
   --help, -h               Show help message
 ```
 

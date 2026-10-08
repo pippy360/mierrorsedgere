@@ -541,3 +541,37 @@ enough I can die".
 - **Not ported:** the IntoZipLine glide, the `ziplinestart` / `ziplinehitwall` animations and the impact camera.
 - **Trace start overlaps:** while `ZLS_Moving`, the forward trace ignores a box that starts inside geometry. This
   avoids a false impact at the top anchor.
+
+## 11. Windows port (agent/windows-port, 2026-10-08)
+
+The game builds and runs on Windows as `mirrorsedge_windows.exe`, drawn with Direct3D 11. Build steps, the
+design and the full list of what was and was not run are in `docs/WINDOWS_PORT.md`.
+
+### 11.1 Changes
+- **`src/renderer/d3d11_renderer.*`**: a second renderer backend with `MetalRenderer`'s interface and passes.
+- **`src/renderer/msl_to_hlsl.*`**: the shaders stay MSL. The Direct3D backend translates the built-in
+  shaders, the sun shadow lookup and the generated material shaders to HLSL at start-up and caches the
+  compiled bytecode per user.
+- **Moved out of `metal_renderer.mm`, unchanged, so both backends use one copy:** the built-in shader text
+  (`builtin_shaders_msl.hpp`), the HUD / cutscene / chapter-select draw lists (`overlay_ui.inl`,
+  `hud_font.hpp`) and the texture and clip helpers (`render_common.hpp`).
+- **`src/main.mm` is now `src/main.cpp`**, plain C++ on both platforms. Only the window surface differs.
+  The renderers take the game root from `--game-root` instead of a literal path.
+- **`src/platform/`**: default game root (Steam install on Windows, `MEDGE_ME_INSTALL` anywhere), temp and
+  cache directories.
+- **CMake**: target `mirrorsedge_windows` for MinGW-w64 with MSYS2's UCRT64 packages; `play_windows.bat`.
+
+### 11.2 Results (Windows 11, NVIDIA RTX A5000 Laptop GPU and Intel UHD Graphics, retail from Steam)
+- **`mirrorsedge_windows.exe --verify-all`:** `ORACLE VERIFICATION COMPLETE: ALL SYSTEMS PASS!` on both GPUs.
+  Material shaders compiled 213/213, 537/537, 289/289 and 6/6.
+- **All ten chapters** load and run in a window at the display's 60 Hz. Their 4,281 material shaders
+  (with `Escape_p`) all translate and compile.
+- **Against the Metal screenshots in `screenshots/`:** the eight shots with a fixed camera differ by 1.0 to
+  1.7 of 255 on average (translucent HUD panels, hand pose, texture filtering).
+- **macOS:** compiles and links on a `macos-15` GitHub runner. Not run there: no Mac was available, and the
+  runner has no retail assets.
+
+### 11.3 Remaining gaps
+- The front end runs at about 21 fps on the test laptop: it is drawn by the CPU reference renderer.
+- Not exercised on Windows: a gamepad, the fullscreen toggle, a play-through of a level, the Direct3D
+  debug layer, AMD GPUs.
