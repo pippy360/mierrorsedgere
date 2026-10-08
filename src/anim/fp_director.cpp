@@ -221,7 +221,7 @@ void Director::tick_climb(const PawnFrame& frame) {
     }
     // Going down is the slide (bClimbDownFast: the stick held right down, which a key always is);
     // the tree's Climb node shows it. Stepping down, the up animations backwards, is not played.
-    pawn_.climb_sliding = frame.velocity.z < -20.0f;
+    pawn_.climb_sliding = frame.velocity.z < -1.0f;
     if (climb_step_time_ < 0.0f && !climb_exiting_ && frame.velocity.z > 20.0f) {
         // ClimbAnims[bClimbLeftHand ? right : left].
         const bool right_hand = climb_left_hand_;
@@ -294,7 +294,12 @@ void Director::tick_grab(const PawnFrame& frame) {
             grab_free_turn_ = true;
         }
     }
-    pawn_.grab_turn = grab_turn_ == 3 ? (grab_turned_right_ ? 2 : 1) : 0;
+    // OnCustomAnimEnd: the start's end makes it the idle, the end's end clears it.
+    if (!tree_.custom_anim_playing(Slot::FullBody)) {
+        if (grab_turn_ == 1) grab_turn_ = 3;
+        else if (grab_turn_ == 2) grab_turn_ = 0;
+    }
+    pawn_.grab_turn_type = grab_turn_;
     pawn_.grab_turn_deg = turn;
 }
 
@@ -713,7 +718,7 @@ void Director::tick(const PawnFrame& frame) {
 
     if (frame.movement == EMovement::MOVE_Climb) tick_climb(frame);
     if (frame.movement == EMovement::MOVE_Grabbing) tick_grab(frame);
-    else pawn_.grab_turn = 0;
+    else pawn_.grab_turn_type = 0;
     if (frame.movement == EMovement::MOVE_Melee || frame.movement == EMovement::MOVE_MeleeCrouch) tick_melee(frame);
 
     // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before the

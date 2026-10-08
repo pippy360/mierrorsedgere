@@ -48,7 +48,7 @@ struct PawnAnimState {
     bool climbing_pipe = false;
     int climb_hand = 0;           // 0 left hand up, 1 right
     bool climb_sliding = false;
-    int grab_turn = 0;            // hanging and looking back: 0 no, 1 over the left shoulder, 2 the right
+    int grab_turn_type = 0;       // TdPawn.CurrentGrabTurnType: 0 none, 1 start, 2 end, 3 idle
     float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
 };
 

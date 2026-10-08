@@ -256,7 +256,8 @@ void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, 
     seq.time = (rate < 0.0f && seq.seq) ? seq.seq->length : 0.0f;
     seq.root_motion = root_motion;
     set_active(n, channel, blend_in);
-    n.pending_blend_out = looping ? -1.0f : blend_out;
+    // With no time to blend out in, it holds its last frame until something else takes the slot.
+    n.pending_blend_out = (looping || blend_out <= 0.0f) ? -1.0f : blend_out;
 }
 
 void AnimTree::stop_custom_anim(Slot slot, float blend_out) {
@@ -359,9 +360,27 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
     } else if (n.cls == "TdAnimNodeGrabbing") {
         // Hang, HangFree, then the looking-back idles (left, right, and their extremes).
         // TdMove_IntoGrab: GrabAnimNode.SetActiveMove(legs on the wall ? 0 : 1).
-        want = pawn.hanging_free ? 1 : 0;
-        if (pawn.grab_turn == 1) want = 2;
-        else if (pawn.grab_turn == 2) want = 3;
+        // Measured on the recordings (the node is native; every frame it has weight fits to 0.005):
+        // turned past a quarter turn with the turn started, the idle of that side shows at once,
+        // shared with its extreme by how far past ((|d| - 90) / 90); with no turn it goes back to
+        // the hang over 0.2 s; in between (the turn's end playing) it stays as it is.
+        const int hang = pawn.hanging_free ? 1 : 0;
+        const float off = std::fabs(pawn.grab_turn_deg);
+        if (became_relevant) {
+            set_active(n, hang, 0.0f);
+        } else if (pawn.grab_turn_type >= 2 && off > 90.0f && n.weight.size() >= 6) {
+            const size_t side = pawn.grab_turn_deg < 0.0f ? 0 : 1;
+            const float extreme = std::min((off - 90.0f) / 90.0f, 1.0f);
+            std::fill(n.weight.begin(), n.weight.end(), 0.0f);
+            n.weight[2 + side] = 1.0f - extreme;
+            n.weight[4 + side] = extreme;
+            n.target = n.weight;
+            n.active = static_cast<int>(2 + side);
+            n.blend_to_go = 0.0f;
+        } else if (pawn.grab_turn_type <= 1 && (n.active != hang || n.target[static_cast<size_t>(hang)] < 1.0f)) {
+            set_active(n, hang, 0.2f);
+        }
+        return;
     } else if (n.cls == "TdAnimNodeClimb") {
         // LadderLeft, LadderRight, LadderSlide, PipeLeft, PipeRight, PipeSlide, TurnLeftIdle, TurnRightIdle.
         const int base = pawn.climbing_pipe ? 3 : 0;
