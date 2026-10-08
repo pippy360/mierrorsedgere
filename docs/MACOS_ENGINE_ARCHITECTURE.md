@@ -168,7 +168,7 @@ stateDiagram-v2
     Falling --> SkillRoll: Crouch Button on Landing (200 < Height < 530)
     Falling --> HardLanding: Landing without Roll (Height >= 530)
     Falling --> SoftLanding: Landing (Height <= 300)
-    SkillRoll --> Running: Momentum Preserved
+    SkillRoll --> Walking: fallinglandroll Ends (1.27s Root Motion)
     HardLanding --> Walking: Stumble Recovery (15 HP Dmg)
     SoftLanding --> Running: Uninterrupted Flow
     
@@ -206,7 +206,7 @@ stateDiagram-v2
 #### 5. Skill Roll & Landings (`TdMove_Landing`)
 - **Height Thresholds:**
   - Fall $\le 200 \text{ units}$: Seamless running continuation.
-  - Fall between $200$ and $530 \text{ units}$: Pressing Crouch within a $0.3\text{s}$ pre-landing window executes a Skill Roll (`SkillRollLandingHeight = 200.f`), fully conserving forward velocity.
+  - Fall between $200$ and $530 \text{ units}$: Crouch pressed within $0.2\text{s}$ before touchdown (`TdPawn.CanSkillRoll`, `RollTriggerWindow`) executes a Skill Roll (`SkillRollLandingHeight = 200.f`). `TdMove_SkillRoll.StartMove` zeroes Velocity and Acceleration and plays `fallinglandroll` with root motion: the pawn rolls $313.5 \text{ units}$ along its facing over the animation's $1.267\text{s}$ (no steering, look locked), leaves at the animation's $\approx 233 \text{ units/s}$ exit speed and `OnCustomAnimEnd` returns it to `MOVE_Walking`. The camera rides the animation's EyeJoint / CameraJoint (`TdPlayerPawn.CalcCamera`, see `ANIMATION_SYSTEM_RE.md` §6): one full forward somersault, eyes down to $13 \text{ units}$ above the floor.
   - Fall $\ge 530 \text{ units}$ without roll: Hard Landing (`HardLandingHeight = 530.f`), dealing $15$ damage and cutting speed by `LandingSpeedReduction = 65.f`.
 
 #### 6. Coil (`TdMove_Coil`)
@@ -348,8 +348,8 @@ The automated test suite verifies the physical invariants of the engine:
    Simulation must match within $\pm 0.5\%$.
 2. **`test_wallrun_angle_filter`:**
    Incident angle $< 57^\circ$ triggers wallrun; angle $> 57^\circ$ results in wall bump deceleration.
-3. **`test_skill_roll_conservation`:**
-   Dropping $350 \text{ units}$ without roll reduces velocity by $\ge 65 \text{ units/s}$; with timely crouch input, velocity conservation $\ge 98\%$.
+3. **Skill roll (oracle Stage 6, `--verify-all`):**
+   A timely crouch on a $308 \text{ unit}$ drop starts `MOVE_SkillRoll`. The roll must last `fallinglandroll`'s $1.267\text{s}$ ($\pm 2$ frames) and end in `MOVE_Walking`, move $313.5 \text{ units}$ of root motion along the body's facing (no sideways drift), and turn the camera through a full forward somersault (pitch minimum $\le -355^\circ$, ending level at $-360^\circ$) with the eyes below $40 \text{ units}$ at the bottom.
 4. **`test_springboard_boost`:**
    Vaulting over an obstacle ($h = 100$) elevates vertical impulse to $950 \text{ units/s}$.
 

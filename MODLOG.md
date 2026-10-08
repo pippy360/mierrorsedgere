@@ -626,3 +626,58 @@ The hand-over still pops 12 uu, because the gameplay camera rests 8 uu higher an
 standing pose the animation ends in; retail turns Faith in place as control returns in five chapters; one
 second of Edge tilts twice as far as retail's view; the opening's title lettering and the chapter name are not
 drawn. Section 5 of `docs/LEVEL_INTROS.md` has the list.
+
+---
+
+## 13. Skill roll: the whole animation, root motion and the camera somersault (agent/roll-anim-360, 2026-10-08)
+
+**Bug (user report):** "the roll animation seems to be incorrect (it doesn't do a full 360)".
+
+### 13.1 Root causes
+- **Cut short.** The roll ended after an unsourced `skill_roll_time = 0.5 s`. `fallinglandroll` lasts 1.267 s, so
+  only 39% of it played.
+- **No root motion.** The roll carried the landing speed (at least `run_speed`). TdMove_SkillRoll.StartMove zeroes
+  Velocity and Acceleration and moves the pawn on `fallinglandroll`'s root motion.
+- **No camera animation.** The camera stayed at `eye_height` with the controller's view and only dipped 40 uu.
+  TdPlayerPawn.CalcCamera puts the camera on the 1P mesh's EyeJoint and adds the swizzled CameraJoint rotation. In
+  `fallinglandroll` that is one full forward somersault.
+
+### 13.2 Changes
+- `parkour_controller.cpp`:
+  - `fallinglandroll`'s 38 root-forward keys are baked into `kSkillRollRootForward` (313.5 uu).
+  - `land()` starts the roll with zero velocity and takes the body's facing as the roll direction. It also restarts
+    `combat_anim_time`, because the landing runs after the step has already advanced it.
+  - `update_landing_moves` moves the pawn by the root motion each step, at crouch height. The velocity is the root
+    speed, so the roll exits at about 233 uu/s.
+  - The roll ends with the animation (1.2667 s), into Walking or Crouch.
+  - `skill_roll_time` is removed from `types.hpp`.
+- `anim_system.cpp`: `camera_animation()` and `player_camera()` port CalcCamera (`docs/ANIMATION_SYSTEM_RE.md` §6).
+- `metal_renderer.mm` and `d3d11_renderer.cpp`: `render_frame` draws from `player_camera()`.
+- `main.cpp`, Stage 6: checks the roll's time, distance and camera somersault, and publishes
+  `screenshots/oracle_6_skill_roll_upside_down.png`.
+
+### 13.3 Results
+- **Retail SP01 roll** (`recordings/20260920_145610_escape_overlay_session.jsonl.gz`, replay seg08):
+  - The port now stays within 7 uu of retail for the whole roll. Before, it parted 0.46 s in.
+  - Exit speed is 232.7 uu/s (retail 234, then 226).
+  - The camera pitch matches the recording to within about 4°: −87.7° at 0.2 s, −360° at 0.8 s, −372.8° at 0.95 s,
+    level at the end.
+- **`tools.retail.replay`:** still 28 of 32 segments reproduce. seg08 now parts at 1.73 s, after the roll, during a
+  back-right walk (see 13.4).
+- **`--verify-all`:** ALL SYSTEMS PASS. Stage 6 gives:
+  - 1.2667 s, then MOVE_Walking
+  - 313.5 uu of travel
+  - pitch minimum −372.8°, ending at −360°
+  - eyes down to 13.3 uu
+
+### 13.4 Remaining gaps
+- **Other camera animations.** Only the skill roll plays one. Landings, heave-ups, ladder entry and hang-free turns
+  carry camera motion too (list in `docs/ANIMATION_SYSTEM_RE.md` §6.3).
+- **Mid-roll legs.** On top of the animation, the legs get the lower-body viewmodel's fixed offsets (`is_lower` in
+  `evaluate_faith_1p`: 54 uu back, tilted 16°). So they sit away from where the roll puts them.
+- **Walking back-right after the roll (seg08).** The port tops out near 350–390 uu/s; retail reaches about
+  610 uu/s.
+- **Walk viewmodel at 200–260 uu/s.** Large skin-coloured shapes show at the screen edges. This also happens walking
+  up from rest; the roll now ends in that speed range.
+- **Windows not built.** `D3D11Renderer` gets the same `player_camera()` as `MetalRenderer`, and the shared oracle
+  calls it. Neither was compiled or run on Windows here: this Mac has no MinGW toolchain.

@@ -178,6 +178,18 @@ struct AnimBlendConfig {
     float blend_out_time = 0.15f;
 };
 
+// TdPlayerPawn.CalcCamera puts the first-person camera on Mesh1p's EyeJoint and adds the camera
+// animation (native TdPawn.GetCameraAnimation) to the view rotation. The 1P bone frame is raw +X left,
+// -Y up, +Z forward, so the bone's FMatrix::Rotator is swizzled into the view's:
+// Pitch += -Rot.Roll, Yaw += Rot.Pitch, Roll += -Rot.Yaw.
+struct CameraAnimation {
+    float weight = 0.0f;              // blend weight of the animated camera (0 = none playing)
+    Vec3 eye{0.0f, 0.0f, 0.0f};       // the animation's EyeJoint above the feet: x forward, y right, z up
+    float pitch_deg = 0.0f;           // added to the view rotation (already blended by weight)
+    float yaw_deg = 0.0f;
+    float roll_deg = 0.0f;
+};
+
 class AnimSystem {
 public:
     AnimSystem() = default;
@@ -189,6 +201,15 @@ public:
 
     // Evaluate Faith's first-person skeletal viewmodel (SK_UpperBody + SK_LowerBody + equipped weapon + 1P muzzle flash)
     void evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector<Vertex>& out_triangles) const;
+
+    // The camera animation of the move `telemetry` is in, at the time its viewmodel animation is at.
+    // Only TdMove_SkillRoll's fallinglandroll (a full forward somersault of the view) so far; other
+    // moves return weight 0.
+    [[nodiscard]] CameraAnimation camera_animation(const PlayerTelemetry& telemetry) const;
+
+    // The first-person camera for `telemetry`: the eyes eye_height above the feet looking along the
+    // view rotation, moved onto the animated EyeJoint and turned by camera_animation() while it plays.
+    void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
 
     // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
     void evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const;

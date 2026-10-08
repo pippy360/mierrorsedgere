@@ -123,7 +123,7 @@ In `TdPawn`, the current player move is tracked by `MovementState` and `OldMovem
 | `81` | `MOVE_AutoStepUp` | `TdMove_AutoStepUp`| `TdPhysicsMove` | `PHYS_Walking` | Smooth ledge step without breaking sprint |
 | `82` | `MOVE_MeleeAirAbove` | `TdMove_MeleeAirAbove` | `TdMove_MeleeBase` | `PHYS_Falling` | Aerial takedown stomp onto enemy below |
 | `85` | `MOVE_AirBarge` | `TdMove_AirBarge` | `TdMove_Barge` | `PHYS_Falling` | Mid-air flying shoulder barge into door/window |
-| `91` | `MOVE_SkillRoll` | `TdMove_SkillRoll` | `TdPhysicsMove` | `PHYS_Walking` | Skill roll on landing to convert fall into sprint |
+| `91` | `MOVE_SkillRoll` | `TdMove_SkillRoll` | `TdPhysicsMove` | `PHYS_Walking` | Forward roll on landing (crouch within 0.2 s of touchdown): `fallinglandroll` on root motion (313.5 uu, 1.27 s) with a full camera somersault, then `MOVE_Walking` |
 | `93` | `MOVE_Cutscene` | `TdMove_Cutscene` | `TdPhysicsMove` | `PHYS_None` | Interactive cutscene state (e.g. elevator escape) |
 
 ---
@@ -224,7 +224,7 @@ Faith has a regenerating health pool managed in `TdPawn` and `TdPlayerPawn`:
 - **Regenerate Health Rate**: `25.000 HP/s` (Full recovery from 1 HP to 100 HP takes 4 seconds)
 - **Stun Recovery Rate**: `10.0 units/s`
 - **Taser Recovery Rate**: `50.0 units/s`
-- **Falling Damage Threshold**: `FallingUncontrolledHeight = 1000.0 units`. Falls beyond this without skill roll result in fatal impact. Performing `TdMove_SkillRoll` absorbs fall kinetic energy and converts it to forward sprint momentum.
+- **Falling Damage Threshold**: `FallingUncontrolledHeight = 1000.0 units`. Falls beyond this without skill roll result in fatal impact. Performing `TdMove_SkillRoll` replaces the landing: `StartMove` zeroes Velocity and Acceleration and the pawn rolls on `fallinglandroll`'s root motion (313.5 uu forward over 1.27 s), leaving at the animation's ~233 uu/s exit speed.
 - **Armor Damage Scaling**: Headshots take `1.5x` damage, body hits `1.0x`, limbs `0.75x`.
 
 ---

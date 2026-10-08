@@ -26,7 +26,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
      - **Wallrun & Wall Climb**: Incident angle filtering (0°–57° wallrun, <33° climb) with 15° camera Dutch tilt and vertical boost impulses.
      - **Vault & Springboard**: Swept obstacle detection triggering Speed Vaults and high-impulse Springboards (`JumpZ = 950 u/s`).
      - **Ledge Grab & Zipline**: Ray-cast ledge pull-ups and line-segment zipline cable traversal.
-     - **Crouch Slide & Coil**: Sprint-initiated low-friction slides under ventilation ducts, mid-air leg coils (+60 unit clearance), and momentum-preserving Skill Rolls.
+     - **Crouch Slide & Coil**: Sprint-initiated low-friction slides under ventilation ducts, mid-air leg coils (+60 unit clearance), and Skill Rolls that play `fallinglandroll`'s root motion while the camera somersaults with the animation.
      - **Combat & Disarm**: Interactive weapon snatch (`MOVE_Snatch`) against patrol cops/SWAT bots, firearm ballistics, and Reaction Time slow-motion (0.25x time dilation with cool blue tint).
 
 3. **Apple Metal 3.0 Graphics Engine (`src/renderer/metal_renderer.*`)**:
@@ -129,7 +129,7 @@ The engine features a built-in verification suite that validates assets and driv
 5. **Stage 3 (Wallrun & Camera Tilt)**: Wallruns along the stage-6 billboard across the rooftop gap with the 15° camera Dutch roll (`MOVE_WallRunningLeft`) and lands on the far roof.
 6. **Stage 4 (Wallclimb)**: Starts a wall climb up the stage-10 facade and checks the vertical ascent (`MOVE_WallClimbing`).
 7. **Stage 5 (Zipline & Crouch Slide)**: Verifies cable attachment, gravitational descent, rooftop landing, and low-clearance crouch slide (`MOVE_ZipLine`, `MOVE_Slide`).
-8. **Stage 6 (Mid-Air Coil & Skill Roll)**: Verifies mid-air leg retraction (`MOVE_Coil`, +60 unit boost) and buffered landing momentum retention (`MOVE_SkillRoll`).
+8. **Stage 6 (Mid-Air Coil & Skill Roll)**: Verifies mid-air leg retraction (`MOVE_Coil`, +60 unit boost) and the buffered-crouch skill roll (`MOVE_SkillRoll`). The roll must play the whole 1.27 s `fallinglandroll` on its 313.5 uu of root motion, then return to `MOVE_Walking`. The camera must turn one full forward somersault, down to the floor and back up level.
 9. **Stage 7 (Combat Disarm & Reaction Time)**: Validates enemy disarm QTE (`MOVE_Snatch`), weapon equip (`Colt1911`), and 0.25x reaction time slow-motion dilation.
 10. **Stage 8 (Elevator & Level Streaming)**: Rides the real `Escape_p` main lift (`S_Elevator_01` cab and door `InterpActor`s, `PosTrack` Z 10608 → 12288), checks the mid-shaft sublevel streaming and walks out at the top.
 11. **Stage 9 (Retail Level & UI Overlay)**: Renders `SP01/Edge_p.me1` with the first-person Faith viewmodel and the interactive Chapter Select menu.

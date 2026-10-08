@@ -150,3 +150,79 @@ In Mirror's Edge's Maya/MotionBuilder component space (`RotOrigin = (0, -16384, 
 - $+X_{\text{raw}}$ = Character Left ($-X_{\text{raw}}$ = Character Right)
 - $-Y_{\text{raw}}$ = Character Up ($0$ at feet, $-108.7$ at `Hips`, $-166.2$ at `EyeJoint`)
 - $+Z_{\text{raw}}$ = Character Forward
+
+---
+
+## 6. First-Person Camera Animation (`TdPlayerPawn.CalcCamera`)
+
+Retail puts the first-person camera on the animated 1P mesh, not at a fixed eye height:
+
+- **Location**: `Mesh1p`'s `EyeJoint` (bone `72` of `SK_UpperBody`).
+- **Rotation**: `GetViewRotation()` (the controller's view) plus the native `GetCameraAnimation()`. That is the `CameraJoint` (bone `73`, identity bind pose) rotation relative to the mesh root, decomposed with `FMatrix::Rotator()` and swizzled from the raw mesh axes into view axes:
+  ```
+  View.Pitch += -CamRot.Roll;   View.Yaw += CamRot.Pitch;   View.Roll += -CamRot.Yaw;
+  ```
+  The sum is per component, so an animation can carry the view past ±90° of pitch, all the way round.
+- The camera animation comes from the blended mesh pose. It therefore fades in and out with the slot animation that plays it (`PlayMoveAnim(..., BlendIn, BlendOut)`): weight $w = \text{clamp}\left(\min\left(\frac{\tau}{\text{BlendIn}}, \frac{\text{len} - \tau}{\text{BlendOut}}\right), 0, 1\right)$.
+
+### 6.1 `fallinglandroll` (`TdMove_SkillRoll`)
+
+`TdMove_SkillRoll.StartMove` does the following:
+- `UseRootMotion(true)`
+- `PlayMoveAnim(CNT_FullBody, 'fallinglandroll', 1.0, 0.2, 0.2, bRootMotion)`
+- `SetIgnoreMoveInput(-1)` and `SetIgnoreLookInput(-1)`
+- `ResetCameraLook(0.2)`
+- `Velocity = Acceleration = 0`
+
+`OnCustomAnimEnd` then calls `SetMove(MOVE_Walking)`.
+
+- **Timing**: `1.2667 s`, `38` keys spaced `length / 37` apart (UE3's non-looping `TimeToIndex`).
+- **Root bone**:
+  - Pure forward translation (raw $+Z$): `21.3 → 334.9`, so `313.5 uu` in all.
+  - A single identity rotation key.
+  - Root speed starts near 500 uu/s and peaks near 800 uu/s 0.1 s after touchdown. It falls to about 20 uu/s while inverted (0.45 s), holds about 310 uu/s coming up, and exits at 233 uu/s.
+- **Camera**: `CameraJoint` has no rotation relative to `EyeJoint` in this sequence. The EyeJoint itself turns one full forward somersault, as below. Yaw stays within ±5° and roll within ±3.5°.
+
+| t (s) | 0 | 0.19 | 0.44 | 0.57 | ~0.8 | 0.95 | 1.267 |
+|---|---|---|---|---|---|---|---|
+| camera pitch (animation) | −51.3° | −89° | −192.7° | −276° | −360° | −372.8° | −361.6° |
+| EyeJoint height above feet | 145 | | 13.3 | | | | 152.9 |
+
+**Retail recording check**: `recordings/20260920_145610_escape_overlay_session.jsonl.gz` captures a skill roll on SP01 at 126 s. Its unwrapped view pitch is:
+
+| t (s) | 0 | 0.199 | 0.42 | 0.514 | 0.652 | 0.8 | 0.953 | 1.25 |
+|---|---|---|---|---|---|---|---|---|
+| retail camera pitch | −16.5° | −87.7° | −170.4° | −250.5° | −332.6° | −359.7° | −372.8° | −360° |
+
+The model above reproduces it to within about 4°: the view pitch reset to 0 over 0.2 s, plus $w$ times the animation, with 0.2 s blends.
+
+### 6.2 Port
+
+- [`AnimSystem::camera_animation`](../src/anim/anim_system.cpp) returns `CameraAnimation { weight, eye, pitch/yaw/roll }`. It works in these steps:
+  1. Sample the sequence at `PlayerTelemetry::combat_anim_time` (the move's clock, restarted on the landing frame).
+  2. Run FK.
+  3. Measure the EyeJoint from the root bone, since root motion moves the root's translation into the pawn.
+  4. Map raw (X left, −Y up, Z forward) to (forward, right, up).
+  5. Slerp the CameraJoint rotation from identity by $w$ and apply the swizzle above.
+
+  So far only `MOVE_SkillRoll` plays a camera animation.
+- [`AnimSystem::player_camera`](../src/anim/anim_system.cpp) gives the camera position and rotation:
+  - Position: a lerp from the standing eyes to the animated EyeJoint, by $w$.
+  - Rotation: the view plus the camera animation.
+
+  Both backends' `render_frame` (`MetalRenderer`, `D3D11Renderer`) draw from it, and their `player_camera()` exposes it to the oracle. Oracle Stage 6 checks the somersault: pitch minimum ≤ −355°, ending level at −360°, eyes below 40 uu.
+- The viewmodel (`evaluate_faith_1p`) is already built in the EyeJoint's frame, so the arms and legs stay with the turning camera.
+
+### 6.3 Other `AS_C1P_Unarmed` sequences with camera motion (not applied yet)
+
+Peak swizzled camera rotation, measured with the same FK:
+
+| Sequence | Camera motion |
+|---|---|
+| `fallinglandsoftlanding` | pitch down to −68.6° |
+| `fallinglandhard` | pitch down to −53.5° |
+| `HangHeaveUp` / `HangFreeHeaveUp` | pitch down to −47.7° / −52.6° |
+| `HangFree` | pitch held at +13.2° |
+| `LadderEnterTop` | pitch −72.9°..+26°, yaw up to 53° |
+| `springboardfail` | pitch down to −58.4° |
+| `HangFreeTurnLeft` / `Right` | yaw ∓80° with large pitch and roll |

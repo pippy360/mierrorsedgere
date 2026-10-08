@@ -825,7 +825,7 @@ struct MovementConfig {
     float landing_speed_reduction = 65.0f;     // LandingSpeedReduction
     float roll_trigger_window = 0.2f;          // TdPawn.CanSkillRoll: crouch pressed this recently
     float roll_trigger_rearm = 0.6f;           // a press only re-arms after this long
-    float skill_roll_time = 0.5f;
+    // (TdMove_SkillRoll lasts as long as its fallinglandroll animation: kSkillRollLength in parkour_controller.cpp.)
     float hard_landing_time = 1.8f;
     float lay_on_ground_time = 1.5f;
 
