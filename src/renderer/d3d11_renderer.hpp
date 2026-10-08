@@ -44,6 +44,10 @@ public:
     bool save_screenshot_ppm(const std::string& path);
     bool save_screenshot_png(const std::string& path);
 
+    // The first-person camera render_frame() draws `telemetry` from (outside the menu): the eyes and
+    // view rotation with the current move's camera animation (TdPlayerPawn.CalcCamera) applied.
+    void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
+
     // State inspection
     [[nodiscard]] bool is_initialized() const;
     [[nodiscard]] bool is_headless() const;

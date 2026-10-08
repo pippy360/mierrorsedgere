@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <cstdio>
 #include <unordered_map>
 
 #if defined(_WIN32)
@@ -448,10 +449,75 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s6_roll = (controller.get_move_state() == EMovement::MOVE_SkillRoll);
     log_telemetry("Stage6_SkillRoll");
     const float s6_drop = s6_launch_z - controller.get_position().z;
-    bool s6_pass = s6_coil && s6_roll;
+
+    // The roll itself (TdMove_SkillRoll, retail recording 2026-09-20 14:56): fallinglandroll's root
+    // motion carries the pawn 313.5 uu along its facing, the move lasts the whole 1.267 s animation
+    // (OnCustomAnimEnd -> MOVE_Walking), and the camera rides the animation's EyeJoint / CameraJoint
+    // (TdPlayerPawn.CalcCamera): one full forward somersault, down to the floor and back up level.
+    auto wrap_180 = [](float a) {
+        while (a > 180.0f) a -= 360.0f;
+        while (a <= -180.0f) a += 360.0f;
+        return a;
+    };
+    const Vec3 roll_start = controller.get_position();
+    const Vec3 roll_fwd = Rotator::from_degrees(0.0f, controller.get_body_yaw(), 0.0f).forward();
+    const float roll_t0 = controller.get_telemetry().combat_anim_time;  // already rolled in the landing frame
+    int s6_roll_frames = 0;
+    float cam_pitch = 0.0f, cam_pitch_raw_prev = 0.0f, cam_pitch_min = 0.0f, eye_min = 1e9f;
+    auto sample_camera = [&](bool first) {
+        Vec3 cam_pos;
+        Rotator cam_rot;
+        renderer.player_camera(controller.get_telemetry(), cam_pos, cam_rot);
+        const float raw = cam_rot.to_degrees().x;
+        cam_pitch = first ? raw : cam_pitch + wrap_180(raw - cam_pitch_raw_prev);
+        cam_pitch_raw_prev = raw;
+        cam_pitch_min = first ? cam_pitch : std::min(cam_pitch_min, cam_pitch);
+        eye_min = std::min(eye_min, cam_pos.z - controller.get_position().z);
+    };
+    sample_camera(true);
+    while (s6_roll && controller.get_move_state() == EMovement::MOVE_SkillRoll && s6_roll_frames < 150) {
+        controller.step(in_run, kDt, sim_scene);
+        ++s6_roll_frames;
+        sample_camera(false);
+        // Mid-roll frames (0.2, 0.42, 0.55, 0.8 s in): looking at the floor, upside down, at the sky
+        // behind, and coming back up.
+        const int frame_at = static_cast<int>(s6_roll_frames + roll_t0 / kDt + 0.5f);
+        if (frame_at == 12 || frame_at == 25 || frame_at == 33 || frame_at == 48) {
+            renderer.render_frame(sim_scene, controller.get_telemetry());
+            char name[64];
+            std::snprintf(name, sizeof(name), "oracle_6_skill_roll_%03dms.png",
+                          static_cast<int>(controller.get_telemetry().combat_anim_time * 1000.0f + 0.5f));
+            if (frame_at == 25) {
+                save_and_publish_png("oracle_6_skill_roll_upside_down.png");
+            } else {
+                const std::string tmp_path = std::string("/tmp/me_oracle_screenshots/") + name;
+                renderer.save_screenshot_png(tmp_path);
+                copy_artifact(tmp_path, brain_dir + "/" + name);
+            }
+        }
+    }
+    log_telemetry("Stage6_SkillRoll_End");
+    const float roll_time = roll_t0 + static_cast<float>(s6_roll_frames) * kDt;
+    const Vec3 roll_move = controller.get_position() - roll_start;
+    const float roll_dist = roll_move.dot(roll_fwd);
+    const float roll_side = std::abs(roll_move.dot(Vec3(-roll_fwd.y, roll_fwd.x, 0.0f)));
+    const bool s6_roll_time = std::abs(roll_time - 1.2667f) <= 2.0f * kDt &&
+                              controller.get_move_state() == EMovement::MOVE_Walking;
+    // Up to a 1/120 s substep of it rolled before roll_start was taken (4 uu) and of walking after it
+    // ended (2 uu at its 233 uu/s exit speed).
+    const bool s6_roll_dist = roll_dist > 313.5f - 6.0f && roll_dist < 313.5f + 3.0f && roll_side < 1.0f;
+    // A full forward turn (the animation overshoots to -373) that ends level, and the eyes near the floor.
+    const bool s6_somersault = cam_pitch_min <= -355.0f && std::abs(cam_pitch + 360.0f) < 1.0f && eye_min < 40.0f;
+    bool s6_pass = s6_coil && s6_roll && s6_roll_time && s6_roll_dist && s6_somersault;
     std::cout << "  -> Stage 6 Result: " << (s6_pass ? "PASS" : "FAIL")
               << " (Coil=" << (s6_coil ? "OK" : "NO") << ", Roll=" << (s6_roll ? "OK" : "NO")
-              << ", Drop=" << s6_drop << " u)" << std::endl;
+              << ", Drop=" << s6_drop << " u"
+              << ", RollTime=" << (s6_roll_time ? "OK" : "FAIL") << " [" << roll_time << " s -> "
+              << move_state_name(controller.get_move_state()) << "]"
+              << ", RollDistance=" << (s6_roll_dist ? "OK" : "FAIL") << " [" << roll_dist << " u, " << roll_side
+              << " u sideways]"
+              << ", CameraSomersault=" << (s6_somersault ? "OK" : "FAIL") << " [pitch min " << cam_pitch_min
+              << "°, end " << cam_pitch << "°, eyes down to " << eye_min << " u])" << std::endl;
 
     // Stage 7: Combat Disarm (Celeste on the stage-19 combat terrace) & Reaction Time
     std::cout << "[Oracle Stage 7] Testing Combat Disarm & Reaction Time..." << std::endl;

@@ -2314,6 +2314,84 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
 }
 
 // -----------------------------------------------------------------------------
+// First-person camera animation (TdPlayerPawn.CalcCamera)
+// -----------------------------------------------------------------------------
+namespace {
+
+// UE3 FMatrix::Rotator() of the rotation `q`, in degrees: pitch and yaw from where the X axis points,
+// roll from the Y and Z axes against the Y axis of that pitch and yaw.
+void matrix_rotator_degrees(const Quat4& q, float& pitch, float& yaw, float& roll) {
+    const Vec3 x_axis = q.rotate(Vec3(1.0f, 0.0f, 0.0f));
+    const Vec3 y_axis = q.rotate(Vec3(0.0f, 1.0f, 0.0f));
+    const Vec3 z_axis = q.rotate(Vec3(0.0f, 0.0f, 1.0f));
+    const float p = std::atan2(x_axis.z, std::sqrt(x_axis.x * x_axis.x + x_axis.y * x_axis.y));
+    const float y = std::atan2(x_axis.y, x_axis.x);
+    const Vec3 sy_axis(-std::sin(y), std::cos(y), 0.0f);
+    const float r = std::atan2(z_axis.dot(sy_axis), y_axis.dot(sy_axis));
+    pitch = p * RAD2DEG;
+    yaw = y * RAD2DEG;
+    roll = r * RAD2DEG;
+}
+
+}  // namespace
+
+CameraAnimation AnimSystem::camera_animation(const PlayerTelemetry& telemetry) const {
+    constexpr size_t kRoot = 0, kEyeJoint = 72, kCameraJoint = 73;  // SK_UpperBody
+    CameraAnimation out;
+    if (!loaded_ || faith_upper_.bones.size() <= kCameraJoint) return out;
+    // TdMove_SkillRoll.StartMove: PlayMoveAnim(CNT_FullBody, 'fallinglandroll', 1.0, BlendIn 0.2,
+    // BlendOut 0.2, bRootMotion); the move ends with the animation (OnCustomAnimEnd). The armed roll
+    // plays the same unarmed sequence (evaluate_faith_1p).
+    if (telemetry.move_state != EMovement::MOVE_SkillRoll) return out;
+    const AnimSequenceAsset* seq = faith_unarmed_set_.find_sequence("fallinglandroll");
+    if (!seq || seq->length <= 0.0f) return out;
+    constexpr float kBlendIn = 0.2f;
+    constexpr float kBlendOut = 0.2f;
+    const float t = std::clamp(telemetry.combat_anim_time, 0.0f, seq->length);
+    out.weight = std::clamp(std::min(t / kBlendIn, (seq->length - t) / kBlendOut), 0.0f, 1.0f);
+    if (out.weight <= 0.0f) return out;
+
+    thread_local std::vector<Vec3> local_pos, comp_pos;
+    thread_local std::vector<Quat4> local_quat, comp_quat;
+    // (sample_sequence_pose wraps a normalised time of 1 back round to the first key.)
+    sample_sequence_pose(faith_upper_, faith_unarmed_set_, seq, std::min(t / seq->length, 0.9999f), local_pos,
+                         local_quat);
+    compute_skeleton_fk(faith_upper_.bones, local_pos, local_quat, comp_pos, comp_quat);
+
+    // Root motion moves the root bone's translation into the pawn, so the eye is measured from it.
+    const Quat4 root_inv = comp_quat[kRoot].conjugate();
+    const Vec3 eye = root_inv.rotate(comp_pos[kEyeJoint] - comp_pos[kRoot]);
+    out.eye = Vec3(eye.z, -eye.x, -eye.y);
+
+    // The camera bone's rotation (its bind pose looks straight ahead), blended in from none like the
+    // slot's pose: forward through a whole turn and back to level for this sequence.
+    const Quat4 cam = Quat4::multiply(root_inv, comp_quat[kCameraJoint]).normalized();
+    float p = 0.0f, y = 0.0f, r = 0.0f;
+    matrix_rotator_degrees(Quat4::slerp(Quat4(), cam, out.weight), p, y, r);
+    out.pitch_deg = -r;
+    out.yaw_deg = p;
+    out.roll_deg = -y;
+    return out;
+}
+
+void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
+    const Vec3 still_eye(0.0f, 0.0f, telemetry.eye_height);
+    out_pos = telemetry.position + still_eye;
+    out_rot = Rotator::from_degrees(telemetry.pitch_deg, telemetry.yaw_deg, telemetry.camera_roll_deg);
+    const CameraAnimation ca = camera_animation(telemetry);
+    if (ca.weight <= 0.0f) return;
+    // The roll locks the view to the body (SetIgnoreLookInput, ResetCameraLook), so the view's yaw is
+    // the body's: the frame the mesh, and its EyeJoint, are posed in.
+    const Rotator body = Rotator::from_degrees(0.0f, telemetry.yaw_deg, 0.0f);
+    const Vec3 anim_eye = body.forward() * ca.eye.x + body.right() * ca.eye.y + Vec3(0.0f, 0.0f, ca.eye.z);
+    out_pos = telemetry.position + still_eye + (anim_eye - still_eye) * ca.weight;
+    // CalcCamera adds the camera animation to the view rotation component-wise; the rotator's axes stay
+    // continuous past +-90 deg of pitch, so the view can turn all the way over.
+    out_rot = Rotator::from_degrees(telemetry.pitch_deg + ca.pitch_deg, telemetry.yaw_deg + ca.yaw_deg,
+                                    telemetry.camera_roll_deg + ca.roll_deg);
+}
+
+// -----------------------------------------------------------------------------
 // Static draw-order index lists for evaluate_enemy_swat_indexed()
 // -----------------------------------------------------------------------------
 void AnimSystem::build_enemy_swat_index_lists() {

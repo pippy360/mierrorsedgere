@@ -291,6 +291,7 @@ private:
     float m_turn_total = 0.0f;
     float m_turn_target_yaw = 0.0f;
     float m_landing_timer = 0.0f;
+    Vec3 m_roll_dir{1.0f, 0.0f, 0.0f};  // TdMove_SkillRoll root motion direction: the body's facing at touchdown
     float m_damage_cooldown = 0.0f;
     float m_air_fall_start_z = 0.0f;
     float m_fall_peak_z = 0.0f;

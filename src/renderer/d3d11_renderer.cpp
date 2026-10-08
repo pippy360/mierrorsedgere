@@ -1510,8 +1510,11 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     // ---------------------------------------------------------------------
     // Camera View & Projection Matrices (Unreal Engine to Direct3D clip space)
     // ---------------------------------------------------------------------
-    Vec3 cam_pos = telemetry.position + Vec3(0.0f, 0.0f, telemetry.eye_height);
-    Rotator rot = Rotator::from_degrees(telemetry.pitch_deg, telemetry.yaw_deg, telemetry.camera_roll_deg);
+    // TdPlayerPawn.CalcCamera: the eyes and the view rotation, moved and turned by the current move's
+    // camera animation (the skill roll's somersault).
+    Vec3 cam_pos;
+    Rotator rot;
+    player_camera(telemetry, cam_pos, rot);
     float fov_deg = telemetry.fov_deg;
     float near_plane = 5.0f;
     float far_plane = 65000.0f;
@@ -2413,6 +2416,11 @@ bool D3D11Renderer::save_screenshot_png(const std::string& path) {
         std::cerr << "[D3D11Renderer] Failed to export PNG: " << path << std::endl;
     }
     return success;
+}
+
+void D3D11Renderer::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
+    // Without the character assets camera_animation() plays nothing: the plain eyes and view rotation.
+    impl_->anim_system.player_camera(telemetry, out_pos, out_rot);
 }
 
 bool D3D11Renderer::is_initialized() const { return impl_->initialized; }

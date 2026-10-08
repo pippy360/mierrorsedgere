@@ -2,6 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <iterator>
 
 namespace me {
 
@@ -53,6 +54,30 @@ constexpr float kBargeKickTime = 0.85f;
 // TdPawn.SpeedCurve_LightWeapon: seconds of sprinting -> speed (uu/s), CIM_Linear keys.
 const std::vector<std::pair<float, float>> kSpeedCurveLightWeapon = {
     {0.0f, 0.0f}, {0.4f, 400.0f}, {1.0f, 520.0f}, {3.5f, 650.0f}, {7.0f, 720.0f}};
+
+// TdMove_SkillRoll.StartMove zeroes Velocity, turns on root motion and plays AS_C1P_Unarmed
+// fallinglandroll (1.2667 s, 38 keys) with bRootMotion; only OnCustomAnimEnd hands back to
+// MOVE_Walking. The animation's root bone never rotates and only moves forward (raw +Z): these are
+// its 38 keys, 313.5 uu in all. A non-looping sequence spaces its keys Length / (NumKeys - 1) apart.
+// The 2026-09-20 14:56 escape recording's roll moves at exactly these keys' rate from its first
+// frame (496, 571, 779, 534, 258 ... 234 uu/s), lasts 1.25 s and is in MOVE_Walking at 1.267 s.
+constexpr float kSkillRollLength = 1.266667f;
+constexpr float kSkillRollRootForward[] = {
+    21.3379f,  38.3493f,  57.8220f,  84.1520f,  111.4325f, 129.7298f, 138.6140f, 144.7754f,
+    148.7529f, 151.6988f, 153.8096f, 155.2819f, 156.3122f, 157.0971f, 157.8332f, 158.7171f,
+    159.9452f, 161.7142f, 164.2207f, 167.6612f, 172.5321f, 179.0229f, 186.8704f, 195.8112f,
+    205.5820f, 215.9794f, 226.6942f, 237.3042f, 247.7936f, 258.3770f, 268.9775f, 279.5186f,
+    289.9233f, 300.1150f, 309.7264f, 318.5809f, 326.8875f, 334.8549f};
+
+// fallinglandroll's root bone forward offset `t` seconds into the roll (keys interpolated
+// linearly, held at either end).
+float skill_roll_root_forward(float t) {
+    constexpr int n = static_cast<int>(std::size(kSkillRollRootForward));
+    const float f = std::clamp(t / kSkillRollLength, 0.0f, 1.0f) * static_cast<float>(n - 1);
+    const int i0 = std::min(static_cast<int>(f), n - 2);
+    const float a = f - static_cast<float>(i0);
+    return kSkillRollRootForward[i0] + (kSkillRollRootForward[i0 + 1] - kSkillRollRootForward[i0]) * a;
+}
 
 // Fraction of a move of length `move_len` that stops kContactSkin short of the contact.
 float safe_fraction(float fraction, float move_len) {
@@ -354,6 +379,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_turn_total = 0.0f;
     m_turn_target_yaw = spawn_yaw;
     m_landing_timer = 0.0f;
+    m_roll_dir = Rotator::from_degrees(0.0f, spawn_yaw, 0.0f).forward();
     m_damage_cooldown = 0.0f;
     m_air_fall_start_z = spawn_pos.z;
     m_fall_peak_z = spawn_pos.z;
@@ -2221,16 +2247,20 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
 
     const bool backwards = speed > 1.0f && h.dot(fwd) < 0.0f;
     if (fall >= c.skill_roll_min_fall && can_skill_roll() && !backwards && air_move != EMovement::MOVE_MeleeAir) {
-        // Skill roll: the impact becomes forward momentum (at least SpeedMaxBaseVelocity).
-        const Vec3 dir = (speed > 1.0f) ? h.normalized() : fwd;
-        speed = std::max(speed, c.run_speed);
-        m_telemetry.velocity = dir * speed;
+        // TdMove_SkillRoll.StartMove: Velocity = Acceleration = 0 and root motion from here on. The
+        // landing speed is dropped; the pawn rolls fallinglandroll's 313.5 uu along the way the body
+        // faces, and the move lasts the whole 1.27 s animation (update_landing_moves).
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
         m_telemetry.move_state = EMovement::MOVE_SkillRoll;
-        m_landing_timer = c.skill_roll_time;
+        m_landing_timer = kSkillRollLength;
         m_state_timer = 0.0f;
+        m_telemetry.combat_anim_time = 0.0f;  // fallinglandroll's clock (viewmodel and camera animation)
         m_roll_trigger_time = -100.0f;
-        m_sprint_energy = std::max(0.0f, speed - c.speed_max_base_velocity);
-        set_stance(kEyeHeightCrouch);
+        m_roll_dir = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();
+        m_sprint_energy = 0.0f;
+        // The camera rides the animation's EyeJoint (AnimSystem::camera_animation), blending down from
+        // and back up to the standing eyes.
+        set_stance(kEyeHeightStand);
         return;
     }
 
@@ -4238,12 +4268,23 @@ void ParkourController::update_landing_moves(const InputFrame& input, float dt, 
     m_landing_timer -= dt;
 
     if (st == EMovement::MOVE_SkillRoll) {
-        // The roll carries the landing speed forward (a little friction), crouch height.
-        calc_velocity(Vec3(0.0f, 0.0f, 0.0f), dt, 1.0f, c.ground_friction * 0.1f);
-        walk_move(horiz(m_telemetry.velocity) * dt, kCrouchHeight, scene);
-        const float progress = 1.0f - std::clamp(m_landing_timer / std::max(c.skill_roll_time, 1e-3f), 0.0f, 1.0f);
-        set_stance(kEyeHeightCrouch - 40.0f * std::sin(progress * PI));
-        if (m_landing_timer <= 0.0f) {
+        // Root motion: the pawn moves as fallinglandroll's root bone does (SetIgnoreMoveInput(-1), so
+        // no steering), at crouch height. Float rounding can leave a sliver of the animation for one
+        // more step; it is finished now instead.
+        const bool ends = m_landing_timer <= 1e-4f;
+        const float t1 = ends ? kSkillRollLength : kSkillRollLength - m_landing_timer;
+        const float t0 = std::clamp(kSkillRollLength - (m_landing_timer + dt), 0.0f, t1);
+        const float z1 = skill_roll_root_forward(t1);
+        // The velocity is the root motion's rate over the last step's worth of animation, so the
+        // final (partial) step leaves at the animation's exit speed; walk_move takes off the part a
+        // wall blocks.
+        const float rate = (z1 - skill_roll_root_forward(std::max(0.0f, t1 - dt))) / dt;
+        m_telemetry.velocity.x = m_roll_dir.x * rate;
+        m_telemetry.velocity.y = m_roll_dir.y * rate;
+        walk_move(m_roll_dir * (z1 - skill_roll_root_forward(t0)), kCrouchHeight, scene);
+        if (ends) {
+            // OnCustomAnimEnd: SetMove(MOVE_Walking) - crouching if crouch is held or there is no
+            // room to stand.
             const bool stand = !input.crouch && has_room(kPawnHeight, scene);
             st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
             set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
