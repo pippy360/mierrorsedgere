@@ -714,7 +714,12 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_Snatch: {
                 // TdMove_Disarm: she has no velocity of her own; AlignPawn flies her to DisarmOffset
                 // from the enemy (SetPreciseLocation), where the two canned animations meet.
-                m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+                if (m_snatch_fail) {
+                    m_telemetry.velocity.x *= std::max(0.0f, 1.0f - 4.0f * step_dt);
+                    m_telemetry.velocity.y *= std::max(0.0f, 1.0f - 4.0f * step_dt);
+                } else {
+                    m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+                }
                 if (m_snatch_align) {
                     Vec3 to = m_snatch_target - m_telemetry.position;
                     to.z = 0.0f;
@@ -4822,10 +4827,12 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     m_telemetry.disarm_prompt_visible = false;
     EnemyBot* disarm_candidate = nullptr;
     bool candidate_from_back = false;
+    bool disarm_out_of_time = false;  // an armed enemy in reach, but not open to it
     for (auto& bot : scene.enemies) {
         if (!bot.alive || bot.weapon_name == "None" || bot.weapon_name.empty()) continue;
         float dist = m_telemetry.position.distance(bot.position);
         if (dist < 210.0f) {
+            disarm_out_of_time = true;
             Vec3 bot_fwd(std::cos(bot.yaw_deg * DEG2RAD), std::sin(bot.yaw_deg * DEG2RAD), 0.0f);
             Vec3 bot_to_player = (m_telemetry.position - bot.position).normalized_xy();
             bool behind_enemy = (bot_fwd.dot(bot_to_player) < -0.25f);
@@ -4843,6 +4850,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         if (disarm_candidate != nullptr) {
             EnemyBot& bot = *disarm_candidate;
             m_telemetry.move_state = EMovement::MOVE_Snatch;
+            m_snatch_fail = false;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_time = 0.0f;
             m_telemetry.snatch_from_back = candidate_from_back;
@@ -4905,6 +4913,21 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             bot.disarm_weapon_time = m_snatch_attach;
             m_telemetry.active_subtitle = std::string(candidate_from_back ? "Stealth Disarm (" : "Weapon Disarmed (") +
                                           ws.display_name + ")!";
+        } else if (disarm_out_of_time && !ws.equipped && m_telemetry.grounded && m_telemetry.move_state == EMovement::MOVE_Walking) {
+            // TdMove_Disarm.StartMiss: SnatchFail on the full body with its own root motion
+            // (0.1 in, 0.4 out). Retail: 0.77 s in the move, 590 uu/s down to 200 in its first frame.
+            m_telemetry.move_state = EMovement::MOVE_Snatch;
+            m_snatch_fail = true;
+            m_snatch_align = false;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = 0.77f;
+            m_telemetry.snatch_from_back = false;
+            m_telemetry.snatch_weapon_attached = false;
+            m_snatch_attach = m_telemetry.combat_anim_duration;
+            m_telemetry.velocity.x *= 0.34f;
+            m_telemetry.velocity.y *= 0.34f;
+            set_move_anim("SnatchFail");
         } else if (ws.equipped && ws.drop_timer <= 0.0f && !input.use) {
             // In Mirror's Edge, pressing the Disarm/Secondary button while holding a gun with no enemy in range tosses the gun
             drop_current_weapon("Tossed " + ws.display_name);

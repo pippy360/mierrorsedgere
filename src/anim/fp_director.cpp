@@ -69,6 +69,8 @@ const MoveAnim kMoveAnims[] = {
     {"snatchfwd2", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
     {"snatchfwd3", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
     {"snatchback", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    // TdMove_Disarm.StartMiss.
+    {"snatchfail", Slot::FullBody, 1.0f, 0.1f, 0.4f, false},
     // TdMove_SpeedVault / TdMove_VaultOver: VaultTypes[].AnimName, PlayMoveAnim(FullBody, AnimToPlay, 1.0, 0.15, 0.2).
     {"autostepuprightleg", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
     {"stepuprightleg88", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
