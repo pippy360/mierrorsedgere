@@ -211,6 +211,29 @@ public:
     // view rotation, moved onto the animated EyeJoint and turned by camera_animation() while it plays.
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
 
+    enum EnemyArchetypeId : uint32_t {
+        EnemyArch_SWAT    = 0,
+        EnemyArch_Patrol  = 1,
+        EnemyArch_Support = 2,
+        EnemyArch_Riot    = 3,
+        EnemyArch_Pursuit = 4,
+        EnemyArch_Celeste = 5,
+        EnemyArch_Count   = 6
+    };
+
+    struct EnemyCharacterModel {
+        SkeletalMeshAsset mesh;
+        DXT1Texture tex_diffuse;
+        DXT1Texture tex_specular;
+        DXT1Texture tex_normal;
+        std::vector<size_t> chunk_vert_counts;
+    };
+
+    [[nodiscard]] EnemyArchetypeId resolve_enemy_archetype(const std::string& archetype_name) const;
+    [[nodiscard]] const EnemyCharacterModel& enemy_character_model(uint32_t arch_id) const {
+        return enemy_models_[arch_id < EnemyArch_Count ? arch_id : 0];
+    }
+
     // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
     void evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const;
 
@@ -223,12 +246,12 @@ public:
         size_t vertex_count = 0;  // vertices written to out_vertices
         size_t index_list = 0;    // enemy_swat_index_lists() entry to draw
         size_t index_count = 0;   // leading indices of that list to draw (0 = nothing to draw)
+        uint32_t archetype_id = 0; // EnemyArchetypeId (0..EnemyArch_Count-1) for GPU texture binding
     };
     EnemySwatDraw evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
                                               Vertex* out_vertices) const;
     [[nodiscard]] size_t enemy_swat_max_vertices() const { return enemy_swat_max_vertices_; }
-    // Static triangle-list indices for evaluate_enemy_swat_indexed(): entry 0 is the body alone, every other
-    // entry the body, one weapon mesh and the muzzle flash. Rebuilt by init_from_game_root().
+    // Static triangle-list indices for evaluate_enemy_swat_indexed(): rebuilt by init_from_game_root().
     [[nodiscard]] const std::vector<std::vector<uint32_t>>& enemy_swat_index_lists() const { return enemy_swat_index_lists_; }
 
     // Evaluate 3D dropped weapons on the ground and active ballistic tracers / impact sparks
@@ -276,6 +299,15 @@ public:
     [[nodiscard]] const DXT1Texture& swat_diffuse_tex() const { return swat_diffuse_tex_; }
     [[nodiscard]] const DXT1Texture& swat_specular_tex() const { return swat_specular_tex_; }
     [[nodiscard]] const DXT1Texture& swat_normal_tex() const { return swat_normal_tex_; }
+    [[nodiscard]] const DXT1Texture& enemy_diffuse_tex(EnemyArchetypeId id) const {
+        return enemy_models_[static_cast<size_t>(id) % EnemyArch_Count].tex_diffuse;
+    }
+    [[nodiscard]] const DXT1Texture& enemy_specular_tex(EnemyArchetypeId id) const {
+        return enemy_models_[static_cast<size_t>(id) % EnemyArch_Count].tex_specular;
+    }
+    [[nodiscard]] const DXT1Texture& enemy_normal_tex(EnemyArchetypeId id) const {
+        return enemy_models_[static_cast<size_t>(id) % EnemyArch_Count].tex_normal;
+    }
     [[nodiscard]] const DXT1Texture& ammo_diffuse_tex() const { return ammo_diffuse_tex_; }
     [[nodiscard]] const AnimSetAsset& faith_unarmed_anims() const { return faith_unarmed_set_; }
     [[nodiscard]] const AnimSetAsset& faith_common_anims() const { return faith_common_set_; }
@@ -292,6 +324,7 @@ private:
     SkeletalMeshAsset faith_upper_;
     SkeletalMeshAsset faith_lower_;
     SkeletalMeshAsset swat_mesh_;
+    std::array<EnemyCharacterModel, EnemyArch_Count> enemy_models_{};
     SkeletalMeshAsset heli_mesh_;
     DXT1Texture heli_diffuse_tex_;
     SkeletalMeshAsset colt1911_mesh_;
@@ -313,13 +346,15 @@ private:
     mutable std::unordered_map<std::string, AnimSetAsset> level_intro_sets_;
     AnimSetAsset swat_set_;
     AnimSetAsset swat_2h_set_;
+    AnimSetAsset celeste_set_;
 
     std::vector<AnimBlendConfig> blend_configs_;
 
     // evaluate_enemy_swat_indexed() support, built by build_enemy_swat_index_lists() once the meshes are loaded.
     void build_enemy_swat_index_lists();
     std::vector<std::vector<uint32_t>> enemy_swat_index_lists_;
-    std::unordered_map<const SkeletalMeshAsset*, size_t> enemy_swat_weapon_index_list_;  // weapon mesh -> list
+    std::array<size_t, EnemyArch_Count> enemy_body_only_index_list_{};
+    std::array<std::unordered_map<const SkeletalMeshAsset*, size_t>, EnemyArch_Count> enemy_weapon_index_lists_{};
     size_t enemy_swat_max_vertices_ = 0;
 };
 

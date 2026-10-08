@@ -346,6 +346,7 @@ struct D3D11Renderer::Impl {
     struct EnemyFrameDraw {
         size_t index_count = 0;  // leading indices of the list to draw (0 = nothing to draw)
         size_t index_list = 0;   // enemy_index_buffers entry
+        uint32_t archetype_id = 0;
         bool in_view = false;    // may cover pixels of the camera view (world pass)
         bool in_shadow = false;  // may cover texels of the near shadow cascade (shadow pass)
     };
@@ -1316,6 +1317,12 @@ struct D3D11Renderer::Impl {
     UITexture vm_skin_gpu_tex;
     UITexture vm_glove_gpu_tex;
     UITexture vm_lower_gpu_tex;
+    struct CharacterGPUTextures {
+        UITexture diffuse;
+        UITexture specular;
+        UITexture normal;
+    };
+    CharacterGPUTextures enemy_gpu_textures[AnimSystem::EnemyArch_Count];
     UITexture swat_d_gpu_tex;
     UITexture swat_s_gpu_tex;
     UITexture swat_n_gpu_tex;
@@ -1354,9 +1361,15 @@ struct D3D11Renderer::Impl {
         vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex(), false);
         vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex(), false);
         vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex(), false);
-        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex(), true);
-        swat_s_gpu_tex   = upload_dxt1_texture(anim_system.swat_specular_tex(), true);
-        swat_n_gpu_tex   = upload_dxt1_texture(anim_system.swat_normal_tex(), false);
+        for (size_t a = 0; a < AnimSystem::EnemyArch_Count; ++a) {
+            auto arch = static_cast<AnimSystem::EnemyArchetypeId>(a);
+            enemy_gpu_textures[a].diffuse  = upload_dxt1_texture(anim_system.enemy_diffuse_tex(arch), true);
+            enemy_gpu_textures[a].specular = upload_dxt1_texture(anim_system.enemy_specular_tex(arch), true);
+            enemy_gpu_textures[a].normal   = upload_dxt1_texture(anim_system.enemy_normal_tex(arch), false);
+        }
+        swat_d_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].diffuse;
+        swat_s_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].specular;
+        swat_n_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].normal;
         ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex(), true);
 
         for (const auto& [wname, wmesh] : anim_system.weapon_meshes()) {
@@ -1759,6 +1772,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 !impl->enemy_index_buffers[mesh.index_list]) {
                 return;
             }
+            draw.archetype_id = mesh.archetype_id;
 
             // World-space bounding sphere of the posed vertices (the triangle list is built from them alone).
             // fmin/fmax skip NaN operands, so a NaN coordinate instead makes the bounds NaN explicitly, and
@@ -1941,7 +1955,9 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         auto srv_or = [](const UITexture& t, const UITexture& fallback) -> ID3D11ShaderResourceView* {
             return t ? t->srv.Get() : (fallback ? fallback->srv.Get() : nullptr);
         };
-        auto bind_world_char_wep_textures = [&](const std::string& wname) {
+        auto bind_world_char_wep_textures = [&](const std::string& wname, uint32_t arch_id = 0) {
+            uint32_t safe_arch = (arch_id < AnimSystem::EnemyArch_Count) ? arch_id : 0;
+            const auto& ctex = impl->enemy_gpu_textures[safe_arch];
             ID3D11ShaderResourceView* t_wep_d = srv_or(nullptr, impl->tex_default_white);
             ID3D11ShaderResourceView* t_wep_s = srv_or(nullptr, impl->tex_default_black);
             auto it_w = impl->weapon_gpu_textures.find(wname);
@@ -1953,12 +1969,12 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 if (it_w->second.specular) t_wep_s = it_w->second.specular->srv.Get();
             }
             ID3D11ShaderResourceView* srvs[6] = {
-                srv_or(impl->swat_d_gpu_tex, impl->tex_default_white),        // texture(0) swat_d_tex
-                t_wep_d,                                                      // texture(1) wep_d_tex
-                t_wep_s,                                                      // texture(2) wep_s_tex
-                srv_or(impl->ammo_d_gpu_tex, impl->tex_default_white),        // texture(3) ammo_d_tex
-                srv_or(impl->swat_s_gpu_tex, impl->tex_default_black),        // texture(4) swat_s_tex
-                srv_or(impl->swat_n_gpu_tex, impl->tex_default_flat_normal),  // texture(5) swat_n_tex
+                srv_or(ctex.diffuse ? ctex.diffuse : impl->swat_d_gpu_tex, impl->tex_default_white),        // texture(0) swat_d_tex
+                t_wep_d,                                                                                    // texture(1) wep_d_tex
+                t_wep_s,                                                                                    // texture(2) wep_s_tex
+                srv_or(impl->ammo_d_gpu_tex, impl->tex_default_white),                                      // texture(3) ammo_d_tex
+                srv_or(ctex.specular ? ctex.specular : impl->swat_s_gpu_tex, impl->tex_default_black),      // texture(4) swat_s_tex
+                srv_or(ctex.normal ? ctex.normal : impl->swat_n_gpu_tex, impl->tex_default_flat_normal),    // texture(5) swat_n_tex
             };
             ctx->PSSetShaderResources(0, 6, srvs);
             ctx->PSSetSamplers(0, 1, impl->mat_samplers[0][0].GetAddressOf());
@@ -2049,7 +2065,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
                 if (!impl->frame_enemy_draws[ei].in_view) continue;
                 const auto& bot = active_scene.enemies[ei];
-                bind_world_char_wep_textures(bot.weapon_name);
+                bind_world_char_wep_textures(bot.weapon_name, impl->frame_enemy_draws[ei].archetype_id);
                 set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = Float3(1.0f, 1.0f, 1.0f);

@@ -195,6 +195,7 @@ struct MetalRenderer::Impl {
     // is written to enemy_vertex_buffers[slot][i] only when the enemy can reach a pass's render target.
     struct EnemyFrameDraw {
         size_t corner_count = 0;  // triangle-list vertices (0 = nothing to draw)
+        uint32_t archetype_id = 0;
         bool in_view = false;     // may cover pixels of the camera view (world pass)
         bool in_shadow = false;   // may cover texels of the near shadow cascade (shadow pass)
     };
@@ -947,6 +948,12 @@ struct MetalRenderer::Impl {
     id<MTLTexture> vm_skin_gpu_tex = nil;
     id<MTLTexture> vm_glove_gpu_tex = nil;
     id<MTLTexture> vm_lower_gpu_tex = nil;
+    struct CharacterGPUTextures {
+        id<MTLTexture> diffuse = nil;
+        id<MTLTexture> specular = nil;
+        id<MTLTexture> normal = nil;
+    };
+    CharacterGPUTextures enemy_gpu_textures[AnimSystem::EnemyArch_Count];
     id<MTLTexture> swat_d_gpu_tex = nil;
     id<MTLTexture> swat_s_gpu_tex = nil;
     id<MTLTexture> swat_n_gpu_tex = nil;
@@ -989,9 +996,15 @@ struct MetalRenderer::Impl {
         vm_skin_gpu_tex  = upload_dxt1_texture(anim_system.faith_skin_tex(), false);
         vm_glove_gpu_tex = upload_dxt1_texture(anim_system.faith_glove_tex(), false);
         vm_lower_gpu_tex = upload_dxt1_texture(anim_system.faith_lower_tex(), false);
-        swat_d_gpu_tex   = upload_dxt1_texture(anim_system.swat_diffuse_tex(), true);
-        swat_s_gpu_tex   = upload_dxt1_texture(anim_system.swat_specular_tex(), true);
-        swat_n_gpu_tex   = upload_dxt1_texture(anim_system.swat_normal_tex(), false);
+        for (size_t a = 0; a < AnimSystem::EnemyArch_Count; ++a) {
+            auto arch = static_cast<AnimSystem::EnemyArchetypeId>(a);
+            enemy_gpu_textures[a].diffuse  = upload_dxt1_texture(anim_system.enemy_diffuse_tex(arch), true);
+            enemy_gpu_textures[a].specular = upload_dxt1_texture(anim_system.enemy_specular_tex(arch), true);
+            enemy_gpu_textures[a].normal   = upload_dxt1_texture(anim_system.enemy_normal_tex(arch), false);
+        }
+        swat_d_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].diffuse;
+        swat_s_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].specular;
+        swat_n_gpu_tex   = enemy_gpu_textures[AnimSystem::EnemyArch_SWAT].normal;
         ammo_d_gpu_tex   = upload_dxt1_texture(anim_system.ammo_diffuse_tex(), true);
 
         for (const auto& [wname, wmesh] : anim_system.weapon_meshes()) {
@@ -1355,6 +1368,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 const AnimSystem::EnemySwatDraw mesh =
                     impl->anim_system.evaluate_enemy_swat_indexed(bot, sim_time, reaction_active, posed.data());
                 if (mesh.index_count == 0) return;
+                draw.archetype_id = mesh.archetype_id;
 
                 // World-space bounding sphere of the posed vertices (the triangle list is built from them alone).
                 // fmin/fmax skip NaN operands, so a NaN coordinate instead makes the bounds NaN explicitly, and
@@ -1554,10 +1568,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc setRenderPipelineState:impl_->world_pipeline];
         [enc setDepthStencilState:impl_->depth_write_state];
 
-        auto bind_world_char_wep_textures = [&](const std::string& wname) {
-            id<MTLTexture> t_swat   = impl_->swat_d_gpu_tex ? impl_->swat_d_gpu_tex : impl_->tex_default_white;
-            id<MTLTexture> t_swat_s = impl_->swat_s_gpu_tex ? impl_->swat_s_gpu_tex : impl_->tex_default_black;
-            id<MTLTexture> t_swat_n = impl_->swat_n_gpu_tex ? impl_->swat_n_gpu_tex : impl_->tex_default_flat_normal;
+        auto bind_world_char_wep_textures = [&](const std::string& wname, uint32_t arch_id = 0) {
+            uint32_t safe_arch = (arch_id < AnimSystem::EnemyArch_Count) ? arch_id : 0;
+            const auto& ctex = impl_->enemy_gpu_textures[safe_arch];
+            id<MTLTexture> t_swat   = ctex.diffuse  ? ctex.diffuse  : (impl_->swat_d_gpu_tex ? impl_->swat_d_gpu_tex : impl_->tex_default_white);
+            id<MTLTexture> t_swat_s = ctex.specular ? ctex.specular : (impl_->swat_s_gpu_tex ? impl_->swat_s_gpu_tex : impl_->tex_default_black);
+            id<MTLTexture> t_swat_n = ctex.normal   ? ctex.normal   : (impl_->swat_n_gpu_tex ? impl_->swat_n_gpu_tex : impl_->tex_default_flat_normal);
             id<MTLTexture> t_wep_d  = impl_->tex_default_white;
             id<MTLTexture> t_wep_s  = impl_->tex_default_black;
             auto it_w = impl_->weapon_gpu_textures.find(wname);
@@ -1652,7 +1668,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
                 if (!impl_->frame_enemy_draws[ei].in_view) continue;
                 const auto& bot = active_scene.enemies[ei];
-                bind_world_char_wep_textures(bot.weapon_name);
+                bind_world_char_wep_textures(bot.weapon_name, impl_->frame_enemy_draws[ei].archetype_id);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                 uniforms.is_runner_vision = 0.0f;

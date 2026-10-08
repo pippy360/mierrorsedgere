@@ -1162,22 +1162,52 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         }
     }
 
-    // 3. Load KrugerSec / CPF SWAT Officer Skeletal Mesh & Textures (CH_TKY_Cop_SWAT.upk)
-    UPKPackage pkg_swat(cooked + "Characters/CH_TKY_Cop_SWAT.upk");
-    if (pkg_swat.is_valid()) {
-        for (const auto& exp : pkg_swat.get_exports()) {
-            if (pkg_swat.get_export_class(exp) == "SkeletalMesh" && exp.object_name == "CH_TKY_Cop_SWAT") {
-                parse_skeletal_mesh(pkg_swat, exp, swat_mesh_);
+    // 3. Load KrugerSec / CPF / Runner / Celeste Enemy Character Skeletal Meshes & Textures
+    struct EnemyCharacterSpec {
+        EnemyArchetypeId id;
+        const char* upk_file;
+        const char* skel_name;
+        const char* tex_d;
+        const char* tex_s;
+        const char* tex_n;
+    };
+    static const EnemyCharacterSpec kEnemySpecs[] = {
+        {EnemyArch_SWAT,    "Characters/CH_TKY_Cop_SWAT.upk",    "CH_TKY_Cop_SWAT",       "T_TKY_Cop_SWAT_D",      "T_TKY_Cop_SWAT_S",      "T_TKY_Cop_SWAT_N"},
+        {EnemyArch_Patrol,  "Characters/CH_TKY_Cop_Patrol.upk",  "SK_TKY_Cop_Patrol_PK",  "T_TKY_CopPatrol_02_D",  "T_TKY_CopPatrol_01_S",  "T_TKY_CopPatrol_01_N"},
+        {EnemyArch_Support, "Characters/CH_TKY_Cop_Support.upk", "SK_TKY_Cop_Support",    "T_TKY_CopSupport_01_D", "T_TKY_CopSupport_01_S", "T_TKY_CopSupport_01_N"},
+        {EnemyArch_Riot,    "Characters/CH_TKY_Cop_Riot.upk",    "SK_TKY_Cop_Riot",       "T_TKY_CopRiot_01_D",    "T_TKY_CopRiot_01_S",    "T_TKY_CopRiot_01_N"},
+        {EnemyArch_Pursuit, "Characters/CH_TKY_Cop_Pursuit.upk", "SK_TKY_Cop_Pursuit",    "T_CopPursuit01_D",      "T_CopPursuit01_S",      "T_CopPursuit01_N"},
+        {EnemyArch_Celeste, "Characters/CH_Celeste.upk",         "SK_Celeste",            "Celeste_Merged_D",      "Celeste_Merged_S_2k",   "Celeste_Merged_N"}
+    };
+    for (const auto& es : kEnemySpecs) {
+        UPKPackage pkg_e(cooked + es.upk_file);
+        if (!pkg_e.is_valid()) continue;
+        EnemyCharacterModel& mdl = enemy_models_[es.id];
+        for (const auto& exp : pkg_e.get_exports()) {
+            if (pkg_e.get_export_class(exp) == "SkeletalMesh" && exp.object_name == es.skel_name) {
+                parse_skeletal_mesh(pkg_e, exp, mdl.mesh);
                 break;
             }
         }
-        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_D", swat_diffuse_tex_);
-        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_S", swat_specular_tex_);
-        parse_dxt1_texture(pkg_swat, "T_TKY_Cop_SWAT_N", swat_normal_tex_);
-        swat_mesh_.tex_diffuse = swat_diffuse_tex_;
-        swat_mesh_.tex_specular = swat_specular_tex_;
-        swat_mesh_.tex_normal = swat_normal_tex_;
+        parse_dxt1_texture(pkg_e, es.tex_d, mdl.tex_diffuse);
+        parse_dxt1_texture(pkg_e, es.tex_s, mdl.tex_specular);
+        parse_dxt1_texture(pkg_e, es.tex_n, mdl.tex_normal);
+        mdl.mesh.tex_diffuse = mdl.tex_diffuse;
+        mdl.mesh.tex_specular = mdl.tex_specular;
+        mdl.mesh.tex_normal = mdl.tex_normal;
+        mdl.chunk_vert_counts.clear();
+        for (const auto& v : mdl.mesh.vertices) {
+            if (v.chunk_index >= mdl.chunk_vert_counts.size()) {
+                mdl.chunk_vert_counts.resize(static_cast<size_t>(v.chunk_index) + 1, 0);
+            }
+            mdl.chunk_vert_counts[v.chunk_index]++;
+        }
     }
+    swat_mesh_ = enemy_models_[EnemyArch_SWAT].mesh;
+    swat_diffuse_tex_ = enemy_models_[EnemyArch_SWAT].tex_diffuse;
+    swat_specular_tex_ = enemy_models_[EnemyArch_SWAT].tex_specular;
+    swat_normal_tex_ = enemy_models_[EnemyArch_SWAT].tex_normal;
+
 
     // Load KrugerSec / CPF SWAT Blackhawk Helicopter Skeletal Mesh & Diffuse Texture (Vehicles/SWAT_Blackhawk.upk)
     {
@@ -1313,6 +1343,9 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
 
     UPKPackage pkg_as_swat_2h(cooked + "Animations/AS_AI_Assault_TwoHanded.upk");
     if (pkg_as_swat_2h.is_valid()) parse_anim_set_package(pkg_as_swat_2h, swat_2h_set_);
+
+    UPKPackage pkg_as_celeste(cooked + "Animations/AS_AI_Celeste_Unarmed.upk");
+    if (pkg_as_celeste.is_valid()) parse_anim_set_package(pkg_as_celeste, celeste_set_);
 
     loaded_ = faith_upper_.is_valid() && faith_lower_.is_valid() &&
               swat_mesh_.is_valid() && !faith_unarmed_set_.sequences.empty() &&
@@ -2416,14 +2449,35 @@ void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, 
 // -----------------------------------------------------------------------------
 // Static draw-order index lists for evaluate_enemy_swat_indexed()
 // -----------------------------------------------------------------------------
+AnimSystem::EnemyArchetypeId AnimSystem::resolve_enemy_archetype(const std::string& archetype_name) const {
+    std::string low = to_lower_str(archetype_name);
+    EnemyArchetypeId cand = EnemyArch_SWAT;
+    if (low.find("celeste") != std::string::npos || low.find("tutorial") != std::string::npos) {
+        cand = EnemyArch_Celeste;
+    } else if (low.find("pursuit") != std::string::npos) {
+        cand = EnemyArch_Pursuit;
+    } else if (low.find("riot") != std::string::npos) {
+        cand = EnemyArch_Riot;
+    } else if (low.find("support") != std::string::npos || low.find("gunner") != std::string::npos || low.find("heavy") != std::string::npos) {
+        cand = EnemyArch_Support;
+    } else if (low.find("patrol") != std::string::npos) {
+        cand = EnemyArch_Patrol;
+    } else {
+        cand = EnemyArch_SWAT;
+    }
+    if (enemy_models_[cand].mesh.is_valid()) return cand;
+    return EnemyArch_SWAT;
+}
+
 void AnimSystem::build_enemy_swat_index_lists() {
     enemy_swat_index_lists_.clear();
-    enemy_swat_weapon_index_list_.clear();
     enemy_swat_max_vertices_ = 0;
+    for (uint32_t a = 0; a < EnemyArch_Count; ++a) {
+        enemy_body_only_index_list_[a] = 0;
+        enemy_weapon_index_lists_[a].clear();
+    }
     if (!swat_mesh_.is_valid()) return;
 
-    // Exactly the corners the triangle-list output has, in its order: each index of each whole triangle, except
-    // out-of-range indices, which are skipped. The weapon's vertices follow the body's, the flash follows the weapon.
     auto append_corners = [](const SkeletalMeshAsset& mesh, uint32_t base, std::vector<uint32_t>& out) {
         for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
             for (int k = 0; k < 3; ++k) {
@@ -2433,29 +2487,34 @@ void AnimSystem::build_enemy_swat_index_lists() {
             }
         }
     };
-    const size_t body_vertices = swat_mesh_.vertices.size();
-    std::vector<uint32_t> body;
-    append_corners(swat_mesh_, 0, body);
-    enemy_swat_index_lists_.push_back(std::move(body));
-    enemy_swat_max_vertices_ = body_vertices;
 
-    auto add_weapon = [&](const SkeletalMeshAsset& wmesh) {
-        if (!wmesh.is_valid() || enemy_swat_weapon_index_list_.count(&wmesh)) return;
-        std::vector<uint32_t> list = enemy_swat_index_lists_[0];
-        append_corners(wmesh, static_cast<uint32_t>(body_vertices), list);
-        const size_t flash_base = body_vertices + wmesh.vertices.size();
-        for (size_t f = 0; f < kMuzzleFlashVertexCount; ++f) list.push_back(static_cast<uint32_t>(flash_base + f));
-        enemy_swat_weapon_index_list_[&wmesh] = enemy_swat_index_lists_.size();
-        enemy_swat_index_lists_.push_back(std::move(list));
-        enemy_swat_max_vertices_ = std::max(enemy_swat_max_vertices_, flash_base + kMuzzleFlashVertexCount);
-    };
-    // Every mesh get_weapon_mesh() can return.
-    add_weapon(colt1911_mesh_);
-    for (const auto& [wname, wmesh] : weapon_meshes_) add_weapon(wmesh);
+    for (uint32_t a = 0; a < EnemyArch_Count; ++a) {
+        const SkeletalMeshAsset& bmesh = enemy_models_[a].mesh.is_valid() ? enemy_models_[a].mesh : swat_mesh_;
+        const size_t body_vertices = bmesh.vertices.size();
+        std::vector<uint32_t> body;
+        append_corners(bmesh, 0, body);
+        size_t body_list_idx = enemy_swat_index_lists_.size();
+        enemy_body_only_index_list_[a] = body_list_idx;
+        enemy_swat_index_lists_.push_back(std::move(body));
+        enemy_swat_max_vertices_ = std::max(enemy_swat_max_vertices_, body_vertices);
+
+        auto add_weapon = [&](const SkeletalMeshAsset& wmesh) {
+            if (!wmesh.is_valid() || enemy_weapon_index_lists_[a].count(&wmesh)) return;
+            std::vector<uint32_t> list = enemy_swat_index_lists_[body_list_idx];
+            append_corners(wmesh, static_cast<uint32_t>(body_vertices), list);
+            const size_t flash_base = body_vertices + wmesh.vertices.size();
+            for (size_t f = 0; f < kMuzzleFlashVertexCount; ++f) list.push_back(static_cast<uint32_t>(flash_base + f));
+            enemy_weapon_index_lists_[a][&wmesh] = enemy_swat_index_lists_.size();
+            enemy_swat_index_lists_.push_back(std::move(list));
+            enemy_swat_max_vertices_ = std::max(enemy_swat_max_vertices_, flash_base + kMuzzleFlashVertexCount);
+        };
+        add_weapon(colt1911_mesh_);
+        for (const auto& [wname, wmesh] : weapon_meshes_) add_weapon(wmesh);
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Evaluate KrugerSec / CPF SWAT Officer Skeletal Mesh (AT_Cop + LBS)
+// Evaluate KrugerSec / CPF Officer / Runner / Celeste Skeletal Mesh + Weapon
 // -----------------------------------------------------------------------------
 void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const {
     out_triangles.clear();
@@ -2475,8 +2534,16 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
     EnemySwatDraw draw;
     if (!loaded_ || !swat_mesh_.is_valid() || enemy_swat_index_lists_.empty()) return draw;
 
+    const EnemyArchetypeId arch_id = resolve_enemy_archetype(bot.archetype);
+    const EnemyCharacterModel& char_model = enemy_models_[arch_id];
+    const SkeletalMeshAsset& body_mesh = char_model.mesh.is_valid() ? char_model.mesh : swat_mesh_;
+    draw.archetype_id = arch_id;
+
     bool two_handed = is_heavy_weapon_name(bot.weapon_name);
     const AnimSetAsset* active_set = (two_handed && !swat_2h_set_.sequences.empty()) ? &swat_2h_set_ : &swat_set_;
+    if (arch_id == EnemyArch_Celeste && !celeste_set_.sequences.empty() && !two_handed) {
+        active_set = &celeste_set_;
+    }
     const AnimSequenceAsset* seq_a = nullptr;
     const AnimSequenceAsset* seq_b = nullptr;
     float blend_alpha = 0.0f;
@@ -2539,21 +2606,22 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
 
     thread_local std::vector<Vec3> local_pos, local_pos_b, comp_pos, delta_pos, skinned_pos, skinned_norm;
     thread_local std::vector<Quat4> local_quat, local_quat_b, comp_quat, delta_quat;
-    sample_sequence_pose(swat_mesh_, *owner_a, seq_a, norm_time, local_pos, local_quat);
+    sample_sequence_pose(body_mesh, *owner_a, seq_a, norm_time, local_pos, local_quat);
     if (seq_b && blend_alpha > 0.001f) {
         const AnimSetAsset* owner_b = (active_set->find_sequence(seq_b->name) == seq_b) ? active_set : &swat_set_;
-        sample_sequence_pose(swat_mesh_, *owner_b, seq_b, norm_time, local_pos_b, local_quat_b);
+        sample_sequence_pose(body_mesh, *owner_b, seq_b, norm_time, local_pos_b, local_quat_b);
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
-    compute_skeleton_fk(swat_mesh_.bones, local_pos, local_quat, comp_pos, comp_quat);
-    compute_skin_deltas(swat_mesh_, comp_pos, comp_quat, delta_pos, delta_quat);
+    compute_skeleton_fk(body_mesh.bones, local_pos, local_quat, comp_pos, comp_quat);
+    compute_skin_deltas(body_mesh, comp_pos, comp_quat, delta_pos, delta_quat);
 
     // Map raw component coordinates (X=Left, -Y=Up, +Z=Forward) to Unreal/Engine bot local space (+X=Forward, +Y=Right, +Z=Up)
-    skinned_pos.resize(swat_mesh_.vertices.size());
-    skinned_norm.resize(swat_mesh_.vertices.size());
-    for (size_t i = 0; i < swat_mesh_.vertices.size(); ++i) {
-        const SkinnedVertex& sv = swat_mesh_.vertices[i];
+    const size_t body_vertices = body_mesh.vertices.size();
+    skinned_pos.resize(body_vertices);
+    skinned_norm.resize(body_vertices);
+    for (size_t i = 0; i < body_vertices; ++i) {
+        const SkinnedVertex& sv = body_mesh.vertices[i];
         Vec3 p_acc(0.0f, 0.0f, 0.0f);
         Vec3 n_acc(0.0f, 0.0f, 0.0f);
         for (int k = 0; k < 4; ++k) {
@@ -2571,36 +2639,40 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
                                              ? get_weapon_mesh(bot.weapon_name)
                                              : nullptr;
 
-    // Body: one output vertex per skinned vertex; index list 0 references them in triangle order.
-    const size_t body_vertices = swat_mesh_.vertices.size();
+    // Body: one output vertex per skinned vertex; u2.x=1.0 for armor/uniform/skin, u2.x=1.25 for small eye/visor sub-chunks; u2.y=archetype_id
     for (size_t vi = 0; vi < body_vertices; ++vi) {
-        const SkinnedVertex& sv = swat_mesh_.vertices[vi];
+        const SkinnedVertex& sv = body_mesh.vertices[vi];
+        const size_t chunk_v = (sv.chunk_index < char_model.chunk_vert_counts.size())
+                                   ? char_model.chunk_vert_counts[sv.chunk_index]
+                                   : body_vertices;
+        const bool is_eye_or_visor = (arch_id != EnemyArch_Celeste && chunk_v > 0 && chunk_v < 400);
         Vertex out_v{};
         out_v.position = skinned_pos[vi];
         out_v.normal = skinned_norm[vi];
         out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
         out_v.u = sv.u;
         out_v.v = sv.v;
-        out_v.u2 = (sv.chunk_index == 1) ? 1.25f : 1.0f;
+        out_v.u2 = is_eye_or_visor ? 1.25f : 1.0f;
+        out_v.v2 = static_cast<float>(arch_id);
         out_v.color = 0xFFFFFFFF;
         out_vertices[vi] = out_v;
     }
+    const size_t body_list_idx = enemy_body_only_index_list_[arch_id];
     draw.vertex_count = body_vertices;
-    draw.index_list = 0;
-    draw.index_count = enemy_swat_index_lists_[0].size();
+    draw.index_list = body_list_idx;
+    draw.index_count = enemy_swat_index_lists_[body_list_idx].size();
 
     // Attach weapon to officer's RightWeapon bone in component space (1:1 scale + animated RightWeapon rotation)
     if (bot_wmesh && bot_wmesh->is_valid()) {
-        // build_enemy_swat_index_lists() covers every mesh get_weapon_mesh() returns.
-        const auto it_list = enemy_swat_weapon_index_list_.find(bot_wmesh);
-        if (it_list == enemy_swat_weapon_index_list_.end()) return draw;
+        const auto it_list = enemy_weapon_index_lists_[arch_id].find(bot_wmesh);
+        if (it_list == enemy_weapon_index_lists_[arch_id].end()) return draw;
 
         int32_t rw_idx = 0;
-        auto it_rw = swat_mesh_.bone_name_to_index.find("rightweapon");
-        if (it_rw == swat_mesh_.bone_name_to_index.end()) {
-            it_rw = swat_mesh_.bone_name_to_index.find("righthand");
+        auto it_rw = body_mesh.bone_name_to_index.find("rightweapon");
+        if (it_rw == body_mesh.bone_name_to_index.end()) {
+            it_rw = body_mesh.bone_name_to_index.find("righthand");
         }
-        if (it_rw != swat_mesh_.bone_name_to_index.end()) rw_idx = it_rw->second;
+        if (it_rw != body_mesh.bone_name_to_index.end()) rw_idx = it_rw->second;
 
         const Vec3 rw_pos = comp_pos[rw_idx];
         const Quat4 rw_quat = comp_quat[rw_idx];
@@ -2618,6 +2690,7 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
             out_v.u = sv.u;
             out_v.v = sv.v;
             out_v.u2 = (sv.mat_type == 1) ? 3.0f : 2.0f;
+            out_v.v2 = 0.0f;
             out_v.color = bot.disarm_window ? disarm_red : 0xFFFFFFFF;
             weapon_out[vi] = out_v;
         }

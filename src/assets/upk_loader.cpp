@@ -1290,7 +1290,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                                        low_mesh.find("runnerramp") != std::string::npos)));
         a.is_balance_beam = (low_class.find("balancewalkvolume") != std::string::npos || low_class.find("balance") != std::string::npos);
         a.is_swing_bar = (low_class.find("swingvolume") != std::string::npos || low_mesh.find("swingpole") != std::string::npos);
-        a.is_enemy = (low_class.find("ai") != std::string::npos || low_class.find("botpawn") != std::string::npos || low_class.find("cop") != std::string::npos);
+        a.is_enemy = (low_class.find("botpawn") != std::string::npos);
         a.is_bag = (low_class.find("bag") != std::string::npos || low_obj.find("bag") != std::string::npos || low_mesh.find("s_bag") != std::string::npos);
         a.is_elevator_part = is_elev_mesh || is_elev_button;
         a.is_runner_vision = b_loi || is_elev_button || a.is_springboard || a.is_zipline ||
@@ -3970,7 +3970,8 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                                                std::vector<DummyFireBarrage>& out_barrages,
                                                std::vector<LevelScene::KismetValveProp>* out_valves,
                                                std::vector<LevelScene::KismetLookAtPoint>* out_lookats,
-                                               std::vector<LevelScene::KismetLevelTransition>* out_transitions) const {
+                                               std::vector<LevelScene::KismetLevelTransition>* out_transitions,
+                                               std::vector<EnemyBot>* out_enemies) const {
     if (!valid_) return;
     std::string pkg_stem = std::filesystem::path(file_path_).stem().string();
 
@@ -4188,6 +4189,86 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                 tr.next_checkpoint_name = nc->s;
             }
             out_transitions->push_back(std::move(tr));
+        } else if (out_enemies && cls == "SeqAct_TdActorFactory") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            std::string bot_template = "AITemplate_PatrolCop_Colt1911";
+            int32_t tpl_ref = prop_object(props, "BotTemplate");
+            if (tpl_ref < 0 && -tpl_ref - 1 < static_cast<int32_t>(imports_.size())) {
+                const auto& imp = imports_[static_cast<size_t>(-tpl_ref - 1)];
+                bot_template = imp.object_number > 0 ? imp.object_name + "_" + std::to_string(imp.object_number - 1) : imp.object_name;
+            } else if (tpl_ref > 0 && static_cast<size_t>(tpl_ref) <= exports_.size()) {
+                bot_template = export_object_name(*this, tpl_ref);
+            }
+
+            std::string weapon = "Colt1911";
+            std::string low_tpl = bot_template;
+            for (char& ch : low_tpl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (low_tpl.find("sniper") != std::string::npos || low_tpl.find("m95") != std::string::npos) {
+                weapon = "M95";
+            } else if (low_tpl.find("support") != std::string::npos || low_tpl.find("minimi") != std::string::npos) {
+                weapon = "FNMinimi";
+            } else if (low_tpl.find("g36") != std::string::npos) {
+                weapon = "G36C";
+            } else if (low_tpl.find("scar") != std::string::npos) {
+                weapon = "FNSCARL";
+            } else if (low_tpl.find("mp5") != std::string::npos) {
+                weapon = "MP5K";
+            } else if (low_tpl.find("tmp") != std::string::npos) {
+                weapon = "SteyrTMP";
+            } else if (low_tpl.find("shotgun") != std::string::npos || low_tpl.find("neostead") != std::string::npos) {
+                weapon = (low_tpl.find("patrol") != std::string::npos) ? "Remington870" : "Neostead";
+            } else if (low_tpl.find("m93") != std::string::npos) {
+                weapon = "BerettaM93R";
+            }
+
+            if (const UProperty* vlinks = find_prop(props, "VariableLinks")) {
+                for (const auto& vl : vlinks->elements) {
+                    const UProperty* desc_p = find_prop(vl, "LinkDesc");
+                    const UProperty* lvars = find_prop(vl, "LinkedVariables");
+                    std::string desc = desc_p ? desc_p->s : "";
+                    if (desc != "Spawn Point" || !lvars) continue;
+                    for (int32_t sp_ref : lvars->ints) {
+                        Vec3 sp{};
+                        if (!resolve_actor_location(sp_ref, sp)) continue;
+                        if (sp.length_sq() < 1.0f) continue;
+
+                        float yaw_deg = 0.0f;
+                        int32_t actual_actor = sp_ref;
+                        if (sp_ref > 0 && static_cast<size_t>(sp_ref) <= exports_.size()) {
+                            UPropertyList sp_props;
+                            parse_export_properties(*this, sp_ref, sp_props);
+                            int32_t inner = prop_object(sp_props, "ObjValue");
+                            if (inner > 0 && static_cast<size_t>(inner) <= exports_.size()) {
+                                actual_actor = inner;
+                            }
+                            UPropertyList act_props;
+                            parse_export_properties(*this, actual_actor, act_props);
+                            if (const UProperty* rot = find_prop(act_props, "Rotation")) {
+                                yaw_deg = static_cast<float>(rot->vi[1]) * (360.0f / 65536.0f);
+                            }
+                        }
+
+                        // Avoid duplicating an already-registered spawn point within 25 cm
+                        bool duplicate = false;
+                        for (const auto& existing : *out_enemies) {
+                            if ((existing.home_position - sp).length_sq() < 625.0f) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (duplicate) continue;
+
+                        EnemyBot bot{};
+                        bot.archetype = bot_template;
+                        bot.weapon_name = weapon;
+                        bot.position = sp;
+                        bot.home_position = sp;
+                        bot.yaw_deg = yaw_deg;
+                        out_enemies->push_back(std::move(bot));
+                    }
+                }
+            }
         }
     }
 }
@@ -4365,7 +4446,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         pkg->extract_elevators(mesh_library, out_scene.elevators, &door_infos);
         pkg->extract_reflections(out_scene.reflection_captures, out_scene.reflection_volumes);
         pkg->extract_helicopter_encounters(out_scene.heli_attack_nodes, out_scene.helicopters, out_scene.dummy_fire_barrages,
-                                           &out_scene.kismet_valves, &out_scene.kismet_lookat_points, &out_scene.kismet_level_transitions);
+                                           &out_scene.kismet_valves, &out_scene.kismet_lookat_points, &out_scene.kismet_level_transitions,
+                                           &out_scene.enemies);
     }
     // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
     assign_elevator_parts(out_scene, door_infos, mesh_library);
@@ -4739,6 +4821,16 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
                 }
                 enemy_ord++;
                 out_scene.enemies.push_back(bot);
+            }
+        }
+        if (out_scene.collision) {
+            for (auto& bot : out_scene.enemies) {
+                CollisionHit floor_hit = out_scene.collision->line_check(
+                    bot.position + Vec3(0.0f, 0.0f, 80.0f), bot.position - Vec3(0.0f, 0.0f, 180.0f));
+                if (floor_hit.hit) {
+                    bot.position.z = floor_hit.location.z;
+                    bot.home_position.z = floor_hit.location.z;
+                }
             }
         }
     }

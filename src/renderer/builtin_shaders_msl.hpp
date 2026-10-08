@@ -227,19 +227,19 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
         if (dot(vtx_N, V) < -0.25) vtx_N = -vtx_N;
         N = vtx_N;
         if (in.uv2.x < 1.12) {
-            // Apply high-resolution 2048x2048 tangent-space normal map (T_TKY_Cop_SWAT_N)
-            float2 duvdx = dfdx(in.uv);
-            float2 duvdy = dfdy(in.uv);
-            float det_uv = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
-            float3 T = (abs(det_uv) > 1e-10)
-                           ? normalize((dpdx * duvdy.y - dpdy * duvdx.y) * sign(det_uv))
-                           : normalize(dpdx - vtx_N * dot(vtx_N, dpdx));
-            T = normalize(T - vtx_N * dot(vtx_N, T));
-            float3 B = normalize(cross(vtx_N, T));
+            // Apply high-resolution tangent-space normal map using screen-space cotangent frame
+            // (handles mirrored character UV shells cleanly without seam flips)
+            float3 dp2perp = cross(dpdy, vtx_N);
+            float3 dp1perp = cross(vtx_N, dpdx);
+            float2 duv1 = dfdx(in.uv);
+            float2 duv2 = dfdy(in.uv);
+            float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+            float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+            float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-12);
             float3 n_ts = swat_n_tex.sample(world_tex_sampler, in.uv).rgb * 2.0 - 1.0;
             n_ts.xy *= 0.85;
             n_ts.z = sqrt(max(1.0 - dot(n_ts.xy, n_ts.xy), 0.04));
-            N = normalize(T * n_ts.x + B * n_ts.y + vtx_N * n_ts.z);
+            N = normalize(T * (n_ts.x * invmax) + B * (n_ts.y * invmax) + vtx_N * n_ts.z);
         }
     } else {
         if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
@@ -270,34 +270,70 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float rv_factor = saturate(max(uniforms.is_runner_vision, uniforms.runner_vision_strength));
 
     if (in.uv2.x > 0.5) {
-        // Dynamic UE3 Spherical Harmonics (_SH) hemisphere + half-Lambert wrap + rim lighting for 3D characters & weapons
-        float wrap_sun = saturate(dot(N, L) * 0.5 + 0.5) * mix(0.68, 1.0, shadow);
-        float view_fill = saturate(dot(N, V)) * 0.34;
-        float rim_light = pow(1.0 - saturate(dot(N, V)), 2.6) * 0.44;
-        lighting = float3(0.52, 0.56, 0.64) + float3(0.68, 0.65, 0.58) * wrap_sun + view_fill + float3(0.44, 0.55, 0.72) * rim_light;
+        // Dynamic UE3 Spherical Harmonics (_SH) character & weapon lighting
+        float char_shadow = mix(0.42, 1.0, shadow);
+        float ndl_direct = max(dot(N, L), 0.0) * char_shadow;
+        float ndl_wrap = saturate(dot(N, L) * 0.5 + 0.5) * mix(0.65, 1.0, shadow);
+        float3 sh_sky = float3(0.30, 0.36, 0.46) * (0.65 + 0.35 * sky_hemi);
+        float3 sh_ground = float3(0.14, 0.12, 0.10) * (1.0 - sky_hemi);
+        float rim_light = pow(1.0 - saturate(dot(N, V)), 2.8) * 0.38;
+        lighting = sh_sky + sh_ground
+                 + float3(0.76, 0.72, 0.64) * (0.55 * ndl_direct + 0.45 * ndl_wrap)
+                 + float3(0.38, 0.48, 0.66) * rim_light;
 
         float3 H = normalize(L + V);
         float3 H_sky = normalize(normalize(float3(0.25, -0.35, 0.90)) + V);
         float3 R_env = reflect(-V, N);
         float env_h = saturate(R_env.z * 0.5 + 0.5);
         float3 env_col = mix(float3(0.14, 0.19, 0.28), float3(0.72, 0.82, 0.96), env_h);
-        float fresnel = pow(1.0 - saturate(dot(N, V)), 2.5);
+        float fresnel = pow(1.0 - saturate(dot(N, V)), 2.8);
 
         if (in.uv2.x < 1.12) {
-            // UE3 MI_TKY_Cop_SWAT_SH (Diffuse Multiply = 2.4, Specular Power = 40.0, Mask quadrant at uv*0.5+0.5)
-            float3 d_swat = swat_d_tex.sample(world_tex_sampler, in.uv).rgb;
-            float3 s_swat = swat_s_tex.sample(world_tex_sampler, in.uv).rgb;
-            float3 mask_swat = swat_d_tex.sample(world_tex_sampler, clamp(in.uv, 0.0, 0.998) * 0.5 + 0.5).rgb;
-            base_albedo = d_swat * 2.4 + s_swat * 0.24 + float3(0.085, 0.018, 0.010) * mask_swat.b * 0.40;
+            // Per-archetype UE3 MaterialInstanceConstant parameters from cooked CH_TKY_Cop_* / CH_Celeste UPKs:
+            // 0 = SWAT, 1 = Patrol, 2 = Support, 3 = Riot, 4 = Pursuit, 5 = Celeste
+            int arch = int(in.uv2.y + 0.5);
+            float diff_mult = 4.20;
+            float spec_pow = 36.0;
+            float spec_mult = 0.85;
+            float refl_mult = 0.80;
+            float3 sss_col = float3(0.078, 0.013, 0.007);
+            if (arch == 1) {
+                // CH_TKY_Cop_Patrol (white/blue CPF armor)
+                diff_mult = 1.25; spec_pow = 18.0; spec_mult = 0.95; refl_mult = 0.48;
+                sss_col = float3(0.08, 0.03, 0.02);
+            } else if (arch == 2) {
+                // CH_TKY_Cop_Support (heavy armor)
+                diff_mult = 3.80; spec_pow = 36.0; spec_mult = 0.85; refl_mult = 0.75;
+                sss_col = float3(0.075, 0.012, 0.008);
+            } else if (arch == 3) {
+                // CH_TKY_Cop_Riot
+                diff_mult = 1.25; spec_pow = 48.0; spec_mult = 1.05; refl_mult = 0.72;
+                sss_col = float3(0.32, 0.09, 0.03);
+            } else if (arch == 4) {
+                // CH_TKY_Cop_Pursuit
+                diff_mult = 1.48; spec_pow = 48.0; spec_mult = 1.15; refl_mult = 0.58;
+                sss_col = float3(0.20, 0.06, 0.01);
+            } else if (arch == 5) {
+                // CH_Celeste
+                diff_mult = 1.20; spec_pow = 18.0; spec_mult = 0.60; refl_mult = 0.32;
+                sss_col = float3(0.28, 0.05, 0.035);
+            }
 
-            float3 refl_add = env_col * s_swat * (0.22 + 0.65 * mask_swat.g) * (0.35 + 0.65 * fresnel);
-            float3 cloth_rim = float3(0.07, 0.10, 0.16) * mask_swat.r * pow(1.0 - saturate(dot(N, V)), 3.0);
-            float3 spec_lobe = s_swat * (pow(max(dot(N, H), 0.0), 32.0) * 0.55 + pow(max(dot(N, H_sky), 0.0), 20.0) * 0.30);
-            spec_add = spec_lobe + refl_add + cloth_rim;
+            float3 d_char = swat_d_tex.sample(world_tex_sampler, in.uv).rgb;
+            float3 s_char = swat_s_tex.sample(world_tex_sampler, in.uv).rgb;
+            float back_wrap = saturate(-dot(N, L) * 0.5 + 0.35);
+            base_albedo = d_char * diff_mult + s_char * 0.14 + sss_col * back_wrap * 0.35;
+
+            float3 refl_add = env_col * s_char * refl_mult * (0.28 + 0.72 * fresnel);
+            float3 spec_lobe = s_char * spec_mult * (
+                pow(max(dot(N, H), 0.0), spec_pow) * char_shadow +
+                pow(max(dot(N, H_sky), 0.0), max(spec_pow * 0.5, 12.0)) * 0.35);
+            spec_add = spec_lobe + refl_add;
         } else if (in.uv2.x < 1.5) {
-            // UE3 MI_TKY_Cop_SWAT_eye_SH (EyeColor = (0.164, 0.184, 0.302), Whiteness = 0.25, Specular = 2.0)
-            base_albedo = float3(0.09, 0.10, 0.14);
-            spec_add = float3(0.85, 0.90, 0.98) * pow(max(dot(N, H), 0.0), 64.0) * 0.75;
+            // UE3 MI_TKY_Cop_SWAT_eye_SH / visor sub-material
+            base_albedo = float3(0.08, 0.09, 0.12);
+            spec_add = float3(0.85, 0.90, 0.98) * pow(max(dot(N, H), 0.0), 64.0) * 0.80
+                     + env_col * 0.35 * fresnel;
         } else if (in.uv2.x < 2.5) {
             // 3D Enemy Weapon / Dropped Weapon main high-res GPU texture (linear sRGB + cubemap sheen)
             if (in.color.r > 0.85 && in.color.g < 0.20) {
