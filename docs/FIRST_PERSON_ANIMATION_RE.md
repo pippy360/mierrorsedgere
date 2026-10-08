@@ -226,26 +226,40 @@ With both, the port's eye through 2,118 frames of swinging is retail's camera to
 
 ## 8. With a weapon
 
-None of this could be measured: no retail recording has a weapon in hand (section 10). It is what the scripts and the packages say, run through the same tree.
+What the scripts and the packages say, checked against a retail session recorded for it with a pistol (Colt 1911) and a rifle (G36C) in hand: frames at every 15 degrees of pitch, and the tree dumped at each step (`build/retail/extra/`, pass 4).
 
-**The sequences.** `TdPawn.UpdateAnimSets` fills `Mesh1p.AnimSets`: `[0]` stays `AS_C1P_Unarmed`, `[1]` is the common armed set (`AS_C1P_OneHanded_Common` for a light weapon, `AS_C1P_TwoHanded_Common` for a heavy one) and `[2]` the weapon's own `AnimationSetCharacter1p`. A node's sequence name is looked up in the weapon's set first, then the common one, then the unarmed one, so with a weapon the same tree plays the armed `walkfwd`, `Stand` and the rest wherever a set has one. The armed sets carry 82 bone tracks to the unarmed set's 74 (the weapon bones).
+**The sequences.** `TdPawn.UpdateAnimSets` fills `Mesh1p.AnimSets`: `[0]` stays `AS_C1P_Unarmed`, `[1]` is the common armed set (`AS_C1P_OneHanded_Common` for a light weapon, `AS_C1P_TwoHanded_Common` for a heavy one) and `[2]` the weapon's own `AnimationSetCharacter1p`. A node's sequence name is looked up in the weapon's set first, then the common one, then the unarmed one. The armed sets carry 82 bone tracks to the unarmed set's 74 (the weapon bones).
+
+**Where the arms come from.** Each arm is a per-bone blend of its own, always whole (`ArmedRight` from `SpineXRight` down, `ArmedLeft` from `SpineXLeft`; `Child2Weight` 1 in the package and in every dump). What it lays over the body:
+
+```
+ArmedRight -> AgainstWallState [1, 3] -- Default --> Custom_Weapon (slot) -> WeaponState
+                                      -- against the wall --> againstwall
+ArmedLeft  -> AgainstWallState [1, 2] -- Default --> WeaponType: light -> the body's own; heavy -> Custom_Weapon -> WeaponState
+                                      -- against the wall --> againstwall
+WeaponState: Default -> standready / walkfwdready / runfwdready by walking state; Relaxed, Unarmed, HeavyArmed -> the body's own
+```
+
+So unarmed, relaxed or holstered the arms are the body's; at the ready the right arm is the ready stance (both arms with a heavy weapon), and `standfire` and the reload play over it on `Custom_Weapon`.
 
 **The weapon state** (`TdPawn.WeaponAnimState`: 0 unarmed, 1 relaxed, 2 ready, 3 reloading, 4 throwing away, 5 heavy, 6 holstering):
 
-| when | what |
-| --- | --- |
-| a weapon comes to hand | `unholster` on `CannedUpperBody` (in at once, out over 0.2), state 2 |
-| firing | `StopCustomAnim(Weapon, 0)`, `standfire` on `Weapon` (0.1 in, no blend out), state 2 |
-| reloading | the weapon's reload on `Weapon` (0.2 / 0.2), state 3 |
-| throwing it away | `throwaway` on `CannedUpperBody` (0.1 in), state 4 |
-| `UpdateWeaponAnimState` | a light weapon goes from ready to relaxed after 5 s and 1,000 uu of travel (`AmountTilUnarmed`); a heavy one stays up |
+| when | what | retail |
+| --- | --- | --- |
+| a weapon comes to hand | `unholster` on `CannedUpperBody` (in at once, out over 0.2), state 2 | |
+| firing | `StopCustomAnim(Weapon, 0)`, `standfire` on `Weapon` (0.1 in, no blend out), state 2 | 0.83 of the slot 0.07 s after the shot, all of it 0.56 s in (the G36C's is 0.87 s long), gone a second after |
+| throwing it away | `throwaway` on `CannedUpperBody` (0.1 in), state 4 | playing, 0.47 s in, 0.3 s after the button |
+| `UpdateWeaponAnimState` | a light weapon goes from ready to relaxed after 5 s and 1,000 uu of travel (`AmountTilUnarmed`, counted from when she became ready: `SetWeaponAnimState` does nothing when the state is already the one asked for, so a shot fired at the ready does not start either over); a heavy one stays up | the pistol, 250 uu walked since it came up, a shot, 8 s still: ready throughout, and 750 uu into a run it began to come down; the rifle ready after 6 s still |
 
-`TdAnimNodeWeaponState` maps relaxed, unarmed and heavy to the main tree and everything else to its default child, the ready stances (`standready`, `walkfwdready`, `runfwdready`); it blends over 0.3 s to ready and 2.0 s back. Ready, a pistol is up in the lower right of the view; relaxed, the arm swings with the run and the gun is out of sight.
+`TdAnimNodeWeaponState` blends over 0.3 s to ready and 2.0 s back: in the run above the node was 0.72 ready / 0.28 relaxed 0.55 s after it began.
 
-**The arm.** `ArmedRight` lays the weapon branch over `SpineXRight` and what hangs from it; a heavy weapon adds `ArmedLeft` for the other arm. `TdAnimNodeWeaponPoseOffset` holds a profile of bones for each weapon ("OneHanded-Colt1911", "TwoHanded-G36C" ...): on those bones the pose is offset by the difference between the weapon's own `weaponpose` and the common set's, which is what fits the same stance to each grip. Two light weapons also nudge the right shoulder (`OneHandedRightShoulderTranslationOffset`: the Beretta (0, 0.80, -1.43), the TMP (0, 4, -1)).
+Standing, the ready stance is `standready`; walking `walkfwdready`; running `runfwdready`; crouched and still, `standready` again; sliding, `runfwdready` under the slide. Relaxed, a pistol is out of sight at every pitch: the arm is the body's and swings with the run.
 
-**The aim.** `TdSkelControlAim1p` on `SpineXRight` and `SpineXLeft` turns the armed arm with the view. It is native. The port turns those bones by the view's pitch, one for one, about the mesh's sideways axis, by how far the weapon is at the ready: it keeps the gun on the crosshair, and it is not checked against retail.
+**The grip.** `TdAnimNodeWeaponPoseOffset` holds a profile of bones for each weapon ("OneHanded-Colt1911", "TwoHanded-G36C" ...): on those bones the pose is offset by the difference between the weapon's own `weaponpose` and the common set's, which fits the same stance to each grip. Two light weapons also nudge the right shoulder (`OneHandedRightShoulderTranslationOffset`: the Beretta (0, 0.80, -1.43), the TMP (0, 4, -1)).
 
+**The aim.** `TdSkelControlAim1p` on `SpineXRight` and `SpineXLeft` turns the armed arm with the view. It is native. In retail's frames the weapon is at the same place on the screen at every pitch from 75 degrees up to 75 down, pistol and rifle both, so it turns one for one, and that is what the port does: those bones turned by the view's pitch about the mesh's sideways axis, by how far the weapon is at the ready.
+
+**Against a wall.** `TdPlayerPawn.AgainstWallState` (native `UpdateAgainstWall`: 0 none, 1 both arms, 2 the left, 3 the right) puts the arms it names on `againstwall` (in 0.35 s, out 0.55) and the camera's node on the `AgainstWallCam` aim. Run up to a fence with a pistol, retail has her left palm flat on it and the pistol pointing straight up in her right hand for as long as she stands there.
 
 ## 9. The port
 
