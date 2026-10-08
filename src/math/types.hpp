@@ -1126,6 +1126,18 @@ struct PlayerTelemetry {
     bool reaction_active = false;
     bool grounded = true;
     bool move_input = false;  // the player is pushing a direction (the pawn's Acceleration is not zero)
+    // What the current move read off the level, for the first-person animation (fp::PawnFrame).
+    // `move_anim` names the animation a move with a choice picked ("VaultOverHigh", "HangFreeHeaveUp"),
+    // or is "@reached" when it gets to the place it was steering for; `move_anim_serial` counts them,
+    // so each is played once however often the telemetry is read.
+    std::string move_anim;
+    uint32_t move_anim_serial = 0;
+    float ground_distance = -1.0f;  // falling fast: the feet above what is under them; -1 not known
+    bool jump_over_gap = false;     // TdMove_Jump.StartJump: nothing to land on 1.1 x the speed ahead
+    bool move_left = false;         // a dodge jump going left
+    bool hanging_free = false;      // hanging with no wall for the legs
+    float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
+    float balance_lean = 0.0f;      // -1 .. 1 off the beam
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

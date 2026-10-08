@@ -242,6 +242,8 @@ bool Director::play_named(const std::string& name) {
     std::string playing;
     if (tree_.custom_anim_playing(a->slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(a->slot) < 0.05f) return true;
     tree_.play_custom_anim(a->slot, name, a->rate, a->blend_in, a->blend_out, a->looping, true);
+    // TdMove_IntoGrab.ReachedPreciseLocation: the hardest catch also knocks the camera.
+    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, 0.2f, false, true);
     return true;
 }
 
@@ -272,7 +274,6 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.4f);
             break;
         case EMovement::MOVE_Grabbing:
-        case EMovement::MOVE_IntoGrab:
         case EMovement::MOVE_SoftLanding:
         case EMovement::MOVE_180Turn:
             tree_.stop_custom_anim(Slot::FullBody, 0.2f);
@@ -397,9 +398,6 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
         case EMovement::MOVE_GrabJump:
             play(Slot::FullBody, "HangTurnJump", 1.0f, 0.2f, 0.2f);
             set_animation_state(EMovement::MOVE_Grabbing);
-            break;
-        case EMovement::MOVE_IntoGrab:
-            if (frame.move_anim.empty()) play(Slot::FullBody, frame.hanging_free ? "HangFreeHardStart" : "HangHardStart", 1.0f, 0.1f, 0.2f);
             break;
         case EMovement::MOVE_GrabTransfer:
             tree_.stop_custom_anim(Slot::FullBody, 0.1f);
@@ -557,6 +555,10 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;
     pawn_.heavy_weapon = frame.heavy_weapon;
+    pawn_.swing_angle = frame.swing_angle;
+    pawn_.balance_lean = frame.balance_lean;
+    pawn_.hanging_free = frame.hanging_free;
+    pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
     tree_.tick(pawn_, frame.dt);
     last_velocity_ = frame.velocity;

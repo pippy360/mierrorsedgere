@@ -42,6 +42,12 @@ struct PawnAnimState {
     // How far the weapon arms are laid over the body (ArmedLeft / ArmedRight's Child2Weight): 0 unarmed.
     float armed_left = 0.0f;
     float armed_right = 0.0f;
+    float swing_angle = 0.0f;     // radians from hanging straight down, positive ahead of the bar
+    float balance_lean = 0.0f;    // -1 .. 1 off the beam
+    bool hanging_free = false;
+    bool climbing_pipe = false;
+    int climb_hand = 0;           // 0 left hand up, 1 right
+    bool climb_sliding = false;
 };
 
 // One node of the tree: its fixed properties and its state this frame.

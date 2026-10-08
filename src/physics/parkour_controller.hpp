@@ -254,6 +254,11 @@ private:
     void update_fall_height_volumes(const LevelScene& scene);
     void leave_ground(EMovement air_move);
     void set_stance(float eye_height);
+    // Tells the animation which of a move's animations plays (PlayerTelemetry::move_anim).
+    void set_move_anim(const char* name) {
+        m_telemetry.move_anim = name;
+        ++m_telemetry.move_anim_serial;
+    }
     [[nodiscard]] bool can_skill_roll() const;
     [[nodiscard]] bool jump_pressed() const { return m_jump_buffer > 0.0f; }
     void consume_jump() { m_jump_buffer = 0.0f; }
@@ -383,6 +388,7 @@ private:
     float m_wallrun_yaw_max = 0.0f;         // TdMove_WallRun.MaxContraintWorld
     float m_vault_look_lock = 0.0f;         // VaultTypes[].VaultTimeUp of the vault started (high vaults)
     bool m_vault_down = false;              // TdMove_SpeedVault reached VaultState 3 (the drop)
+    bool m_path_planted = false;            // the springboard's foot is on the step (ReachedPreciseLocation)
 
     // UE3 Pawn.Base: the actor the pawn stands on (moving elevator parts carry the pawn).
     int32_t m_base_actor = -1;

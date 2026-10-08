@@ -176,7 +176,12 @@ def write_frames(samples, path, hints=True):
                     d["t"], d["move"], d["px"], d["py"], d["pz"], d["vx"], d["vy"], d["vz"],
                     d.get("pyaw", d.get("yaw", 0.0)), d.get("cyaw", d.get("yaw", 0.0)), d.get("cpitch", d.get("pitch", 0.0))))
                 if extra:
-                    f.write(" %.2f %d %d %d %d %s" % tuple(extra[k]))
+                    g, gap, left, free, acc, anim = extra[k][:6]
+                    f.write(" g=%.2f gap=%d left=%d free=%d acc=%d" % (g, gap, left, free, acc))
+                    if anim != "-":
+                        f.write(" anim=%s" % anim)
+                    for name, value in extra[k][6:]:
+                        f.write(" %s=%s" % (name, value))
                 f.write("\n")
             i = j
     return kept

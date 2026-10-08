@@ -346,8 +346,30 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;
+    } else if (n.cls == "TdAnimNodeBalanceWalk") {
+        // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
+        want = 1;
+    } else if (n.cls == "TdAnimNodeBalanceBlend") {
+        // Left, Middle, Right: by how far she leans off the beam.
+        if (n.weight.size() >= 3) {
+            const float lean = std::clamp(pawn.balance_lean, -1.0f, 1.0f);
+            n.weight[0] = std::max(0.0f, -lean);
+            n.weight[1] = 1.0f - std::fabs(lean);
+            n.weight[2] = std::max(0.0f, lean);
+            n.target = n.weight;
+            n.blend_to_go = 0.0f;
+        }
+        return;
+    } else if (n.cls == "TdAnimNodeLedgeWalk" || n.cls == "TdAnimNodeDirSwitch") {
+        // Right / Left along a ledge, Forward / Backward crouched: by the way she is going, and the
+        // last way while she is still.
+        const float yaw = pawn.yaw_deg * DEG2RAD;
+        const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+        const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
+        const float along = n.cls == "TdAnimNodeLedgeWalk" ? right : forward;
+        if (std::fabs(along) > 1.0f) want = along >= 0.0f ? 0 : 1;
     } else {
-        // Not modelled yet: the node stays on its first child.
+        // Driven by nothing here: the node stays on its first child.
         want = 0;
     }
     if (static_cast<size_t>(want) < n.blend_in.size()) blend = n.blend_in[static_cast<size_t>(want)];

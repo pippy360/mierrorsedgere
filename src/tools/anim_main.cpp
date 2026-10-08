@@ -9,12 +9,12 @@
 // (pitch, yaw, roll in degrees), the two things TdPlayerPawn.CalcCamera takes from the mesh.
 //
 // A frames file has one retail frame per line:
-//   t  move  px py pz  vx vy vz  pawn_yaw  view_yaw  view_pitch  [ground  gap  left  free  accel  anim]
-// and a line "reset" where the recording was cut (a pause, a reload). The optional columns are
-// what the moves read off the level, which a recording does not carry: the height of the feet
-// above the ground (-1 unknown), whether a long jump is over a gap, whether a sideways move goes
-// left, whether she hangs free, whether the player is pushing a direction, and the animation the
-// move picked ("-" for none, "@reached" for getting to the place the move steers for).
+//   t  move  px py pz  vx vy vz  pawn_yaw  view_yaw  view_pitch  [name=value ...]
+// and a line "reset" where the recording was cut (a pause, a reload). The name=value hints are
+// what the moves read off the level, which a recording does not carry: g (the height of the feet
+// above the ground), gap (a long jump over a gap), left (a sideways move going left), free (hanging
+// free), acc (the player pushing a direction), anim (the animation the move picked, "@reached" for
+// getting to the place the move steers for), swing (the swing's angle), lean, pipe.
 
 #include "../anim/anim_system.hpp"
 #include "../anim/fp_director.hpp"
@@ -132,16 +132,23 @@ int main(int argc, char** argv) {
         me::fp::PawnFrame f;
         ls >> t >> move >> f.position.x >> f.position.y >> f.position.z >> f.velocity.x >> f.velocity.y >> f.velocity.z >> f.yaw_deg >>
             f.view_yaw_deg >> f.view_pitch_deg;
-        int gap = 0, left = 0, hang_free = 0, accel = 1;
-        std::string anim;
-        if (ls >> f.ground_distance >> gap >> left >> hang_free >> accel >> anim) {
-            f.long_jump_over_gap = gap != 0;
-            f.move_left = left != 0;
-            f.hanging_free = hang_free != 0;
-            f.accelerating = accel != 0;
-            if (anim != "-") f.move_anim = anim;
-        } else {
-            f.ground_distance = -1.0f;
+        // What the moves read off the level, as name=value: g (ground distance), gap, left, free,
+        // acc (pushing a direction), anim (the animation the move picked, or @reached), swing
+        // (radians), lean, pipe.
+        f.ground_distance = -1.0f;
+        for (std::string token; ls >> token;) {
+            const size_t eq = token.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string key = token.substr(0, eq), value = token.substr(eq + 1);
+            if (key == "g") f.ground_distance = std::stof(value);
+            else if (key == "gap") f.long_jump_over_gap = value != "0";
+            else if (key == "left") f.move_left = value != "0";
+            else if (key == "free") f.hanging_free = value != "0";
+            else if (key == "acc") f.accelerating = value != "0";
+            else if (key == "anim") f.move_anim = value;
+            else if (key == "swing") f.swing_angle = std::stof(value);
+            else if (key == "lean") f.balance_lean = std::stof(value);
+            else if (key == "pipe") f.climbing_pipe = value != "0";
         }
         f.movement = static_cast<me::EMovement>(move);
         f.dt = last_t < 0.0 ? 0.0f : static_cast<float>(t - last_t);

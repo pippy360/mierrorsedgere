@@ -1446,6 +1446,7 @@ struct AnimSystem::FirstPerson {
     float last_time = -1.0f;
     EMovement last_move = EMovement::MOVE_None;
     fp::PawnFrame last_frame;
+    uint32_t move_anim_serial = 0;
 };
 
 // Runs the first-person tree up to this frame and says what of it to use.
@@ -1480,8 +1481,17 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.view_yaw_deg = telemetry.yaw_deg;
         frame.view_pitch_deg = telemetry.pitch_deg;
         frame.accelerating = telemetry.move_input;
-        // The controller springs off the board the frame the move starts.
-        if (telemetry.move_state == EMovement::MOVE_SpringBoarding && fp.last_move != EMovement::MOVE_SpringBoarding) frame.move_anim = "@reached";
+        frame.ground_distance = telemetry.ground_distance;
+        frame.long_jump_over_gap = telemetry.jump_over_gap;
+        frame.move_left = telemetry.move_left;
+        frame.hanging_free = telemetry.hanging_free;
+        frame.swing_angle = telemetry.swing_angle;
+        frame.balance_lean = telemetry.balance_lean;
+        if (restart) fp.move_anim_serial = telemetry.move_anim_serial;
+        if (telemetry.move_anim_serial != fp.move_anim_serial) {
+            fp.move_anim_serial = telemetry.move_anim_serial;
+            frame.move_anim = telemetry.move_anim;
+        }
         // Called once a rendered frame, which can be several simulated ones (the headless oracle
         // steps without drawing). A move that started in the gap started `combat_anim_time` ago (the
         // controller's clock of the move), not at the last frame drawn.

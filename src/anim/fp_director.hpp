@@ -35,6 +35,9 @@ struct PawnFrame {
     bool move_left = false;      // a sideways move going left (dodge jumps)
     bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
     bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)
+    float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
+    float balance_lean = 0.0f;   // -1 .. 1 off the beam
+    bool climbing_pipe = false;  // on a pipe, not a ladder
 };
 
 class Director {
