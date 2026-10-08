@@ -176,6 +176,9 @@ public:
                            std::vector<InterpDoorInfo>* out_doors = nullptr) const;
     void extract_reflections(std::vector<SceneCaptureReflectInfo>& out_captures,
                              std::vector<ReflectionVolumeInfo>& out_volumes) const;
+    void extract_helicopter_encounters(std::vector<HeliAttackNode>& out_nodes,
+                                       std::vector<HelicopterInstance>& out_helicopters,
+                                       std::vector<DummyFireBarrage>& out_barrages) const;
 
     // Built-in LZO1X-1 decompressor
     static bool lzo1x_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t expected_len);

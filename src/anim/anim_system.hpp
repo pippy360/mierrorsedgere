@@ -292,6 +292,8 @@ private:
     SkeletalMeshAsset faith_upper_;
     SkeletalMeshAsset faith_lower_;
     SkeletalMeshAsset swat_mesh_;
+    SkeletalMeshAsset heli_mesh_;
+    DXT1Texture heli_diffuse_tex_;
     SkeletalMeshAsset colt1911_mesh_;
     std::unordered_map<std::string, SkeletalMeshAsset> weapon_meshes_;
 

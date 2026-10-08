@@ -3965,6 +3965,195 @@ void UPKPackage::extract_reflections(std::vector<SceneCaptureReflectInfo>& out_c
     }
 }
 
+void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_nodes,
+                                               std::vector<HelicopterInstance>& out_helicopters,
+                                               std::vector<DummyFireBarrage>& out_barrages) const {
+    if (!valid_) return;
+    std::string pkg_stem = std::filesystem::path(file_path_).stem().string();
+
+    auto resolve_actor_location = [&](int32_t obj_idx, Vec3& out_loc) -> bool {
+        if (obj_idx <= 0 || static_cast<size_t>(obj_idx) > exports_.size()) return false;
+        UPropertyList props;
+        parse_export_properties(*this, obj_idx, props);
+        if (const UProperty* loc = find_prop(props, "Location")) {
+            out_loc = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            return true;
+        }
+        int32_t inner = prop_object(props, "ObjValue");
+        if (inner > 0 && static_cast<size_t>(inner) <= exports_.size()) {
+            UPropertyList inner_props;
+            parse_export_properties(*this, inner, inner_props);
+            if (const UProperty* loc = find_prop(inner_props, "Location")) {
+                out_loc = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto parse_side_enum = [](const std::string& s) -> EHeliAttackSide {
+        if (s == "ESide_Right") return EHeliAttackSide::Right;
+        if (s == "ESide_Left") return EHeliAttackSide::Left;
+        if (s == "ESide_UseLeftWhenHovering") return EHeliAttackSide::UseLeftWhenHovering;
+        if (s == "ESide_UseRightWhenHovering") return EHeliAttackSide::UseRightWhenHovering;
+        if (s == "ESide_Both") return EHeliAttackSide::Both;
+        if (s == "ESide_None") return EHeliAttackSide::None;
+        return EHeliAttackSide::UseLeftWhenHovering;
+    };
+
+    // Map kismet node index -> earliest trigger actor world location that activates it (up to 3 hops)
+    std::unordered_map<int32_t, Vec3> node_trigger_pos;
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx = static_cast<int32_t>(i + 1);
+        std::string cls = get_export_class(exports_[i]);
+        if (cls != "SeqEvent_TdTouch" && cls != "SeqEvent_Touch") continue;
+        UPropertyList ev_props;
+        parse_export_properties(*this, idx, ev_props);
+        int32_t orig_ref = prop_object(ev_props, "Originator");
+        Vec3 trig_loc{};
+        if (!resolve_actor_location(orig_ref, trig_loc)) continue;
+
+        std::vector<int32_t> frontier = {idx};
+        for (int hop = 0; hop < 3 && !frontier.empty(); ++hop) {
+            std::vector<int32_t> next_frontier;
+            for (int32_t cur : frontier) {
+                UPropertyList cprops;
+                parse_export_properties(*this, cur, cprops);
+                const UProperty* outs = find_prop(cprops, "OutputLinks");
+                if (!outs) continue;
+                for (const auto& out_el : outs->elements) {
+                    const UProperty* links = find_prop(out_el, "Links");
+                    if (!links) continue;
+                    for (const auto& l_el : links->elements) {
+                        int32_t target_op = prop_object(l_el, "LinkedOp");
+                        if (target_op > 0 && static_cast<size_t>(target_op) <= exports_.size()) {
+                            if (node_trigger_pos.find(target_op) == node_trigger_pos.end()) {
+                                node_trigger_pos[target_op] = trig_loc;
+                                next_frontier.push_back(target_op);
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = std::move(next_frontier);
+        }
+    }
+
+    for (size_t i = 0; i < exports_.size(); ++i) {
+        int32_t idx = static_cast<int32_t>(i + 1);
+        const auto& exp = exports_[i];
+        std::string cls = get_export_class(exp);
+
+        if (cls == "TdAttackPathNode") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            HeliAttackNode node{};
+            node.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            if (const UProperty* loc = find_prop(props, "Location")) {
+                node.location = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            }
+            if (const UProperty* rot = find_prop(props, "Rotation")) {
+                node.yaw_deg = static_cast<float>(rot->vi[1]) * (360.0f / 65536.0f);
+            }
+            node.attack_radius = prop_float(props, "AttackVolumeRadius", 3000.0f);
+            node.attack_height = prop_float(props, "AttackVolumeHeight", 2000.0f);
+            node.attack_angle = prop_float(props, "AttackVolumeAngle", 45.0f);
+            node.exposure = prop_int(props, "Exposure", 80);
+            out_nodes.push_back(std::move(node));
+        } else if (cls == "SeqAct_TdHelicopterFactory") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            HelicopterInstance heli{};
+            heli.object_name = pkg_stem + "." + export_object_name(*this, idx);
+
+            if (const UProperty* vlinks = find_prop(props, "VariableLinks")) {
+                for (const auto& vl : vlinks->elements) {
+                    const UProperty* desc_p = find_prop(vl, "LinkDesc");
+                    const UProperty* lvars = find_prop(vl, "LinkedVariables");
+                    std::string desc = desc_p ? desc_p->s : "";
+                    if (!lvars) continue;
+                    if (desc == "Spawn Point" && !lvars->ints.empty()) {
+                        Vec3 sp{};
+                        if (resolve_actor_location(lvars->ints[0], sp)) {
+                            heli.spawn_pos = sp;
+                            heli.position = sp;
+                        }
+                    } else if (desc == "Crew") {
+                        heli.gunner_count = std::max<int32_t>(1, static_cast<int32_t>(lvars->ints.size()));
+                    }
+                }
+            }
+
+            if (const UProperty* olinks = find_prop(props, "OutputLinks")) {
+                for (const auto& ol : olinks->elements) {
+                    const UProperty* links = find_prop(ol, "Links");
+                    if (!links) continue;
+                    for (const auto& l_el : links->elements) {
+                        int32_t top = prop_object(l_el, "LinkedOp");
+                        if (top <= 0 || static_cast<size_t>(top) > exports_.size()) continue;
+                        std::string tcls = get_export_class(exports_[static_cast<size_t>(top - 1)]);
+                        UPropertyList tprops;
+                        parse_export_properties(*this, top, tprops);
+                        if (tcls == "SeqAct_SetHeliTarget") {
+                            heli.side_preference = parse_side_enum(prop_name(tprops, "SideOfHelicopter"));
+                        } else if (tcls == "SeqAct_Delay") {
+                            heli.hold_fire_delay = prop_float(tprops, "Duration", 6.0f);
+                        }
+                    }
+                }
+            }
+
+            auto trig_it = node_trigger_pos.find(idx);
+            if (trig_it != node_trigger_pos.end()) {
+                heli.trigger_pos = trig_it->second;
+                heli.trigger_radius = 2800.0f;
+            } else {
+                heli.trigger_pos = heli.spawn_pos;
+                heli.trigger_radius = 5200.0f;
+            }
+            heli.retreat_dest = heli.spawn_pos + Vec3(0.0f, 0.0f, 4500.0f);
+            out_helicopters.push_back(std::move(heli));
+        } else if (cls == "SeqAct_TdDummyWeaponFire") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            DummyFireBarrage bar{};
+            bar.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            bar.shots_to_fire = std::clamp(prop_int(props, "ShotsToFire", 14), 1, 64);
+            if (const UProperty* spread = find_prop(props, "MaxSpread")) {
+                bar.spread_deg = std::max(std::abs(spread->vi[0]), std::abs(spread->vi[1])) * (360.0f / 65536.0f);
+                if (bar.spread_deg <= 0.1f) bar.spread_deg = 8.0f;
+            }
+            bool got_origin = false;
+            bool got_target = false;
+            if (const UProperty* vlinks = find_prop(props, "VariableLinks")) {
+                for (const auto& vl : vlinks->elements) {
+                    const UProperty* desc_p = find_prop(vl, "LinkDesc");
+                    const UProperty* lvars = find_prop(vl, "LinkedVariables");
+                    std::string desc = desc_p ? desc_p->s : "";
+                    if (!lvars || lvars->ints.empty()) continue;
+                    int32_t var_ref = lvars->ints[0];
+                    if (desc == "Origin") {
+                        got_origin = resolve_actor_location(var_ref, bar.origin);
+                    } else if (desc == "Target") {
+                        got_target = resolve_actor_location(var_ref, bar.target);
+                    }
+                }
+            }
+            if (got_origin && got_target) {
+                auto trig_it = node_trigger_pos.find(idx);
+                if (trig_it != node_trigger_pos.end()) {
+                    bar.trigger_pos = trig_it->second;
+                    bar.trigger_radius = 1800.0f;
+                } else {
+                    bar.trigger_pos = (bar.origin + bar.target) * 0.5f;
+                    bar.trigger_radius = 1800.0f;
+                }
+                out_barrages.push_back(std::move(bar));
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // High-Level Level Loader
 // -----------------------------------------------------------------------------
@@ -4137,6 +4326,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     for (const auto& pkg : loaded_packages) {
         pkg->extract_elevators(mesh_library, out_scene.elevators, &door_infos);
         pkg->extract_reflections(out_scene.reflection_captures, out_scene.reflection_volumes);
+        pkg->extract_helicopter_encounters(out_scene.heli_attack_nodes, out_scene.helicopters, out_scene.dummy_fire_barrages);
     }
     // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
     assign_elevator_parts(out_scene, door_infos, mesh_library);

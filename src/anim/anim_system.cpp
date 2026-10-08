@@ -1179,6 +1179,28 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         swat_mesh_.tex_normal = swat_normal_tex_;
     }
 
+    // Load KrugerSec / CPF SWAT Blackhawk Helicopter Skeletal Mesh & Diffuse Texture (Vehicles/SWAT_Blackhawk.upk)
+    {
+        UPKPackage pkg_heli(cooked + "Vehicles/SWAT_Blackhawk.upk");
+        if (pkg_heli.is_valid()) {
+            for (const auto& exp : pkg_heli.get_exports()) {
+                if (pkg_heli.get_export_class(exp) == "SkeletalMesh" &&
+                    exp.object_name == "SK_SWAT_Blackhawk_01") {
+                    parse_skeletal_mesh(pkg_heli, exp, heli_mesh_);
+                    break;
+                }
+            }
+            parse_dxt1_texture(pkg_heli, "T_blackhawk_outside_D", heli_diffuse_tex_);
+            if (heli_diffuse_tex_.is_valid()) {
+                heli_mesh_.tex_diffuse = heli_diffuse_tex_;
+                for (auto& v : heli_mesh_.vertices) {
+                    Vec3 c = heli_diffuse_tex_.sample_rgb01(v.u, v.v);
+                    v.color = pack_rgba8(c.x, c.y, c.z);
+                }
+            }
+        }
+    }
+
     // Load shared brass cartridge texture from Weapons/WP_Ammo.upk (used by M_Ammo sections on Glock18/FNSCARL/FNMinimi)
     {
         UPKPackage pkg_ammo(cooked + "Weapons/WP_Ammo.upk");
@@ -2724,6 +2746,80 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float /*sim_t
                                      tr.hit_enemy ? 16.0f : 10.0f);
         }
     }
+
+    // 3. Render Active SWAT Blackhawk Helicopters (SK_SWAT_Blackhawk_01) with Spinning Main & Tail Rotors
+    if (heli_mesh_.is_valid()) {
+        for (const auto& heli : scene.helicopters) {
+            if (heli.state == EHeliState::Dormant || heli.state == EHeliState::Destroyed) continue;
+
+            const float cy = std::cos(heli.yaw_deg * DEG2RAD);
+            const float sy = std::sin(heli.yaw_deg * DEG2RAD);
+            const float cp = std::cos(heli.pitch_deg * DEG2RAD);
+            const float sp = std::sin(heli.pitch_deg * DEG2RAD);
+            const float cr = std::cos(heli.roll_deg * DEG2RAD);
+            const float sr = std::sin(heli.roll_deg * DEG2RAD);
+
+            const float cmr = std::cos(heli.main_rotor_rad);
+            const float smr = std::sin(heli.main_rotor_rad);
+            const float ctr = std::cos(heli.tail_rotor_rad);
+            const float str = std::sin(heli.tail_rotor_rad);
+            const Vec3 tail_hub(0.0f, -80.2f, -1124.2f); // Bone [4] VH_Extra2 tail rotor mast pivot
+
+            auto xform_heli_pt = [&](Vec3 p, uint8_t b0, bool is_normal) -> Vec3 {
+                // Spin main rotor (bones 2 & 3) around local Y (up in Blackhawk rig) and tail rotor (bone 4) around local X
+                if (b0 == 2 || b0 == 3) {
+                    float rx = p.x * cmr - p.z * smr;
+                    float rz = p.x * smr + p.z * cmr;
+                    p.x = rx;
+                    p.z = rz;
+                } else if (b0 == 4) {
+                    Vec3 rel = is_normal ? p : (p - tail_hub);
+                    float ry = rel.y * ctr - rel.z * str;
+                    float rz = rel.y * str + rel.z * ctr;
+                    p = is_normal ? Vec3(rel.x, ry, rz) : (tail_hub + Vec3(rel.x, ry, rz));
+                }
+                // Map Blackhawk skeletal rig (+Z nose forward, +X right, -Y up) to UE world axes (+X forward, +Y right, +Z up)
+                float lx = p.z;
+                float ly = p.x;
+                float lz = -p.y;
+                // Apply roll & pitch in local aircraft frame, then yaw into world space
+                float r_y = ly * cr - lz * sr;
+                float r_z = ly * sr + lz * cr;
+                float p_x = lx * cp + r_z * sp;
+                float p_z = -lx * sp + r_z * cp;
+                float w_x = p_x * cy - r_y * sy;
+                float w_y = p_x * sy + r_y * cy;
+                return is_normal ? Vec3(w_x, w_y, p_z).normalized() : (heli.position + Vec3(w_x, w_y, p_z));
+            };
+
+            for (size_t i = 0; i + 2 < heli_mesh_.indices.size(); i += 3) {
+                for (int k = 0; k < 3; ++k) {
+                    uint16_t vi = heli_mesh_.indices[i + k];
+                    if (vi >= heli_mesh_.vertices.size()) continue;
+                    const SkinnedVertex& sv = heli_mesh_.vertices[vi];
+                    Vertex out_v{};
+                    out_v.position = xform_heli_pt(sv.bind_pos, sv.bones[0], false);
+                    out_v.normal = xform_heli_pt(sv.bind_norm, sv.bones[0], true);
+                    out_v.tangent = Vec3(cy, sy, 0.0f);
+                    out_v.u = sv.u;
+                    out_v.v = sv.v;
+                    out_v.u2 = 0.0f; // vertex color sampled from T_blackhawk_outside_D with hemisphere + sun lighting
+                    out_v.color = sv.color;
+                    out_world_tris.push_back(out_v);
+                }
+            }
+
+            // Door gunner muzzle flash when firing FNMinimi bursts
+            if (heli.muzzle_flash_timer > 0.0f) {
+                Vec3 fwd(cy, sy, 0.0f);
+                Vec3 right(-sy, cy, 0.0f);
+                float side_sign = (heli.side_preference == EHeliAttackSide::Right ||
+                                   heli.side_preference == EHeliAttackSide::UseRightWhenHovering) ? 1.0f : -1.0f;
+                Vec3 gun_mount = heli.position + right * (side_sign * 165.0f) - Vec3(0.0f, 0.0f, 45.0f);
+                append_muzzle_flash_mesh(out_world_tris, gun_mount, right * side_sign, fwd, Vec3(0.0f, 0.0f, 1.0f), 26.0f, 42.0f);
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2733,6 +2829,7 @@ bool AnimSystem::verify_all() const {
     if (!loaded_) return false;
     if (faith_upper_.bones.size() != 74 || faith_lower_.bones.size() != 74) return false;
     if (swat_mesh_.bones.size() != 88 || colt1911_mesh_.bones.size() != 8) return false;
+    if (!heli_mesh_.is_valid() || heli_mesh_.bones.size() != 6) return false;
     if (weapon_meshes_.size() < 10) return false;
     if (faith_unarmed_set_.sequences.size() < 250) return false;
     if (swat_set_.sequences.size() < 90) return false;
