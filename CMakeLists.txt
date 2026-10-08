@@ -18,14 +18,18 @@ set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -O2 -fobjc-arc -Wall -Wextra -Wno-
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    /opt/homebrew/include
-    /opt/homebrew/include/SDL2
 )
+if(APPLE)
+    include_directories(
+        /opt/homebrew/include
+        /opt/homebrew/include/SDL2
+    )
 
-# Link directories
-link_directories(
-    /opt/homebrew/lib
-)
+    # Link directories
+    link_directories(
+        /opt/homebrew/lib
+    )
+endif()
 
 # The asset loader and the parkour controller: plain C++, no window, GPU or audio.
 set(CORE_SOURCES
@@ -68,16 +72,22 @@ if(MINGW)
     target_link_options(me_menu PRIVATE -static)
 endif()
 
+# The game itself: everything but the renderer backend is shared between the platforms.
+set(GAME_SOURCES
+    src/main.cpp
+    ${CORE_SOURCES}
+    src/audio/audio_engine.cpp
+    src/cutscene/cutscene_player.cpp
+    src/platform/platform.cpp
+    src/ui/main_menu.cpp
+    ${FRONTEND_SOURCES}
+)
+
 if(APPLE)
 
 # Source files
 set(SOURCES
-    src/main.mm
-    ${CORE_SOURCES}
-    src/audio/audio_engine.cpp
-    src/cutscene/cutscene_player.cpp
-    src/ui/main_menu.cpp
-    ${FRONTEND_SOURCES}
+    ${GAME_SOURCES}
     src/renderer/metal_renderer.mm
 )
 
@@ -104,5 +114,49 @@ target_link_libraries(mirrorsedge_macos PRIVATE
     "-framework ImageIO"
     "-framework OpenAL"
 )
+
+elseif(WIN32)
+
+# mirrorsedge_windows: the same game on Direct3D 11 (src/renderer/d3d11_renderer.cpp).
+# Built with MinGW-w64 against MSYS2's UCRT64 packages (docs/WINDOWS_PORT.md):
+#   pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,SDL2,openal,libvorbis,ffmpeg,zlib}
+find_package(SDL2 CONFIG REQUIRED)
+find_package(OpenAL CONFIG REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(VORBISFILE REQUIRED IMPORTED_TARGET vorbisfile)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libswresample libavutil)
+
+add_executable(mirrorsedge_windows
+    ${GAME_SOURCES}
+    src/renderer/d3d11_renderer.cpp
+    src/renderer/msl_to_hlsl.cpp
+)
+target_link_libraries(mirrorsedge_windows PRIVATE
+    SDL2::SDL2
+    OpenAL::OpenAL
+    PkgConfig::VORBISFILE
+    PkgConfig::FFMPEG
+    ZLIB::ZLIB
+    Threads::Threads
+    d3d11
+    dxgi
+    d3dcompiler
+    dxguid
+)
+
+# The DLLs the game loads (SDL2, OpenAL Soft, Vorbis, FFmpeg and what they need) are copied next to the
+# executable, so it starts from Explorer or any shell without MSYS2 on PATH.
+option(ME_BUNDLE_RUNTIME_DLLS "Copy the game's runtime DLLs next to mirrorsedge_windows.exe" ON)
+if(ME_BUNDLE_RUNTIME_DLLS)
+    get_filename_component(ME_COMPILER_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    add_custom_command(TARGET mirrorsedge_windows POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+            -DME_EXECUTABLE=$<TARGET_FILE:mirrorsedge_windows>
+            -DME_SEARCH_DIRS=${ME_COMPILER_BIN_DIR}
+            -DME_OBJDUMP=${CMAKE_OBJDUMP}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bundle_runtime_dlls.cmake
+        VERBATIM
+    )
+endif()
 
 endif()
