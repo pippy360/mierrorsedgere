@@ -126,6 +126,26 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         n.blend_out = float_array(find_prop(props, "BlendOutWeight"));
         n.use_old_state = prop_bool(props, "bUseOldState", false);
         n.child2_weight = prop_float(props, "Child2Weight", 0.0f);
+        n.bone_weight = float_array(find_prop(props, "Child2PerBoneWeight"));
+        if (const UProperty* profiles = find_prop(props, "Profiles"); profiles && !profiles->elements.empty()) {
+            if (const UProperty* comps = find_prop(profiles->elements[0], "AimComponents")) {
+                static const char* const kDirs[9] = {"LU", "LC", "LD", "CU", "CC", "CD", "RU", "RC", "RD"};
+                for (const auto& comp : comps->elements) {
+                    TreeNode::AimBone a;
+                    a.bone = prop_name(comp, "BoneName");
+                    for (int d = 0; d < 9; ++d) {
+                        a.rot[d][0] = a.rot[d][1] = a.rot[d][2] = 0.0f;
+                        a.rot[d][3] = 1.0f;
+                        a.trans[d][0] = a.trans[d][1] = a.trans[d][2] = 0.0f;
+                        const UProperty* t = find_prop(comp, kDirs[d]);
+                        if (!t) continue;
+                        if (const UProperty* q = find_prop(t->fields, "Quaternion")) std::memcpy(a.rot[d], q->v, sizeof a.rot[d]);
+                        if (const UProperty* tr = find_prop(t->fields, "Translation")) std::memcpy(a.trans[d], tr->v, sizeof a.trans[d]);
+                    }
+                    n.aim.push_back(a);
+                }
+            }
+        }
         n.active = prop_int(props, "ActiveChildIndex", 0);
     }
     for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -181,6 +201,13 @@ void AnimTree::reset() {
         }
     }
     walk_master_ = -1;
+    land_amount_ = 0.0f;
+    land_time_ = -1.0f;
+}
+
+void AnimTree::set_landed(float amount) {
+    land_amount_ = amount;
+    land_time_ = 0.0f;
 }
 
 const AnimSequenceAsset* AnimTree::find_sequence(const std::string& name) const {
@@ -390,6 +417,15 @@ void AnimTree::advance(TreeNode& n, const PawnAnimState& pawn, float dt) {
 
 void AnimTree::tick(const PawnAnimState& pawn, float dt) {
     if (root_ < 0) return;
+    // TdAnimNodeLandOffset (native): into the landing pose over LandInto, back out over LandOut.
+    float land = 0.0f;
+    if (land_time_ >= 0.0f) {
+        constexpr float kLandInto = 0.1f, kLandOut = 0.4f;
+        land_time_ += dt;
+        if (land_time_ < kLandInto) land = land_amount_ * land_time_ / kLandInto;
+        else if (land_time_ < kLandInto + kLandOut) land = land_amount_ * (1.0f - (land_time_ - kLandInto) / kLandOut);
+        else land_time_ = -1.0f;
+    }
     nodes_[static_cast<size_t>(root_)].incoming = 1.0f;
     for (int index : order_) {
         TreeNode& n = nodes_[static_cast<size_t>(index)];
@@ -443,6 +479,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 break;
             case TreeNode::Kind::Passthrough:
                 if (!n.weight.empty()) n.weight[0] = 1.0f;
+                if (n.cls == "TdAnimNodeLandOffset") n.aim_y = land;
                 if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;
             case TreeNode::Kind::Directional:

@@ -16,6 +16,7 @@ The recorder half comes from [tesseract](https://github.com/pippy360/tesseract)'
 | `replay.py` | anywhere | Turns a trace into a `me_replay` script, runs it and scores the result. |
 | `intro_capture.py` | Windows | Boots retail at each chapter's first checkpoint and records the start-of-level intro (camera, pawn, sounds, optionally a frame a second). No key is sent to the game. |
 | `intro_check.py` | Windows to play, anywhere to compare | Plays the port's intros with `--trace` and lays them over those recordings: eye position, view direction, the hand-over, and every sound cue. `docs/LEVEL_INTROS.md` has the method and the results. |
+| `anim_check.py` | anywhere, with `me_anim` built | Runs the port's first-person animation tree (`me_anim`) over the recordings and scores what it plays against the `anim1p` records retail logged, per movement state. `docs/FIRST_PERSON_ANIMATION_RE.md` has the method and the results. |
 | `src/tools/replay_main.cpp` → `me_replay` | anywhere | Headless: loads the level from the retail packages and steps the controller once per recorded retail frame. |
 
 ## 1. Record (Windows, retail installed)

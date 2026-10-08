@@ -564,6 +564,7 @@ void ParkourController::equip_weapon(const std::string& weapon_name) {
 
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
     if (dt <= 0.0f) return;
+    m_telemetry.move_input = std::fabs(input.forward) > 0.01f || std::fabs(input.strafe) > 0.01f;
 
     // Input edges. TdPlayerInput: Jump and Crouch are press actions (holding a key never
     // retriggers a move); a jump press is buffered for JumpTapTime.

@@ -77,6 +77,15 @@ struct TreeNode {
     std::vector<float> blend_out;    // BlendOutWeight
     bool use_old_state = false;      // TdAnimNodeMovementState.bUseOldState
     float child2_weight = 0.0f;      // AnimNodeBlend.Child2Weight
+    std::vector<float> bone_weight;  // AnimNodeBlendPerBone.Child2PerBoneWeight: how much of the target each bone takes
+    // AnimNodeAimOffset.Profiles[0].AimComponents: what the node adds to a bone, in the mesh's space,
+    // for each of the nine directions LU LC LD CU CC CD RU RC RD.
+    struct AimBone {
+        std::string bone;
+        float rot[9][4];
+        float trans[9][3];
+    };
+    std::vector<AimBone> aim;
 
     // State.
     std::vector<float> weight;   // per child
@@ -92,6 +101,7 @@ struct TreeNode {
     float hold_blend_out = 0.0f;      // TdAnimNodeCustomBlend.BlendOutTime
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
     float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
+    float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
     const AnimSequenceAsset* seq = nullptr;
 };
 
@@ -118,6 +128,9 @@ public:
     // TdAnimNodeCustomBlend.Activate on the node of that name: its second child at `amount` for
     // `duration`, blended in and back out.
     void activate_custom_blend(const std::string& node_name, float amount, float duration, float blend_in, float blend_out);
+
+    // TdAnimNodeLandOffset.Landed: the dip of a landing, by how hard it was (0..1).
+    void set_landed(float amount);
 
     // Where the walk cycle is: the "Walk" synch group's master, as CurrentTime / SequenceLength (-1 with none).
     [[nodiscard]] float walk_cycle() const;
@@ -154,6 +167,8 @@ private:
     std::vector<char> in_walk_group_;
     int walk_master_ = -1;
     int walk_synch_ = -1;  // the AnimNodeSynch that owns it ("MasterSync")
+    float land_amount_ = 0.0f;
+    float land_time_ = -1.0f;
 };
 
 }  // namespace fp

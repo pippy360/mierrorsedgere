@@ -1125,6 +1125,7 @@ struct PlayerTelemetry {
     float reaction_energy = 100.0f;
     bool reaction_active = false;
     bool grounded = true;
+    bool move_input = false;  // the player is pushing a direction (the pawn's Acceleration is not zero)
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

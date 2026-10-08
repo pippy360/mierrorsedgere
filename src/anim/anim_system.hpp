@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <memory>
 #include <cstdint>
 
 namespace me {
@@ -288,6 +289,11 @@ public:
 private:
     bool loaded_ = false;
     std::string game_root_;
+    // Faith's first-person animation tree, the director that drives it from the pawn, and its pose
+    // (fp_anim / fp_director / fp_pose). Ticked once per simulation time from evaluate_faith_1p.
+    struct FirstPerson;
+    mutable std::shared_ptr<FirstPerson> fp_;
+    bool tick_first_person(const PlayerTelemetry& telemetry) const;
 
     SkeletalMeshAsset faith_upper_;
     SkeletalMeshAsset faith_lower_;

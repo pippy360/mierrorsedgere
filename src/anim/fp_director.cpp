@@ -247,6 +247,7 @@ bool Director::play_named(const std::string& name) {
 
 // TdMove_Landing.LandNormal: the run takes the landing in its stride.
 void Director::land_normal(float amount) {
+    tree_.set_landed(amount);
     tree_.activate_custom_blend("LandingRun", amount, 0.6f * amount, 0.15f, 0.4f);
 }
 

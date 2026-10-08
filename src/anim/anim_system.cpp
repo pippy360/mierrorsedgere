@@ -1,4 +1,6 @@
 #include "anim_system.hpp"
+#include "fp_director.hpp"
+#include "fp_pose.hpp"
 #include <mutex>
 #include <fstream>
 #include <iostream>
@@ -1432,9 +1434,74 @@ bool is_heavy_weapon_name(const std::string& wname) {
 // -----------------------------------------------------------------------------
 // Evaluate Faith's 1P Skeletal Viewmodel (AT_C1P Blend Tree + Linear Blend Skinning)
 // -----------------------------------------------------------------------------
+struct AnimSystem::FirstPerson {
+    fp::Director director;
+    fp::PoseEvaluator poser;
+    fp::Pose pose;
+    bool tried = false;
+    bool ok = false;
+    float last_time = -1.0f;
+    EMovement last_move = EMovement::MOVE_None;
+};
+
+// Runs the first-person tree up to this frame. True when the tree's pose is the one to draw:
+// unarmed, in play, and in a move the director plays (the armed and the melee poses are still
+// picked by hand below).
+bool AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
+    if (!fp_) fp_ = std::make_shared<FirstPerson>();
+    FirstPerson& fp = *fp_;
+    if (!fp.tried) {
+        fp.tried = true;
+        std::string error;
+        const AnimSetAsset* set = &faith_unarmed_set_;
+        fp.ok = fp.director.init(game_root_, [set](const std::string& name) { return set->find_sequence(name); }, error);
+        if (fp.ok) fp.poser.init(faith_upper_, faith_unarmed_set_, fp.director.tree());
+        else std::cerr << "[anim] first-person tree: " << error << "\n";
+    }
+    if (!fp.ok) return false;
+
+    float dt = telemetry.sim_time - fp.last_time;
+    const bool restart = fp.last_time < 0.0f || dt < 0.0f || dt > 0.5f;
+    if (restart) {
+        fp.director.reset();
+        dt = 0.0f;
+    }
+    if (restart || dt > 0.0f) {
+        fp::PawnFrame frame;
+        frame.dt = dt;
+        frame.movement = telemetry.move_state;
+        frame.position = telemetry.position;
+        frame.velocity = telemetry.velocity;
+        frame.yaw_deg = telemetry.yaw_deg;
+        frame.view_yaw_deg = telemetry.yaw_deg;
+        frame.view_pitch_deg = telemetry.pitch_deg;
+        frame.accelerating = telemetry.move_input;
+        // The controller springs off the board the frame the move starts.
+        if (telemetry.move_state == EMovement::MOVE_SpringBoarding && fp.last_move != EMovement::MOVE_SpringBoarding) frame.move_anim = "@reached";
+        fp.director.tick(frame);
+        fp.poser.evaluate(fp.director.tree(), fp.pose);
+        fp.last_time = telemetry.sim_time;
+        fp.last_move = telemetry.move_state;
+    }
+
+    if (telemetry.weapon.equipped || telemetry.intro_active || telemetry.falling_to_death) return false;
+    switch (telemetry.move_state) {
+        case EMovement::MOVE_Melee:
+        case EMovement::MOVE_MeleeAir:
+        case EMovement::MOVE_MeleeSlide:
+        case EMovement::MOVE_MeleeWallrun:
+        case EMovement::MOVE_MeleeCrouch:
+        case EMovement::MOVE_Snatch:
+            return false;
+        default:
+            return !fp.pose.pos.empty();
+    }
+}
+
 void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector<Vertex>& out_triangles) const {
     out_triangles.clear();
     if (!loaded_ || !faith_upper_.is_valid()) return;
+    const bool use_tree = tick_first_person(telemetry);
 
     const AnimSetAsset* active_set = &faith_unarmed_set_;
     const AnimSetAsset* set_b_ptr = &faith_unarmed_set_;
@@ -2045,8 +2112,20 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         }
     }
 
+    // Unarmed and in play: the pose is the animation tree's, not the one picked above, and the view
+    // is taken from the EyeJoint the way TdPlayerPawn.CalcCamera takes it.
+    if (use_tree) {
+        local_pos = fp_->pose.pos;
+        local_quat = fp_->pose.rot;
+        vm_offset = Vec3(0.0f, 0.0f, 0.0f);
+        show_lower_body = true;
+        lower_body_high_kick = false;
+    }
+
     // Forward kinematics in component space
     compute_skeleton_fk(faith_upper_.bones, local_pos, local_quat, comp_pos, comp_quat);
+    fp::ViewFrame tree_view;
+    if (use_tree) tree_view = fp_->poser.view(comp_pos, comp_quat, telemetry.pitch_deg, 0.0f);
 
     // Compute per-bone Linear Blend Skinning deltas
     compute_skin_deltas(faith_upper_, comp_pos, comp_quat, delta_pos, delta_quat);
@@ -2069,6 +2148,14 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     // (rel.x, rel.z, -rel.y) is a proper right-handed 90-deg rotation (det = +1).
     float kick_arc = std::sin(combat_progress * PI);
     auto raw_to_vm_pos = [&](const Vec3& raw_p, bool is_lower) -> Vec3 {
+        if (use_tree) {
+            // TdPlayerPawn.Mesh1p draws with its own field of view, 90 degrees across
+            // (TdSkeletalMeshComponent.FOV). The renderers project the viewmodel at 100, which the
+            // armed and intro poses below were placed for, so the body is widened to come out at 90.
+            constexpr float kFov90In100 = 1.19175359f;  // tan(50 deg) / tan(45 deg)
+            const Vec3 d = raw_p - tree_view.eye;
+            return Vec3(d.dot(tree_view.left) * kFov90In100, d.dot(tree_view.forward), d.dot(tree_view.up) * kFov90In100);
+        }
         Vec3 rel = eye_inv_quat.rotate(raw_p - eye_pos);
         if (!is_lower) {
             float vy = rel.z;
@@ -2096,6 +2183,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         return Vec3(lx, ly * cos_p - lz * sin_p, ly * sin_p + lz * cos_p - 8.0f);
     };
     auto raw_to_vm_dir = [&](const Vec3& raw_d) -> Vec3 {
+        if (use_tree) return Vec3(raw_d.dot(tree_view.left), raw_d.dot(tree_view.forward), raw_d.dot(tree_view.up)).normalized();
         Vec3 rel = eye_inv_quat.rotate(raw_d);
         float vy = rel.z;
         float vz = -rel.y;
@@ -2114,7 +2202,13 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         for (size_t i = 0; i < mesh.vertices.size(); ++i) {
             const SkinnedVertex& sv = mesh.vertices[i];
             uint8_t dom_bone = sv.bones[0];
-            if (!is_lower) {
+            if (use_tree) {
+                // The whole body, as retail draws it; only what the lower body's own material covers.
+                if (is_lower && sv.chunk_index != 1) {
+                    vert_valid[i] = 0;
+                    continue;
+                }
+            } else if (!is_lower) {
                 if (sv.chunk_index == 1) {
                     // Chunk 1 (Faith_Glove): keep RightForeArm wrap, RightHand, fingers, and RightForeArmRoll strap (47..71),
                     // culling only the shoulder cuff on 46.
@@ -2150,7 +2244,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
             }
             skinned_pos[i] = raw_to_vm_pos(p_acc, is_lower);
             skinned_norm[i] = raw_to_vm_dir(n_acc);
-            if (skinned_pos[i].y < (is_lower ? 10.0f : 2.0f)) {
+            if (skinned_pos[i].y < (use_tree ? 4.0f : (is_lower ? 10.0f : 2.0f))) {
                 vert_valid[i] = 0; // Behind near plane
             }
         }
