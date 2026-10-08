@@ -475,8 +475,13 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         return;
     } else if (n.cls == "TdAnimNodeClimb") {
         // LadderLeft, LadderRight, LadderSlide, PipeLeft, PipeRight, PipeSlide, TurnLeftIdle, TurnRightIdle.
+        // Looking back past a quarter turn (TdMove_Climb.StartTurningAngle) the look idle of that side
+        // shows: measured on a ladder, on at 90.2 to 92.8 degrees and off again under 90, either
+        // way over the node's 0.2 s.
         const int base = pawn.climbing_pipe ? 3 : 0;
-        want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
+        if (pawn.look_deg < -90.0f && n.weight.size() > 6) want = 6;
+        else if (pawn.look_deg > 90.0f && n.weight.size() > 7) want = 7;
+        else want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
     } else if (n.cls == "TdAnimNodeBalanceWalk") {
         // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
         want = 1;

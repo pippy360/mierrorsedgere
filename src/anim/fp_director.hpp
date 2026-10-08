@@ -105,6 +105,8 @@ private:
     float climb_step_length_ = 0.0f;
     bool climb_hand_switched_ = false;
     bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
+    float climb_last_vz_ = 0.0f;
+    float climb_step_z_ = 0.0f;      // where the step being climbed started
     // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
     // hang's turn, and the shimmy step.
     int grab_turn_ = 0;

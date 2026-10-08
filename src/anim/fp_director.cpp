@@ -347,15 +347,34 @@ void Director::tick_climb(const PawnFrame& frame) {
         }
         if (climb_step_time_ >= climb_step_length_) climb_step_time_ = -1.0f;
     }
-    // Going down is the slide (bClimbDownFast: the stick held right down, which a key always is);
-    // the tree's Climb node shows it. Stepping down, the up animations backwards, is not played.
-    pawn_.climb_sliding = frame.velocity.z < -1.0f;
-    if (climb_step_time_ < 0.0f && !climb_exiting_ && frame.velocity.z > 20.0f) {
-        // ClimbAnims[bClimbLeftHand ? right : left].
-        const bool right_hand = climb_left_hand_;
+    // Going down: a slide (bClimbDownFast: backward at full deflection more than four rungs up),
+    // which the tree's Climb node shows, or near the bottom a step down: the up animation of the
+    // other hand played backwards (HandleClimbAction). The slide gathers speed from nothing, while a
+    // step moves at its own speed from its first frame, which is how the two are told apart here.
+    const float vz = frame.velocity.z;
+    const bool stepping_speed = vz <= -50.0f && vz >= -150.0f;
+    if (vz >= -1.0f) pawn_.climb_sliding = false;
+    else if (climb_step_time_ < 0.0f && !stepping_speed) pawn_.climb_sliding = true;
+    const bool step_down = !pawn_.climb_sliding && stepping_speed;
+    // A step starts as she starts to move, and the next when she has climbed the rungs this one
+    // covers and is still going: one rung of 32 uu on a ladder, two on a pipe. (Retail stands still
+    // for a frame between steps, so a tap climbs one step and no more.)
+    const bool moving = vz > 20.0f || step_down;
+    const bool was_moving = climb_last_vz_ > 20.0f || (climb_last_vz_ <= -50.0f && climb_last_vz_ >= -150.0f);
+    climb_last_vz_ = vz;
+    const float rungs = frame.climbing_pipe ? 64.0f : 32.0f;
+    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > rungs + 2.0f;
+    if (!climb_exiting_ && moving && (!was_moving || past_step)) {
+        // Where this step started: a frame's travel back from here.
+        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? rungs : -rungs) : frame.position.z - vz * frame.dt;
+        // Up: ClimbAnims[bClimbLeftHand ? right : left]; down, the other one at -1.
+        const bool right_hand = step_down ? !climb_left_hand_ : climb_left_hand_;
         const char* name = frame.climbing_pipe ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
                                                : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
-        play(Slot::FullBody, name, 1.0f, 0.1f, 0.075f);
+        // At the speed the move climbs at (96 uu/s a ladder, 128 a pipe) the animation lasts as long
+        // as its step; a controller that climbs faster gets it played faster.
+        const float pace = std::clamp(std::fabs(vz) / (frame.climbing_pipe ? 128.0f : 96.0f), 1.0f, 2.0f);
+        play(Slot::FullBody, name, (step_down ? -1.0f : 1.0f) * pace, 0.1f, 0.075f);
         climb_step_time_ = 0.0f;
         climb_step_length_ = frame.climbing_pipe ? 0.5f : 1.0f / 3.0f;
         climb_hand_switched_ = false;
@@ -787,6 +806,8 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             climb_left_hand_ = false;
             climb_step_time_ = -1.0f;
             climb_exiting_ = false;
+            climb_last_vz_ = 0.0f;
+            climb_step_z_ = frame.position.z;
             break;
         case EMovement::MOVE_Grabbing:
             // TdMove_Grab.StartMove: RootOffset.X += RelativeExtent + 1 with the legs on the wall (the
@@ -913,6 +934,12 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;
     pawn_.heavy_weapon = frame.heavy_weapon;
+    {
+        float look = frame.view_yaw_deg - frame.yaw_deg;
+        while (look > 180.0f) look -= 360.0f;
+        while (look < -180.0f) look += 360.0f;
+        pawn_.look_deg = look;
+    }
     // The swing's angle stays where it was when she lets go (the poses fade under the jump off).
     if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
