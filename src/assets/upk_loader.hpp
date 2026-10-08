@@ -181,7 +181,8 @@ public:
                                        std::vector<DummyFireBarrage>& out_barrages,
                                        std::vector<LevelScene::KismetValveProp>* out_valves = nullptr,
                                        std::vector<LevelScene::KismetLookAtPoint>* out_lookats = nullptr,
-                                       std::vector<LevelScene::KismetLevelTransition>* out_transitions = nullptr) const;
+                                       std::vector<LevelScene::KismetLevelTransition>* out_transitions = nullptr,
+                                       std::vector<EnemyBot>* out_enemies = nullptr) const;
 
     // Built-in LZO1X-1 decompressor
     static bool lzo1x_decompress(const uint8_t* src, size_t src_len, uint8_t* dst, size_t expected_len);
