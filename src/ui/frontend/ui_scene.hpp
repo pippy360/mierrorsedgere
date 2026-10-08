@@ -79,7 +79,51 @@ struct UiImageComp {
     const UiStyle* style = nullptr;
     const Image* texture = nullptr;  // ImageRef.ImageTexture, which replaces the style's DefaultImage
     float opacity = 1.0f;
+    int8_t adjust[2] = {-1, -1};     // StyleCustomization.Formatting where it overrides the style
+    int8_t align[2] = {-1, -1};
     std::string resolver;            // StyleResolverTag: "IncrementStyle" means the owner widget supplies the style
+};
+
+// A piece of a string drawn in its own font or colour: "<Fonts:UI_Fonts_Final.Symbols>B<Fonts:/>"
+// is the padlock of a locked course.
+struct UiRun {
+    std::string text;
+    const Font* font = nullptr;  // null: the style's font
+    bool colored = false;
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+// UIList with its UIComp_ListPresenter.
+struct UiListColumn {
+    std::string field;         // CellDataField: "FriendlyName"
+    float width = 0.0f;        // CellSize
+    bool percent = false;      // UIEXTENTEVAL_PercentSelf: of the list's width
+};
+
+struct UiListRow {
+    std::vector<std::vector<UiRun>> cells;  // one per column
+    bool enabled = true;                    // a disabled element is drawn in the Disabled state
+};
+
+struct UiList {
+    float row_height = 0.0f;  // RowHeight
+    bool row_percent = false; // UIEXTENTEVAL_PercentSelf: of the list's height
+    float cell_padding = 0.0f;
+    std::vector<UiListColumn> columns;
+    const UiStyle* cell[4] = {nullptr, nullptr, nullptr, nullptr};     // GlobalCellStyle: normal, active, selected, under the cursor
+    const UiStyle* overlay[4] = {nullptr, nullptr, nullptr, nullptr};  // ItemOverlayStyle, the same four
+    bool every_other = false;  // bOnlyDrawEveryOtherElementOverlay
+    int scrollbar = -1;        // VerticalScrollbar, a child widget
+    std::vector<UiListRow> rows;
+    int index = 0;  // the selected element
+    int top = 0;    // the first element shown
+
+    // A row and the padding under it, and how many of them fit, for a list this tall (scene pixels).
+    [[nodiscard]] float pitch(float list_height) const { return (row_percent ? row_height * list_height : row_height) + cell_padding; }
+    [[nodiscard]] int visible(float list_height) const {
+        const float p = pitch(list_height);
+        return p > 0.0f ? static_cast<int>(list_height / p) : 0;
+    }
 };
 
 struct UiWidget {
@@ -111,8 +155,10 @@ struct UiWidget {
     UiImageComp image;       // BackgroundImageComponent / ImageComponent
     UiImageComp bar;         // UISlider.SliderBarImageComponent
     UiImageComp marker;      // UISlider.MarkerImageComponent
-    const UiStyle* increment = nullptr;  // UITdOptionButton.IncrementStyle
+    const UiStyle* increment = nullptr;  // UITdOptionButton.IncrementStyle, UIScrollbar.IncrementStyle
     const UiStyle* decrement = nullptr;
+    const UiStyle* marker_style = nullptr;  // UIScrollbar.MarkerStyle
+    std::shared_ptr<UiList> list;           // UIList
     float slider[4] = {0.0f, 1.0f, 0.0f, 1.0f};  // UISlider.SliderValue: min, max, current, nudge
     float bar_size = 8.0f;
     float marker_width = 0.1f;   // of the slider's width
@@ -178,6 +224,8 @@ public:
     // SetDataStoreBinding / SetValue: markup is resolved, plain text taken as it is.
     void set_text(UiSystem& ui, const std::string& widget, const std::string& markup);
     void set_visible(const std::string& widget, bool visible);
+    // UIList.SetIndex: selects an element, scrolls it into view and moves the scrollbar's marker.
+    void list_select(int widget, int index);
     [[nodiscard]] bool visible(int widget) const;  // it and every ancestor
 
     // Resolves every widget's rectangle. Call after text or visibility changed.
@@ -221,6 +269,8 @@ public:
     std::unique_ptr<UiScene> load_scene(const std::string& package, const std::string& scene);
     // "<Strings:TdGameUI.TdMainMenu.StoryCaptionText>" -> "STORY". Unknown tags are dropped; "\n" becomes a line break.
     [[nodiscard]] std::string resolve_markup(const std::string& markup) const;
+    // The same, keeping what the inline tags ask for: <Fonts:Package.Font>, <Styles:Tag>, <Color:R=,G=,B=,A=>.
+    std::vector<UiRun> parse_runs(const std::string& markup);
     const UiStyle* style_by_tag(const std::string& tag);
     // TdGame.Default__TdProfileSettings: every setting with its values and default.
     bool load_profile_settings(ProfileSettings& out);

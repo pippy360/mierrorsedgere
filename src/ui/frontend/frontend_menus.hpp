@@ -67,6 +67,8 @@ protected:
     ProfileSettings& settings();
     struct StringList& string_list(const std::string& tag);
     std::vector<KeyBinding>& bindings();  // PlayerInput.Bindings
+    // A point of the viewport in the scene's 1280x720 pixels.
+    void to_scene(float x, float y, float& sx, float& sy) const;
 
     // What the scripts call.
     void close();

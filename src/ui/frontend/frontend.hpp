@@ -43,6 +43,9 @@ struct Profile {
     bool controller = false;          // GAMEPAD SETUP, and "Accept" in the button bar
     uint32_t unlocked_levels = 0x7FF; // PLAY CHAPTER's list: bit i is Assets::maps[i]
     bool hard_unlocked = false;       // the story was finished: HARD is offered
+    uint32_t time_trials = 0xFFFFFFFFu;  // TIME TRIAL: bit i is Assets::time_trials[i], unlocked
+    uint32_t level_races = 0xFFFFFFFFu;  // SPEED RUN: bit i is Assets::level_races[i], unlocked
+    int stars = 0;                       // GetTimeTrialRating: stars earned over all the courses
     std::string player_name = "Player";
 };
 

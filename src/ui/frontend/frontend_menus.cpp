@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 
 namespace me::fe {
 
@@ -48,6 +49,10 @@ const Profile& SubMenu::profile() const { return fe_.profile_; }
 ProfileSettings& SubMenu::settings() { return fe_.settings_; }
 StringList& SubMenu::string_list(const std::string& tag) { return fe_.string_lists_[tag]; }
 std::vector<KeyBinding>& SubMenu::bindings() { return fe_.bindings_; }
+void SubMenu::to_scene(float x, float y, float& sx, float& sy) const {
+    sx = (x - fe_.origin_x_) / fe_.scale_;
+    sy = y / fe_.scale_;
+}
 
 void SubMenu::close() { fe_.close_scene(this, nullptr); }
 void SubMenu::close_then(const std::function<void()>& then) { fe_.close_scene(this, then); }
@@ -951,6 +956,132 @@ private:
     bool stomp_ = false;    // bPromptForBindStomp
 };
 
+// --- TdUIScene_TimeTrial (TIME TRIAL OFFLINE) and TdUIScene_SPLevelRace (SPEED RUN) -------------
+
+// TdUtils.FormatTime: seconds as minutes, seconds and hundredths.
+std::string format_time(float seconds) {
+    const int hundredths = static_cast<int>(std::lround(seconds * 100.0f));
+    char text[32];
+    std::snprintf(text, sizeof text, "%02d:%02d:%02d", hundredths / 6000, (hundredths / 100) % 60, hundredths % 100);
+    return text;
+}
+
+class RaceMenu : public SubMenu {
+public:
+    RaceMenu(Frontend& fe, const std::string& scene, bool time_trial)
+        : SubMenu(fe, time_trial ? "TdUI_FrontEnd_TimeTrial" : "TdUI_FrontEnd_LevelRace", scene), time_trial_(time_trial) {}
+
+    void opened() override {
+        bar_append("Back", Key::Escape);
+        race_button_ = bar_append("Race", Key::Accept);
+        list_ = scene_->find("StretchList");
+        if (list_ >= 0 && !scene_->widgets[static_cast<size_t>(list_)].list) list_ = -1;
+        if (list_ >= 0) {
+            UiList& list = *scene_->widgets[static_cast<size_t>(list_)].list;
+            const std::vector<RaceStretch>& stretches = courses();
+            for (size_t i = 0; i < stretches.size(); ++i) {
+                UiListRow row;
+                row.enabled = unlocked(i);
+                for (const UiListColumn& column : list.columns) {
+                    // StretchFlags is the padlock, open or shut, out of the symbol font.
+                    if (column.field == "StretchFlags") row.cells.push_back(ui().parse_runs(row.enabled ? "<Strings:TdGameUI.TdSymbols.Unlocked>" : "<Strings:TdGameUI.TdSymbols.Locked>"));
+                    else if (column.field == "FriendlyName") row.cells.push_back({UiRun{stretches[i].name}});
+                    else row.cells.emplace_back();
+                }
+                list.rows.push_back(std::move(row));
+            }
+        }
+        // <TdTimeTrialData:PlayerBestTimeData;0.PlayerName> and .TotalRating.
+        if (UiWidget* w = scene_->get("ProfileName")) w->text = profile().player_name;
+        if (UiWidget* w = scene_->get("ProfileStarsNum")) w->text = std::to_string(profile().stars);
+        scene_->layout();
+        if (list_ >= 0) {
+            set_focus(list_);
+            select(0);
+        }
+    }
+
+    void tick(float dt) override {
+        // OnPreTick: the times of the course are asked for a moment after the selection settles,
+        // and START RACE comes back with them if the course is unlocked.
+        if (request_ <= 0.0f) return;
+        request_ -= dt;
+        if (request_ <= 0.0f) bar_disable(race_button_, !unlocked(static_cast<size_t>(index())));
+    }
+
+    void key_pressed(Key key) override {
+        if (list_ < 0) return;
+        const int count = static_cast<int>(courses().size());
+        if (count == 0) return;
+        if (key == Key::Up || key == Key::Down) {
+            // LISTWRAP_Jump: past either end the selection goes to the other.
+            const int next = (index() + (key == Key::Down ? 1 : count - 1)) % count;
+            play(key == Key::Down ? "ListDown" : "ListUp");
+            select(next);
+        }
+    }
+
+    void key_released(Key key) override {
+        if (key == Key::Accept) {
+            const std::vector<UiScene::BarButton>& bar = scene_->bar("ButtonBar");
+            const bool enabled = race_button_ >= 0 && static_cast<size_t>(race_button_) < bar.size() && !bar[static_cast<size_t>(race_button_)].disabled;
+            if (!enabled || courses().empty()) return;
+            // StartRace.
+            play("Accept");
+            host_action(std::string(time_trial_ ? "TimeTrial " : "SpeedRun ") + courses()[static_cast<size_t>(index())].map);
+        } else {
+            SubMenu::key_released(key);
+        }
+    }
+
+    void mouse_click(float x, float y) override {
+        // A click on an element selects it; the rest is the scene's.
+        if (list_ >= 0) {
+            const UiWidget& w = scene_->widgets[static_cast<size_t>(list_)];
+            const UiList& list = *w.list;
+            float sx = 0.0f, sy = 0.0f;
+            to_scene(x, y, sx, sy);
+            const float right = list.scrollbar >= 0 ? scene_->widgets[static_cast<size_t>(list.scrollbar)].rect.l : w.rect.r;
+            const float pitch = list.pitch(w.rect.h());
+            if (sx >= w.rect.l && sx < right && sy >= w.rect.t && sy < w.rect.b && pitch > 0.0f) {
+                const int element = list.top + static_cast<int>((sy - w.rect.t) / pitch);
+                if (element < static_cast<int>(list.rows.size()) && element - list.top < list.visible(w.rect.h())) select(element);
+                return;
+            }
+        }
+        SubMenu::mouse_click(x, y);
+    }
+
+private:
+    const std::vector<RaceStretch>& courses() { return time_trial_ ? assets().time_trials : assets().level_races; }
+    bool unlocked(size_t i) const { return i < 32 && (((time_trial_ ? profile().time_trials : profile().level_races) >> i) & 1u) != 0; }
+    int index() const { return list_ >= 0 ? scene_->widgets[static_cast<size_t>(list_)].list->index : 0; }
+
+    // OnStretchList_ValueChanged.
+    void select(int element) {
+        scene_->list_select(list_, element);
+        bar_disable(race_button_, true);
+        request_ = 0.25f;
+        const std::vector<RaceStretch>& stretches = courses();
+        if (static_cast<size_t>(index()) < stretches.size()) {
+            const RaceStretch& course = stretches[static_cast<size_t>(index())];
+            for (int k = 0; k < 3; ++k) {
+                if (UiWidget* w = scene_->get("QualifyingTimeLabel" + std::to_string(k + 1))) w->text = format_time(course.rating[k]);
+            }
+            if (UiWidget* w = scene_->get("QualifyingTimeTimeLabel")) w->text = format_time(course.qualifying);
+            if (UiWidget* w = scene_->get("UnlockDesc")) w->text = course.unlock;
+        }
+        // No time has been set: TotalTime is shown as dashes.
+        if (UiWidget* w = scene_->get("YourBestTimeLabel")) w->text = "--:--:--";
+        scene_->layout();
+    }
+
+    bool time_trial_ = true;
+    int list_ = -1;
+    int race_button_ = -1;
+    float request_ = 0.0f;
+};
+
 }  // namespace
 
 std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
@@ -959,6 +1090,8 @@ std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
     else if (scene == "TdLoadLevel") menu = std::make_unique<LoadLevelMenu>(fe);
     else if (scene == "TdGameSettings" || scene == "TdAudioSettings" || scene == "TdVideoSettingsPC") menu = std::make_unique<OptionMenu>(fe, scene);
     else if (scene == "TdKeyMappings") menu = std::make_unique<KeyMappingsMenu>(fe);
+    else if (scene == "TdTTSelectStretchOffline") menu = std::make_unique<RaceMenu>(fe, scene, true);
+    else if (scene == "TdLRSelectLevelOffline") menu = std::make_unique<RaceMenu>(fe, scene, false);
     if (menu && !menu->valid()) menu.reset();
     return menu;
 }
