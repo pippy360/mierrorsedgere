@@ -392,6 +392,9 @@ private:
     float m_balance_danger_time = 0.0f;     // how long she has been losing her balance on a beam
     float m_balance_fall_time = -1.0f;      // since TdMove_Balance.Falloff, while she is still on it
     float m_balance_fall_side = 0.0f;
+    float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
+    float m_smooth_last_z = 0.0f;
+    bool m_smooth_was_walking = false;
     int m_against_wall = 0;                 // TdPlayerPawn.AgainstWallState
     float m_against_wall_yaw = 0.0f;        // the way into that wall
     float m_against_wall_off = 0.0f;        // how long the check has found no wall (StopAgainstWall)

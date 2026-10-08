@@ -2122,7 +2122,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 Vec3 eye;
                 Rotator eye_rot;
                 renderer.player_camera(controller.get_telemetry(), eye, eye_rot);
-                controller.update_camera_collision(eye - controller.get_telemetry().camera_mesh_offset, dt, active_scene);
+                const Vec3 off = controller.get_telemetry().camera_mesh_offset;
+                controller.update_camera_collision(eye - Vec3(off.x, off.y, 0.0f), dt, active_scene);
             }
             if (audio.is_vo_playing()) {
                 was_vo_playing = true;

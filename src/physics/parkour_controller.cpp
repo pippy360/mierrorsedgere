@@ -365,6 +365,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.snatch_from_back = false;
     m_cam_mesh_offset = Vec3(0.0f, 0.0f, 0.0f);
     m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+    m_mesh_smooth_z = 0.0f;
+    m_smooth_was_walking = false;
     m_cam_constrain_look = false;
     m_snatch_align = false;
     m_against_wall = 0;
@@ -882,6 +884,24 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.swing_angle = m_swing_angle;
     m_telemetry.body_yaw_deg = m_pawn_yaw;
     update_against_wall(effective_dt, scene);
+    {
+        // The first-person mesh, and the eye in it, do not take a fast change of the floor's height
+        // at once (TdPawn.SmoothOffset / TargetMeshTranslationZ, native). Retail running a flight
+        // of stairs, a ramp to the pawn: the eye 20 uu low going up at 283 uu/s of rise, 19 high
+        // coming down at 300 to 470, level again within 0.15 s at either end, and no different
+        // from level ground walking it at 79. So: a rise or drop faster than 150 uu/s is held back
+        // and let out with a time constant of 0.065 s.
+        const bool walking = m_telemetry.grounded && m_base_actor < 0 &&
+                             (m_telemetry.move_state == EMovement::MOVE_Walking || m_telemetry.move_state == EMovement::MOVE_Crouch);
+        if (walking && m_smooth_was_walking && effective_dt > 0.0f) {
+            const float dz = m_telemetry.position.z - m_smooth_last_z;
+            if (std::abs(dz) >= 150.0f * effective_dt) m_mesh_smooth_z -= dz;
+        }
+        m_mesh_smooth_z = std::clamp(m_mesh_smooth_z * std::exp(-effective_dt / 0.065f), -40.0f, 40.0f);
+        m_smooth_was_walking = walking;
+        m_smooth_last_z = m_telemetry.position.z;
+        m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z;
+    }
     if (m_telemetry.move_state != EMovement::MOVE_Snatch) m_telemetry.snatch_weapon_attached = true;
     for (auto& bot : scene.enemies) {
         if (bot.disarm_weapon.empty()) continue;
@@ -1164,7 +1184,8 @@ void ParkourController::update_camera_collision(const Vec3& eye, float dt, const
         const float step = kCameraMeshReturn * dt;
         m_cam_mesh_offset = d.length_xy() <= step ? want : m_cam_mesh_offset + d * (step / d.length_xy());
     }
-    m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+    m_telemetry.camera_mesh_offset.x = m_cam_mesh_offset.x;
+    m_telemetry.camera_mesh_offset.y = m_cam_mesh_offset.y;
 
     // TdMove_Walking.CheckForCameraCollision goes on (AgainstWallState 0): the same box along the
     // view, 15 ahead. Met, the view cannot go further down than it is, and met inside the last
