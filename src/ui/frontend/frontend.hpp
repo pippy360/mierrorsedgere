@@ -29,7 +29,8 @@ namespace me::fe {
 class SubMenu;
 
 enum class Screen : uint8_t { Start, MainMenu };
-enum class Key : uint8_t { Other, Left, Right, Up, Down, Accept, Escape };
+// PrevPage and NextPage are the gamepad's shoulders (a tab control's pages); Reset is its X (DEFAULTS).
+enum class Key : uint8_t { Other, Left, Right, Up, Down, Accept, Escape, PrevPage, NextPage, Reset };
 
 // The four columns, ETdMainMenuPanel.
 enum Panel : int { kStory = 0, kTimeTrial = 1, kOptions = 2, kExtras = 3, kPanelCount = 4 };
@@ -62,10 +63,12 @@ public:
     void set_stick_offsets(const std::array<float, kPanelCount>& left, const std::array<float, kPanelCount>& right);
 
     void update(float dt);
-    void key_down(Key key);
-    void key_up(Key key);
+    // `name` is the key's engine name ("W", "SpaceBar", "LeftShift", "RightMouseButton"), for the
+    // screens that care which key it was: CONTROLS binds it. Without it only Escape can be told.
+    void key_down(Key key, const std::string& name = {});
+    void key_up(Key key, const std::string& name = {});
     void mouse_move(float x, float y);
-    void mouse_click(float x, float y);
+    void mouse_click(float x, float y);  // the left button
 
     // TdUIScene.ActivateLevelEvent: the level's Kismet does the rest (the camera, the fades).
     void level_event(const std::string& name) { kismet_.fire_event(name); }
@@ -87,11 +90,14 @@ public:
     // The profile's settings (TdProfileSettings) and the PC string lists (resolution, texture detail, ...).
     [[nodiscard]] ProfileSettings& settings() { return settings_; }
     [[nodiscard]] StringList& string_list(const std::string& tag) { return string_lists_[tag]; }
+    // PlayerInput.Bindings as the CONTROLS screen last saved them; the retail defaults until then.
+    [[nodiscard]] const std::vector<KeyBinding>& bindings() const { return bindings_; }
     [[nodiscard]] const Assets& assets() const { return assets_; }
     // Where a map of the chapter list is, relative to CookedPC ("edge_p" -> "Maps/SP01/Edge_p.me1"); "" if it is not installed.
     [[nodiscard]] std::string map_path(const std::string& file) const;
     // A Texture2D of the retail packages by object path, read on first use (Assets::image).
     const Image* image(const std::string& object_path) { return assets_.image(object_path); }
+    const Font* font(const std::string& name) { return assets_.font(name); }
     [[nodiscard]] const KismetRunner& kismet() const { return kismet_; }
 
     // UI sound cue names played since the last call ("TabChangeRight", "NavigateDown", "Accept"),
@@ -155,6 +161,7 @@ private:
     UiSystem ui_;
     ProfileSettings settings_;
     std::unordered_map<std::string, StringList> string_lists_;
+    std::vector<KeyBinding> bindings_;
     std::vector<std::unique_ptr<SubMenu>> scenes_;
     std::vector<std::unique_ptr<SubMenu>> closed_;  // closed during this update; destroyed at its end
     Profile profile_;

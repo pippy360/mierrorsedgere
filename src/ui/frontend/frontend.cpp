@@ -120,6 +120,7 @@ bool Frontend::init(const std::string& game_root, int width, int height, std::st
         l.values = list.strings;
         l.index = list.default_index;
     }
+    bindings_ = assets_.default_bindings;
     // What a PC reports at run time; a host replaces these with its own.
     string_lists_["ScreenResolution"].values = {std::to_string(width_) + "x" + std::to_string(height_)};
     string_lists_["ScreenResolution"].index = 0;
@@ -257,9 +258,11 @@ void Frontend::open_main_menu() {
     build_panels();
 }
 
-void Frontend::key_down(Key key) {
+void Frontend::key_down(Key key, const std::string& name) {
     if (screen_ == Screen::MainMenu && !scenes_.empty()) {
-        scenes_.back()->key_pressed(key);
+        SubMenu* top = scenes_.back().get();
+        if (!name.empty() && top->raw_key(name, false)) return;
+        top->key_pressed(key);
         return;
     }
     if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
@@ -286,14 +289,16 @@ void Frontend::key_down(Key key) {
     }
 }
 
-void Frontend::key_up(Key key) {
+void Frontend::key_up(Key key, const std::string& name) {
     if (screen_ == Screen::Start) {
         // TdUIScene_Start.HandleInputKey: any key released, once the start button is up.
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
     }
     if (!scenes_.empty()) {
-        scenes_.back()->key_released(key);
+        SubMenu* top = scenes_.back().get();
+        if (!name.empty() && top->raw_key(name, true)) return;
+        top->key_released(key);
         return;
     }
     if (current_panel_ < 0) return;
@@ -433,7 +438,7 @@ int Frontend::button_at(float x, float y) const {
 }
 
 void Frontend::mouse_move(float x, float y) {
-    if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
+    if (screen_ != Screen::MainMenu || current_panel_ < 0 || !scenes_.empty()) return;
     // A button entering the Active state rebinds the description; focus stays where it was.
     const int b = button_at(x, y);
     if (b != hovered_ && b >= 0) description_ = panels_[static_cast<size_t>(current_panel_)].buttons[static_cast<size_t>(b)].description;
@@ -445,6 +450,11 @@ void Frontend::mouse_click(float x, float y) {
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
     }
+    if (!scenes_.empty()) {
+        SubMenu* top = scenes_.back().get();
+        if (!top->raw_key("LeftMouseButton", true)) top->mouse_click(x, y);
+        return;
+    }
     if (current_panel_ < 0) return;
     const int b = button_at(x, y);
     if (b >= 0) {
@@ -452,10 +462,7 @@ void Frontend::mouse_click(float x, float y) {
         if (p.focus != b) fade_timer_ = 0.0f;
         p.focus = b;
         description_ = p.buttons[static_cast<size_t>(b)].description;
-        if (!animating_) {
-            action_ = p.buttons[static_cast<size_t>(b)].widget;
-            sound("Accept");
-        }
+        button_clicked(p.buttons[static_cast<size_t>(b)].widget);
         return;
     }
     // The small caption of another column: OnButtonClicked_Panel<N>.
@@ -736,9 +743,16 @@ const Frame& Frontend::frame() {
         f.roll = view->euler.x;
         f.fov = view->fov;
     }
-    if (screen_ == Screen::Start) draw_start(f);
-    else if (!scenes_.empty()) scenes_.back()->draw(f, scale_, origin_x_, gamma());
-    else draw_menu(f);
+    if (screen_ == Screen::Start) {
+        draw_start(f);
+    } else if (!scenes_.empty()) {
+        // The top scene, over the ones it lets show through.
+        size_t first = scenes_.size() - 1;
+        while (first > 0 && scenes_[first]->draws_parent()) --first;
+        for (size_t i = first; i < scenes_.size(); ++i) scenes_[i]->draw(f, scale_, origin_x_, gamma(), i + 1 == scenes_.size());
+    } else {
+        draw_menu(f);
+    }
     return f;
 }
 

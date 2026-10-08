@@ -6,7 +6,9 @@
 //
 // Script commands, separated by ';' (time advances in 1/60 s steps):
 //   wait <seconds>                  run the front end
-//   key <name>                      press and release: any, left, right, up, down, enter, escape
+//   key <name>                      press and release: any, left, right, up, down, enter, escape,
+//                                   prevpage, nextpage (the gamepad's shoulders), reset (its X);
+//                                   or a key by its engine name, as the game sends it: SpaceBar, W, LeftShift
 //   move <x> <y> | click <x> <y>    the mouse, in viewport pixels
 //   shot <file.png>                 render the current frame into --out
 //   state                           print the screen, column and focused button
@@ -46,9 +48,23 @@ me::fe::Key parse_key(const std::string& s) {
     if (s == "right") return Key::Right;
     if (s == "up") return Key::Up;
     if (s == "down") return Key::Down;
-    if (s == "enter") return Key::Accept;
-    if (s == "escape") return Key::Escape;
+    if (s == "enter" || s == "Enter" || s == "SpaceBar") return Key::Accept;
+    if (s == "escape" || s == "Escape") return Key::Escape;
+    if (s == "prevpage") return Key::PrevPage;
+    if (s == "nextpage") return Key::NextPage;
+    if (s == "reset") return Key::Reset;
     return Key::Other;
+}
+
+// The keys the script names the way the engine does are sent with that name, as the game sends them.
+std::string engine_key_name(const std::string& s) {
+    if (s == "enter") return "Enter";
+    if (s == "escape") return "Escape";
+    if (s == "left") return "Left";
+    if (s == "right") return "Right";
+    if (s == "up") return "Up";
+    if (s == "down") return "Down";
+    return (!s.empty() && s[0] >= 'A' && s[0] <= 'Z') ? s : std::string();
 }
 
 std::string trim(const std::string& s) {
@@ -217,9 +233,10 @@ int main(int argc, char** argv) {
             std::string name;
             cs >> name;
             const me::fe::Key k = parse_key(name);
-            fe.key_down(k);
+            const std::string engine_name = engine_key_name(name);
+            fe.key_down(k, engine_name);
             fe.update(dt);
-            fe.key_up(k);
+            fe.key_up(k, engine_name);
             fe.update(dt);
         } else if (verb == "move" || verb == "click") {
             float x = 0.0f, y = 0.0f;
@@ -269,6 +286,31 @@ int main(int argc, char** argv) {
                 me::fe::write_png(out_dir + "/" + name + ".png", img->w, img->h, img->px.data());
                 me::fe::write_png(out_dir + "/" + name + "_a.png", img->w, img->h, alpha.data());
                 std::cout << "texture " << path << ": " << img->w << "x" << img->h << "\n";
+            }
+        } else if (verb == "bindings") {
+            // The key bindings as CONTROLS last saved them (the gamepad's left out).
+            for (const me::fe::KeyBinding& b : fe.bindings()) {
+                if (b.key.compare(0, 4, "Xbox") != 0) std::cout << "  " << b.key << " = " << b.command << "\n";
+            }
+        } else if (verb == "kern") {
+            // kern <font> <text>: every glyph's width and what follows it ("kern Helvetica_Small_Normal DEFAULTS")
+            std::string font_name, text;
+            cs >> font_name;
+            std::getline(cs, text);
+            text = trim(text);
+            const me::fe::Font* font = fe.font(font_name);
+            if (!font || !font->valid()) {
+                std::cout << "kern: no font " << font_name << "\n";
+            } else {
+                std::cout << font_name << " scale " << font->scale << " spacing " << font->spacing << " line " << font->line_height << " width "
+                          << font->width(text) << "\n";
+                for (size_t i = 0; i < text.size(); ++i) {
+                    const unsigned char c = static_cast<unsigned char>(text[i]);
+                    const unsigned char next = i + 1 < text.size() ? static_cast<unsigned char>(text[i + 1]) : 0;
+                    const auto pair = font->pairs.find((static_cast<uint32_t>(c) << 16) | next);
+                    std::cout << "  '" << text[i] << "' w " << font->glyphs[c].w << " advance " << font->advance(c, next) << " pair "
+                              << (pair == font->pairs.end() ? 0.0f : pair->second) << "\n";
+                }
             }
         } else if (verb == "rects") {
             // The open scene's widgets with their resolved rectangles (scene pixels) and text.

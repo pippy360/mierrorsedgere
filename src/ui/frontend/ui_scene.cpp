@@ -595,6 +595,9 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
         if (w.markup.empty()) {
             if (const UProperty* p = v.field("ImageDataSource", "MarkupString")) w.markup = p->s;
         }
+        if (w.markup.empty()) {
+            if (const UProperty* p = v.field("CaptionDataSource", "MarkupString")) w.markup = p->s;  // UILabelButton
+        }
         w.text = resolve_markup(w.markup);
 
         ObjRef owner;
@@ -618,20 +621,37 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
             w.increment = impl_->style_ref(v, "IncrementStyle");
             w.decrement = impl_->style_ref(v, "DecrementStyle");
         }
+        if (w.cls.find("TabControl") != std::string::npos) {
+            if (const UProperty* pages = v.find("Pages")) {
+                for (int32_t page : pages->ints) {
+                    auto it = widget_of.find(page);
+                    if (it != widget_of.end()) w.pages.push_back(it->second);
+                }
+            }
+        }
+        if (w.cls.find("TabPage") != std::string::npos) {
+            if (const UProperty* p = v.find("TabButton")) {
+                auto it = widget_of.find(p->i);
+                if (it != widget_of.end()) w.tab_button = it->second;
+            }
+        }
+        // A tab button is drawn in its tab control's styles.
+        if (w.cls.find("TabButton") != std::string::npos && w.parent >= 0 &&
+            scene->widgets[static_cast<size_t>(w.parent)].cls.find("TabControl") != std::string::npos) {
+            const View control = impl_->view(ObjRef{pkg, export_of[static_cast<size_t>(w.parent)]});
+            if (const UiStyle* caption = impl_->style_ref(control, "TabButtonCaptionStyle")) w.string.style = caption;
+            if (const UiStyle* background = impl_->style_ref(control, "TabButtonBackgroundStyle")) w.image.style = background;
+        }
     }
 
     // What every TdUIButtonBar button looks like, from the first bar's first template.
     for (const UiWidget& w : scene->widgets) {
         if (w.cls != "TdUIButtonBarButton") continue;
         if (w.string.style) {
-            const UiTextStyle& t = w.string.style->text_for(UiState::Enabled);
-            scene->bar_font = t.font;
-            std::copy(t.color, t.color + 4, scene->bar_text);
+            scene->bar_font = w.string.style->text_for(UiState::Enabled).font;
+            scene->bar_text = w.string.style;
         }
-        if (w.string.shadow) {
-            const UiTextStyle& t = w.string.shadow->text_for(UiState::Enabled);
-            std::copy(t.color, t.color + 4, scene->bar_shadow);
-        }
+        scene->bar_shadow = w.string.shadow;
         if (w.image.style) scene->bar_image = w.image.style->image_for(UiState::Enabled).image;
         break;
     }
@@ -754,8 +774,11 @@ void ui_draw_text(Frame& f, const Font& font, const std::string& text, const Rec
         // The canvas places a string on whole pixels.
         const float px = std::round(x), py = std::round(y + line * static_cast<float>(i));
         if (shadow_color && shadow[3] > 0.0f) {
-            // UIComp_TdDropShadowString: the offsets are fractions of the line height.
-            draw_line(f, font, lines[i], px + std::round(shadow_h * line), py + std::round(shadow_v * line), shadow, clip);
+            // UIComp_TdDropShadowString: the same glyphs again, moved by fractions of the line
+            // height and not put back on whole pixels, so the filter softens them: 1.44 pixels
+            // right for the 24 pixel font. Down it is that less one pixel (measured: the button
+            // bar's and the labels' shadows start 0.44 below their text, the big title's 1.2).
+            draw_line(f, font, lines[i], px + shadow_h * line, py + shadow_v * line - 1.0f, shadow, clip);
         }
         draw_line(f, font, lines[i], px, py, main_color, clip);
     }
@@ -772,14 +795,29 @@ void ui_draw_image(Frame& f, const Image& image, const Rect& box, const float uv
         op.clip = *clip;
     }
     const float w = static_cast<float>(image.w), h = static_cast<float>(image.h);
-    const float ul = uv[2] > 0.0f ? uv[2] : w, vl = uv[3] > 0.0f ? uv[3] : h;
-    op.quads.push_back(Quad{box.l, box.t, box.r, box.b, uv[0] / w, uv[1] / h, (uv[0] + ul) / w, (uv[1] + vl) / h});
+    const float ul = uv[2] != 0.0f ? uv[2] : w, vl = uv[3] != 0.0f ? uv[3] : h;
+    // A negative extent runs backwards from the origin, which wraps: UL = -1024 at U = 0 is the
+    // whole 1024 wide texture mirrored.
+    float u0 = uv[0], u1 = uv[0] + ul, v0 = uv[1], v1 = uv[1] + vl;
+    if (ul < 0.0f) {
+        u0 += w;
+        u1 += w;
+    }
+    if (vl < 0.0f) {
+        v0 += h;
+        v1 += h;
+    }
+    op.quads.push_back(Quad{box.l, box.t, box.r, box.b, u0 / w, v0 / h, u1 / w, v1 / h});
     f.ui.push_back(std::move(op));
 }
 
 void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma,
-                             const Rect* clip) {
+                             const Rect* clip, bool stretch_h, bool stretch_v) {
     if (!image.valid() || color[3] <= 0.0f || box.w() <= 0.0f || box.h() <= 0.0f) return;
+    if (uv[2] < 0.0f || uv[3] < 0.0f || (!stretch_h && !stretch_v)) {
+        ui_draw_image(f, image, box, uv, color, gamma, clip);
+        return;
+    }
     DrawOp op;
     op.kind = DrawOp::Kind::Image;
     op.image = &image;
@@ -790,19 +828,20 @@ void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, cons
     }
     const float tw = static_cast<float>(image.w), th = static_cast<float>(image.h);
     const float ul = uv[2] > 0.0f ? uv[2] : tw, vl = uv[3] > 0.0f ? uv[3] : th;
-    // Unscaled, the canvas draws on whole pixels: texels land on screen pixels.
-    const float left = std::floor(box.l), top = std::floor(box.t);
     const float width = box.w(), height = box.h();
     const float mid_u = std::floor(ul * 0.5f), mid_v = std::floor(vl * 0.5f);
     // A corner is half the image. Where the box is larger than the image the halves keep their
     // size and the gap is filled from the middle; where it is smaller they are scaled down to
     // meet (a 1024x256 panel behind a short message box is drawn at 0.7 of its size, frame and all).
-    const float fx = std::min(mid_u, width * 0.5f);
-    const float fy = std::min(mid_v, height * 0.5f);
-    const float right = fx < mid_u ? left + width - fx : std::floor(left + width - fx);
-    const float bottom = fy < mid_v ? top + height - fy : std::floor(top + height - fy);
-    const float xs[4] = {left, left + fx, right, right + fx};
-    const float ys[4] = {top, top + fy, bottom, bottom + fy};
+    // An axis that is not stretched has no middle: its halves meet in the middle of the box.
+    const float fx = stretch_h ? std::min(mid_u, width * 0.5f) : width * 0.5f;
+    const float fy = stretch_v ? std::min(mid_v, height * 0.5f) : height * 0.5f;
+    // Nothing is put on whole pixels: the quads sit where the layout left the widget, and a box
+    // that starts between two pixels has its image filtered across them. (Fitted on retail's
+    // frames: the tab frame of CONTROLS and the button bar's boxes both come out wrong, by up to
+    // a pixel, with the near edges floored.)
+    const float xs[4] = {box.l, box.l + fx, box.r - fx, box.r};
+    const float ys[4] = {box.t, box.t + fy, box.b - fy, box.b};
     const float us[4] = {uv[0], uv[0] + mid_u, uv[0] + ul - mid_u, uv[0] + ul};
     const float vs[4] = {uv[1], uv[1] + mid_v, uv[1] + vl - mid_v, uv[1] + vl};
     for (int row = 0; row < 3; ++row) {
@@ -1045,7 +1084,7 @@ Rect to_view(const Rect& s, float scale, float origin_x) {
 
 }  // namespace
 
-void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) const {
+void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) {
     const UiWidget& w = widgets[static_cast<size_t>(index)];
     if (w.hidden) return;
     opacity *= w.opacity;
@@ -1068,8 +1107,8 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
         float color[4] = {is.color[0], is.color[1], is.color[2], is.color[3] * comp.opacity * opacity};
         // StylePadding is taken off each side of the widget (it is negative on the panel styles).
         Rect r{where.l + is.padding[0], where.t + is.padding[1], where.r - is.padding[0], where.b - is.padding[1]};
-        if (is.adjust[0] == kAdjustStretch && is.adjust[1] == kAdjustStretch) {
-            ui_draw_image_stretched(f, *image, r, is.uv, color, gamma);
+        if (is.adjust[0] == kAdjustStretch || is.adjust[1] == kAdjustStretch) {
+            ui_draw_image_stretched(f, *image, r, is.uv, color, gamma, nullptr, is.adjust[0] == kAdjustStretch, is.adjust[1] == kAdjustStretch);
             return;
         }
         // EMaterialAdjustmentType: Normal scales the image to the widget, Justified keeps its
@@ -1094,23 +1133,36 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
 
     if (w.cls == "TdUIButtonBar") {
         // The six button templates are placed by TdUIButtonBar.AppendButton, not by the scene.
-        for (const auto& [bar_index, buttons] : button_bars) {
+        for (auto& [bar_index, buttons] : button_bars) {
             if (bar_index != index || !bar_font || !bar_font->valid()) continue;
             float right = box.r;
-            for (const BarButton& b : buttons) {
-                if (b.label.empty()) continue;
+            for (BarButton& b : buttons) {
+                b.rect = Rect{};
+                if (b.label.empty() || b.hidden) continue;
                 const float width = bar_font->width(b.label);
                 const Rect text{right - width, box.t, right, box.b};
+                b.rect = Rect{text.l - bar_padding[0], text.t - bar_padding[1], text.r + bar_padding[0], text.b + bar_padding[1]};
                 if (bar_image && bar_image->valid()) {
                     // TdImageButtonBarBackground around the auto-sized label: StylePadding (-20, -3).
                     const float white[4] = {1.0f, 1.0f, 1.0f, opacity};
                     const float full[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    ui_draw_image_stretched(f, *bar_image, Rect{text.l - bar_padding[0], text.t - bar_padding[1], text.r + bar_padding[0], text.b + bar_padding[1]},
-                                            full, white, gamma);
+                    ui_draw_image_stretched(f, *bar_image, b.rect, full, white, gamma);
                 }
-                float color[4] = {bar_text[0], bar_text[1], bar_text[2], bar_text[3] * opacity * (b.disabled ? 0.5f : 1.0f)};
-                float shadow[4] = {bar_shadow[0], bar_shadow[1], bar_shadow[2], bar_shadow[3] * opacity};
-                ui_draw_text(f, *bar_font, b.label, text, 0, 1, false, color, shadow, 0.06f, 0.06f, gamma);
+                // A disabled button is its label in the Disabled state: paler, and without the shadow.
+                const UiState st = b.disabled ? UiState::Disabled : UiState::Enabled;
+                float color[4] = {1.0f, 1.0f, 1.0f, opacity};
+                float shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (bar_text) {
+                    const UiTextStyle& ts = bar_text->text_for(st);
+                    std::copy(ts.color, ts.color + 3, color);
+                    color[3] = ts.color[3] * opacity;
+                }
+                if (bar_shadow) {
+                    const UiTextStyle& ss = bar_shadow->text_for(st);
+                    std::copy(ss.color, ss.color + 3, shadow);
+                    shadow[3] = ss.color[3] * opacity;
+                }
+                ui_draw_text(f, *bar_font, b.label, text, 0, 1, false, color, shadow[3] > 0.0f ? shadow : nullptr, 0.06f, 0.06f, gamma);
                 right = text.l - 50.0f * scale;
             }
         }
@@ -1174,8 +1226,8 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
     for (int child : order) draw_widget(f, child, scale, origin_x, gamma, opacity);
 }
 
-void UiScene::draw(Frame& f, float scale, float origin_x, float gamma) const {
-    if (!widgets.empty()) draw_widget(f, 0, scale, origin_x, gamma, 1.0f);
+void UiScene::draw(Frame& f, float scale, float origin_x, float gamma, float opacity) {
+    if (!widgets.empty()) draw_widget(f, 0, scale, origin_x, gamma, opacity);
 }
 
 }  // namespace me::fe

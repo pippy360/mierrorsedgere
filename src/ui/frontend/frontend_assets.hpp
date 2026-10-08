@@ -147,6 +147,19 @@ struct StringListData {
     std::vector<std::string> strings;
 };
 
+// One UIDataProvider_TdKeyBinding of DefaultGame.ini: a row of the CONTROLS screen.
+struct KeyAction {
+    std::string id;        // "MoveForward": the widgets are KeyBindLabel_<id> and KeyBindButton_<id>_0 / _1
+    std::string command;   // "GBA_MoveForward"
+    std::string friendly;  // "MOVE FORWARD"
+};
+
+// One PlayerInput.Bindings entry.
+struct KeyBinding {
+    std::string key;      // "W", "SpaceBar", "LeftMouseButton"
+    std::string command;  // "GBA_MoveForward"
+};
+
 struct Assets {
     // `viewport_height` picks the font tier. Returns false and sets `error` when the retail
     // install is missing something the front end cannot do without.
@@ -181,6 +194,10 @@ struct Assets {
 
     std::vector<MapProvider> maps;  // in DefaultGame.ini order: the Training Area, then the story
     std::vector<StringListData> string_lists;
+    std::vector<KeyAction> key_actions;
+    std::vector<KeyBinding> default_bindings;  // DefaultInput.ini [Engine.PlayerInput] Bindings, in file order
+    // What a key is called on the CONTROLS screen ("SpaceBar" -> "SPACE"); "" for a key that cannot be bound.
+    [[nodiscard]] std::string key_label(const std::string& key) const;
 
     City city;
     KismetGraph kismet;  // the menu level's Main_Sequence and its Matinees
