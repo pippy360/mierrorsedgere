@@ -708,6 +708,10 @@ struct EnemyBot {
     bool disarm_window = false;
     float attack_timer = 0.0f;
     std::string weapon_name = "Colt1911";
+    // The weapon still in his hands while it is being taken off him, and for how much longer
+    // (TdMove_Disarm: hers is attached to her hand only as the move ends, a shotgun's part way in).
+    std::string disarm_weapon;
+    float disarm_weapon_time = 0.0f;
     EEnemyAnimState anim_state = EEnemyAnimState::Idle;
     std::string active_anim_seq;
     float anim_timer = 0.0f;
@@ -1162,6 +1166,7 @@ struct PlayerTelemetry {
     float combat_anim_duration = 0.6f;
     int melee_variant = 0;
     bool snatch_from_back = false;
+    bool snatch_weapon_attached = true;  // TdMove_Disarm: the weapon is in her hand yet (AttachWeaponToHand)
     bool melee_hit_confirmed = false;
     bool disarm_prompt_visible = false;
     float hit_marker_timer = 0.0f;

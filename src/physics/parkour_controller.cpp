@@ -725,6 +725,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                         m_snatch_align = false;  // something in the way (retail moves the enemy instead)
                     }
                 }
+                if (m_state_timer >= m_snatch_attach) m_telemetry.snatch_weapon_attached = true;
                 if (m_state_timer >= m_telemetry.combat_anim_duration) {
                     m_telemetry.move_state = m_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
                 }
@@ -881,6 +882,12 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.swing_angle = m_swing_angle;
     m_telemetry.body_yaw_deg = m_pawn_yaw;
     update_against_wall(effective_dt, scene);
+    if (m_telemetry.move_state != EMovement::MOVE_Snatch) m_telemetry.snatch_weapon_attached = true;
+    for (auto& bot : scene.enemies) {
+        if (bot.disarm_weapon.empty()) continue;
+        bot.disarm_weapon_time -= effective_dt;
+        if (bot.disarm_weapon_time <= 0.0f || m_telemetry.move_state != EMovement::MOVE_Snatch) bot.disarm_weapon.clear();
+    }
     m_telemetry.balance_lean = m_balance_lean;
     if (m_telemetry.move_state != EMovement::MOVE_Balance) {
         m_telemetry.balance_danger = 0;
@@ -4845,6 +4852,14 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             ++m_disarm_count;
             m_telemetry.combat_anim_duration = snatch_length(snatched_wep, snatch);
             set_move_anim(snatch);
+            // PlayDisarmStart / StopMove: AttachWeaponToHand comes as the move ends, but 0.8 s in for
+            // the Remington and 1.4 s for the Neostead. Until then it is still in his hands.
+            m_snatch_attach = snatched_wep.find("Remington") != std::string::npos ? 0.8f
+                              : snatched_wep.find("Neostead") != std::string::npos ? 1.4f
+                              : m_telemetry.combat_anim_duration;
+            m_telemetry.snatch_weapon_attached = false;
+            bot.disarm_weapon = snatched_wep;
+            bot.disarm_weapon_time = m_snatch_attach;
             m_telemetry.active_subtitle = std::string(candidate_from_back ? "Stealth Disarm (" : "Weapon Disarmed (") +
                                           ws.display_name + ")!";
         } else if (ws.equipped && ws.drop_timer <= 0.0f && !input.use) {

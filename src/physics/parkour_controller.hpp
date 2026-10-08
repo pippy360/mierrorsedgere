@@ -313,6 +313,7 @@ private:
     float m_snatch_speed = 0.0f;
     bool m_snatch_align = false;
     int m_disarm_count = 0;
+    float m_snatch_attach = 0.0f;  // when in the move the weapon becomes hers to hold
     bool m_jump_consumed = false;
     bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
 

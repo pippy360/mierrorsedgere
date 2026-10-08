@@ -2409,7 +2409,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         }
     };
 
-    const SkeletalMeshAsset* equipped_wmesh = (telemetry.weapon.equipped || state == EMovement::MOVE_Snatch)
+    // Through a disarm the weapon is not in her hand until the move attaches it.
+    const SkeletalMeshAsset* equipped_wmesh = (state == EMovement::MOVE_Snatch ? telemetry.snatch_weapon_attached : telemetry.weapon.equipped)
                                                   ? get_weapon_mesh(telemetry.weapon.name)
                                                   : nullptr;
     size_t w_idx_cnt = equipped_wmesh ? equipped_wmesh->indices.size() : 0;
@@ -2854,7 +2855,8 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         skinned_norm[i] = Vec3(n_acc.z, -n_acc.x, -n_acc.y).normalized();
     }
 
-    const SkeletalMeshAsset* bot_wmesh = (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
+    const SkeletalMeshAsset* bot_wmesh = !bot.disarm_weapon.empty() ? get_weapon_mesh(bot.disarm_weapon)
+                                         : (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
                                              ? get_weapon_mesh(bot.weapon_name)
                                              : nullptr;
 
