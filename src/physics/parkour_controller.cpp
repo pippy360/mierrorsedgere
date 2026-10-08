@@ -3972,6 +3972,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         m_climb_top = top;
         m_climb_normal = wall_out;
         m_climb_can_exit_top = act.can_exit_at_top;
+        m_telemetry.climbing_pipe = act.is_pipe;
         m_telemetry.wall_normal = wall_out;
         m_state_timer = 0.0f;
         m_coil_timer = 0.0f;

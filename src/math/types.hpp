@@ -584,6 +584,7 @@ struct LevelActor {
     bool is_zipline = false;
     bool is_ladder = false;
     bool can_exit_at_top = true;
+    bool is_pipe = false;        // TdLadderVolume.LadderType: a drain pipe, climbed with its own animations
     bool is_ledge = false;
     bool is_springboard = false;
     bool is_balance_beam = false;
@@ -1138,6 +1139,7 @@ struct PlayerTelemetry {
     bool hanging_free = false;      // hanging with no wall for the legs
     float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
     float body_yaw_deg = 0.0f;      // TdPawn.Rotation.Yaw: where the body faces while the view looks round
+    bool climbing_pipe = false;     // the ladder volume being climbed is a pipe
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};

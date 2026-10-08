@@ -16,9 +16,9 @@ Scores, per movement state:
 
 A recording has the pawn but not the level, and some of what the moves play depends on what
 they found in the level: which vault, which way of catching a ledge, whether a long jump is over
-a gap, how far the ground is. Those come from the recording itself, as the controller would give
-them in the game: the ground distance from where the fall ends, the rest from the name of the
-animation retail went on to play. `--no-hints` runs without them. The hints say which of a move's
+a gap, how far the ground is, whether the stick is pushed. Those come from the recording itself, as
+the controller would give them in the game: the ground distance from where the fall ends, the rest
+from the name of the animation retail went on to play. `--no-hints` runs without them. The hints say which of a move's
 animations to play, never when or how: the slot, the rate, the blend times and the frame are the
 port's.
 
@@ -84,20 +84,16 @@ def level_hints(run, names):
     direction, animation)."""
     n = len(run)
     out = [[-1.0, 0, 0, 0, 1, "-"] for _ in range(n)]
-    # Braking is the ground friction alone, 8 a second off the speed; anything gentler is the player
-    # still pushing.
-    # (The recorder sometimes samples one game frame twice: no change in speed says nothing.)
-    speed = [math.hypot(d["vx"], d["vy"]) for d in run]
-    pushing = 0
+    # Whether the stick is pushed is not recorded. The one thing it decides here is the stopping step,
+    # which letting go of the stick plays, so the frame retail starts one is the frame it was let go.
+    # (Telling it from the speed alone, by the braking, finds too many: a landing or a wall brakes
+    # her as hard.)
     for i in range(n):
-        dt = run[i]["t"] - run[i - 1]["t"] if i else 0.0
-        if speed[i] < 1.0:
-            pushing = 0
-        elif i > 0 and dt > 0.0 and abs(speed[i] - speed[i - 1]) > 0.05:
-            pushing = 0 if speed[i] < speed[i - 1] * 0.93 else 1
-        elif i == 0:
-            pushing = 1
-        out[i][4] = pushing
+        before = {a[0].lower(): a[1] for a in run[i - 1]["anim1p"]} if i else {}
+        fresh = [a for a in run[i]["anim1p"] if a[0].lower().startswith("walktostandpass") and a[1] < 0.07
+                 and (a[0].lower() not in before or a[1] < before[a[0].lower()] - 0.1)]
+        if fresh:
+            out[i][4] = 0
     leaf_names = [[a[0].lower() for a in d["anim1p"]] for d in run]
     # Where each stretch of one movement state ends.
     end = [0] * n

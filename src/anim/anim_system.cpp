@@ -1487,6 +1487,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.hanging_free = telemetry.hanging_free;
         frame.swing_angle = telemetry.swing_angle;
         frame.balance_lean = telemetry.balance_lean;
+        frame.climbing_pipe = telemetry.climbing_pipe;
         // The controller's blows: 0 right, 1 left, 2 the combo's third, 3 crouched.
         frame.melee_variant = telemetry.move_state == EMovement::MOVE_Melee ? telemetry.melee_variant : -1;
         frame.melee_hit = telemetry.melee_hit_confirmed;
