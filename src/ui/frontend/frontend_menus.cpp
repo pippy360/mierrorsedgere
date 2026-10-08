@@ -1250,6 +1250,112 @@ private:
     int control_ = -1;
 };
 
+// --- TdUIScene_TdCredits (CREDITS) ------------------------------------------------------------
+
+// The scene holds the logo and the stick; the names are drawn by native code, which is rebuilt
+// here from retail's frames (docs/SUB_MENUS_RE.md has the measurements). Three fonts: the names in
+// Helvetica_Small_Normal, a sub-block's heading in Helvetica_Medium_Italic, a block's in
+// Helvetica_Headline_Thick_Italic. Headings end left of the stick, names start right of it, and
+// everything climbs the screen at a steady pace.
+constexpr float kCreditsSpeed = 48.4f;  // scene pixels a second (678 pixels in 14.01 s)
+constexpr float kCreditsNameGap = 22.5f;     // from the middle of the stick widget to where the names start
+constexpr float kCreditsHeadingGap = 21.5f;  // and back to where the headings end
+
+class CreditsMenu : public SubMenu {
+public:
+    explicit CreditsMenu(Frontend& fe) : SubMenu(fe, "TdUI", "TdCredits") {}
+
+    void opened() override {
+        fonts_[0] = assets().font("Helvetica_Small_Normal");
+        fonts_[1] = assets().font("Helvetica_Medium_Italic");
+        fonts_[2] = assets().font("Helvetica_Headline_Thick_Italic");
+        scene_->layout();
+        if (!fonts_[0] || !fonts_[1] || !fonts_[2]) return;
+        float line[3];
+        for (int k = 0; k < 3; ++k) line[k] = static_cast<float>(fonts_[k]->line_height) * fonts_[k]->scale / scene_->view_scale;
+        // TdGameCredits.int: NumBlocks blocks, each a heading and sub-blocks of a heading and names.
+        // A block is its heading's line, its sub-blocks, and one more heading line of space; a
+        // sub-block is a line for each name and one sub-heading line of space.
+        const std::string data = "TdGameCredits.TdCreditsData.";
+        const int blocks = std::atoi(assets().localized(data + "NumBlocks").c_str());
+        float y = 0.0f;
+        for (int b = 0; b < blocks; ++b) {
+            const std::string block = data + "Block" + std::to_string(b);
+            lines_.push_back(Line{assets().localized(block + "Header"), 2, y});
+            y += line[2];
+            const int subs = std::atoi(assets().localized(block + "SubBlocks").c_str());
+            for (int sb = 0; sb < subs; ++sb) {
+                const std::string sub = block + "SubBlock" + std::to_string(sb);
+                lines_.push_back(Line{assets().localized(sub + "Header"), 1, y});
+                const int names = std::atoi(assets().localized(sub + "Names").c_str());
+                for (int n = 0; n < names; ++n) lines_.push_back(Line{assets().localized(sub + "Name" + std::to_string(n)), 0, y + line[0] * static_cast<float>(n)});
+                y += line[0] * static_cast<float>(names) + line[1];
+            }
+            y += line[2];
+        }
+        height_ = y;
+    }
+
+    void tick(float dt) override {
+        scroll_ += kCreditsSpeed * dt;
+        // Not seen on retail (the list runs for some ten minutes): once the last line has left
+        // the screen the scene closes.
+        if (!lines_.empty() && scroll_ > height_ + 720.0f) close();
+    }
+
+    void key_pressed(Key) override {}
+    // HandleInputKey: Start, A, B, Enter, Escape and the space bar all leave.
+    void key_released(Key key) override {
+        if (key == Key::Accept || key == Key::Escape) {
+            play("Cancel");
+            close();
+        }
+    }
+    bool raw_key(const std::string& name, bool released) override {
+        if (name == "SpaceBar" && released) key_released(Key::Escape);
+        return name == "SpaceBar";
+    }
+
+    void draw(Frame& f, float scale, float origin_x, float gamma, bool top) override {
+        SubMenu::draw(f, scale, origin_x, gamma, top);
+        const int stick = scene_->find("StickImage");
+        if (stick < 0) return;
+        const Rect& r = scene_->widgets[static_cast<size_t>(stick)].rect;
+        // TdMenuPostProcesWrapper with nothing selected: the material's own thin stick.
+        DrawOp op;
+        op.kind = DrawOp::Kind::Stick;
+        op.rect = Rect{origin_x + r.l * scale, r.t * scale, origin_x + r.r * scale, r.b * scale};
+        op.stick.move_amount = 1.0f;
+        f.ui.push_back(std::move(op));
+        const float middle = (r.l + r.r) * 0.5f;
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // CurrentCreditsTextColor
+        for (const Line& l : lines_) {
+            const Font& font = *fonts_[l.font];
+            const float line = static_cast<float>(font.line_height) * font.scale;
+            const float y = (720.0f + l.y - scroll_) * scale;
+            if (y + line < 0.0f || y > 720.0f * scale) continue;
+            if (l.font == 0) {
+                const float x = origin_x + (middle + kCreditsNameGap) * scale;
+                ui_draw_text(f, font, l.text, Rect{x, y, x + font.width(l.text), y + line}, 0, 0, false, black, nullptr, 0.0f, 0.0f, gamma);
+            } else {
+                const float x = origin_x + (middle - kCreditsHeadingGap) * scale;
+                ui_draw_text(f, font, l.text, Rect{x - font.width(l.text), y, x, y + line}, 2, 0, false, black, nullptr, 0.0f, 0.0f, gamma);
+            }
+        }
+    }
+
+private:
+    struct Line {
+        std::string text;
+        int font = 0;
+        float y = 0.0f;  // from the top of the list, scene pixels
+    };
+    const Font* fonts_[3] = {nullptr, nullptr, nullptr};
+    std::vector<Line> lines_;
+    float height_ = 0.0f;
+    float scroll_ = 0.0f;
+};
+
 }  // namespace
 
 std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
@@ -1259,6 +1365,7 @@ std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
     else if (scene == "TdGameSettings" || scene == "TdAudioSettings" || scene == "TdVideoSettingsPC") menu = std::make_unique<OptionMenu>(fe, scene);
     else if (scene == "TdKeyMappings") menu = std::make_unique<KeyMappingsMenu>(fe);
     else if (scene == "TdUnlocks") menu = std::make_unique<UnlocksMenu>(fe);
+    else if (scene == "TdCredits") menu = std::make_unique<CreditsMenu>(fe);
     else if (scene == "TdTTSelectStretchOffline") menu = std::make_unique<RaceMenu>(fe, scene, true);
     else if (scene == "TdLRSelectLevelOffline") menu = std::make_unique<RaceMenu>(fe, scene, false);
     if (menu && !menu->valid()) menu.reset();
