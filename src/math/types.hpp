@@ -1137,6 +1137,8 @@ struct PlayerTelemetry {
     bool jump_over_gap = false;     // TdMove_Jump.StartJump: nothing to land on 1.1 x the speed ahead
     bool move_left = false;         // a dodge jump going left
     bool hanging_free = false;      // hanging with no wall for the legs
+    bool ledge_sloped = false;      // TdMove_Grab.bSlopedLedge: the ledge's top is not level
+    float ledge_slope_deg = 0.0f;   // how steeply the ledge runs up to her right
     float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
     float body_yaw_deg = 0.0f;      // TdPawn.Rotation.Yaw: where the body faces while the view looks round
     bool climbing_pipe = false;     // the ladder volume being climbed is a pipe

@@ -148,6 +148,10 @@ int main(int argc, char** argv) {
             else if (key == "gap") f.long_jump_over_gap = value != "0";
             else if (key == "left") f.move_left = value != "0";
             else if (key == "free") f.hanging_free = value != "0";
+            else if (key == "slope") {
+                f.ledge_slope_deg = std::stof(value);
+                f.ledge_sloped = f.ledge_slope_deg != 0.0f;
+            }
             else if (key == "acc") f.accelerating = value != "0";
             else if (key == "anim") f.move_anim = value;
             else if (key == "swing") f.swing_angle = std::stof(value);

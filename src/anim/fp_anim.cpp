@@ -501,6 +501,21 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
             n.blend_to_go = 0.0f;
         }
         return;
+    } else if (n.cls == "TdAnimNodeGrabSlope") {
+        // Hang, Hang45 (hang45right), Hang45m (hang45left): the level hang and the two it leans
+        // into on a ledge that runs up to one side. In hang45right the right hand is 42 uu under
+        // the left with the hands 42 apart, so it is the hang from a ledge falling 45 degrees to
+        // her right, and hang45left its mirror. The node is native and in no recording: taken as
+        // straight in the slope between the level pose and those.
+        if (n.weight.size() >= 3) {
+            const float a = std::clamp(pawn.grab_slope_deg / 45.0f, -1.0f, 1.0f);
+            n.weight[0] = 1.0f - std::fabs(a);
+            n.weight[1] = std::max(-a, 0.0f);
+            n.weight[2] = std::max(a, 0.0f);
+            n.target = n.weight;
+            n.blend_to_go = 0.0f;
+        }
+        return;
     } else if (n.cls == "TdAnimNodeTurn") {
         return;  // tick_turn
     } else if (n.cls == "TdAnimNodeGrabbing") {

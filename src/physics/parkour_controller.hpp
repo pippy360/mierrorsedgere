@@ -154,6 +154,7 @@ private:
         float top_z = 0.0f;             // walkable top
         float wall_distance = 0.0f;     // pawn centre -> wall face, along -normal
         Vec3 top_point{0.0f, 0.0f, 0.0f};
+        Vec3 top_normal{0.0f, 0.0f, 1.0f};  // of the surface the hands go on (TdPawn.MoveLedgeNormal)
     };
 
     // TdMove_GrabTransfer: an obstacle standing on a grabbed lip (a rail) that leaves no room to

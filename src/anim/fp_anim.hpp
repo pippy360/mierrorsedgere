@@ -56,6 +56,7 @@ struct PawnAnimState {
     int grab_turn_type = 0;       // TdPawn.CurrentGrabTurnType: 0 none, 1 start, 2 end, 3 idle
     float look_deg = 0.0f;        // the view's yaw off the body's, positive to the right
     float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
+    float grab_slope_deg = 0.0f;  // how steeply the ledge she hangs from runs up to her right
 };
 
 // One node of the tree: its fixed properties and its state this frame.

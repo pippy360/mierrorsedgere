@@ -38,6 +38,8 @@ struct PawnFrame {
     bool move_left = false;      // a sideways move going left (dodge jumps)
     bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
     bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)
+    bool ledge_sloped = false;   // the ledge's top is not level (TdMove_Grab.bSlopedLedge)
+    float ledge_slope_deg = 0.0f;  // how steeply it runs up to her right
     float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     bool climbing_pipe = false;  // on a pipe, not a ladder
@@ -109,6 +111,7 @@ private:
     bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
     float climb_last_vz_ = 0.0f;
     float climb_step_z_ = 0.0f;      // where the step being climbed started
+    bool sloped_ledge_ = false;      // the ledge being caught or hung from is sloped
     float climb_step_size_ = 32.0f;  // and how far it goes: one rung, or two on a pipe
     // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
     // hang's turn, and the shimmy step.

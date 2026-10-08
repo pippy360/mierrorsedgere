@@ -523,9 +523,17 @@ void Director::update_walking_state(const PawnFrame& frame) {
 bool Director::play_named(const std::string& name) {
     const MoveAnim* a = find_move_anim(name);
     if (!a) return false;
+    Slot slot = a->slot;
+    float blend_out = a->blend_out;
+    // TdMove_IntoGrab.ReachedPreciseLocation on a sloped ledge: the lighter catches go to the camera
+    // alone, so the body keeps the hang the slope gives it, and the others take 0.8 s to leave.
+    if (sloped_ledge_ && std::strncmp(a->name, "hang", 4) == 0 && std::strstr(a->name, "hardstart")) {
+        if (std::strcmp(a->name, "hanghardstartvertical") == 0 || std::strcmp(a->name, "hanghardstart3") == 0) blend_out = 0.8f;
+        else slot = Slot::Camera;
+    }
     std::string playing;
-    if (tree_.custom_anim_playing(a->slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(a->slot) < 0.05f) return true;
-    tree_.play_custom_anim(a->slot, name, a->rate, a->blend_in, a->blend_out, a->looping, true);
+    if (tree_.custom_anim_playing(slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(slot) < 0.05f) return true;
+    tree_.play_custom_anim(slot, name, a->rate, a->blend_in, blend_out, a->looping, true);
     // TdMove_Climb.ExitAtTop: over the top, and the walking tree comes in under it.
     if (std::strstr(a->name, "exittop")) {
         climb_exiting_ = true;
@@ -533,7 +541,7 @@ bool Director::play_named(const std::string& name) {
         set_animation_state(EMovement::MOVE_Walking, 0.5f);
     }
     // TdMove_IntoGrab.ReachedPreciseLocation: the hardest catch also knocks the camera.
-    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, 0.2f, false, true);
+    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, sloped_ledge_ ? 0.8f : 0.2f, false, true);
     return true;
 }
 
@@ -856,7 +864,9 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
         case EMovement::MOVE_Grabbing:
             // TdMove_Grab.StartMove: RootOffset.X += RelativeExtent + 1 with the legs on the wall (the
             // recordings have the eye 1 forward in 794 of 872 hanging frames), over 0.3 s.
+            // Hanging free from a sloped ledge it is 3 up instead.
             if (!frame.hanging_free) set_root_offset(Vec3(1.0f, 0.0f, 0.0f), 0.3f);
+            else if (frame.ledge_sloped) set_root_offset(Vec3(0.0f, 0.0f, 3.0f), 0.3f);
             grab_turn_ = 0;
             grab_timer_ = -1.0f;
             grab_free_turn_ = false;
@@ -934,6 +944,7 @@ void Director::tick(const PawnFrame& frame) {
     else if (!airborne_) fall_top_ = frame.position.z;
     airborne_ = airborne;
 
+    sloped_ledge_ = frame.ledge_sloped;
     // The animation the move's own checks chose, on the frame it chooses it.
     if (frame.move_anim == "@reached") {
         // TdMove_SpringBoard.ReachedPreciseLocation: off the other leg than the one in front.
@@ -990,6 +1001,7 @@ void Director::tick(const PawnFrame& frame) {
     if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
     pawn_.hanging_free = frame.hanging_free;
+    pawn_.grab_slope_deg = frame.ledge_slope_deg;
     pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
     tick_weapon(frame);

@@ -1571,10 +1571,12 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             Vec3 column = wall.point + into * extra;
             float top_z = 0.0f;
             bool got_top = false;
+            Vec3 top_normal(0.0f, 0.0f, 1.0f);
             const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start),
                                            Vec3(column.x, column.y, z_end), scene);
             if (top.hit && top.normal.z >= kWalkableFloorZ) {
                 top_z = top.point.z;
+                top_normal = top.normal;
                 got_top = true;
             } else {
                 const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start),
@@ -1595,6 +1597,7 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             out.top_z = top_z;
             out.wall_distance = wall.distance;
             out.top_point = Vec3(column.x, column.y, top_z);
+            out.top_normal = top_normal;
             return out;
         }
     }
@@ -3142,6 +3145,14 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
 
     // TdMove_Grab.bIsHangingFree: nothing in front of the legs to put the feet against.
     m_telemetry.hanging_free = !probe_wall(ledge.normal * -1.0f, kPawnRadius + 45.0f, 60.0f, scene).found;
+    // TdMove_IntoGrab / TdMove_Grab.bSlopedLedge: MoveLedgeNormal.Z < 0.999. The hang's pose leans
+    // with the ledge by how steeply it runs along her shoulders.
+    {
+        const Vec3 right(ledge.normal.y, -ledge.normal.x, 0.0f);  // her right, facing the wall
+        m_telemetry.ledge_sloped = ledge.top_normal.z < 0.999f;
+        m_telemetry.ledge_slope_deg = m_telemetry.ledge_sloped
+            ? std::atan2(-ledge.top_normal.dot(right), ledge.top_normal.z) * RAD2DEG : 0.0f;
+    }
     // TdMove_IntoGrab.ReachedPreciseLocation: how she catches the ledge, by where she came from and
     // how fast she was falling (HangImpactMinZSpeed -600, HangHardImpactMinZSpeed -1000).
     set_move_anim(m_telemetry.move_state == EMovement::MOVE_WallClimbing ? "hanghardstartvertical"
@@ -3263,7 +3274,8 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         leave_ground(EMovement::MOVE_Falling);
         return;
     }
-    if (std::abs(input.strafe) > 0.3f && m_hang_time > c.grab_shimmy_delay) {
+    // TdMove_Grab.HandleMoveAction: there is no shimmying along a sloped ledge.
+    if (std::abs(input.strafe) > 0.3f && m_hang_time > c.grab_shimmy_delay && !m_telemetry.ledge_sloped) {
         Vec3 along(-n.y, n.x, 0.0f);
         if (along.dot(facing_right() * sign_of(input.strafe)) < 0.0f) along = -along;
         // The ledge has to continue that way: test multiple depths beyond the wall face + thin box sweep
