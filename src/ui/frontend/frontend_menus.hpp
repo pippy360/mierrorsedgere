@@ -67,6 +67,7 @@ protected:
     ProfileSettings& settings();
     struct StringList& string_list(const std::string& tag);
     std::vector<KeyBinding>& bindings();  // PlayerInput.Bindings
+    std::vector<std::string>& viewed_unlocks();
     // A point of the viewport in the scene's 1280x720 pixels.
     void to_scene(float x, float y, float& sx, float& sy) const;
 
@@ -83,6 +84,7 @@ protected:
 
     // TdUIButtonBar. `key` is the key that does what a click on the button does.
     int bar_append(const std::string& markup, Key key = Key{}, const std::string& bar = "ButtonBar");
+    void bar_clear(const std::string& bar = "ButtonBar");
     void bar_disable(int button, bool disable, const std::string& bar = "ButtonBar");
 
     // Focus.

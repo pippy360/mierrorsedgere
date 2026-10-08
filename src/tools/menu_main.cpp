@@ -178,6 +178,9 @@ int main(int argc, char** argv) {
             // --courses <n>: the first n TIME TRIAL courses and SPEED RUN chapters are unlocked (1 = a profile that has only trained)
             const int n = std::atoi(next().c_str());
             profile.time_trials = profile.level_races = n >= 32 ? 0xFFFFFFFFu : ((1u << (n < 0 ? 0 : n)) - 1u);
+        } else if (a == "--completed") {
+            // --completed <n>: chapters finished, for UNLOCKABLES (0 = a profile that has only trained)
+            profile.levels_completed = std::atoi(next().c_str());
         } else if (a == "--hard") {
             profile.hard_unlocked = true;
         } else if (a == "--player") {

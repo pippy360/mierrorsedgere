@@ -715,6 +715,15 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
                 list->cell[k] = impl_->style_ref(v, "GlobalCellStyle", k);
                 list->overlay[k] = impl_->style_ref(v, "ItemOverlayStyle", k);
             }
+            // RowAutoSizeMode other than CELLAUTOSIZE_None: a row is as tall as its text.
+            const UProperty* auto_size = v.find("RowAutoSizeMode");
+            if ((!auto_size || auto_size->s != "CELLAUTOSIZE_None") && list->cell[0]) {
+                const UiTextStyle& ts = list->cell[0]->text_for(UiState::Enabled);
+                if (ts.font && ts.font->valid()) {
+                    list->row_height = static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale_;
+                    list->row_percent = false;
+                }
+            }
             if (const UProperty* p = v.find("VerticalScrollbar")) {
                 auto it = widget_of.find(p->i);
                 if (it != widget_of.end()) list->scrollbar = it->second;
@@ -751,6 +760,14 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
             if (const UProperty* p = v.find("TabButton")) {
                 auto it = widget_of.find(p->i);
                 if (it != widget_of.end()) w.tab_button = it->second;
+            }
+            // UITabPage.ButtonCaption is what the page's button says.
+            if (const UProperty* caption = v.field("ButtonCaption", "MarkupString")) {
+                if (w.tab_button >= 0 && !caption->s.empty()) {
+                    UiWidget& button = scene->widgets[static_cast<size_t>(w.tab_button)];
+                    button.markup = caption->s;
+                    button.text = resolve_markup(caption->s);
+                }
             }
         }
         // A tab button is drawn in its tab control's styles.
@@ -1358,7 +1375,9 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
         const UiList& list = *w.list;
         const float pitch = list.pitch(w.rect.h());
         const int shown = list.visible(w.rect.h());
-        const float right = list.scrollbar >= 0 ? widgets[static_cast<size_t>(list.scrollbar)].rect.l : w.rect.r;
+        // The elements stop at the scrollbar, where one is shown.
+        const bool scrollbar = list.scrollbar >= 0 && !widgets[static_cast<size_t>(list.scrollbar)].hidden;
+        const float right = scrollbar ? widgets[static_cast<size_t>(list.scrollbar)].rect.l : w.rect.r;
         for (int k = 0; k < shown && list.top + k < static_cast<int>(list.rows.size()); ++k) {
             const int element = list.top + k;
             const UiListRow& row = list.rows[static_cast<size_t>(element)];
@@ -1384,15 +1403,22 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
                 const float inset = list.cell_padding * 0.5f;
                 const Rect text = to_view(Rect{x + inset, cell_rect.t + inset, x + width, cell_rect.b}, scale, origin_x);
                 float pen = text.l;
+                // Pieces in a smaller font sit in the middle of the line's height.
+                float line = 0.0f;
                 for (const UiRun& run : row.cells[c]) {
                     const Font& font = run.font && run.font->valid() ? *run.font : *ts.font;
+                    line = std::max(line, static_cast<float>(font.line_height) * font.scale);
+                }
+                for (const UiRun& run : row.cells[c]) {
+                    const Font& font = run.font && run.font->valid() ? *run.font : *ts.font;
+                    const float drop = (line - static_cast<float>(font.line_height) * font.scale) * 0.5f;
                     float color[4] = {ts.color[0], ts.color[1], ts.color[2], ts.color[3] * opacity};
                     if (run.colored) {
                         std::copy(run.color, run.color + 3, color);
                         color[3] = run.color[3] * ts.color[3] * opacity;
                     }
                     const float run_width = font.width(run.text);
-                    ui_draw_text(f, font, run.text, Rect{pen, text.t, pen + run_width, text.b}, 0, 0, false, color, nullptr, 0.0f, 0.0f, gamma);
+                    ui_draw_text(f, font, run.text, Rect{pen, text.t + drop, pen + run_width, text.b}, 0, 0, false, color, nullptr, 0.0f, 0.0f, gamma);
                     pen += run_width;
                 }
                 x += width;

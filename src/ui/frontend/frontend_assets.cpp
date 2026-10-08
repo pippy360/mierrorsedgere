@@ -577,6 +577,41 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
             else if (key == "Rating3Time") current->rating[2] = static_cast<float>(std::atof(value.c_str()));
         }
     }
+    // UNLOCKABLES: the artwork, the videos and the music.
+    {
+        std::ifstream game_ini(get_config_path(game_root, "DefaultGame.ini"));
+        std::string line;
+        UnlockItem* current = nullptr;
+        auto unquote = [](std::string v) {
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+            return v;
+        };
+        while (std::getline(game_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                current = nullptr;
+                const std::pair<const char*, std::vector<UnlockItem>*> kinds[3] = {
+                    {"UIDataProvider_ArtworkUnlocks", &artwork}, {"UIDataProvider_VideosUnlocks", &videos}, {"UIDataProvider_MusicUnlocks", &music}};
+                for (const auto& [cls, list] : kinds) {
+                    const std::string suffix = std::string(" ") + cls + "]";
+                    if (line.size() <= suffix.size() || line.compare(line.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+                    list->emplace_back();
+                    current = &list->back();
+                    current->id = line.substr(1, line.size() - suffix.size() - 1);
+                    const std::string section = "TdGame." + current->id + " " + cls + ".";
+                    current->name = unquote(localized(section + "FriendlyName"));
+                    current->description = unquote(localized(section + "Description"));
+                }
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (!current || eq == std::string::npos) continue;
+            const std::string key = line.substr(0, eq), value = unquote(line.substr(eq + 1));
+            if (key == "ResourcePath") current->resource = value;
+            else if (key == "LevelId") current->level = std::atoi(value.c_str());
+            else if (key == "UnlockId") current->unlock_id = std::atoi(value.c_str());
+        }
+    }
     // The key bindings: the actions ("[<Id> UIDataProvider_TdKeyBinding]" of DefaultGame.ini) and
     // the keys they start on ([Engine.PlayerInput] of DefaultInput.ini; the "GBA_" entries there
     // are the aliases themselves, not keys).

@@ -49,6 +49,8 @@ const Profile& SubMenu::profile() const { return fe_.profile_; }
 ProfileSettings& SubMenu::settings() { return fe_.settings_; }
 StringList& SubMenu::string_list(const std::string& tag) { return fe_.string_lists_[tag]; }
 std::vector<KeyBinding>& SubMenu::bindings() { return fe_.bindings_; }
+std::vector<std::string>& SubMenu::viewed_unlocks() { return fe_.viewed_unlocks_; }
+void SubMenu::bar_clear(const std::string& bar) { scene_->bar(bar).clear(); }
 void SubMenu::to_scene(float x, float y, float& sx, float& sy) const {
     sx = (x - fe_.origin_x_) / fe_.scale_;
     sy = y / fe_.scale_;
@@ -1082,6 +1084,172 @@ private:
     float request_ = 0.0f;
 };
 
+// --- TdUIScene_Unlocks with its three tab pages (UNLOCKABLES) --------------------------------
+
+// TdUIScene_BigOverlayImage: VIEW IMAGE.
+class BigImageMenu : public SubMenu {
+public:
+    BigImageMenu(Frontend& fe, const Image* image) : SubMenu(fe, "TdUI_FrontEnd", "TdBigOverlayImage"), image_(image) {}
+    void opened() override {
+        bar_append("Back", Key::Escape);
+        if (UiWidget* big = scene_->get("BigImage")) {
+            big->image.texture = image_;
+            big->image.present = true;
+        }
+        scene_->layout();
+    }
+    void key_pressed(Key) override {}
+
+private:
+    const Image* image_ = nullptr;
+};
+
+class UnlocksMenu : public SubMenu {
+public:
+    explicit UnlocksMenu(Frontend& fe) : SubMenu(fe, "TdUI_FrontEnd", "TdUnlocks") {}
+
+    void opened() override {
+        pages_[0] = Page{"Artwork", "ArtworkList", "ArtworkDescriptionLabel", "ArtworkImage", "ViewImage", &assets().artwork, {}, -1};
+        pages_[1] = Page{"Videos", "VideosList", "VideosDescriptionLabel", "VideosPreviewImage", "PlayMovie", &assets().videos, {}, -1};
+        pages_[2] = Page{"Music", "MusicList", "MusicDescriptionLabel", "", "PlayMusic", &assets().music, {}, -1};
+        for (Page& page : pages_) {
+            page.list = scene_->find(page.list_name);
+            if (page.list >= 0 && !scene_->widgets[static_cast<size_t>(page.list)].list) page.list = -1;
+            // <TdUnlocksData:UnlockedArtwork>: what the profile has unlocked.
+            for (size_t i = 0; i < page.items->size(); ++i) {
+                if ((*page.items)[i].level <= profile().levels_completed) page.shown.push_back(static_cast<int>(i));
+            }
+            fill(page);
+        }
+        control_ = scene_->find("TabControl");
+        activate_page(control_, 0);
+    }
+
+    // TdUIScene_Unlocks.OnTabPageActivated and the page's RefreshButtonBar.
+    void page_activated(int, int index) override {
+        for (int k = 0; k < 3; ++k) {
+            scene_->set_visible(std::string(pages_[k].name) + "BGImage", k == index);
+            scene_->set_visible(std::string(pages_[k].name) + "BGTopImage", k == index);
+        }
+        const Page& page = pages_[index];
+        bar_clear();
+        bar_append("<Strings:TdGameUI.TdButtonCallouts.Back>", Key::Escape);
+        bar_append(std::string("<Strings:TdGameUI.TdButtonCallouts.") + page.action + ">", Key::Accept);
+        if (page.list >= 0) {
+            set_focus(page.list);
+            select(scene_->widgets[static_cast<size_t>(page.list)].list->index);
+        }
+    }
+
+    void key_pressed(Key key) override {
+        const int index = std::max(active_page(control_), 0);
+        const Page& page = pages_[index];
+        if ((key == Key::Up || key == Key::Down) && page.list >= 0 && !page.shown.empty()) {
+            const int now = scene_->widgets[static_cast<size_t>(page.list)].list->index;
+            const int next = std::clamp(now + (key == Key::Down ? 1 : -1), 0, static_cast<int>(page.shown.size()) - 1);
+            if (next == now) return;
+            play(key == Key::Down ? "ListDown" : "ListUp");
+            select(next);
+        } else if (key == Key::Left || key == Key::Right || key == Key::PrevPage || key == Key::NextPage) {
+            // The tabs, side by side.
+            const bool forward = key == Key::Right || key == Key::NextPage;
+            const int next = index + (forward ? 1 : -1);
+            if (next < 0 || next > 2) return;
+            play(forward ? "TabChangeRight" : "TabChangeLeft");
+            activate_page(control_, next);
+        }
+    }
+
+    void key_released(Key key) override {
+        if (key != Key::Accept) {
+            SubMenu::key_released(key);
+            return;
+        }
+        const int index = std::max(active_page(control_), 0);
+        const UnlockItem* item = current(pages_[index]);
+        if (!item) return;
+        play("Accept");
+        // The entry has been looked at: it loses its "+".
+        if (std::find(viewed_unlocks().begin(), viewed_unlocks().end(), item->id) == viewed_unlocks().end()) viewed_unlocks().push_back(item->id);
+        fill(pages_[index]);
+        if (index == 0) {
+            open(std::make_unique<BigImageMenu>(fe_, assets().image(item->resource)));  // ViewImage
+        } else if (index == 1) {
+            host_action("PlayMovie " + item->resource.substr(0, item->resource.find(';')));
+        } else {
+            host_action("PlayMusic " + item->resource);
+        }
+    }
+
+    void mouse_click(float x, float y) override {
+        const Page& page = pages_[std::max(active_page(control_), 0)];
+        if (page.list >= 0) {
+            const UiWidget& w = scene_->widgets[static_cast<size_t>(page.list)];
+            float sx = 0.0f, sy = 0.0f;
+            to_scene(x, y, sx, sy);
+            const float pitch = w.list->pitch(w.rect.h());
+            if (sx >= w.rect.l && sx < w.rect.r && sy >= w.rect.t && sy < w.rect.b && pitch > 0.0f) {
+                const int element = w.list->top + static_cast<int>((sy - w.rect.t) / pitch);
+                if (element < static_cast<int>(page.shown.size())) select(element);
+                return;
+            }
+        }
+        SubMenu::mouse_click(x, y);
+    }
+
+private:
+    struct Page {
+        const char* name = "";
+        const char* list_name = "";
+        const char* description = "";
+        const char* image = "";
+        const char* action = "";
+        const std::vector<UnlockItem>* items = nullptr;
+        std::vector<int> shown;
+        int list = -1;
+    };
+
+    const UnlockItem* current(const Page& page) {
+        if (page.list < 0 || page.shown.empty()) return nullptr;
+        const int element = scene_->widgets[static_cast<size_t>(page.list)].list->index;
+        return &(*page.items)[static_cast<size_t>(page.shown[static_cast<size_t>(element)])];
+    }
+
+    // The list's elements: the name, with the red "+" of an entry that has not been looked at yet.
+    void fill(Page& page) {
+        if (page.list < 0) return;
+        UiList& list = *scene_->widgets[static_cast<size_t>(page.list)].list;
+        list.rows.clear();
+        for (int i : page.shown) {
+            const UnlockItem& item = (*page.items)[static_cast<size_t>(i)];
+            const bool viewed = std::find(viewed_unlocks().begin(), viewed_unlocks().end(), item.id) != viewed_unlocks().end();
+            UiListRow row;
+            row.cells.push_back(ui().parse_runs(item.name + (viewed ? "" : "<Strings:TdGameUI.TdSymbols.Plus>")));
+            list.rows.push_back(std::move(row));
+        }
+    }
+
+    // OnArtworkList_ValueChanged and its two siblings: the description, and the picture.
+    void select(int element) {
+        const Page& page = pages_[std::max(active_page(control_), 0)];
+        scene_->list_select(page.list, element);
+        const UnlockItem* item = current(page);
+        if (UiWidget* w = scene_->get(page.description)) w->text = item ? item->description : std::string();
+        if (UiWidget* w = scene_->get(page.image)) {
+            std::string path = item ? item->resource : std::string();
+            const size_t semicolon = path.find(';');
+            if (semicolon != std::string::npos) path.erase(0, semicolon + 1);
+            w->image.texture = path.empty() ? nullptr : assets().image(path);
+            w->image.present = true;
+            w->hidden = w->image.texture == nullptr;
+        }
+        scene_->layout();
+    }
+
+    Page pages_[3];
+    int control_ = -1;
+};
+
 }  // namespace
 
 std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
@@ -1090,6 +1258,7 @@ std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
     else if (scene == "TdLoadLevel") menu = std::make_unique<LoadLevelMenu>(fe);
     else if (scene == "TdGameSettings" || scene == "TdAudioSettings" || scene == "TdVideoSettingsPC") menu = std::make_unique<OptionMenu>(fe, scene);
     else if (scene == "TdKeyMappings") menu = std::make_unique<KeyMappingsMenu>(fe);
+    else if (scene == "TdUnlocks") menu = std::make_unique<UnlocksMenu>(fe);
     else if (scene == "TdTTSelectStretchOffline") menu = std::make_unique<RaceMenu>(fe, scene, true);
     else if (scene == "TdLRSelectLevelOffline") menu = std::make_unique<RaceMenu>(fe, scene, false);
     if (menu && !menu->valid()) menu.reset();

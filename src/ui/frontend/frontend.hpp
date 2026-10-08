@@ -46,6 +46,7 @@ struct Profile {
     uint32_t time_trials = 0xFFFFFFFFu;  // TIME TRIAL: bit i is Assets::time_trials[i], unlocked
     uint32_t level_races = 0xFFFFFFFFu;  // SPEED RUN: bit i is Assets::level_races[i], unlocked
     int stars = 0;                       // GetTimeTrialRating: stars earned over all the courses
+    int levels_completed = 10;           // UNLOCKABLES: an entry is there once the chapter of its LevelId is done
     std::string player_name = "Player";
 };
 
@@ -111,7 +112,10 @@ public:
     //   "NewGame"                       a new game at the difficulty now in settings()
     //   "StartLevel <map> [checkpoint]" PLAY CHAPTER ("StartLevel edge_p After_Intro")
     //   "TimeTrial <stretch>"           START RACE
+    //   "SpeedRun <map url>"            START RACE on SPEED RUN ("SpeedRun edge_p?LoadCheckpoint=Edge_Start")
     //   "ApplySettings"                 an options screen was saved
+    //   "PlayMovie <bink>"              PLAY VIDEO on UNLOCKABLES ("PlayMovie Attract_Movie")
+    //   "PlayMusic <resource>"          PLAY MUSIC on UNLOCKABLES ("PlayMusic AudioUnlock1")
     //   "Quit"
     std::string take_action();
 
@@ -165,6 +169,7 @@ private:
     ProfileSettings settings_;
     std::unordered_map<std::string, StringList> string_lists_;
     std::vector<KeyBinding> bindings_;
+    std::vector<std::string> viewed_unlocks_;  // SetUnlockViewed: the entries of UNLOCKABLES that have lost their "+"
     std::vector<std::unique_ptr<SubMenu>> scenes_;
     std::vector<std::unique_ptr<SubMenu>> closed_;  // closed during this update; destroyed at its end
     Profile profile_;
