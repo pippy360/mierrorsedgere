@@ -790,16 +790,21 @@ void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, cons
     }
     const float tw = static_cast<float>(image.w), th = static_cast<float>(image.h);
     const float ul = uv[2] > 0.0f ? uv[2] : tw, vl = uv[3] > 0.0f ? uv[3] : th;
-    // The canvas draws on whole pixels: texels land on screen pixels.
+    // Unscaled, the canvas draws on whole pixels: texels land on screen pixels.
     const float left = std::floor(box.l), top = std::floor(box.t);
     const float width = box.w(), height = box.h();
     const float mid_u = std::floor(ul * 0.5f), mid_v = std::floor(vl * 0.5f);
-    const float fx = std::min(mid_u, width * 0.5f);  // the width of a corner, on screen and in texels
+    // A corner is half the image. Where the box is larger than the image the halves keep their
+    // size and the gap is filled from the middle; where it is smaller they are scaled down to
+    // meet (a 1024x256 panel behind a short message box is drawn at 0.7 of its size, frame and all).
+    const float fx = std::min(mid_u, width * 0.5f);
     const float fy = std::min(mid_v, height * 0.5f);
-    const float xs[4] = {left, left + fx, std::floor(left + width - fx), std::floor(left + width - fx) + fx};
-    const float ys[4] = {top, top + fy, std::floor(top + height - fy), std::floor(top + height - fy) + fy};
-    const float us[4] = {uv[0], uv[0] + fx, uv[0] + ul - fx, uv[0] + ul};
-    const float vs[4] = {uv[1], uv[1] + fy, uv[1] + vl - fy, uv[1] + vl};
+    const float right = fx < mid_u ? left + width - fx : std::floor(left + width - fx);
+    const float bottom = fy < mid_v ? top + height - fy : std::floor(top + height - fy);
+    const float xs[4] = {left, left + fx, right, right + fx};
+    const float ys[4] = {top, top + fy, bottom, bottom + fy};
+    const float us[4] = {uv[0], uv[0] + mid_u, uv[0] + ul - mid_u, uv[0] + ul};
+    const float vs[4] = {uv[1], uv[1] + mid_v, uv[1] + vl - mid_v, uv[1] + vl};
     for (int row = 0; row < 3; ++row) {
         for (int col = 0; col < 3; ++col) {
             if (xs[col + 1] <= xs[col] || ys[row + 1] <= ys[row]) continue;
@@ -849,24 +854,57 @@ std::vector<UiScene::BarButton>& UiScene::bar(const std::string& widget) {
     return none;
 }
 
-// UUIScene::ResolveScenePositions. Faces are resolved in the docking stack's order: widgets in
-// tree order, each face after the face it is docked to. What a percentage padding measures is
-// read as it stands at that moment: a face that has not been resolved yet reads as the face it
-// is docked to, without its padding (which is why the same docking gives SettingsPanel a
-// different top in TdAudioSettings, where it comes before the label it hangs from, than in
-// TdGameSettings, where it comes after).
+// UUIScene::ResolveScenePositions.
+//
+// The first pass resolves every face in the docking stack's order: widgets in tree order, each
+// face after the face it is docked to, strings not yet sizing anything. What a percentage padding
+// measures is read as it stands at that moment, and a face that has not been resolved yet reads
+// as the face it is docked to, without its padding. (That is why the same docking gives
+// SettingsPanel a different top in TdAudioSettings, where it comes before the label it hangs
+// from, than in TdGameSettings, where it comes after.)
+//
+// Then the auto-sized strings set their widgets' sizes, and only the faces that depend on a face
+// that moved are resolved again. A face that does not (the top of the message box's panel, which
+// hangs from the top of the message) keeps what the first pass gave it.
 void UiScene::layout() {
     if (widgets.empty()) return;
     const Rect scene{0.0f, 0.0f, kSceneWidth, kSceneHeight};
     const size_t n = widgets.size();
-    std::vector<float> value(n * 4, 0.0f);
-    std::vector<uint8_t> state(n * 4, 0);  // 0 not resolved, 1 being resolved, 2 resolved
-    value[2] = kSceneWidth;
-    value[3] = kSceneHeight;
+    const bool first = face_value_.size() != n * 4;
+    if (first) {
+        face_value_.assign(n * 4, 0.0f);
+        face_value_[2] = kSceneWidth;
+        face_value_[3] = kSceneHeight;
+    }
+    std::vector<float>& value = face_value_;
+    std::vector<uint8_t> state(n * 4, first ? 0 : 2);  // 0 not resolved, 1 being resolved, 2 resolved
     for (int f = 0; f < 4; ++f) state[static_cast<size_t>(f)] = 2;
+    bool autosize = false;
 
     std::function<float(int, int)> resolve;
-    std::function<float(int, int)> read;
+    auto target_of = [&](const UiWidget& w, int f) { return w.dock_widget[f] >= 0 ? w.dock_widget[f] : 0; };
+
+    // The extent the string wants, in scene pixels; negative if it does not size the widget that way.
+    auto string_extent = [&](int wi, int orientation) -> float {
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
+        if (!w.string.present || !w.string.style || !w.string.autosize[orientation] || w.cls == "TdUIButtonBarButton") return -1.0f;
+        if (w.dock_face[orientation] < 4 && w.dock_face[orientation + 2] < 4) return -1.0f;  // both faces docked
+        const UiTextStyle& ts = w.string.style->text_for(UiState::Enabled);
+        if (!ts.font || !ts.font->valid()) return -1.0f;
+        if (orientation == 0) {
+            float width = 0.0f;
+            for (const std::string& l : ui_wrap(*ts.font, w.text, 0.0f, false)) width = std::max(width, ts.font->width(l) / view_scale);
+            return width;
+        }
+        const float width = (resolve(wi, 2) - resolve(wi, 0)) * view_scale;
+        const size_t lines = ui_wrap(*ts.font, w.text, width, ts.wrap).size();
+        return static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale * static_cast<float>(std::max<size_t>(lines, 1));
+    };
+    // Auto-sizing moves the far face, or the near one when only the far one is docked.
+    auto sized_face = [&](int wi, int orientation) {
+        const UiWidget& w = widgets[static_cast<size_t>(wi)];
+        return (w.dock_face[orientation + 2] < 4 && w.dock_face[orientation] >= 4) ? orientation : orientation + 2;
+    };
 
     // A Position value as viewport pixels. Right and Bottom are a width and a height from the
     // widget's own Left and Top unless they are in viewport pixels.
@@ -887,47 +925,23 @@ void UiScene::layout() {
             default: return (far_face ? own_origin() : owner_near()) + v * owner_extent();
         }
     };
-    auto target_of = [&](const UiWidget& w, int f) { return w.dock_widget[f] >= 0 ? w.dock_widget[f] : 0; };
-
-    read = [&](int wi, int f) -> float {
+    auto read = [&](int wi, int f) -> float {
         const size_t k = static_cast<size_t>(wi) * 4 + static_cast<size_t>(f);
         if (state[k] == 2) return value[k];
         const UiWidget& w = widgets[static_cast<size_t>(wi)];
         if (w.dock_face[f] < 4) return resolve(target_of(w, f), w.dock_face[f]);
         return resolve(wi, f);
     };
-
-    // The height or width the string wants, in scene pixels; negative if it does not size the widget.
-    auto string_extent = [&](int wi, int orientation) -> float {
-        const UiWidget& w = widgets[static_cast<size_t>(wi)];
-        if (!w.string.present || !w.string.style || !w.string.autosize[orientation] || w.cls == "TdUIButtonBarButton") return -1.0f;
-        if (w.dock_face[orientation] < 4 && w.dock_face[orientation + 2] < 4) return -1.0f;  // both faces docked
-        const UiTextStyle& ts = w.string.style->text_for(UiState::Enabled);
-        if (!ts.font || !ts.font->valid()) return -1.0f;
-        if (orientation == 0) {
-            float width = 0.0f;
-            for (const std::string& l : ui_wrap(*ts.font, w.text, 0.0f, false)) width = std::max(width, ts.font->width(l) / view_scale);
-            return width;
-        }
-        const float width = (resolve(wi, 2) - resolve(wi, 0)) * view_scale;
-        const size_t lines = ui_wrap(*ts.font, w.text, width, ts.wrap).size();
-        return static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale * static_cast<float>(std::max<size_t>(lines, 1));
-    };
-
     resolve = [&](int wi, int f) -> float {
         const size_t k = static_cast<size_t>(wi) * 4 + static_cast<size_t>(f);
         if (state[k] != 0) return value[k];
         state[k] = 1;
         const UiWidget& w = widgets[static_cast<size_t>(wi)];
         const int orientation = f & 1;
-        const float wanted = string_extent(wi, orientation);
-        // Auto-sizing moves the far face, or the near one when only the far one is docked.
-        const bool sizes_near = wanted >= 0.0f && w.dock_face[orientation + 2] < 4 && w.dock_face[orientation] >= 4;
+        const float wanted = autosize && sized_face(wi, orientation) == f ? string_extent(wi, orientation) : -1.0f;
         float out;
-        if (wanted >= 0.0f && f < 2 && sizes_near) {
-            out = resolve(wi, f + 2) - wanted;
-        } else if (wanted >= 0.0f && f >= 2 && !sizes_near) {
-            out = resolve(wi, f - 2) + wanted;
+        if (wanted >= 0.0f) {
+            out = f < 2 ? resolve(wi, f + 2) - wanted : resolve(wi, f - 2) + wanted;
         } else if (w.dock_face[f] < 4) {
             const int target = target_of(w, f);
             const float base = resolve(target, w.dock_face[f]);
@@ -964,8 +978,61 @@ void UiScene::layout() {
         const std::vector<int>& children = widgets[static_cast<size_t>(i)].children;
         for (size_t c = children.size(); c-- > 0;) stack.push_back(children[c]);
     }
-    for (int wi : order) {
-        for (int f = 0; f < 4; ++f) resolve(wi, f);
+    if (first) {
+        for (int wi : order) {
+            for (int f = 0; f < 4; ++f) resolve(wi, f);
+        }
+    }
+
+    // What each face is resolved from, turned round: the faces to resolve again when one moves.
+    std::vector<std::vector<int>> dependents(n * 4);
+    for (size_t wi = 1; wi < n; ++wi) {
+        const UiWidget& w = widgets[wi];
+        const int owner = w.parent < 0 ? 0 : w.parent;
+        for (int f = 0; f < 4; ++f) {
+            const int self = static_cast<int>(wi) * 4 + f;
+            auto needs = [&](int widget, int face) { dependents[static_cast<size_t>(widget) * 4 + static_cast<size_t>(face)].push_back(self); };
+            if (w.dock_face[f] < 4) {
+                needs(target_of(w, f), w.dock_face[f]);
+            } else if (w.pos_type[f] != kPosPixelViewport) {
+                if (f >= 2) needs(static_cast<int>(wi), f - 2);
+                if (w.pos_type[f] == kPosPixelOwner || w.pos_type[f] == kPosPercentOwner) {
+                    needs(owner, f & 1);
+                    if (w.pos_type[f] == kPosPercentOwner) needs(owner, (f & 1) + 2);
+                }
+            }
+        }
+        // A wrapped string's height follows its width.
+        if (w.string.present && w.string.autosize[1]) {
+            dependents[wi * 4 + 0].push_back(static_cast<int>(wi) * 4 + sized_face(static_cast<int>(wi), 1));
+            dependents[wi * 4 + 2].push_back(static_cast<int>(wi) * 4 + sized_face(static_cast<int>(wi), 1));
+        }
+    }
+
+    autosize = true;
+    for (int pass = 0; pass < 4; ++pass) {
+        // The faces the strings size, and everything hanging off them, are open again.
+        std::vector<int> open;
+        for (size_t wi = 1; wi < n; ++wi) {
+            for (int orientation = 0; orientation < 2; ++orientation) {
+                if (string_extent(static_cast<int>(wi), orientation) >= 0.0f) open.push_back(static_cast<int>(wi) * 4 + sized_face(static_cast<int>(wi), orientation));
+            }
+        }
+        if (open.empty()) break;
+        const std::vector<float> before = value;
+        while (!open.empty()) {
+            const int k = open.back();
+            open.pop_back();
+            if (state[static_cast<size_t>(k)] == 0) continue;
+            state[static_cast<size_t>(k)] = 0;
+            for (int d : dependents[static_cast<size_t>(k)]) open.push_back(d);
+        }
+        for (int wi : order) {
+            for (int f = 0; f < 4; ++f) resolve(wi, f);
+        }
+        float moved = 0.0f;
+        for (size_t k = 0; k < value.size(); ++k) moved = std::max(moved, std::fabs(value[k] - before[k]));
+        if (moved < 0.01f) break;
     }
     for (size_t i = 0; i < n; ++i) widgets[i].rect = Rect{value[i * 4], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]};
 }

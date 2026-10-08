@@ -202,6 +202,7 @@ public:
 private:
     friend class UiSystem;
     void draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) const;
+    std::vector<float> face_value_;  // every widget's four faces as last resolved
 };
 
 // Loads scenes and styles. One per front end; it borrows the Assets.
