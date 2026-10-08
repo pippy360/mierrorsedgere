@@ -138,7 +138,9 @@ void PoseEvaluator::apply_aim(const TreeNode& n, size_t node_index, Pose& out) c
             if (which[k] != static_cast<int>(b)) continue;
             Quat4 q;
             Vec3 t;
-            aim_offset(n.aim[k], n.aim_x, n.aim_y, q, t);
+            // AnimNodeAimOffset.GetBoneAtoms: the aim over the profile's range, held to the poses it has.
+            const float x = n.aim_x < 0.0f ? n.aim_x / n.aim_range_neg : n.aim_x / n.aim_range_pos;
+            aim_offset(n.aim[k], std::clamp(x, -1.0f, 1.0f), n.aim_y, q, t);
             crot[b] = Quat4::multiply(q, crot[b]).normalized();
             cpos[b] += t;
             out.rot[b] = Quat4::multiply(prot.conjugate(), crot[b]).normalized();

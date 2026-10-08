@@ -113,6 +113,26 @@ def level_hints(run, names):
             out[i][2] = 1
         if any(s.startswith("hangfree") for s in seen):
             out[i][3] = 1
+    # The swing's angle. The bar is not in the recording, but she hangs SwingPendulumLength (120)
+    # under it: the lowest point of the swing puts the bar 120 above it, and the angle is where she
+    # is on that arc, positive ahead of the bar the way she faces. (The recorded velocity is zero
+    # all through a swing: the move places her.)
+    i = 0
+    while i < n:
+        if run[i]["move"] != 60:
+            i += 1
+            continue
+        j = i
+        while j < n and run[j]["move"] == 60:
+            j += 1
+        low = min(range(i, j), key=lambda k: run[k]["pz"])
+        x0, y0, z0 = run[low]["px"], run[low]["py"], run[low]["pz"] + 120.0
+        for k in range(i, j):
+            d = run[k]
+            yaw = math.radians(d.get("pyaw", 0.0))
+            along = (d["px"] - x0) * math.cos(yaw) + (d["py"] - y0) * math.sin(yaw)
+            out[k].append(("swing", "%.3f" % math.atan2(along, max(1.0, z0 - d["pz"]))))
+        i = j
     # On a pipe or a ladder: the level says, and here the names of what retail plays on it do.
     i = 0
     while i < n:

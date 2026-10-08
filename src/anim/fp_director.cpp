@@ -99,7 +99,9 @@ const MoveAnim kMoveAnims[] = {
     {"hangfreeend", Slot::FullBody, 1.0f, 0.1f, 0.2f, false},
     {"hangfreefoldedendhangfree", Slot::FullBody, 1.0f, 0.0f, 0.2f, false},
     {"hangfoldedendhang", Slot::FullBody, 1.0f, 0.0f, 0.2f, false},
-    // TdMove_GrabTransfer.
+    // TdMove_GrabTransfer (the same turns TdMove_Grab plays by its own rules while hanging).
+    {"hangturnrightstart", Slot::FullBody, 1.0f, 0.2f, 0.1f, false},
+    {"hangturnleftstart", Slot::FullBody, 1.0f, 0.2f, 0.1f, false},
     {"hangfreetransferup", Slot::FullBody, 1.0f, 0.1f, 0.1f, false},
     {"hangtransferup", Slot::FullBody, 1.0f, 0.1f, 0.1f, false},
     {"hangturnjump", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
@@ -204,6 +206,34 @@ void Director::reset() {
     grab_free_turn_ = false;
     shimmy_ = false;
     melee_phase_ = 0;
+    root_offset_ = root_target_ = Vec3(0.0f, 0.0f, 0.0f);
+    root_blend_ = 0.0f;
+    root_timer_ = -1.0f;
+    swing_strength_ = swing_target_ = 0.0f;
+    swing_blend_ = 0.0f;
+}
+
+void Director::set_root_offset(const Vec3& offset, float blend_time) {
+    root_target_ = offset;
+    root_blend_ = blend_time;
+    if (blend_time <= 0.0f) root_offset_ = offset;
+}
+
+void Director::apply_mesh_transform(ViewFrame& view) const {
+    // The root offset is in the root bone's space, so it turns with the body.
+    Vec3 eye = view.eye_pawn + root_offset_;
+    const float angle = swing_angle_ * swing_strength_;
+    if (angle != 0.0f) {
+        // SetPawnRotation: the body turns by the swing's angle about a point 94 above the mesh's
+        // origin (the capsule's centre), feet forward when she is ahead of the bar.
+        constexpr float kPivot = 94.0f;
+        const float c = std::cos(angle), sn = std::sin(angle);
+        const float x = eye.x, z = eye.z - kPivot;
+        eye.x = x * c - z * sn;
+        eye.z = kPivot + x * sn + z * c;
+        view.anim_pitch += angle * RAD2DEG;
+    }
+    view.eye_pawn = eye;
 }
 
 // TdMove_Climb.HandleClimbAction / Climb / OnTimer: one step at a time, hand over hand. A pipe is
@@ -546,6 +576,11 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.6f, 0.2f, true, true);
             break;
         case EMovement::MOVE_Swing:
+            // SetRootOffset(vect(0, -50, -32), AnimBlendTime, BCS_BoneSpace): up 50 and back 32, so the
+            // hands are on the bar; EnableSwingControl.
+            set_root_offset(Vec3(-32.0f, 0.0f, 50.0f), 0.15f);
+            swing_target_ = 1.0f;
+            swing_blend_ = 0.15f;
             tree_.stop_custom_anim(Slot::FullBody, 0.15f);
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.15f);
             if (frame.move_anim.empty()) play(Slot::FullBody, "SwingHardStart", 1.0f, 0.15f, 0.2f);
@@ -566,12 +601,18 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             play(Slot::FullBody, "CrouchSlide", 1.0f, 0.4f, 0.4f);
             break;
         case EMovement::MOVE_RumpSlide:
+            set_root_offset(Vec3(0.0f, 0.0f, 20.0f), 0.3f);  // TdMove_RumpSlide.RootOffset
             set_animation_state(EMovement::MOVE_None);
             play(Slot::FullBody, "crouchslideintoend45", 1.0f, 0.15f, 0.2f);
             break;
         case EMovement::MOVE_Crouch:
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.25f);
             tree_.stop_custom_anim(Slot::LowerBody, 0.25f);
+            // Out of a walk the mesh is lifted 15 for a moment while the capsule drops.
+            if (old == EMovement::MOVE_Walking) {
+                set_root_offset(Vec3(0.0f, 0.0f, 15.0f), 0.1f);
+                root_timer_ = 0.15f;
+            }
             break;
         case EMovement::MOVE_180Turn: {
             // TdMove_180Turn.StartMove: the running turn, or the standing one.
@@ -671,6 +712,15 @@ void Director::tick(const PawnFrame& frame) {
         pawn_.old_movement = EMovement::MOVE_None;
     } else if (frame.movement != pawn_.movement) {
         const EMovement old = pawn_.movement;
+        // TdMove.StopMove: SetRootOffset(vect(0, 0, 0), 0.3); the swing lets go quicker.
+        if (old == EMovement::MOVE_Swing) {
+            set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.1f);
+            swing_target_ = 0.0f;
+            swing_blend_ = 0.25f;
+        } else {
+            set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.3f);
+        }
+        root_timer_ = -1.0f;
         stop_move(old, frame.movement, frame);
         // TdMove.StopMove: ClearAnimationMovementState.
         pawn_.animation_movement = EMovement::MOVE_None;
@@ -691,6 +741,26 @@ void Director::tick(const PawnFrame& frame) {
     }
     time_in_move_ += frame.dt;
 
+    if (root_timer_ >= 0.0f) {
+        root_timer_ -= frame.dt;
+        if (root_timer_ < 0.0f) set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.1f);
+    }
+    if (root_blend_ > frame.dt) {
+        root_offset_ += (root_target_ - root_offset_) * (frame.dt / root_blend_);
+        root_blend_ -= frame.dt;
+    } else {
+        root_offset_ = root_target_;
+        root_blend_ = 0.0f;
+    }
+    if (swing_blend_ > frame.dt) {
+        swing_strength_ += (swing_target_ - swing_strength_) * (frame.dt / swing_blend_);
+        swing_blend_ -= frame.dt;
+    } else {
+        swing_strength_ = swing_target_;
+        swing_blend_ = 0.0f;
+    }
+    if (frame.movement == EMovement::MOVE_Swing) swing_angle_ = frame.swing_angle;
+
     // TdPawn.EnterFallingHeight.
     const bool airborne = is_airborne(frame.movement);
     if (airborne) fall_top_ = airborne_ ? std::max(fall_top_, frame.position.z) : frame.position.z;
@@ -704,7 +774,9 @@ void Director::tick(const PawnFrame& frame) {
             play(Slot::FullBody, tree_.left_leg_forward() ? "SpringBoardRightLeg" : "SpringBoardLeftLeg", 1.0f, 0.15f, 0.25f);
         }
     } else if (!frame.move_anim.empty()) {
-        play_named(frame.move_anim);
+        // Hanging, the turns are TdMove_Grab's own (tick_grab), not something the move names.
+        const bool own = frame.movement == EMovement::MOVE_Grabbing && lower(frame.move_anim).compare(0, 8, "hangturn") == 0;
+        if (!own) play_named(frame.move_anim);
     }
 
     // Letting go of the stick while walking: the legs take the stopping step (native; measured).

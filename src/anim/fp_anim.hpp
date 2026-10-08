@@ -94,6 +94,8 @@ struct TreeNode {
         float trans[9][3];
     };
     std::vector<AimBone> aim;
+    float aim_range_neg = 1.0f, aim_range_pos = 1.0f;  // the profile's HorizontalRange: the Aim.X at which its left and right poses are whole
+    bool aim_from_legs = false;                         // TdAnimNodeAimOffset.bAimSourceIsLegRotation
 
     // State.
     std::vector<float> weight;   // per child
@@ -180,6 +182,14 @@ private:
     int walk_synch_ = -1;  // the AnimNodeSynch that owns it ("MasterSync")
     float land_amount_ = 0.0f;
     float land_time_ = -1.0f;
+    // TdAnimNodeTurn (native; measured): where the legs point, and the standing turn that brings
+    // them round when the view has left them more than 65 degrees behind.
+    float leg_yaw_ = 0.0f;
+    bool leg_yaw_set_ = false;
+    bool turning_ = false;
+    float turn_time_ = 0.0f;
+    float turn_side_ = 0.0f;
+    void tick_turn(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant);
 };
 
 }  // namespace fp

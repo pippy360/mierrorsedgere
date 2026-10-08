@@ -157,7 +157,8 @@ int main(int argc, char** argv) {
         if (eye_file.is_open()) {
             poser.evaluate(director.tree(), pose);
             poser.component_space(pose, comp_pos, comp_rot);
-            const me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg);
+            me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg);
+            director.apply_mesh_transform(v);
             char line[160];
             std::snprintf(line, sizeof line, "%.6f %.3f %.3f %.3f %.3f %.3f %.3f", t, v.eye_pawn.x, v.eye_pawn.y, v.eye_pawn.z, v.anim_pitch,
                           v.anim_yaw, v.anim_roll);

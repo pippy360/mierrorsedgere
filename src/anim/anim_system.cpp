@@ -1515,6 +1515,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         while (look > 180.0f) look -= 360.0f;
         while (look < -180.0f) look += 360.0f;
         fp.view = fp.poser.view(fp.comp_pos, fp.comp_rot, telemetry.pitch_deg, look);
+        fp.director.apply_mesh_transform(fp.view);
         fp.last_time = telemetry.sim_time;
         fp.last_move = telemetry.move_state;
     }
