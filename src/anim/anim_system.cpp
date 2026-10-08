@@ -1492,6 +1492,8 @@ bool AnimSystem::tick_first_person(const PlayerTelemetry& telemetry) const {
         case EMovement::MOVE_MeleeWallrun:
         case EMovement::MOVE_MeleeCrouch:
         case EMovement::MOVE_Snatch:
+        // The skill roll's body and camera are timed together below and in camera_animation().
+        case EMovement::MOVE_SkillRoll:
             return false;
         default:
             return !fp.pose.pos.empty();
