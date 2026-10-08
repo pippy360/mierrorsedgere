@@ -563,6 +563,7 @@ struct LevelActor {
     bool is_trigger = false;
     bool is_zipline = false;
     bool is_ladder = false;
+    bool can_exit_at_top = true;
     bool is_ledge = false;
     bool is_springboard = false;
     bool is_balance_beam = false;

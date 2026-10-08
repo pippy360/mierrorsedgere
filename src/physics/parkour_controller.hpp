@@ -331,6 +331,7 @@ private:
     Vec3 m_climb_top{0.0f, 0.0f, 0.0f};
     Vec3 m_climb_normal{0.0f, 0.0f, 0.0f};
     float m_climb_cooldown = 0.0f;
+    bool m_climb_can_exit_top = true;
     Vec3 m_balance_start{0.0f, 0.0f, 0.0f};
     Vec3 m_balance_end{0.0f, 0.0f, 0.0f};
     float m_balance_lean = 0.0f;

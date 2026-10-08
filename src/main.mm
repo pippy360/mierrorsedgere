@@ -783,13 +783,46 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         const Vec3 climb_top_pos = controller.get_position();
         const bool climb_ok = grabbed_pipe1 && caught_pipe2 && controller.is_grounded() && (climb_top_pos.z >= 4910.0f);
 
-        s13_pass = bal_ok && climb_ok;
+        // 13C. Climb both Tutorial_p TdLadderVolume ladders to the top and verify clean dismount onto top platform:
+        //      - Ladder 1 (Billboard catwalk ladder at (-4202, -1369, 3183..4177), WallNormal=(-1,0,0))
+        //      - Ladder 2 (Rooftop ladder at (1393, -3907, 4191..4437), WallNormal=(-1,0,0))
+        controller.reset(Vec3(-4266.0f, -1369.0f, 3183.0f), 0.0f);
+        bool grabbed_ladder1 = false;
+        bool exited_ladder1 = false;
+        for (int i = 0; i < 420; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_Climb) grabbed_ladder1 = true;
+            if (grabbed_ladder1 && controller.get_move_state() != EMovement::MOVE_Climb &&
+                controller.is_grounded() && controller.get_position().x > -4202.0f &&
+                controller.get_position().z >= 4080.0f) {
+                exited_ladder1 = true;
+                break;
+            }
+        }
+        controller.reset(Vec3(1329.0f, -3907.0f, 4192.0f), 0.0f);
+        bool grabbed_ladder2 = false;
+        bool exited_ladder2 = false;
+        for (int i = 0; i < 180; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            if (controller.get_move_state() == EMovement::MOVE_Climb) grabbed_ladder2 = true;
+            if (grabbed_ladder2 && controller.get_move_state() != EMovement::MOVE_Climb &&
+                controller.is_grounded() && controller.get_position().x > 1393.0f &&
+                controller.get_position().z >= 4340.0f) {
+                exited_ladder2 = true;
+                break;
+            }
+        }
+        const bool ladders_ok = grabbed_ladder1 && exited_ladder1 && grabbed_ladder2 && exited_ladder2;
+
+        s13_pass = bal_ok && climb_ok && ladders_ok;
         std::cout << "  -> Stage 13 Result: " << (s13_pass ? "PASS" : "FAIL")
                   << " (Balance Entered=" << (entered_balance ? "YES" : "NO")
                   << ", Balance End X=" << bal_end_pos.x
                   << ", Pipe1 Grabbed=" << (grabbed_pipe1 ? "YES" : "NO")
                   << ", Pipe2 Caught=" << (caught_pipe2 ? "YES" : "NO")
-                  << ", Roof Exit Z=" << climb_top_pos.z << ")" << std::endl;
+                  << ", Roof Exit Z=" << climb_top_pos.z
+                  << ", Ladder1 TopExit=" << (exited_ladder1 ? "YES" : "NO")
+                  << ", Ladder2 TopExit=" << (exited_ladder2 ? "YES" : "NO") << ")" << std::endl;
     }
 
     bool s14_pass = false;
