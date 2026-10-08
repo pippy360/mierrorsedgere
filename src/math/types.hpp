@@ -383,24 +383,34 @@ enum class EMovement : uint8_t {
     MOVE_Barge = 19,
     MOVE_Landing = 20,
     MOVE_Climb = 21,
+    MOVE_IntoClimb = 22,
     MOVE_180Turn = 24,
     MOVE_180TurnInAir = 25,
     MOVE_LayOnGround = 26,
+    MOVE_IntoZipLine = 27,
     MOVE_ZipLine = 28,
     MOVE_Balance = 29,
     MOVE_LedgeWalk = 30,
     MOVE_GrabTransfer = 31,
     MOVE_MeleeAir = 32,
     MOVE_DodgeJump = 33,
+    MOVE_WallRunDodgeJump = 34,
+    MOVE_Stumble = 35,
     MOVE_StepUp = 37,
     MOVE_RumpSlide = 38,
+    MOVE_Vertigo = 47,
     MOVE_MeleeSlide = 48,
+    MOVE_WallClimbDodgeJump = 49,
     MOVE_WallClimb180TurnJump = 50,
     MOVE_Swing = 60,
     MOVE_Coil = 61,
     MOVE_MeleeWallrun = 62,
+    MOVE_MeleeCrouch = 63,
+    MOVE_FallingUncontrolled = 72,
+    MOVE_SwingJump = 73,
     MOVE_SoftLanding = 78,
     MOVE_AutoStepUp = 81,
+    MOVE_AirBarge = 85,
     MOVE_SkillRoll = 91
 };
 
@@ -428,24 +438,34 @@ inline const char* move_state_name(EMovement m) {
         case EMovement::MOVE_Barge: return "MOVE_Barge";
         case EMovement::MOVE_Landing: return "MOVE_Landing";
         case EMovement::MOVE_Climb: return "MOVE_Climb";
+        case EMovement::MOVE_IntoClimb: return "MOVE_IntoClimb";
         case EMovement::MOVE_180Turn: return "MOVE_180Turn";
         case EMovement::MOVE_180TurnInAir: return "MOVE_180TurnInAir";
         case EMovement::MOVE_LayOnGround: return "MOVE_LayOnGround";
+        case EMovement::MOVE_IntoZipLine: return "MOVE_IntoZipLine";
         case EMovement::MOVE_ZipLine: return "MOVE_ZipLine";
         case EMovement::MOVE_Balance: return "MOVE_Balance";
         case EMovement::MOVE_LedgeWalk: return "MOVE_LedgeWalk";
         case EMovement::MOVE_GrabTransfer: return "MOVE_GrabTransfer";
         case EMovement::MOVE_MeleeAir: return "MOVE_MeleeAir";
         case EMovement::MOVE_DodgeJump: return "MOVE_DodgeJump";
+        case EMovement::MOVE_WallRunDodgeJump: return "MOVE_WallRunDodgeJump";
+        case EMovement::MOVE_Stumble: return "MOVE_Stumble";
         case EMovement::MOVE_StepUp: return "MOVE_StepUp";
         case EMovement::MOVE_RumpSlide: return "MOVE_RumpSlide";
+        case EMovement::MOVE_Vertigo: return "MOVE_Vertigo";
         case EMovement::MOVE_MeleeSlide: return "MOVE_MeleeSlide";
+        case EMovement::MOVE_WallClimbDodgeJump: return "MOVE_WallClimbDodgeJump";
         case EMovement::MOVE_WallClimb180TurnJump: return "MOVE_WallClimb180TurnJump";
         case EMovement::MOVE_Swing: return "MOVE_Swing";
         case EMovement::MOVE_Coil: return "MOVE_Coil";
         case EMovement::MOVE_MeleeWallrun: return "MOVE_MeleeWallrun";
+        case EMovement::MOVE_MeleeCrouch: return "MOVE_MeleeCrouch";
+        case EMovement::MOVE_FallingUncontrolled: return "MOVE_FallingUncontrolled";
+        case EMovement::MOVE_SwingJump: return "MOVE_SwingJump";
         case EMovement::MOVE_SoftLanding: return "MOVE_SoftLanding";
         case EMovement::MOVE_AutoStepUp: return "MOVE_AutoStepUp";
+        case EMovement::MOVE_AirBarge: return "MOVE_AirBarge";
         case EMovement::MOVE_SkillRoll: return "MOVE_SkillRoll";
         default: return "MOVE_Unknown";
     }
@@ -1105,6 +1125,7 @@ struct PlayerTelemetry {
     float reaction_energy = 100.0f;
     bool reaction_active = false;
     bool grounded = true;
+    bool move_input = false;  // the player is pushing a direction (the pawn's Acceleration is not zero)
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

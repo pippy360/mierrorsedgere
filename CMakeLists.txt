@@ -34,6 +34,9 @@ endif()
 # The asset loader and the parkour controller: plain C++, no window, GPU or audio.
 set(CORE_SOURCES
     src/anim/anim_system.cpp
+    src/anim/fp_anim.cpp
+    src/anim/fp_director.cpp
+    src/anim/fp_pose.cpp
     src/assets/upk_loader.cpp
     src/assets/ue3_props.cpp
     src/assets/package_manager.cpp
@@ -53,6 +56,14 @@ target_link_libraries(me_replay PRIVATE ZLIB::ZLIB)
 if(MINGW)
     # no libstdc++ / libgcc DLLs to ship next to it
     target_link_options(me_replay PRIVATE -static)
+endif()
+
+# me_anim: runs the first-person animation tree over a recorded retail run and prints what it
+# plays, to be compared with what retail played (docs/FIRST_PERSON_ANIMATION_RE.md).
+add_executable(me_anim src/tools/anim_main.cpp ${CORE_SOURCES})
+target_link_libraries(me_anim PRIVATE ZLIB::ZLIB)
+if(MINGW)
+    target_link_options(me_anim PRIVATE -static)
 endif()
 
 # The front end ("Press Any Key" and the main menu): its state machine and the CPU reference
