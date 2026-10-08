@@ -1521,6 +1521,28 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             } else if (valid_se) {
                 a.location = ps->vec_val;
                 a.end_point = pe->vec_val;
+                if (a.is_zipline) {
+                    // TdZiplineVolume.SplineLocations (NumSplineSegments = 10): the editor bakes the
+                    // cable as 11 points on the quadratic Bezier Start -> Middle -> End (the cooked
+                    // SplineLocations match (1-t)^2 S + 2t(1-t) M + t^2 E at t = i/10 to 0.001 uu), and
+                    // the native TdMove_ZipLine rides the polyline through them. Without a Middle the
+                    // cable is the straight Start -> End line.
+                    const Vec3 s = ps->vec_val;
+                    const Vec3 e = pe->vec_val;
+                    const Vec3 m = (pm && is_valid_world_vec(pm->vec_val) && pm->vec_val.length_sq() > 1.0f)
+                                       ? pm->vec_val
+                                       : (s + e) * 0.5f;
+                    constexpr int kNumSplineSegments = 10;
+                    a.spline_points.reserve(kNumSplineSegments + 1);
+                    for (int i = 0; i <= kNumSplineSegments; ++i) {
+                        const float t = static_cast<float>(i) / kNumSplineSegments;
+                        a.spline_points.push_back(s * ((1.0f - t) * (1.0f - t)) + m * (2.0f * t * (1.0f - t)) + e * (t * t));
+                    }
+                    if (const auto* pmd = get_prop("MoveDirection");
+                        pmd && is_valid_world_vec(pmd->vec_val) && pmd->vec_val.length_sq() > 0.25f) {
+                        a.move_direction = pmd->vec_val.normalized();
+                    }
+                }
             } else {
                 a.is_zipline = false;
                 a.is_balance_beam = false;

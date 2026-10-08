@@ -120,7 +120,7 @@ Extracted directly from `/Users/tomnom/mirrorsedge/TdGame/Config/DefaultPawnMove
 | `TdMove_Landing` | `SkillRollLandingHeight`<br>`SoftLandingHeight`<br>`HardLandingHeight`<br>`HardLandingDamage` | `200`<br>`300`<br>`530`<br>`15 HP` | Fall height < 200: seamless run.<br>200–530: crouch input triggers skill roll retaining momentum.<br>> 530 without roll: hard landing stumble + damage. |
 | `TdMove_Coil` | `CoilMinTriggerSpeed`<br>`TotalHeightBoost`<br>`HeightBoostDuration`<br>`CoilTime` | `100`<br>`60.0`<br>`0.25 s`<br>`0.5 s` | Mid-air crouch tucks Faith's legs, lifting collision bottom by 60 units to clear fences/pipes. |
 | `TdMove_180Turn` | `TurnTime`<br>`FrictionModifier` | `0.25 s`<br>`0.3` | Instant 180° camera flip retaining backward trajectory for wallrun-jump combos. |
-| `TdMove_ZipLine` | `MinZipVelocity`<br>`MinZipAcceleration` | `300`<br>`400` | Snaps to cable vector, accelerating under gravity. |
+| `TdMove_ZipLine` | `MinZipVelocity`<br>`MinZipAcceleration`<br>`HangOffset.Z` | `300`<br>`400`<br>`-90` | Rides the polyline through `SplineLocations` (the Bezier Start → Middle → End), accelerating with the cable's pitch; stopped at the end wall by the forward impact trace (0.8 s hold, then a drop). See §10. |
 
 ---
 
@@ -476,3 +476,68 @@ Stages 1–7 run on Tutorial_p at the tutorial's own training spots; stage 8 run
   still cast.
 - SSAO in `post_fragment` is screen-space and unchanged.
 - Shadow memory is 2 × 64 MB (was 64 MB). The far map re-renders about once per 1536 UU of travel.
+
+---
+
+## 10. Ziplines follow the cable (agent/zipline-arc, 2026-10-08)
+
+**Bug (user report):** "going down the zipline doesn't follow the arc of the zip line and if it goes for long
+enough I can die".
+
+### 10.1 Root causes
+- **Straight line.** The port rode the chord from `Start` to `End` at up to 850 uu/s. Retail rides the polyline
+  through `TdZiplineVolume.SplineLocations`: 11 points on the quadratic Bezier `Start → Middle → End`. The cables
+  sag up to 391 uu below the chord (Edge_Pt1), so the hands were up to 380 uu off the cable.
+- **Thrown off before the end.** 90 uu before `End` the port let go at 320 uu/s, wherever that was. On the
+  Tutorial and Factory_Pursu_Spt cables that dropped the pawn into a pit.
+- **Void kill.** The checkpoint void check (2200 below the last checkpoint) also ran while riding and after letting
+  go, so a long descent could kill the pawn in the air.
+
+### 10.2 Changes
+- `upk_loader.cpp` bakes the 11 spline points (they match the cooked `SplineLocations` to 0.001 uu) and reads
+  `MoveDirection`.
+- `ParkourController::update_zipline` ports TdMove_ZipLine's native tick (MirrorsEdge.exe `0x1209400`, vtable slot
+  70), then `PHYS_Flying`:
+  - Gravity (800 · |V̂.Z|) is applied. The step, at least `MinZipVelocity`, is steered from the hands back onto the
+    cable and along it.
+  - Acceleration is `max(MinZipAcceleration, 800 · |Dir.Z|)` along the step. Friction is 0.163, fitted to the
+    retail ride.
+  - A box trace ahead of the hands (600, 20, then 2 uu) gives `ZLS_CloseToEnd`, then the impact: `ziplinehitwall`,
+    0.8 s held still with no look input, then a fall.
+  - Past the last spline point the pawn flies off with its speed.
+  - `HitWall`: touching a floor or slope (normal Z > 0.1) knocks the pawn off (TdMove_Stumble, a fall here).
+- `try_initiate_zipline` ports TdMove_IntoZipLine:
+  - **Grab rules:** facing within 90° of `MoveDirection`; outside `LandingStrip` (500, 2D) of the bottom anchor; not
+    the same cable within `SameZipLineRedoMoveTime` (3 s); `RedoMoveTime` 0.5 s.
+  - **Placement:** hands 100 ahead of the nearest point; centre `HangOffset` (90) below the cable, so the feet are 180
+    below (they were 200).
+  - **Velocity:** `slope · |v2d| · max(slope · v̂2d, 0)`, or none when falling faster than `ZVelocityFallLimit`.
+  - **Port differences:** the snap is instant (retail glides for about 0.3 s); the cable can still be grabbed from
+    the ground; a grab needs room for the hanging body. Jump still hops off the cable (retail ignores it). Crouch
+    lets go keeping the ride's velocity.
+- **Camera:** TdMove_ZipLine.UpdateViewRotation's look assist. The view is drawn to `CurrentLookAtPoint`, 600 ahead,
+  until the player turns it.
+- **Void check:** skipped while riding. After letting go, the drop is measured from the exit height until the pawn
+  lands. The respawn position is not touched.
+
+### 10.3 Results
+- **Retail Edge_Pt1 ride** (`recordings/20261002_102817_edge_pt1.jsonl.gz`):
+  - It stops against the wall with the feet at (7046.0, −3356.6, 5988.5). Retail: centre (7046.1, −3356.3, 6078.6),
+    feet 5988.6.
+  - The camera pitch dips to −27.5° about 0.5 s in, then eases as the cable flattens. Retail: −27.5° at 0.55 s.
+  - Top speed is 1730–1800 uu/s (retail 1777–1783).
+- **All 20 cooked cables** (scratch harness: ground grab at u = 0.06, no input):
+  - The hands stay within 3.9 uu of the cable (were 15–380).
+  - Factory_Pursu_Spt no longer dies: the pawn flies off the open end and its fall-height volume catches it.
+  - Tutorial: the ride ends against `BlockingVolume_20` with nothing below, so riding to the end kills (see 10.4).
+  - Subway_RenCo: the ride ends against the anchor (`S_ZipLineBase_01c`) and drops 168. The harness's idle pawn is
+    then shot by the enemies there, before and after this change.
+- **`--verify-all`:** ALL SYSTEMS PASS. Stage 5 rides 1277 u; the Stage 15 drop lands soft.
+
+### 10.4 Remaining gaps
+- **Tutorial cable end.** The end is an invisible BlockingVolume over a drop to z 0, so riding to the end is lethal.
+  Celeste's line (A_VO_SP00_Zip_19_1) is "Make sure you hit the soft target, Faith. Wouldn't want to have to come
+  scrape you up!". Let go with crouch over the red cushion.
+- **Not ported:** the IntoZipLine glide, the `ziplinestart` / `ziplinehitwall` animations and the impact camera.
+- **Trace start overlaps:** while `ZLS_Moving`, the forward trace ignores a box that starts inside geometry. This
+  avoids a false impact at the top anchor.

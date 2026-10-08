@@ -461,18 +461,32 @@ Mirror's Edge replaces traditional UE3 character movement with a discrete state 
 | :--- | :--- | :--- |
 | `AIAimOneShotPenalties` | `{'Easy': 200.0, 'Medium': 200.0, 'Hard': 200.0}` | Configuration parameter |
 | `AiAimPenalties` | `{'Easy': 0.01, 'Medium': 0.1, 'Hard': 0.3}` | Enemy weapon dispersion modifier during move |
-| `MinZipAcceleration` | `400` | Vertical distance in Unreal Units (1 uu = 1 cm) |
-| `MinZipVelocity` | `300` | Vertical distance in Unreal Units (1 uu = 1 cm) |
-| `ZipFadeInTime` | `0.1` | Vertical distance in Unreal Units (1 uu = 1 cm) |
-| `ZipFadeOutTime` | `0.5` | Vertical distance in Unreal Units (1 uu = 1 cm) |
+| `MinZipAcceleration` | `400` | Least acceleration down the cable, uu/s² (the native move uses `max(400, 800 * abs(Dir.Z))`) |
+| `MinZipVelocity` | `300` | Least speed along the cable, uu/s |
+| `ZipFadeInTime` | `0.1` | Zipline sound fade-in, seconds |
+| `ZipFadeOutTime` | `0.5` | Zipline sound fade-out, seconds |
 
 #### `[TdGame.TdMove_IntoZipLine]`
 | Parameter | Exact Value | Mechanical Description |
 | :--- | :--- | :--- |
-| `IntoZiplineBlendInTime` | `0.3` | Vertical distance in Unreal Units (1 uu = 1 cm) |
-| `IntoZiplineBlendOutTime` | `0.2` | Vertical distance in Unreal Units (1 uu = 1 cm) |
-| `RedoMoveTime` | `0.5` | Time in seconds |
-| `ZVelocityFallLimit` | `-600` | Vertical distance in Unreal Units (1 uu = 1 cm) |
+| `IntoZiplineBlendInTime` | `0.3` | Grab animation blend-in, seconds |
+| `IntoZiplineBlendOutTime` | `0.2` | Grab animation blend-out, seconds |
+| `RedoMoveTime` | `0.5` | Time in seconds before a cable can be grabbed again |
+| `ZVelocityFallLimit` | `-600` | Falling faster than this (uu/s) onto the cable drops the horizontal speed carried onto it |
+
+The ride (MirrorsEdge.exe `0x1209400`, TdMove_ZipLine's native tick, then `PHYS_Flying`) follows the polyline through
+`TdZiplineVolume.SplineLocations`: 11 points on the quadratic Bezier `Start → Middle → End`. Each tick, gravity
+(800 · |V̂.Z|) is applied, and the step (at least `MinZipVelocity`) is steered from the hands back onto the cable and
+along it. `HangOffset (0, 0, -90)` holds the pawn's centre 90 below the cable, so its feet are 180 below.
+
+A box trace ahead of the hands (600 → `ZLS_CloseToEnd`, 20 → impact) stops the ride at the end wall. On impact the
+pawn plays `ziplinehitwall`, loses look input for 0.8 s and is held still, then falls. Past the last point it flies
+off with its speed. Grabbing (`TdMove_IntoZipLine.CanDoMove`) needs all of:
+- facing within 90° of `MoveDirection`;
+- at least `LandingStrip` (500, 2D) from the bottom anchor;
+- not the same cable within `SameZipLineRedoMoveTime` (3 s).
+
+The hands go to the cable 100 ahead of the nearest point.
 
 #### `[TdGame.TdMove_Swing]`
 | Parameter | Exact Value | Mechanical Description |
