@@ -49,6 +49,8 @@ struct PawnAnimState {
     int weapon_state = 0;         // TdPawn.WeaponAnimState: 0 unarmed, 1 relaxed, 2 ready, 3 reload, 4 throwing, 5 heavy armed
     float swing_angle = 0.0f;     // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;    // -1 .. 1 off the beam
+    int balance_danger = 0;       // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;         // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     bool hanging_free = false;
     bool climbing_pipe = false;
     int climb_hand = 0;           // 0 left hand up, 1 right
@@ -56,6 +58,7 @@ struct PawnAnimState {
     int grab_turn_type = 0;       // TdPawn.CurrentGrabTurnType: 0 none, 1 start, 2 end, 3 idle
     float look_deg = 0.0f;        // the view's yaw off the body's, positive to the right
     float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
+    float grab_slope_deg = 0.0f;  // how steeply the ledge she hangs from runs up to her right
 };
 
 // One node of the tree: its fixed properties and its state this frame.

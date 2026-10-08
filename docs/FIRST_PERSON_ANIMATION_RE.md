@@ -104,7 +104,9 @@ MOVE_Jump     [["runfwd", 0.3162, 0.7457], ["JumpSlow", 0.0168, 0.1682], ["JumpL
 
 `JumpSlow` is the custom animation `TdMove_Jump.StartJump` played; `JumpLand` is the Jump child of the state node coming in under it; `runfwd` is the walking state going out. These records are what the port's choice of animation is checked against.
 
-**A sample's camera is one frame older than its pawn.** The hook reads the camera out of the frame being presented and the pawn out of the game as it is by then, so `x y z yaw pitch roll` of sample `i` belong with `px py pz cyaw cpitch anim1p` of sample `i - 1`. Compared sample for sample, the camera looks as if it trails the eye by a frame's travel (10 uu at a wall run's 600 uu/s); paired a frame apart it does not (section 7).
+**A sample's camera is up to a frame older than its pawn.** The hook reads the camera out of the frame being presented and the pawn out of the game thread as it is at that moment, and the game thread runs up to a frame ahead of the render thread. So `x y z yaw pitch roll` of sample `i` belong with `px py pz cyaw cpitch anim1p` of sample `i - 1` or of sample `i` itself, in stretches: two thirds of the samples of a typical recording are a frame apart and a third are level (a few, across a hitch, two or three apart). Compared sample for sample the camera seems to trail the eye by a frame's travel (10 uu at a wall run's 600 uu/s) in some stretches and to sit on it in others. `build/re/fpanim/eyelag.py` picks the lag per sample, where she moves fast enough for the choices to differ (section 7).
+
+**Only three sequences a sample.** `anim1p` holds the three heaviest sequence players. On a beam, with two lose-balance poses blending, the lean pose can drop off the list; and the weapon arm's sequences (`standready`, `standfire` ...) never make it, sitting as they do under a per-bone blend. For those the recorder's full tree dump is used (`animdump`, on request: every node with its children's weights).
 
 ## 5. Rules measured on the recordings
 
@@ -130,13 +132,21 @@ What the scripts do not say (the nodes are native) was measured on the nine reco
 
 **Landing.** Every landing goes through `TdMove_Landing.StartMove`. An ordinary one is `LandNormal(GetLandingAmount())` and straight back to walking: `Amount = clamp((fall - 300) / 230, 0.2, 1)`, 0.7 out of a coil, 0.85 for a springboard. It sets `LandNode.Landed` (the dip of the eye and `SpineX`, section 7) and activates the `LandingRun` custom blend: `FallingLandMedium` over the run at `Amount` for `0.6 x Amount` seconds, 0.15 s in and 0.4 s out.
 
-**Close to the ground.** `TdMove_Falling.CloseToGround` (called from native code) lets the jump animation go with `StopCustomAnim(FullBody_Dir, 0.3)`. It fits falling faster than 400 with the ground less than 0.4 s away at that speed.
+**Close to the ground.** `TdMove_Falling.CloseToGround` (called from native code) lets the jump animation go with `StopCustomAnim(FullBody_Dir, 0.3)`. Measured on 21 firings: it fires in a fall when her own box, swept 0.4 s along the velocity, meets something. Landing on level ground that is the drop left being 0.38 to 0.42 of the fall speed; flying at a wall it fired 0.39 s before she hit it; and it fires at any speed (a step off a low ledge fired it 0.17 s in, falling at 240). A ledge she is about to catch counts only if that straight line meets the wall under it, so a fall that arcs down on to a ledge can keep its jump animation to the end.
+
+**A slot's blend time is for a whole blend.** `PlayCustomAnim` and `StopCustomAnim` shorten the time by the weight the channel they blend to already has (`AnimNodeBlendList::SetActiveChild`): the `StopCustomAnim(FullBody_Dir, 0.3)` above, on an animation 0.56 of the way in, took 0.167 s. The state nodes do not do this (shortening theirs too loses 0.3% of the walking frames).
+
+**What a move reads as it starts.** A move's `StartMove` runs before the frame's physics, so the velocity it tests is the frame before's: a jump out of a vault on to a ledge (66 uu/s then, 29 a frame later) is `JumpSlow`, not `JumpStill`.
 
 **The forced state.** `SetAnimationMovementState(State, Delay)` makes the state nodes read `State` instead of the pawn's movement state, at once or after `Delay`; `TdMove.StopMove` clears it, so it never outlives the move that set it.
 
 **Hanging (`TdAnimNodeGrabbing`).** With `d` the view's yaw off the body's and `T` the move's `CurrentGrabTurnType` (0 none, 1 the turn's start, 3 turned, 2 the turn's end): turned past a quarter turn with `T` 2 or 3, the idle of that side shows at once, shared with its "extreme" by how far past, `(|d| - 90) / 90`; with `T` 0 or 1 the node goes back to `Hang` (`HangFree` hanging free: `SetActiveMove` from the script) over 0.2 s; in between it stays as it is. It starts on the hang whenever it regains weight. All 777 frames in which the node has weight fit to 0.005.
 
-**Climbing (`TdAnimNodeClimb`).** The child is the slide while she slides (`bClimbDownFast`), else the still pose of the hand `bClimbLeftHand` says, of the ladder's or the pipe's set; a change blends over 0.2 s. All 580 frames fit to 0.009. Looking back past a quarter turn (`TdMove_Climb.StartTurningAngle`) the look idle of that side takes over, and gives way again under it, over the same 0.2 s: on at 90.2 to 92.8 degrees in a recording made for it (`2_ladder_look`, 99.1% of its frames).
+**Climbing (`TdAnimNodeClimb`).** The child is the slide while she slides (`bClimbDownFast`), else the still pose of the hand `bClimbLeftHand` says, of the ladder's or the pipe's set; a change blends over 0.2 s. All 580 frames fit to 0.009. On a pipe the fast two-rung animation is used while more than one rung is left above her and the plain one for the last (`HandleClimbAction`; 99.5% of the climbing frames with it). Looking back past a quarter turn (`TdMove_Climb.StartTurningAngle`) the look idle of that side takes over, and gives way again under it, over the same 0.2 s: on at 90.2 to 92.8 degrees in a recording made for it (`2_ladder_look`, 99.1% of its frames).
+
+**The beam (`TdAnimNodeBalanceWalk`, `TdAnimNodeBalanceBlend`).** Under a per-bone blend that gives the legs `walkbalancefwd` whatever happens, `BalanceDir` mixes `walkbalancefwd` with `walkbalancefwdleanleft` or `...right` by how far she leans, and `TdAnimNodeBalanceWalk` switches from it to `walkbalancelosebalanceleft` or `...right` while she is losing her balance: in over 0.4 s, back over 0.6 (its `BlendWeight`, as measured). The poses carry the camera: `walkbalancefwd` rolls the view 4.6 degrees (1.6 to 7.1 through the step), the full lean 32, the lose-balance pose 35. From a recording made for it (`5_beam`, 7,855 frames on a beam): she walks it at 245 uu/s (`SpeedModifier` 0.34); a key held leans her that way at 2.0 to 2.7 a second; the lose-balance state comes on about 0.27 s after a key is held from the middle and goes at once when the other key is pressed; 0.8 s of it (`TimeToCounter`) and `TdMove_Balance.Falloff` plays `walkbalancefalloffleft` / `right` (0.3 / 0.3), 1.09 s after the key went down both ways. The fall off animation starts while she is still on the beam, and she is falling 0.27 to 0.30 s later. Stepping on dead in line and left alone, the lean wanders 0.2 to 0.7 either way and she reaches the far end of a 1,740 uu beam every time; stepping on with the view off the line, by 0.7 degrees or by 8, she is over in 3.2 to 3.6 s, mostly to the side away from the turn. On a beam the view turns 31 degrees each way and no further. The balance itself is native (`ControlInfluence` 1.5, `CameraInfluence` 0.3, `GravityInfluence` 0.3, `SpeedInfluence` 2.5 are its numbers); the port's is a fit to those times (a key 2.4 a second, a steady push while the view is off the line, both growing on themselves at `GravityInfluence`, the lose-balance state past 0.65), without the wander.
+
+**The ledge's slope (`TdAnimNodeGrabSlope`).** Under both `Hang` and `HangFree`: the level hang, `hang45right` and `hang45left`. In `hang45right` the right hand is 42 uu lower than the left with the hands 42 apart: the hang from a ledge falling 45 degrees to her right. The node is native and no recording has a sloped ledge; the port mixes the level pose with those straight in the slope.
 
 **The swing (`TdAnimNodeSwing`).** By the move's `SwingAngle` alone, with nothing smoothing it: with `a = clamp(angle / 90 degrees, -1, 1)`, Front `max(a, 0)`, back `max(-a, 0)`, Middle `1 - |a|`. The crossfader under Middle stays at its saved 0.2556 and the camera-bone mask at 0.8013. Three swings, 2,143 frames, every leaf to 0.005. The angle is positive ahead of the bar; the pawn's centre is on a circle of radius 120 (`SwingPendulumLength`) about it, to 0.001.
 
@@ -152,8 +162,8 @@ Where a move picks between animations by what it found in the level, the control
 
 | move | calls |
 | --- | --- |
-| Jump | `StartJump`: forward speed under 5 `JumpStill` (0.15 / 0.15); under `LongJumpNormalThreshold` 500, or with ground within 200 below the point 1.1 x speed ahead, `JumpSlow` (0.1 / 0.2); else `JumpFast`. All on `FullBody_Dir`. Stop: `StopCustomAnim(FullBody_Dir, 0.2)` unless a fall or a vault follows |
-| Falling | off an edge from walking: `JumpAir` (0.3 / 0.2), `JumpStill` going backward. After a dodge jump: state 33. Stop: `FullBody` and `FullBody_Dir` out over 0.2 |
+| Jump | `StartJump`, on the velocity she had before the jump: forward speed under 5 `JumpStill` (0.15 / 0.15); under `LongJumpNormalThreshold` 500, or with ground within 200 below the point 1.1 x speed ahead, `JumpSlow` (0.1 / 0.2); else `JumpFast`. All on `FullBody_Dir`. Stop: `StopCustomAnim(FullBody_Dir, 0.2)` unless a fall or a vault follows |
+| Falling | off an edge from walking: `JumpAir` (0.3 / 0.2); backing off one with room for her under it (`CanStand` a body's height down) the move stops her dead and plays `JumpStill` (0.3 / 0.2), and backing off a lower one it plays nothing. After a dodge jump: state 33. Stop: `FullBody` and `FullBody_Dir` out over 0.2 |
 | SpeedVault / VaultOver | `StopCustomAnim(FullBody_Dir, 0.2)`; `VaultTypes[].AnimName` on `FullBody` (0.15 / 0.2): `autostepuprightleg` (a ledge up to 48), `stepuprightleg88` (48 to 148 with momentum under 200), `VaultOnto`, `VaultOver` (64 to 148), `VaultOverHigh`, `VaultOntoHigh` (145 to 192) |
 | AutoStepUp / StepUp | `autostepuprightleg` at 0.8 (0.15 / 0.25); `vaultonto` (0.15 / 0.25), then `stepup{left,right}leg48`, `stepupleftleg88` at 1.2, `stepup144` (0.15 / 0.1) |
 | SpringBoard | start: `LandNormal` at 0.85. At the foot plant (`ReachedPreciseLocation`): `SpringBoardRightLeg` with the left leg forward, else `SpringBoardLeftLeg` (0.15 / 0.25). Stop: `FullBody` out over 0.1 |
@@ -161,7 +171,7 @@ Where a move picks between animations by what it found in the level, the control
 | WallrunJump | `FullBody` out over 0.2; pushing off hard (`PushSpeed > 0.6`) `WallrunJumpLeft` / `Right`, else `JumpSlow`, on `FullBody_Dir` (0.2 / 0.2); state 11. Stop as Jump |
 | WallClimb | `WallRunVertical` looping at 0.2 (0.2 in); stop over 0.25. 180: `wallrunvertical180turn` (0.2 / 0.1) then `WallrunJumpLeft` (0.1 / 0.2) |
 | DodgeJump | `dodgejumpleft` / `right` (0.1 / 0.2; 0.2 / 0.2 off a wall run) |
-| IntoGrab | plays nothing until the hands are on the ledge (`ReachedPreciseLocation`, just before `SetMove(Grabbing)`), then by where she came from and `IntoGrabSpeed`, her vertical speed when the move started: out of a wall climb's double jump `hanghardstartvertical` (0.2 / 0.2); hanging free `HangFreeHardStart` (0.1 / 0.2); under -1000 `HangHardStart3` with `gethitfront` on `Camera` (0.05 / 0.2); under -600 `HangHardStart2`; else `HangHardStart` (0.1 / 0.2). A folded hang (`CheckForFoldedHang`) plays `HangFoldedStart` (0.2 / 0) with state 3 instead |
+| IntoGrab | plays nothing until the hands are on the ledge (`ReachedPreciseLocation`, just before `SetMove(Grabbing)`), then (on a sloped ledge, `MoveLedgeNormal.Z < 0.999`, the lighter catches go to the `Camera` slot and the others take 0.8 s to leave) by where she came from and `IntoGrabSpeed`, her vertical speed when the move started: out of a wall climb's double jump `hanghardstartvertical` (0.2 / 0.2); hanging free `HangFreeHardStart` (0.1 / 0.2); under -1000 `HangHardStart3` with `gethitfront` on `Camera` (0.05 / 0.2); under -600 `HangHardStart2`; else `HangHardStart` (0.1 / 0.2). A folded hang (`CheckForFoldedHang`) plays `HangFoldedStart` (0.2 / 0) with state 3 instead |
 | Grab | shimmy (`StartShimmy`): one `HangStrafeLeft` / `Right` (`HangFreeStrafeLeft` / `HangFreeStrafe`) a step (0.2 / 0), started again from its first frame while the stick is held; let go, it stops over 0.4 only between 0.1 and 0.25 of the step or past 0.8. Looking back (`UpdateViewRotation`): past a quarter turn `HangTurnRightStart` / `LeftStart` (0.2 / 0.2), the turn type 1 and after 0.2 s 3; back inside it `HangTurnRightEnd` / `LeftEnd` (0.2 / 0.2), type 2 until it ends. Hanging free: `HangFreeTurnRight` / `Left` once past 85.9 degrees. Dropping: `HangEnd` / `HangFreeEnd` (0.1 / 0.2) with state 2 after 0.2 |
 | GrabPullUp | `HangHeaveUp`, `HangFreeHeaveUp`, `HangFoldedHeaveUp`, `...ToCrouch` (0.1 / 0.2) or `Hang(Free)HeaveOver` (0.2 / 0.2); state 3, then 0 (or 15 for the crouching ones) after 0.2 |
 | GrabJump / GrabTransfer | `HangTurnJump` (0.2 / 0.2), state 3; transfer: `HangTurn{Right,Left}Start` (0.2 / 0.1), `hang(free)transferup` (0.1 / 0.1), state 31 |
@@ -169,7 +179,8 @@ Where a move picks between animations by what it found in the level, the control
 | SkillRoll / SoftLanding | `fallinglandroll` with root motion (0.2 / 0.2), state 1 after 0.2; state 25 and `fallinglandintosoftlanding` looping (0.6 in) |
 | Swing / SwingJump | `SwingHardStart(Wide)` (0.15 / 0.2), `Swing180` (0.2 / 0.3), `SwingJumpOff`, `SwingEnd` (0.2 / 0.2); state 60, cleared after 0.3, `SwingOff` |
 | IntoClimb | `PlayStartAnimation`: from a wall run or a transfer `{Pipe,Ladder}ClimbHangStart{Left,Right}` (0.15 / 0.25); falling faster than 800 `...HangStartHard`, than 200 `...HangStart` (0.1 / 0.25); else, on a pipe, `PipeClimbStart` (0.15 / 0.25); always state 21 after 0.15. From the top: `LadderEnterTop` (0.25 / 0.1) |
-| Climb | a step at a time (`HandleClimbAction`, `Climb`): `{Pipe,Ladder}ClimbUp{Left,Right}Hand` on `FullBody` (0.1 / 0.075), the left hand's first, `bClimbLeftHand` turning over 0.1 s into each step; a pipe with more than one rung left uses `PipeClimbUpFast...`, two rungs to the animation. The move flies each 32 uu rung at 96 uu/s (ladder) or 64 (pipe), so a step lasts as long as its animation and the next one starts when it arrives. Down is the slide (`bClimbDownFast`: the stick right back, more than four rungs up; the tree's node shows it) or, near the bottom, a step down: the other hand's up animation at -1. Over the top: `...ExitTop{Right,Left}Hand` with root motion (0.1 / 0.1), state 1 after 0.5. Letting go: `PipeExitBottom` (0.1 / 0.4) |
+| Climb | a step at a time (`HandleClimbAction`, `Climb`): `{Pipe,Ladder}ClimbUp{Left,Right}Hand` on `FullBody` (0.1 / 0.075), the left hand's first, `bClimbLeftHand` turning over 0.1 s into each step; a pipe with more than one rung left above uses `PipeClimbUpFast...`, two rungs to the animation, and `PipeClimbUp...Hand` for the last (down: fast past the second rung). The move flies each 32 uu rung at 96 uu/s (ladder) or 64 (pipe), so a step lasts as long as its animation and the next one starts when it arrives. Down is the slide (`bClimbDownFast`: the stick right back, more than four rungs up; the tree's node shows it) or, near the bottom, a step down: the other hand's up animation at -1. Over the top: `...ExitTop{Right,Left}Hand` with root motion (0.1 / 0.1), state 1 after 0.5. Letting go: `PipeExitBottom` (0.1 / 0.4) |
+| Disarm | `ChooseDisarmType`: from behind `SnatchBack`; from the front `SnatchFwd`, and against a patrol cop's light weapon one of `SnatchFwd`, `SnatchFwd2`, `SnatchFwd3` at random (the TMP: the last two). `StartMove` turns her to the enemy, levels the view (`ResetCameraLook(0.2)`), turns the weapon's grip offsets off and flies her to `DisarmOffset` (125.9) from them at 400 uu/s or her own speed. `PlayDisarmStart`: the weapon's sets go in (`UpdateAnimSets`), the weapon state stays unarmed, and the animation plays on `Canned` (0.1 in, no blend out) out of the weapon's own set or `AS_C1P_OneHanded_Common`: 1.5 to 4.7 s by weapon (2.53 s the one-handed `SnatchFwd`). The move ends when the animation does and the weapon is hers. A miss is `SnatchFail` on `FullBody` (0.1 / 0.4) with root motion |
 | IntoZipLine / ZipLine | `ZiplineStart` (0.2 / 0.4), state 27 after 0.2; letting go `SwingJumpOff` (0.2 / 0.2); `ziplinehitwall` (0.1 / 0.2) |
 | Slide / RumpSlide | `UpperBody` out over 0.1, state 1 then cleared after 0.4, `CrouchSlide` (0.4 / 0.4); stop over 0.2 and `CrouchSlideToCrouch` (0.1 / 0.2), whatever she does next; `crouchslideintoend45` (0.15 / 0.2) |
 | Crouch | start: `FullBody_Dir` and `LowerBody` out over 0.25; stop: `CrouchIntoStand` on `Camera` (0.2 / 0.2) |
@@ -200,7 +211,7 @@ With those, the body is where retail has it. Below is retail looking straight do
 
 Nothing in the tree turns the unarmed arms with the view. Standing, they hang at her sides and are out of sight until she looks nearly straight down; running, the wrists reach about 42 degrees under the horizon at the top of the swing, so with a 90 degree view at 16:9 (29 degrees from the centre to the bottom edge) the hands show when she looks a little down and not when she looks at the horizon. A retail frame of a run at 446 uu/s looking 35 degrees down has no arm in it, and neither does the port's pose for that frame.
 
-Retail's camera looked further back than the eye in a few moves (10 uu in a wall run, 9 on a springboard, 4 to 5 crouched or sliding). That was the recorder: a sample's camera is a frame older than its pawn (section 4), so it trails by the speed over the frame rate. Paired a frame apart, every move's camera is on the eye (the table in section 9).
+Retail's camera looked further back than the eye in a few moves (10 uu in a wall run, 9 on a springboard, 4 to 5 crouched or sliding), and spread 10 to 24 uu in the air. Both were the recorder: a sample's camera is up to a frame older than its pawn (section 4), so it trails by the speed over the frame rate, in stretches. With the lag found per stretch every move's camera is on the eye (the table in section 9), a jump's to 0.1 uu.
 
 Retail (left) and the port's window (right), standing, looking down at about 76 degrees and straight down (`build/re/fpanim/fpshot.py --look`, which turns the port's view with its look keys, I J K L):
 
@@ -213,28 +224,70 @@ Retail (left) and the port's window (right), standing, looking down at about 76 
 
 With both, the port's eye through 2,118 frames of swinging is retail's camera to 0.1 uu and under a tenth of a degree (10th to 90th percentile), where without them it was 131 uu and 69 degrees out.
 
+**A fast change of floor height** does not reach the mesh at once (`TdPawn.SmoothOffset`, `TargetMeshTranslationZ`, `NewFloorSmooth`: native). Retail running a flight of stairs, which is a ramp to the pawn: the eye is 20 uu low going up at 283 uu/s of rise and 19 high coming down at 300 to 470, level again within 0.15 s at either end, and no different from level ground walking the same stairs at 79 uu/s. The port holds back a rise or drop faster than 150 uu/s and lets it out with a time constant of 0.065 s.
+
+**Against a wall** (`TdPlayerPawn.AgainstWallState`, section 8) the view is limited: it stops 27.2 degrees down, standing or crouched, and 44.8 degrees to either side of the way into the wall; two metres out the same view went to 80 down. That limit, and not anything moving the camera, is what keeps the craned camera out of the wall: with it the eye is never nearer than 15 uu. Retail's camera at the wall is where it is in the open, 18.1 to 19.2 uu ahead of the capsule's centre (21.9 while she pushes on, playing `sneakfwd` on the spot), but for the `AgainstWallCam` node: an aim offset whose one pose that is not empty, centre-down, has the `EyeJoint` 12 back, driven by the pitch (`bUsePitch`): 1.2 back measured at 15 degrees down, 3.4 at 27.
+
+**`CheckForCameraCollision`** is the last step of `CalcCamera` for the moves with `bUseCameraCollision` (Walking, Crouch, Slide, Jump, Melee, the wall runs, 180Turn, Vertigo, GrabPullUp, SpeedVault and VaultOver): a 2 uu box swept from 5 behind the camera to 11 ahead along the pawn's facing (15 ahead and 5 up for the first 0.2 s of a crouch or a slide; 20 along the view pulling up; 15 to the side vaulting), and where it meets something `TdPawn.OffsetMeshXY` (native) moves the mesh back by what is missing. Standing at a flat wall it never fires, the capsule keeping the eye 21 uu off and the look limit doing the rest, and no recording shows it firing, so how the offset comes and goes is not measured: the port has it back at once and let out at 60 uu/s. `TdMove_Walking` goes on, away from walls, to stop the view going further down while something is within 15 uu along it.
+
+
 ## 8. With a weapon
 
-None of this could be measured: no retail recording has a weapon in hand (section 10). It is what the scripts and the packages say, run through the same tree.
+What the scripts and the packages say, checked against a retail session recorded for it with a pistol (Colt 1911) and a rifle (G36C) in hand: frames at every 15 degrees of pitch, and the tree dumped at each step (`build/retail/extra/`, pass 4).
 
-**The sequences.** `TdPawn.UpdateAnimSets` fills `Mesh1p.AnimSets`: `[0]` stays `AS_C1P_Unarmed`, `[1]` is the common armed set (`AS_C1P_OneHanded_Common` for a light weapon, `AS_C1P_TwoHanded_Common` for a heavy one) and `[2]` the weapon's own `AnimationSetCharacter1p`. A node's sequence name is looked up in the weapon's set first, then the common one, then the unarmed one, so with a weapon the same tree plays the armed `walkfwd`, `Stand` and the rest wherever a set has one. The armed sets carry 82 bone tracks to the unarmed set's 74 (the weapon bones).
+**The sequences.** `TdPawn.UpdateAnimSets` fills `Mesh1p.AnimSets`: `[0]` stays `AS_C1P_Unarmed`, `[1]` is the common armed set (`AS_C1P_OneHanded_Common` for a light weapon, `AS_C1P_TwoHanded_Common` for a heavy one) and `[2]` the weapon's own `AnimationSetCharacter1p`. A node's sequence name is looked up in the weapon's set first, then the common one, then the unarmed one. The armed sets carry 82 bone tracks to the unarmed set's 74 (the weapon bones).
+
+**Where the arms come from.** Each arm is a per-bone blend of its own, always whole (`ArmedRight` from `SpineXRight` down, `ArmedLeft` from `SpineXLeft`; `Child2Weight` 1 in the package and in every dump). What it lays over the body:
+
+```
+ArmedRight -> AgainstWallState [1, 3] -- Default --> Custom_Weapon (slot) -> WeaponState
+                                      -- against the wall --> againstwall
+ArmedLeft  -> AgainstWallState [1, 2] -- Default --> WeaponType: light -> the body's own; heavy -> Custom_Weapon -> WeaponState
+                                      -- against the wall --> againstwall
+WeaponState: Default -> standready / walkfwdready / runfwdready by walking state; Relaxed, Unarmed, HeavyArmed -> the body's own
+```
+
+So unarmed, relaxed or holstered the arms are the body's; at the ready the right arm is the ready stance (both arms with a heavy weapon), and `standfire` and the reload play over it on `Custom_Weapon`.
 
 **The weapon state** (`TdPawn.WeaponAnimState`: 0 unarmed, 1 relaxed, 2 ready, 3 reloading, 4 throwing away, 5 heavy, 6 holstering):
 
-| when | what |
-| --- | --- |
-| a weapon comes to hand | `unholster` on `CannedUpperBody` (in at once, out over 0.2), state 2 |
-| firing | `StopCustomAnim(Weapon, 0)`, `standfire` on `Weapon` (0.1 in, no blend out), state 2 |
-| reloading | the weapon's reload on `Weapon` (0.2 / 0.2), state 3 |
-| throwing it away | `throwaway` on `CannedUpperBody` (0.1 in), state 4 |
-| `UpdateWeaponAnimState` | a light weapon goes from ready to relaxed after 5 s and 1,000 uu of travel (`AmountTilUnarmed`); a heavy one stays up |
+| when | what | retail |
+| --- | --- | --- |
+| a weapon comes to hand | `unholster` on `CannedUpperBody` (in at once, out over 0.2), state 2 | |
+| firing | `StopCustomAnim(Weapon, 0)`, `standfire` on `Weapon` (0.1 in, no blend out), state 2 | 0.83 of the slot 0.07 s after the shot, all of it 0.56 s in (the G36C's is 0.87 s long), gone a second after |
+| throwing it away | `throwaway` on `CannedUpperBody` (0.1 in), state 4 | playing, 0.47 s in, 0.3 s after the button |
+| `UpdateWeaponAnimState` | a light weapon goes from ready to relaxed after 5 s and 1,000 uu of travel (`AmountTilUnarmed`, counted from when she became ready: `SetWeaponAnimState` does nothing when the state is already the one asked for, so a shot fired at the ready does not start either over); a heavy one stays up | the pistol, 250 uu walked since it came up, a shot, 8 s still: ready throughout, and 750 uu into a run it began to come down; the rifle ready after 6 s still |
 
-`TdAnimNodeWeaponState` maps relaxed, unarmed and heavy to the main tree and everything else to its default child, the ready stances (`standready`, `walkfwdready`, `runfwdready`); it blends over 0.3 s to ready and 2.0 s back. Ready, a pistol is up in the lower right of the view; relaxed, the arm swings with the run and the gun is out of sight.
+`TdAnimNodeWeaponState` blends over 0.3 s to ready and 2.0 s back: in the run above the node was 0.72 ready / 0.28 relaxed 0.55 s after it began.
 
-**The arm.** `ArmedRight` lays the weapon branch over `SpineXRight` and what hangs from it; a heavy weapon adds `ArmedLeft` for the other arm. `TdAnimNodeWeaponPoseOffset` holds a profile of bones for each weapon ("OneHanded-Colt1911", "TwoHanded-G36C" ...): on those bones the pose is offset by the difference between the weapon's own `weaponpose` and the common set's, which is what fits the same stance to each grip. Two light weapons also nudge the right shoulder (`OneHandedRightShoulderTranslationOffset`: the Beretta (0, 0.80, -1.43), the TMP (0, 4, -1)).
+Standing, the ready stance is `standready`; walking `walkfwdready`; running `runfwdready`; crouched and still, `standready` again; sliding, `runfwdready` under the slide. Relaxed, a pistol is out of sight at every pitch: the arm is the body's and swings with the run.
 
-**The aim.** `TdSkelControlAim1p` on `SpineXRight` and `SpineXLeft` turns the armed arm with the view. It is native. The port turns those bones by the view's pitch, one for one, about the mesh's sideways axis, by how far the weapon is at the ready: it keeps the gun on the crosshair, and it is not checked against retail.
+**The grip.** `TdAnimNodeWeaponPoseOffset` holds a profile of bones for each weapon ("OneHanded-Colt1911", "TwoHanded-G36C" ...): on those bones the pose is offset by the difference between the weapon's own `weaponpose` and the common set's, which fits the same stance to each grip. Two light weapons also nudge the right shoulder (`OneHandedRightShoulderTranslationOffset`: the Beretta (0, 0.80, -1.43), the TMP (0, 4, -1)).
 
+**The aim.** `TdSkelControlAim1p` on `SpineXRight` and `SpineXLeft` keeps the armed arm in the view. It is native. In retail's frames the weapon is at the same place on the screen at every pitch from 75 degrees up to 75 down, pistol and rifle both, whether the swan neck has the camera craned out over her feet or not. So the arm, from its spine bone out, is carried rigidly with the camera: turned by the view's pitch about the eye, and moved by what the swan neck moves the camera, by how far the weapon is at the ready. (Turned about its own spine bone, as the port first had it, the pistol sank out of the picture looking down.) Retail above the port for each weapon, at 60 and 30 degrees up, level, 30 and 60 down:
+
+![The pistol and the rifle at five pitches, retail above the port](../screenshots/fp/armed_pitch_retail_vs_port.png)
+
+**The look** is half as fast with a weapon in hand: `TdPlayerInput.PlayerInput` scales `aTurn` and `aLookUp` by the pawn's `GetMobilityMultiplier` (native), and 360 degrees' worth of mouse counts turned retail's view 180.5 with the pistol or the rifle, at the ready or not. (The walk button scales it too, by `WalkButtonMultiplier` 0.3.)
+
+**Picking one up** plays `unholster` at once at full weight for 0.5 s and out over the next 0.2, the ready stance coming in under it over 0.3 s. Spawned with a weapon she has it at the ready from the first frame, with no `unholster` seen.
+
+**Against a wall.** `TdPlayerPawn.AgainstWallState` (native `UpdateAgainstWall`: 0 none, 1 both arms, 2 the left, 3 the right; only in Walking, Crouch and LedgeWalk, `bEnableAgainstWall`) puts the arms it names on `againstwall` and the camera's node on the `AgainstWallCam` aim. Unarmed both palms go flat on the wall; with a pistol the left palm does and the pistol points straight up in the right hand, the ready stance gone while she stands there; she cannot throw a blow (`TdMove_Melee.CanDoMove`) and the idle animations stop. From a recording made for it (`5_wall_camera`, the tree dumped every 0.13 s):
+
+- facing the wall both arms; with the view turned as far off it as it goes there (45 degrees) only the arm of the near shoulder;
+- running at it (435 uu/s) the arms start up 70 to 100 uu before she arrives and are whole 0.15 s after; creeping up to it crouched they start as she arrives;
+- walking away it ends about 0.15 s after she starts (`StopAgainstWall` checks again on a 0.15 s timer), 30 to 40 uu out;
+- the arms' nodes take 0.3 s to the wall and 0.55 back (`BlendWeight` 0.35 and 0.55), the camera's 0.2 either way.
+
+The port finds the wall with a trace from each shoulder along the facing, reaching 8 uu past the capsule and further by 0.14 s of her speed at the wall. Retail's pistol at the fence, the port's, and the port unarmed:
+
+![Against a fence: retail with a pistol, the port with one, the port unarmed](../screenshots/fp/against_wall_retail_vs_port.png)
+
+The port's hands are the animation's alone. Retail also sets `AgainstWallLeftHand` / `RightHand` for the hand IK, which is not run: its left palm is a little lower and nearer the middle and its pistol higher than the port's.
+
+**The disarm** (section 6) through the port's tree, a rifle taken from the front: the canned animation carries the camera with it, and the weapon is in his hands until the move ends (`AttachWeaponToHand` in `StopMove`; 0.8 s in for the Remington and 1.4 for the Neostead, by a timer). No retail recording has a disarm that succeeded (23 scripted tries were punched first; eleven show the miss, `SnatchFail`, 0.77 s in the move).
+
+![The port's disarm of a rifle](../screenshots/fp/disarm_port.png)
 
 ## 9. The port
 
@@ -244,7 +297,7 @@ None of this could be measured: no retail recording has a weapon in hand (sectio
 | `src/anim/fp_director.*` | `fp::Director`: the walking state, each move's calls from section 6, the forced animation state and its timer, the landing, the stopping step, the climb's steps, the shimmy and the look back while hanging, the blows, the weapon state, the swan neck and the hips offset, the root offset and the swing's turn |
 | `src/anim/fp_pose.*` | `fp::PoseEvaluator`: the bones the tree's weights make (list and slot blends, per-bone masks from `Child2PerBoneWeight`, aim offsets over their range, the weapon's grip offsets, the armed arm's turn), and `view()`: the camera of section 7 |
 | `src/anim/anim_system.cpp` | `tick_first_person` runs the tree once per simulated time from the controller's telemetry. `player_camera` puts the world camera on the tree's eye in play. `evaluate_faith_1p` draws the tree's pose from that eye, armed or not; only the disarm (`MOVE_Snatch`) still lays its own arms over the tree's legs |
-| `src/physics/parkour_controller.cpp` | says what its moves chose (below) |
+| `src/physics/parkour_controller.cpp` | says what its moves chose (below); the beam's balance, the against-wall state and its look limits, the camera checks, the floor smoothing, the disarm's alignment and length |
 | `src/tools/anim_main.cpp` | `me_anim`: the tree over a recorded retail run, headless; `--eye` writes the camera, `--bones` where bones are in it |
 | `tools/retail/anim_check.py` | lays what `me_anim` plays next to retail's `anim1p` records and scores it |
 
@@ -256,58 +309,69 @@ What the controller tells the animation, in `PlayerTelemetry`:
 | `ground_distance` | a trace down while falling faster than 400 |
 | `jump_over_gap` | `StartJump`'s trace 1.1 x the speed ahead and 200 down |
 | `move_left`, `hanging_free`, `climbing_pipe` | the dodge's side; no wall for the legs under a ledge; `TdLadderVolume.LadderType` |
-| `swing_angle`, `balance_lean`, `body_yaw_deg`, `move_input` | the swing, the beam, `TdPawn.Rotation.Yaw`, the stick |
+| `swing_angle`, `balance_lean`, `balance_danger`, `body_yaw_deg`, `move_input` | the swing, the beam's lean and lose-balance side, `TdPawn.Rotation.Yaw`, the stick |
+| `climb_top`, `climb_bottom` | how far the ladder goes on (a pipe's last rung) |
+| `ledge_sloped`, `ledge_slope_deg` | the top of the ledge she hangs from |
+| `against_wall` | `AgainstWallState` |
+| `camera_mesh_offset` | where `OffsetMeshXY` and the floor smoothing have the mesh, and the eye in it |
+| `snatch_weapon_attached` | whether the disarmed weapon is in her hand yet |
 
 `python -m tools.retail.anim_check` over the nine recordings:
 
 | | frames | same lead sequence | weight in common |
 | --- | --- | --- | --- |
-| all | 80,238 | 96.7% | 96.8% |
-| Walking | 63,877 | 97.2% | 97.6% |
+| all | 80,238 | 97.2% | 97.4% |
+| Walking | 63,877 | 97.3% | 97.6% |
 | Swing | 2,226 | 99.9% | 99.9% |
-| Falling | 2,104 | 82.5% | 84.3% |
-| Grabbing | 2,037 | 90.5% | 89.1% |
-| VaultOver | 1,891 | 96.5% | 96.3% |
-| Jump | 1,583 | 96.1% | 96.3% |
-| Climb | 1,333 | 97.7% | 97.5% |
-| FallingUncontrolled | 1,085 | 99.4% | 99.4% |
-| WallRunning left / right | 810 | 95.6% / 98.7% | 95.3% / 98.4% |
+| Falling | 2,104 | 93.7% | 93.0% |
+| Grabbing | 2,037 | 90.5% | 89.0% |
+| VaultOver | 1,891 | 96.9% | 96.4% |
+| Jump | 1,583 | 98.0% | 98.1% |
+| Climb | 1,333 | 99.5% | 99.4% |
+| FallingUncontrolled | 1,085 | 99.9% | 99.9% |
+| WallRunning left / right | 810 | 95.8% / 99.3% | 95.7% / 99.0% |
 | GrabPullUp | 471 | 97.2% | 97.0% |
-| Balance | 427 | 97.9% | 68.5% |
+| Balance | 427 | 97.9% | 99.8% |
 | SpringBoarding | 416 | 100% | 99.9% |
-| ZipLine, Landing, Slide, WallRunJump, SwingJump | 1,010 | 100% | 99.6% to 99.9% |
+| ZipLine, Landing, Slide, WallRunJump, SwingJump | 1,010 | 100% | 99.3% to 99.9% |
 | WallClimbing | 169 | 89.9% | 89.1% |
-| IntoGrab | 113 | 68.1% | 76.2% |
-| Crouch | 106 | 95.3% | 93.3% |
+| IntoGrab | 113 | 77.0% | 81.3% |
+| Crouch | 106 | 95.3% | 93.1% |
 
-A recording has the pawn but not the level or the stick, so the check gives the director what the controller gives it in the game, taken from the recording itself: the height above the ground from where the fall ends; the swing's angle from where she is on the arc; pipe or ladder, the vault, catch and heave variants and the long jump's gap from the names of what retail went on to play; the stick's release from the stopping step it plays. The hints never say when or how an animation plays, except the release. `--no-hints` runs without them. The climb's steps, the shimmy, the turns and the hang's look back are not hinted: they come out of the pawn's movement and view by the rules above.
+And over the recordings made for single things (`build/retail/extra/`): the beam (`3_balance_beam`) 95.6% / 98.7% of 7,855 frames on it; the wall (`5_wall_camera`) 95.5% / 95.4% walking and 96.1% / 97.5% crouched; the stairs 100% / 99.7%; standing and crouched turns 97.1%; the ladder 99.1%.
 
-The camera, by `build/re/fpanim/eyecheck.py` on a recording (`20260925_160622`), retail's camera against the port's eye a frame earlier (section 4), retail minus port, median and (10th to 90th percentile spread); 94 is the mesh's origin under the capsule's centre, 65 with the crouched capsule:
+A recording has the pawn but not the level or the stick, so the check gives the director what the controller gives it in the game, taken from the recording itself: the height above the ground from where the fall ends; the swing's angle from where she is on the arc; pipe or ladder, the vault, catch and heave variants and the long jump's gap from the names of what retail went on to play; the stick's release from the stopping step it plays. A fall's hint is how far along her velocity the first thing in the way is (the ground it ends on, or the wall she flies into); a ladder's, how far up its last step is, where she goes over the top. On a beam the lean and the lose-balance state are the player's doing and are read off retail's own balance nodes, so what is compared there is the blending. The hints never say when or how an animation plays, except the release. `--no-hints` runs without them. The climb's steps, the shimmy, the turns and the hang's look back are not hinted: they come out of the pawn's movement and view by the rules above.
+
+The camera, by `build/re/fpanim/eyelag.py` on a recording (`20260925_160622`), retail's camera against the port's eye with the lag found per stretch (section 4: 68% of this one's samples a frame apart, 30% level), retail minus port, median and (10th to 90th percentile spread); 94 is the mesh's origin under the capsule's centre, 65 with the crouched capsule:
 
 | move | frames | forward | up | pitch | roll |
 | --- | --- | --- | --- | --- | --- |
-| Walking | 2,138 | 0.0 (0.9) | -94.0 (2.2) | 0.0 (0.2) | 0.0 (1.3) |
-| Climb | 243 | 0.0 (0.7) | -94.0 (2.7) | 0.0 (0.9) | 0.0 (0.4) |
-| Falling | 176 | 0.0 (23.7) | -98.0 (15.6) | 0.0 (1.2) | 0.0 (0.5) |
-| Jump | 157 | 0.0 (11.3) | -94.0 (10.1) | 0.0 (3.8) | 0.0 (1.0) |
-| Grabbing | 146 | 0.0 (0.1) | -94.0 (0.2) | 0.0 (6.7) | 0.0 (1.4) |
-| VaultOver | 108 | 0.0 (1.0) | -94.1 (1.8) | 0.0 (1.1) | 0.0 (0.5) |
-| GrabPullUp | 94 | 0.4 (1.4) | -93.5 (2.1) | 0.3 (2.1) | 0.1 (1.1) |
-| WallRunning left | 87 | 0.0 (9.8) | -94.0 (5.6) | 0.0 (1.1) | 0.0 (0.8) |
-| SpringBoarding | 83 | 0.1 (6.6) | -94.0 (9.1) | 0.2 (5.0) | 0.1 (1.2) |
-| Slide | 61 | 0.0 (6.7) | -65.0 (2.8) | 0.0 (0.6) | 0.0 (0.0) |
-| Crouch | 52 | 0.0 (0.9) | -65.0 (0.5) | 0.0 (0.0) | 0.0 (0.0) |
+| Walking | 2,139 | 0.0 (0.1) | -94.0 (1.6) | 0.0 (0.0) | 0.0 (1.2) |
+| Climb | 243 | 0.0 (1.6) | -94.1 (2.2) | 0.0 (1.3) | 0.0 (0.3) |
+| Falling | 175 | 0.0 (10.1) | -94.0 (0.7) | 0.0 (0.0) | 0.0 (0.5) |
+| Jump | 154 | 0.0 (0.1) | -94.0 (0.1) | 0.0 (0.0) | 0.0 (1.0) |
+| Grabbing | 146 | 0.0 (0.6) | -94.0 (0.8) | 0.0 (0.1) | 0.0 (1.4) |
+| VaultOver | 108 | 0.0 (1.0) | -94.0 (2.0) | 0.0 (1.1) | 0.0 (0.5) |
+| GrabPullUp | 94 | 0.0 (1.2) | -94.1 (1.9) | 0.0 (2.9) | 0.0 (1.1) |
+| WallRunning left | 86 | 0.0 (0.0) | -94.0 (0.5) | 0.0 (2.2) | 0.0 (0.8) |
+| SpringBoarding | 84 | 0.0 (0.1) | -94.0 (3.1) | 0.6 (2.1) | 0.1 (0.6) |
+| Slide | 62 | 0.0 (1.6) | -65.0 (2.6) | 0.0 (0.0) | 0.0 (0.0) |
+| Crouch | 52 | 0.0 (0.9) | -65.0 (0.5) | 0.0 (0.1) | 0.0 (0.0) |
 | Swing (`20260926_164012`) | 2,118 | 0.0 (0.1) | -94.0 (0.1) | 0.0 (0.0) | 0.0 (0.0) |
+
+(The lag is picked as the one that puts the camera nearest the port's eye, so half a frame's travel or more of real error would hide in it; the choice is only made where she moves 3 uu a frame.) What is left in Falling is the falls that end on a ledge, below.
 
 ## 10. Not done, and not established
 
-- **A weapon in hand has no retail recording**, and neither has the balance beam's lean or its lose-balance poses. Both were attempted for this pass and stopped at a Steam prompt on launch that is the owner's to answer, not a capture script's. So section 8 is the scripts run, not retail measured: the aim control above all (`TdSkelControlAim1p` is native; the port's one-for-one pitch turn is a stand-in), then the blend back from `standfire`, and the shoulder offsets' axes. The balance's lean is driven by the controller's own lean, which nothing checks (the low "weight in common" for Balance above), and the lose-balance poses are not played.
-- **The skeletal controls** other than the root offset, the hips offset, the swing control and the armed arm's turn are not run: the lazy springs, limb IK (the hands on a sloped ledge), foot placement.
-- **Nodes without a recording:** the ledge slope children (`hang45...`), hanging free beyond its start, `AgainstWallState`.
-- **The camera against walls.** `CheckForCameraCollision` and the mesh's `OffsetMeshXY` are not run.
-- **The camera's spread in the air.** The medians are on the eye, but a fall out of a walk, a jump and a wall run spread 10 to 24 uu forward in the table above; one stretch of falling sits about 15 back. Not established.
-- **Falls that end on a ledge.** `CloseToGround` lets the jump animation go before a ledge catch too; a recording does not say how far the ledge was, so the check holds the jump animation too long there (the IntoGrab and Falling rows). In the game the controller's trace decides it.
+- **The hand IK and the other skeletal controls** are not run: the hands set on the wall or on a sloped ledge (`AgainstWallLeftHand`, `EnableGrabIK`), the lazy springs, foot placement. Against a wall the port's hands are where the animation has them, a little off retail's (the figure in section 8).
+- **A disarm that succeeds has no retail recording.** The port's is the scripts run: which animation, on which slot, for how long, 125.9 uu from the enemy, the weapon changing hands as the move ends. How the canned slot is let go at the end is a guess (0.2 s), and the enemy's side of it is the port's own.
+- **`OffsetMeshXY`.** No recording has the camera check firing, so how fast the mesh goes back and comes forward again is not measured.
+- **The beam's balance** is a fit to times, not the native model: retail's lean wanders as she walks and the port's does not, and which way she goes over with the view off the line is retail's most common, not a rule.
+- **A sloped ledge** has no recording: the slope node's mix and the catch on the camera slot are the scripts' and the poses' own.
+- **The floor smoothing** is fitted to one staircase at two speeds: the 150 uu/s under which nothing is held back is somewhere between the 89 that showed nothing and the 283 that showed 20 uu.
+- **The rifle's `standfire`** was gone 0.65 s after the shot where the sequence is 0.87 s long; the port plays it to its end. The reload key did nothing with the rifle in retail; the pistol's `Reload` played for 2.26 s.
+- **With a weapon, up against a wall,** the scripts stop the weapon firing (`TdWeapon.ShouldRefire`); the port does not.
+- **Falls that end on a ledge.** `CloseToGround` fires for a ledge when the line along her velocity meets the wall under it, and a recording does not say where that wall is, so the check gives no hint there and holds the jump animation to the catch (what is left of the IntoGrab and Falling rows). In the game the controller's sweep decides it.
 - **The stopping step's leg** is the other one in 12 of 101 stops (the rule itself misses 6 on retail's own cycle): the port's walk cycle is more than a twentieth of a cycle off retail's at 8 of them.
-- **A pipe's last rung** is climbed with the fast animation in the game; retail uses the plain one when a single rung is left.
-- **On screen**, the port's window has been compared with retail looking down (section 7) and looked at armed and in a melee; the hang's look back and the turns are checked through `me_anim` against the recordings, not by eye in the running port.
+- **On screen**, the port's window has been compared with retail looking down (section 7), with the pistol and the rifle at five pitches and against a fence (section 8), and looked at through a disarm and a melee; the hang's look back and the turns are checked through `me_anim` against the recordings, not by eye in the running port.
 - The tracked `screenshots/oracle_*.png` and `tutorial_*.png` are the Windows (Direct3D 11) build's, from `--verify-all`.

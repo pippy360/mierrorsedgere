@@ -1668,7 +1668,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t ei = 0; ei < active_scene.enemies.size(); ++ei) {
                 if (!impl_->frame_enemy_draws[ei].in_view) continue;
                 const auto& bot = active_scene.enemies[ei];
-                bind_world_char_wep_textures(bot.weapon_name, impl_->frame_enemy_draws[ei].archetype_id);
+                bind_world_char_wep_textures(bot.disarm_weapon.empty() ? bot.weapon_name : bot.disarm_weapon, impl_->frame_enemy_draws[ei].archetype_id);
                 Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
                 std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                 uniforms.is_runner_vision = 0.0f;

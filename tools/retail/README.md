@@ -45,7 +45,8 @@ python -m tools.retail.intro_check compare
 
 * `intro_capture` restarts the game once per chapter and points `[URL] Map` / `LocalMap` of your `TdEngine.ini` at it for each launch, putting them back at the end. It copies the save folder first and compares it afterwards. Do not run it while something else is driving the game.
 * A camera position in any retail trace is 10 uu ahead of the eye, along the view direction: the hook solves it out of the view-projection, whose depth column carries the near plane. `intro_check` takes it out; anything else that compares camera positions has to as well.
-* A sample's camera fields (`x y z yaw pitch roll`) are one frame older than its pawn fields (`px py pz`, `cyaw cpitch`, `anim1p`): the hook reads the camera out of the frame being presented and the pawn out of the game as it is by then. Sample for sample the camera seems to trail the pawn by a frame's travel (10 uu at 600 uu/s); pair camera `i` with pawn `i - 1`.
+* A sample's camera fields (`x y z yaw pitch roll`) are up to a frame older than its pawn fields (`px py pz`, `cyaw cpitch`, `anim1p`): the hook reads the camera out of the frame being presented and the pawn out of the game thread as it is at that moment, which runs up to a frame ahead. In stretches the two are a sample apart (about two thirds of a recording) and in others level; across a hitch two or three apart. Sample for sample the camera then seems to trail the pawn by a frame's travel (10 uu at 600 uu/s). Anything that compares the two has to find the lag per stretch.
+* `anim1p` is the three heaviest sequence players and no more. A sequence under a per-bone blend's target (the weapon arm's `standready`, `standfire`) does not show in it at all.
 * For about six seconds at the start of a chapter the trace's yaw and pitch read 0 and 90, and no sound is logged for the first second or so.
 
 ## 2. Replay

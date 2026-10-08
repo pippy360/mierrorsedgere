@@ -708,6 +708,10 @@ struct EnemyBot {
     bool disarm_window = false;
     float attack_timer = 0.0f;
     std::string weapon_name = "Colt1911";
+    // The weapon still in his hands while it is being taken off him, and for how much longer
+    // (TdMove_Disarm: hers is attached to her hand only as the move ends, a shotgun's part way in).
+    std::string disarm_weapon;
+    float disarm_weapon_time = 0.0f;
     EEnemyAnimState anim_state = EEnemyAnimState::Idle;
     std::string active_anim_seq;
     float anim_timer = 0.0f;
@@ -1137,10 +1141,17 @@ struct PlayerTelemetry {
     bool jump_over_gap = false;     // TdMove_Jump.StartJump: nothing to land on 1.1 x the speed ahead
     bool move_left = false;         // a dodge jump going left
     bool hanging_free = false;      // hanging with no wall for the legs
+    Vec3 camera_mesh_offset{0.0f, 0.0f, 0.0f};  // TdPawn.OffsetMeshXY: the first-person mesh, and the eye in it, kept off a wall
+    bool ledge_sloped = false;      // TdMove_Grab.bSlopedLedge: the ledge's top is not level
+    float ledge_slope_deg = 0.0f;   // how steeply the ledge runs up to her right
     float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
     float body_yaw_deg = 0.0f;      // TdPawn.Rotation.Yaw: where the body faces while the view looks round
     bool climbing_pipe = false;     // the ladder volume being climbed is a pipe
+    float climb_top = -1.0f;        // uu up to the ladder's last step (-1 off a ladder)
+    float climb_bottom = -1.0f;     // uu down to its first
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
+    int balance_danger = 0;         // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;           // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;
@@ -1155,6 +1166,7 @@ struct PlayerTelemetry {
     float combat_anim_duration = 0.6f;
     int melee_variant = 0;
     bool snatch_from_back = false;
+    bool snatch_weapon_attached = true;  // TdMove_Disarm: the weapon is in her hand yet (AttachWeaponToHand)
     bool melee_hit_confirmed = false;
     bool disarm_prompt_visible = false;
     float hit_marker_timer = 0.0f;

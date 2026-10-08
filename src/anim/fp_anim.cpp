@@ -304,6 +304,11 @@ void AnimTree::set_active(TreeNode& n, int child, float blend_time) {
     if (child < 0 || static_cast<size_t>(child) >= n.weight.size()) child = 0;
     for (size_t c = 0; c < n.target.size(); ++c) n.target[c] = static_cast<int>(c) == child ? 1.0f : 0.0f;
     n.active = child;
+    // A slot's time is for a whole blend, and a channel that already has weight has that much less
+    // to go. Measured: StopCustomAnim(FullBody_Dir, 0.3) on an animation 0.56 of the way in took
+    // 0.167 s. The state nodes do not shorten theirs (scaling them too loses 0.3% of the
+    // walking frames).
+    if (blend_time > 0.0f && n.kind == TreeNode::Kind::Slot) blend_time *= 1.0f - std::clamp(n.weight[static_cast<size_t>(child)], 0.0f, 1.0f);
     n.blend_to_go = blend_time;
     if (blend_time <= 0.0f) n.weight = n.target;
 }
@@ -480,6 +485,18 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         for (size_t k = 0; k < n.state_mapping.size(); ++k) {
             if (n.state_mapping[k] == pawn.weapon_state) want = static_cast<int>(k) + 1;
         }
+    } else if (n.cls == "TdAnimNodeAgainstWallState") {
+        // Three of them, by TdPlayerPawn.AgainstWallState (0 none, 1 both hands on the wall, 2 the
+        // left, 3 the right): one under each arm's per-bone blend, whose listed states put that arm
+        // on `againstwall`, and one for the camera, on its Default (the AgainstWallCam aim node)
+        // in every state but 0. Up against a fence retail has the left palm flat on it and the
+        // pistol pointing up in the right hand. To the wall takes 0.35 s, back 0.55 (BlendWeight).
+        want = 0;
+        for (size_t k = 0; k < n.state_mapping.size(); ++k) {
+            if (n.state_mapping[k] == pawn.against_wall) want = static_cast<int>(k) + 1;
+        }
+        const size_t w = static_cast<size_t>(want);
+        blend = w < n.blend_in.size() ? n.blend_in[w] : (want == 0 ? 0.55f : 0.35f);
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;
@@ -492,6 +509,21 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
             n.weight[0] = std::max(a, 0.0f);
             n.weight[1] = 1.0f - std::fabs(a);
             n.weight[2] = std::max(-a, 0.0f);
+            n.target = n.weight;
+            n.blend_to_go = 0.0f;
+        }
+        return;
+    } else if (n.cls == "TdAnimNodeGrabSlope") {
+        // Hang, Hang45 (hang45right), Hang45m (hang45left): the level hang and the two it leans
+        // into on a ledge that runs up to one side. In hang45right the right hand is 42 uu under
+        // the left with the hands 42 apart, so it is the hang from a ledge falling 45 degrees to
+        // her right, and hang45left its mirror. The node is native and in no recording: taken as
+        // straight in the slope between the level pose and those.
+        if (n.weight.size() >= 3) {
+            const float a = std::clamp(pawn.grab_slope_deg / 45.0f, -1.0f, 1.0f);
+            n.weight[0] = 1.0f - std::fabs(a);
+            n.weight[1] = std::max(-a, 0.0f);
+            n.weight[2] = std::max(a, 0.0f);
             n.target = n.weight;
             n.blend_to_go = 0.0f;
         }
@@ -532,8 +564,11 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         else if (pawn.look_deg > 90.0f && n.weight.size() > 7) want = 7;
         else want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
     } else if (n.cls == "TdAnimNodeBalanceWalk") {
-        // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
-        want = 1;
+        // Danger Left, Default, Danger Right, Crouch. Retail on a beam: the lose-balance pose of the
+        // side she is going over comes in over 0.4 s and, countered, goes out over 0.6 (the node's
+        // BlendWeight, as measured); it is at full weight for the last 0.4 s before she falls.
+        want = pawn.balance_danger < 0 ? 0 : pawn.balance_danger > 0 ? 2 : 1;
+        blend = want == 1 ? 0.6f : 0.4f;
     } else if (n.cls == "TdAnimNodeBalanceBlend") {
         // Left, Middle, Right: by how far she leans off the beam.
         if (n.weight.size() >= 3) {
@@ -721,7 +756,9 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 // A bone mask: the source is always whole underneath.
                 if (n.weight.size() >= 2) {
                     n.weight[0] = 1.0f;
-                    n.weight[1] = n.name == "ArmedLeft" ? pawn.armed_left : (n.name == "ArmedRight" ? pawn.armed_right : n.child2_weight);
+                    // (ArmedLeft and ArmedRight too: each arm is always its own branch, which is the
+                    // body's own again unless the weapon's stance or the wall has it.)
+                    n.weight[1] = n.child2_weight;
                 }
                 break;
             case TreeNode::Kind::Passthrough:
@@ -747,6 +784,13 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                     }
                     const float step = dt / 0.1f;  // DirInterpTime
                     n.aim_x = n.aim_x < want ? std::min(n.aim_x + step, want) : std::max(n.aim_x - step, want);
+                }
+                if (n.cls == "TdAnimNodeDirBone" && n.name == "AgainstWallCam") {
+                    // bUsePitch, and the one pose that is not empty is centre-down: the EyeJoint 12
+                    // back. Against a wall retail's camera is 1.2 back looking 15 degrees down and
+                    // 3.4 back at 27, where the look stops: the pitch over a quarter turn.
+                    n.aim_x = 0.0f;
+                    n.aim_y = std::clamp(pawn.view_pitch_deg / 90.0f, -1.0f, 1.0f);
                 }
                 if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;

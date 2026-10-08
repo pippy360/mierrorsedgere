@@ -13,6 +13,24 @@ namespace {
 // cylinder ("sweep out the axis aligned bounding box of just the CollisionComponent").
 constexpr float kPawnRadius = 30.0f;
 constexpr float kPawnHeight = 180.0f;
+
+// SequenceLength of the first-person disarm animations: the weapon's own set where it has them
+// (AS_C1P_TwoHanded_*), else AS_C1P_OneHanded_Common's.
+float snatch_length(const std::string& weapon, const std::string& anim) {
+    struct Row { const char* weapon; float fwd, back; };
+    static const Row kOwn[] = {
+        {"FNMinimi", 3.8667f, 4.6667f}, {"FNSCARL", 2.3333f, 1.5f}, {"G36C", 2.3333f, 1.5f}, {"M95", 2.1f, 1.5f},
+        {"MP5K", 2.5333f, 1.5f}, {"Neostead", 2.4333f, 1.5f}, {"Remington", 1.5f, 1.9333f},
+    };
+    const bool back = anim == "SnatchBack";
+    for (const Row& r : kOwn) {
+        if (weapon.find(r.weapon) != std::string::npos) return back ? r.back : r.fwd;
+    }
+    if (back) return 1.9667f;
+    if (anim == "SnatchFwd2") return 2.1f;
+    if (anim == "SnatchFwd3") return 2.0333f;
+    return 2.5333f;
+}
 constexpr float kCrouchHeight = 122.0f;
 // Camera heights above the feet: BaseEyeHeight 76 above the cylinder centre (90) when standing;
 // the crouch / slide cameras ride the lowered first-person skeleton.
@@ -345,6 +363,15 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.combat_anim_duration = 0.45f;
     m_telemetry.melee_variant = 0;
     m_telemetry.snatch_from_back = false;
+    m_cam_mesh_offset = Vec3(0.0f, 0.0f, 0.0f);
+    m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+    m_mesh_smooth_z = 0.0f;
+    m_smooth_was_walking = false;
+    m_cam_constrain_look = false;
+    m_snatch_align = false;
+    m_against_wall = 0;
+    m_against_wall_off = 0.0f;
+    m_telemetry.against_wall = 0;
     m_telemetry.melee_hit_confirmed = false;
     m_telemetry.disarm_prompt_visible = false;
     m_telemetry.hit_marker_timer = 0.0f;
@@ -685,9 +712,27 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             }
 
             case EMovement::MOVE_Snatch: {
-                // Smoothly damp velocity during weapon disarm animation (SnatchFwd / SnatchBack)
-                m_telemetry.velocity.x *= std::max(0.0f, 1.0f - 10.0f * step_dt);
-                m_telemetry.velocity.y *= std::max(0.0f, 1.0f - 10.0f * step_dt);
+                // TdMove_Disarm: she has no velocity of her own; AlignPawn flies her to DisarmOffset
+                // from the enemy (SetPreciseLocation), where the two canned animations meet.
+                if (m_snatch_fail) {
+                    m_telemetry.velocity.x *= std::max(0.0f, 1.0f - 4.0f * step_dt);
+                    m_telemetry.velocity.y *= std::max(0.0f, 1.0f - 4.0f * step_dt);
+                } else {
+                    m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+                }
+                if (m_snatch_align) {
+                    Vec3 to = m_snatch_target - m_telemetry.position;
+                    to.z = 0.0f;
+                    const float dist = to.length();
+                    const float step = m_snatch_speed * step_dt;
+                    if (dist <= step) {
+                        if (dist > 1e-3f) move_swept(to, kPawnHeight, 0.0f, scene);
+                        m_snatch_align = false;
+                    } else if (move_swept(to * (step / dist), kPawnHeight, 0.0f, scene).hit) {
+                        m_snatch_align = false;  // something in the way (retail moves the enemy instead)
+                    }
+                }
+                if (m_state_timer >= m_snatch_attach) m_telemetry.snatch_weapon_attached = true;
                 if (m_state_timer >= m_telemetry.combat_anim_duration) {
                     m_telemetry.move_state = m_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
                 }
@@ -800,11 +845,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                     m_telemetry.velocity.x *= 0.5f;
                     m_telemetry.velocity.y *= 0.5f;
                 } else if (from == EMovement::MOVE_Walking && m_telemetry.velocity.dot(fwd) < 0.0f) {
-                    // Backing off a drop of two body heights or more: the horizontal velocity is
-                    // zeroed so the pawn drops straight down.
-                    const Vec3 s = m_telemetry.position;
-                    const TraceHit drop = trace_ray(s, s - Vec3(0.0f, 0.0f, 2.0f * kPawnHeight), scene);
-                    if (!drop.hit) {
+                    // TdMove_Falling.StartMove: backing off a drop with room for her below the
+                    // edge (CanStand two half heights under her centre), the horizontal velocity
+                    // is zeroed so the pawn drops straight down.
+                    if (has_room_at(m_telemetry.position - Vec3(0.0f, 0.0f, kPawnHeight), kPawnHeight, scene)) {
                         m_telemetry.velocity.x = 0.0f;
                         m_telemetry.velocity.y = 0.0f;
                     }
@@ -844,7 +888,37 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.sim_time += effective_dt;
     m_telemetry.swing_angle = m_swing_angle;
     m_telemetry.body_yaw_deg = m_pawn_yaw;
+    update_against_wall(effective_dt, scene);
+    {
+        // The first-person mesh, and the eye in it, do not take a fast change of the floor's height
+        // at once (TdPawn.SmoothOffset / TargetMeshTranslationZ, native). Retail running a flight
+        // of stairs, a ramp to the pawn: the eye 20 uu low going up at 283 uu/s of rise, 19 high
+        // coming down at 300 to 470, level again within 0.15 s at either end, and no different
+        // from level ground walking it at 79. So: a rise or drop faster than 150 uu/s is held back
+        // and let out with a time constant of 0.065 s.
+        const bool walking = m_telemetry.grounded && m_base_actor < 0 &&
+                             (m_telemetry.move_state == EMovement::MOVE_Walking || m_telemetry.move_state == EMovement::MOVE_Crouch);
+        if (walking && m_smooth_was_walking && effective_dt > 0.0f) {
+            const float dz = m_telemetry.position.z - m_smooth_last_z;
+            if (std::abs(dz) >= 150.0f * effective_dt) m_mesh_smooth_z -= dz;
+        }
+        m_mesh_smooth_z = std::clamp(m_mesh_smooth_z * std::exp(-effective_dt / 0.065f), -40.0f, 40.0f);
+        m_smooth_was_walking = walking;
+        m_smooth_last_z = m_telemetry.position.z;
+        m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z;
+    }
+    if (m_telemetry.move_state != EMovement::MOVE_Snatch) m_telemetry.snatch_weapon_attached = true;
+    for (auto& bot : scene.enemies) {
+        if (bot.disarm_weapon.empty()) continue;
+        bot.disarm_weapon_time -= effective_dt;
+        if (bot.disarm_weapon_time <= 0.0f || m_telemetry.move_state != EMovement::MOVE_Snatch) bot.disarm_weapon.clear();
+    }
     m_telemetry.balance_lean = m_balance_lean;
+    if (m_telemetry.move_state != EMovement::MOVE_Balance) {
+        m_telemetry.balance_danger = 0;
+        m_balance_danger_time = 0.0f;
+        m_balance_fall_time = -1.0f;
+    }
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
 
@@ -1005,6 +1079,137 @@ void ParkourController::camera_reset_look(float seconds) {
     m_reset_look_time = std::max(0.0f, seconds);  // CancelResetCameraLookTime = Now + seconds
 }
 
+// TdPlayerPawn.UpdateAgainstWall / CheckAgainstWall are native. From a retail recording made for
+// it, walking into a flat wall and away again, standing and crouched, with and without a pistol:
+//  - at the wall both hands go up on it (state 1); with the body turned 45 degrees off it, which
+//    is as far as the view goes there, only the hand of the near shoulder (2 the left, 3 the right);
+//  - running at it (435 uu/s) the hands start up 70 to 100 uu before she gets there, creeping
+//    up to it crouched only as she arrives: the reach grows with her speed at the wall;
+//  - walking away it ends about 0.15 s after she starts (StopAgainstWall checks again on a 0.15 s
+//    timer), 30 to 40 uu out.
+// Only in the moves with bEnableAgainstWall (Walking, Crouch, LedgeWalk).
+void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
+    const EMovement m = m_telemetry.move_state;
+    int state = 0;
+    if ((m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch || m == EMovement::MOVE_LedgeWalk) && m_telemetry.grounded) {
+        const Rotator body = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f);
+        const Vec3 fwd = body.forward();
+        const Vec3 right = body.right();
+        const float toward = std::max(0.0f, horiz(m_telemetry.velocity).dot(fwd));
+        const float reach = kPawnRadius + 8.0f + 0.14f * toward;
+        const float shoulder = 0.78f * (m == EMovement::MOVE_Crouch ? kCrouchHeight : kPawnHeight);
+        bool hand[2] = {false, false};
+        Vec3 normal(0.0f, 0.0f, 0.0f);
+        for (int k = 0; k < 2; ++k) {
+            const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, shoulder) + right * (k == 0 ? -15.0f : 15.0f);
+            const TraceHit hit = trace_ray(start, start + fwd * reach, scene);
+            if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f) {
+                hand[k] = true;
+                normal = normal + horiz(hit.normal);
+            }
+        }
+        state = hand[0] && hand[1] ? 1 : hand[0] ? 2 : hand[1] ? 3 : 0;
+        if (state != 0 && normal.length_sq() > 1e-4f) m_against_wall_yaw = yaw_of(-normal);
+    }
+    if (state != 0) {
+        m_against_wall = state;
+        m_against_wall_off = 0.0f;
+    } else if (m_against_wall != 0) {
+        m_against_wall_off += dt;
+        if (m_against_wall_off >= 0.15f) m_against_wall = 0;
+    }
+    m_telemetry.against_wall = m_against_wall;
+}
+
+// TdMove.CheckForCameraCollision and the moves' own (Walking, Crouch, Slide, GrabPullUp, SpeedVault):
+// a 2 uu box swept from 5 behind the camera to a little ahead of it, and where it meets something
+// TdPawn.OffsetMeshXY moves the first-person mesh, and so the eye, back by what is missing. The
+// script adds the miss each frame to a mesh that is already offset, which settles with the box's
+// end just clear; here the eye comes in without the offset, so one sweep gives that place.
+void ParkourController::update_camera_collision(const Vec3& eye, float dt, const LevelScene& scene) {
+    const EMovement m = m_telemetry.move_state;
+    const Vec3 extent(2.0f, 2.0f, 2.0f);
+    // How far short of `reach` ahead of the camera the box stops, in the plane (0 with nothing there).
+    auto miss = [&](const Vec3& dir, float reach, float lift, Vec3* back) {
+        const Vec3 start = eye - dir * 5.0f;
+        const Vec3 end = eye + dir * reach + Vec3(0.0f, 0.0f, lift);
+        const TraceHit hit = sweep_box(start, extent, end - start, scene);
+        if (!hit.hit) return 0.0f;
+        const Vec3 at = start + (end - start) * hit.fraction;  // HitLocation: the box's centre
+        if (back) *back = Vec3(at.x - end.x, at.y - end.y, 0.0f);
+        return (end - at).length_xy();
+    };
+    const Vec3 facing = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();
+    Vec3 want(0.0f, 0.0f, 0.0f);
+    bool base = false;
+    switch (m) {
+        case EMovement::MOVE_Walking:
+        case EMovement::MOVE_Jump:
+        case EMovement::MOVE_Melee:
+        case EMovement::MOVE_180Turn:
+        case EMovement::MOVE_Vertigo:
+        case EMovement::MOVE_WallRunningLeft:
+        case EMovement::MOVE_WallRunningRight:
+            base = true;  // bUseCameraCollision with TdMove's own check
+            break;
+        case EMovement::MOVE_Crouch:
+        case EMovement::MOVE_Slide:
+            // The first 0.2 s of both: 15 ahead and 5 up, and a unit more than the miss.
+            if (m_state_timer < 0.2f) {
+                const float d = miss(facing, 15.0f, 5.0f, nullptr);
+                if (d > 0.0f) want = facing * -(d + 1.0f);
+            } else if (m == EMovement::MOVE_Crouch) {
+                base = true;
+            }
+            break;
+        case EMovement::MOVE_GrabPullUp: {
+            // Along the view, 20 ahead; the offset is HitLocation - TraceEnd in the world.
+            const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+            miss(view, 20.0f, 0.0f, &want);
+            break;
+        }
+        case EMovement::MOVE_SpeedVaulting:
+        case EMovement::MOVE_VaultOver: {
+            // CameraCollisionDirection = MoveNormal cross (0, 0, -1): to the side she vaults on.
+            const Vec3 n = horiz(m_telemetry.wall_normal);
+            if (n.length_sq() > 0.25f) miss(n.normalized().cross(Vec3(0.0f, 0.0f, -1.0f)), 15.0f, 0.0f, &want);
+            break;
+        }
+        default:
+            break;
+    }
+    if (base) want = facing * -miss(facing, 11.0f, 0.0f, nullptr);
+
+    // OffsetMeshXY is native. Taken here as: back at once, and let out again at kCameraMeshReturn.
+    constexpr float kCameraMeshReturn = 60.0f;  // uu/s
+    if (want.length_xy() >= m_cam_mesh_offset.length_xy()) {
+        m_cam_mesh_offset = want;
+    } else {
+        const Vec3 d = want - m_cam_mesh_offset;
+        const float step = kCameraMeshReturn * dt;
+        m_cam_mesh_offset = d.length_xy() <= step ? want : m_cam_mesh_offset + d * (step / d.length_xy());
+    }
+    m_telemetry.camera_mesh_offset.x = m_cam_mesh_offset.x;
+    m_telemetry.camera_mesh_offset.y = m_cam_mesh_offset.y;
+
+    // TdMove_Walking.CheckForCameraCollision goes on (AgainstWallState 0): the same box along the
+    // view, 15 ahead. Met, the view cannot go further down than it is, and met inside the last
+    // fifth of the sweep, or as the limit comes on, it is brought up by how soon it was met.
+    const bool was = m_cam_constrain_look;
+    m_cam_constrain_look = false;
+    if (m == EMovement::MOVE_Walking && m_against_wall == 0) {
+        const Vec3 camera = eye + m_cam_mesh_offset;
+        const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+        const Vec3 start = camera - view * 5.0f;
+        const TraceHit hit = sweep_box(start, extent, view * 20.0f, scene);
+        if (hit.hit) {
+            const float pitch = m_telemetry.pitch_deg * kUUPerDeg;
+            m_cam_min_pitch = (!was || hit.fraction < 0.8f) ? std::trunc(pitch * hit.fraction) : pitch;
+            m_cam_constrain_look = true;
+        }
+    }
+}
+
 void ParkourController::camera_look_at(float yaw, float pitch, float interp_time, float duration) {
     m_look_at_active = true;
     m_look_at_is_location = false;
@@ -1123,6 +1328,9 @@ void ParkourController::camera_move_changed(EMovement from, EMovement to) {
         case EMovement::MOVE_Climb:
             camera_reset_look(0.3f);
             break;
+        case EMovement::MOVE_Snatch:
+            camera_reset_look(0.2f);  // TdMove_Disarm.StartMove
+            break;
         case EMovement::MOVE_Barge:
             camera_reset_look(m_barge_kick ? 0.2f : 0.3f);  // TdMove_Barge.StartBargin
             break;
@@ -1158,6 +1366,14 @@ void ParkourController::camera_move_changed(EMovement from, EMovement to) {
 
 void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float dt) {
     const EMovement m = m_cam_move;
+
+    // TdPlayerInput.PlayerInput: aTurn and aLookUp are scaled by the pawn's GetMobilityMultiplier
+    // (native). With a weapon in hand retail's view turns half as far for the same mouse travel,
+    // pistol or rifle, at the ready or not (360 degrees' worth of counts gave 180.5).
+    if (m_telemetry.weapon.equipped) {
+        yaw_d *= 0.5f;
+        pitch_d *= 0.5f;
+    }
 
     // Camera changes inside a move.
     if ((m == EMovement::MOVE_VaultOver || m == EMovement::MOVE_SpeedVaulting) && !m_vault_down &&
@@ -1215,13 +1431,34 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
     }
 
     // ... the move's look constraint limits the frame's turn, relative to the body ...
-    const MoveCamera mc = move_camera(m);
+    MoveCamera mc = move_camera(m);
+    const bool at_wall = m_against_wall != 0 && (m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch);
+    if (at_wall) {
+        // Against a wall retail's view stops 27.2 degrees down, standing or crouched, and 44.8
+        // degrees to either side of the way into the wall (5000 and 8192 in Unreal units, by the
+        // look of it; how far up it goes was not tried). Away from the wall the same view went to
+        // 80 down.
+        mc.constrain = true;
+        mc.pitch_min = -5000.0f;
+        mc.pitch_max = 32768.0f;
+    } else if (m == EMovement::MOVE_Walking && m_cam_constrain_look) {
+        // TdMove_Walking.CheckForCameraCollision: with something right in front of the camera she
+        // cannot look further down (bConstrainLook; nothing limits the yaw or looking up).
+        mc.constrain = true;
+        mc.pitch_min = m_cam_min_pitch;
+        mc.pitch_max = 32768.0f;
+        mc.yaw_min = -65536.0f;
+        mc.yaw_max = 65536.0f;
+    }
     if (mc.constrain) {
         const float speed = dt / 0.2f;
         float lo = mc.yaw_min, hi = mc.yaw_max;
         if (m == EMovement::MOVE_WallRunningRight || m == EMovement::MOVE_WallRunningLeft) {
             lo = wrap_deg(m_wallrun_yaw_min - m_pawn_yaw) * kUUPerDeg;
             hi = wrap_deg(m_wallrun_yaw_max - m_pawn_yaw) * kUUPerDeg;
+        } else if (at_wall) {
+            lo = wrap_deg(m_against_wall_yaw - 45.0f - m_pawn_yaw) * kUUPerDeg;
+            hi = wrap_deg(m_against_wall_yaw + 45.0f - m_pawn_yaw) * kUUPerDeg;
         }
         const float rel_yaw = wrap_deg(m_telemetry.yaw_deg - m_pawn_yaw) * kUUPerDeg;
         yaw_d = constrain_axis(rel_yaw, lo, hi, speed, yaw_d * kUUPerDeg) / kUUPerDeg;
@@ -1542,10 +1779,12 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             Vec3 column = wall.point + into * extra;
             float top_z = 0.0f;
             bool got_top = false;
+            Vec3 top_normal(0.0f, 0.0f, 1.0f);
             const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start),
                                            Vec3(column.x, column.y, z_end), scene);
             if (top.hit && top.normal.z >= kWalkableFloorZ) {
                 top_z = top.point.z;
+                top_normal = top.normal;
                 got_top = true;
             } else {
                 const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start),
@@ -1566,6 +1805,7 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             out.top_z = top_z;
             out.wall_distance = wall.distance;
             out.top_point = Vec3(column.x, column.y, top_z);
+            out.top_normal = top_normal;
             return out;
         }
     }
@@ -2430,12 +2670,17 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     if (m_telemetry.velocity.z > 0.0f && m_telemetry.position.z > m_fall_peak_z) {
         m_fall_peak_z = m_telemetry.position.z;
     }
-    // TdMove_Falling.CloseToGround lets the jump animation go a little before the feet arrive.
+    // TdMove_Falling.CloseToGround lets the jump animation go a little before she arrives. Native
+    // code calls it; measured, it is her own box swept 0.4 s along the velocity meeting something:
+    // the ground she lands on (ten landings, the drop left 0.38 to 0.42 of the fall speed), and as
+    // well a wall she is about to fly into (0.39 s before she hit it). At any falling speed.
     m_telemetry.ground_distance = -1.0f;
-    if (m_telemetry.velocity.z < -400.0f) {
-        const Vec3 from = m_telemetry.position + Vec3(0.0f, 0.0f, 5.0f);
-        const TraceHit below = trace_ray(from, from - Vec3(0.0f, 0.0f, 1200.0f), scene);
-        if (below.hit) m_telemetry.ground_distance = std::max(0.0f, m_telemetry.position.z - below.point.z);
+    if (m_telemetry.velocity.z < 0.0f) {
+        const Vec3 delta = m_telemetry.velocity * 0.4f;
+        const float half_z = 0.5f * (kPawnHeight - 1.0f);
+        const Vec3 extent(kPawnRadius - 1.0f, kPawnRadius - 1.0f, half_z);
+        const TraceHit ahead = sweep_box(m_telemetry.position + Vec3(0.0f, 0.0f, 1.0f + half_z), extent, delta, scene);
+        if (ahead.hit && !ahead.start_penetrating) m_telemetry.ground_distance = ahead.fraction * delta.length();
     }
     update_fall_height_volumes(scene);
 
@@ -3108,6 +3353,14 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
 
     // TdMove_Grab.bIsHangingFree: nothing in front of the legs to put the feet against.
     m_telemetry.hanging_free = !probe_wall(ledge.normal * -1.0f, kPawnRadius + 45.0f, 60.0f, scene).found;
+    // TdMove_IntoGrab / TdMove_Grab.bSlopedLedge: MoveLedgeNormal.Z < 0.999. The hang's pose leans
+    // with the ledge by how steeply it runs along her shoulders.
+    {
+        const Vec3 right(ledge.normal.y, -ledge.normal.x, 0.0f);  // her right, facing the wall
+        m_telemetry.ledge_sloped = ledge.top_normal.z < 0.999f;
+        m_telemetry.ledge_slope_deg = m_telemetry.ledge_sloped
+            ? std::atan2(-ledge.top_normal.dot(right), ledge.top_normal.z) * RAD2DEG : 0.0f;
+    }
     // TdMove_IntoGrab.ReachedPreciseLocation: how she catches the ledge, by where she came from and
     // how fast she was falling (HangImpactMinZSpeed -600, HangHardImpactMinZSpeed -1000).
     set_move_anim(m_telemetry.move_state == EMovement::MOVE_WallClimbing ? "hanghardstartvertical"
@@ -3229,7 +3482,8 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         leave_ground(EMovement::MOVE_Falling);
         return;
     }
-    if (std::abs(input.strafe) > 0.3f && m_hang_time > c.grab_shimmy_delay) {
+    // TdMove_Grab.HandleMoveAction: there is no shimmying along a sloped ledge.
+    if (std::abs(input.strafe) > 0.3f && m_hang_time > c.grab_shimmy_delay && !m_telemetry.ledge_sloped) {
         Vec3 along(-n.y, n.x, 0.0f);
         if (along.dot(facing_right() * sign_of(input.strafe)) < 0.0f) along = -along;
         // The ledge has to continue that way: test multiple depths beyond the wall face + thin box sweep
@@ -3991,6 +4245,9 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
 
     const Vec3 into = -m_climb_normal;
     const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 64.0f;
+    // How far the ladder goes on, for the animation: a pipe's last rung is climbed differently.
+    m_telemetry.climb_top = std::max(0.0f, (m_climb_can_exit_top ? m_climb_top.z - 65.0f : m_climb_top.z - 25.0f) - m_telemetry.position.z);
+    m_telemetry.climb_bottom = std::max(0.0f, m_telemetry.position.z - m_climb_base.z);
     m_telemetry.position.x = climb_xy.x;
     m_telemetry.position.y = climb_xy.y;
 
@@ -4161,8 +4418,9 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     const Vec3 fwd = facing_forward();
     const Vec3 beam_fwd = (fwd.dot(u) >= 0.0f) ? u : -u;
 
-    // PlayerBalanceWalk: smooth speed control strictly along the balance pipe spline
-    const float target_speed = input.forward * (m_config.run_speed * 0.48f);
+    // PlayerBalanceWalk: along the beam at TdMove_Balance.SpeedModifier (0.34) of the top speed:
+    // retail walks a beam at 245 uu/s.
+    const float target_speed = input.forward * (720.0f * 0.34f);
     float cur_along = horiz(m_telemetry.velocity).dot(beam_fwd);
     const float accel_step = 900.0f * dt;
     if (std::abs(target_speed - cur_along) <= accel_step) {
@@ -4172,13 +4430,54 @@ void ParkourController::update_balance(const InputFrame& input, float dt, const 
     }
     m_telemetry.velocity = beam_fwd * cur_along;
 
-    // UTdMove_Balance BalanceFactor camera roll & A/D counter-steer
+    // The balance itself is native. From a retail recording made for it (the lean is what the
+    // tree's BalanceDir node shows, the lose-balance state its Danger children):
+    //  - a key held leans her that way at about 2.4 a second (2.0 to 2.7), from either side;
+    //  - stepping on with the view off the beam's line, by 0.7 degrees or by 8, she is over in 3.2
+    //    to 3.6 s, mostly to the side away from the turn; dead in line she reaches the far end of
+    //    a 1,740 uu beam every time. Here: a steady push while the view is off the line, growing
+    //    on itself (GravityInfluence 0.3), sized to that time;
+    //  - past about 0.65 with no key against it she is losing her balance: the key against it ends
+    //    that at once, and TimeToCounter (0.8 s) of it has her off the beam on that side. Holding a
+    //    key from the middle of the beam, that is 1.09 s from the key to the fall.
+    // Retail's lean also wanders by itself as she walks (0.2 to 0.7 over a beam's length, either
+    // way); that is left out.
     const float beam_yaw = yaw_of(beam_fwd);
     const float yaw_diff = wrap_deg(m_telemetry.yaw_deg - beam_yaw);
-    const float sway_drive = std::clamp(yaw_diff / 60.0f, -0.5f, 0.5f) * 0.35f +
-                             input.strafe * 1.15f - m_balance_lean * 1.6f;
-    m_balance_lean = std::clamp(m_balance_lean + sway_drive * dt, -1.0f, 1.0f);
+    const float key = std::abs(input.strafe) > 0.3f ? sign_of(input.strafe) : 0.0f;
+    const float skew = std::abs(yaw_diff) > 0.5f ? -sign_of(yaw_diff) * 0.175f : 0.0f;
+    const float drive = key * 2.4f + 0.3f * m_balance_lean + skew;
+    m_balance_lean = std::clamp(m_balance_lean + drive * dt, -1.0f, 1.0f);
+    const float side = sign_of(m_balance_lean);
+    const bool losing = std::abs(m_balance_lean) >= 0.65f && key * side >= 0.0f;
+    m_balance_danger_time = losing ? m_balance_danger_time + dt : 0.0f;
+    m_telemetry.balance_danger = losing ? static_cast<int>(side) : 0;
     m_telemetry.camera_roll_deg = m_balance_lean * 9.0f;
+    if (m_balance_fall_time < 0.0f && m_balance_danger_time >= 0.8f) {
+        // TdMove_Balance.Falloff: the fall off animation of that side starts while she is still
+        // on the beam, stopped; she is falling 0.27 to 0.30 s later.
+        set_move_anim(side < 0.0f ? "walkbalancefalloffleft" : "walkbalancefalloffright");
+        m_balance_fall_time = 0.0f;
+        m_balance_fall_side = side;
+    }
+    if (m_balance_fall_time >= 0.0f) {
+        m_balance_fall_time += dt;
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        m_telemetry.balance_danger = static_cast<int>(m_balance_fall_side);
+        if (m_balance_fall_time >= 0.28f) {
+            const Vec3 beam_right(-beam_fwd.y, beam_fwd.x, 0.0f);  // her right, walking the beam
+            m_telemetry.velocity = beam_right * (m_balance_fall_side * 200.0f);
+            m_telemetry.position = m_telemetry.position + beam_right * (m_balance_fall_side * (kPawnRadius + 6.0f));
+            m_telemetry.camera_roll_deg = 0.0f;
+            m_telemetry.balance_danger = 0;
+            m_balance_danger_time = 0.0f;
+            m_balance_fall_time = -1.0f;
+            m_balance_lean = 0.0f;
+            m_balance_cooldown = 0.6f;
+            leave_ground(EMovement::MOVE_Falling);
+        }
+        return;
+    }
 
     const Vec3 next_pos = m_telemetry.position + m_telemetry.velocity * dt;
     const float s = horiz(next_pos - m_balance_start).dot(u);
@@ -4528,10 +4827,12 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     m_telemetry.disarm_prompt_visible = false;
     EnemyBot* disarm_candidate = nullptr;
     bool candidate_from_back = false;
+    bool disarm_out_of_time = false;  // an armed enemy in reach, but not open to it
     for (auto& bot : scene.enemies) {
         if (!bot.alive || bot.weapon_name == "None" || bot.weapon_name.empty()) continue;
         float dist = m_telemetry.position.distance(bot.position);
         if (dist < 210.0f) {
+            disarm_out_of_time = true;
             Vec3 bot_fwd(std::cos(bot.yaw_deg * DEG2RAD), std::sin(bot.yaw_deg * DEG2RAD), 0.0f);
             Vec3 bot_to_player = (m_telemetry.position - bot.position).normalized_xy();
             bool behind_enemy = (bot_fwd.dot(bot_to_player) < -0.25f);
@@ -4549,16 +4850,23 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         if (disarm_candidate != nullptr) {
             EnemyBot& bot = *disarm_candidate;
             m_telemetry.move_state = EMovement::MOVE_Snatch;
+            m_snatch_fail = false;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_time = 0.0f;
-            m_telemetry.combat_anim_duration = 0.68f;
             m_telemetry.snatch_from_back = candidate_from_back;
             m_telemetry.hit_marker_timer = 0.35f;
 
-            // Orient Faith toward the enemy being disarmed
+            // TdMove_Disarm.StartMove: she faces the enemy with a level view (TargetRotation,
+            // ResetCameraLook(0.2)) and is flown to DisarmOffset (ChooseDisarmType: 125.899) short
+            // of them at 400 uu/s, or her own speed if that is more, when they stand level.
             Vec3 to_bot = (bot.position - m_telemetry.position).normalized_xy();
+            m_snatch_align = false;
             if (to_bot.length_sq() > 1e-4f) {
                 m_telemetry.yaw_deg = std::atan2(to_bot.y, to_bot.x) * RAD2DEG;
+                m_pawn_yaw = m_telemetry.yaw_deg;
+                m_snatch_target = bot.position - to_bot * 125.899f;
+                m_snatch_speed = std::max(400.0f, m_telemetry.velocity.length_xy());
+                m_snatch_align = std::abs(bot.position.z - m_telemetry.position.z) <= 3.0f;
             }
 
             std::string snatched_wep = bot.weapon_name;
@@ -4583,8 +4891,43 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             }
 
             equip_weapon(snatched_wep);
+            // TdMove_Disarm.ChooseDisarmType: from behind SnatchBack; from the front SnatchFwd, and
+            // for a patrol cop's light weapon one of three (of two for the TMP; Rand in the game,
+            // in turn here). The move lasts as long as the animation (OnCustomAnimEnd).
+            const char* snatch = candidate_from_back ? "SnatchBack" : "SnatchFwd";
+            if (!candidate_from_back && !ws.is_two_handed && bot.archetype.find("PatrolCop") != std::string::npos) {
+                static const char* const kFront[] = {"SnatchFwd", "SnatchFwd2", "SnatchFwd3"};
+                const bool tmp = snatched_wep.find("TMP") != std::string::npos || snatched_wep.find("Steyr") != std::string::npos;
+                snatch = tmp ? kFront[1 + m_disarm_count % 2] : kFront[m_disarm_count % 3];
+            }
+            ++m_disarm_count;
+            m_telemetry.combat_anim_duration = snatch_length(snatched_wep, snatch);
+            set_move_anim(snatch);
+            // PlayDisarmStart / StopMove: AttachWeaponToHand comes as the move ends, but 0.8 s in for
+            // the Remington and 1.4 s for the Neostead. Until then it is still in his hands.
+            m_snatch_attach = snatched_wep.find("Remington") != std::string::npos ? 0.8f
+                              : snatched_wep.find("Neostead") != std::string::npos ? 1.4f
+                              : m_telemetry.combat_anim_duration;
+            m_telemetry.snatch_weapon_attached = false;
+            bot.disarm_weapon = snatched_wep;
+            bot.disarm_weapon_time = m_snatch_attach;
             m_telemetry.active_subtitle = std::string(candidate_from_back ? "Stealth Disarm (" : "Weapon Disarmed (") +
                                           ws.display_name + ")!";
+        } else if (disarm_out_of_time && !ws.equipped && m_telemetry.grounded && m_telemetry.move_state == EMovement::MOVE_Walking) {
+            // TdMove_Disarm.StartMiss: SnatchFail on the full body with its own root motion
+            // (0.1 in, 0.4 out). Retail: 0.77 s in the move, 590 uu/s down to 200 in its first frame.
+            m_telemetry.move_state = EMovement::MOVE_Snatch;
+            m_snatch_fail = true;
+            m_snatch_align = false;
+            m_state_timer = 0.0f;
+            m_telemetry.combat_anim_time = 0.0f;
+            m_telemetry.combat_anim_duration = 0.77f;
+            m_telemetry.snatch_from_back = false;
+            m_telemetry.snatch_weapon_attached = false;
+            m_snatch_attach = m_telemetry.combat_anim_duration;
+            m_telemetry.velocity.x *= 0.34f;
+            m_telemetry.velocity.y *= 0.34f;
+            set_move_anim("SnatchFail");
         } else if (ws.equipped && ws.drop_timer <= 0.0f && !input.use) {
             // In Mirror's Edge, pressing the Disarm/Secondary button while holding a gun with no enemy in range tosses the gun
             drop_current_weapon("Tossed " + ws.display_name);
@@ -4780,6 +5123,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 
     // 4. Context-Sensitive Unarmed Melee Strikes (`input.melee`: Combo Punch/Kick, Crouch Uppercut, Jump Kick, Barge)
     if (input.melee && m_melee_cooldown <= 0.0f && (!ws.equipped || ws.drop_timer > 0.0f) &&
+        !(m_against_wall != 0 && m_telemetry.move_state == EMovement::MOVE_Walking) &&  // TdMove_Melee.CanDoMove
         m_telemetry.move_state != EMovement::MOVE_MeleeSlide &&
         m_telemetry.move_state != EMovement::MOVE_MeleeWallrun) {
 

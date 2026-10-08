@@ -1,4 +1,5 @@
 #define SDL_MAIN_HANDLED
+#include <cstdlib>
 #include <SDL2/SDL.h>
 #if defined(__APPLE__)
 #include <SDL2/SDL_metal.h>
@@ -2104,7 +2105,25 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     intro_handover_frames = 30;
                 }
             } else {
+                // ME_WARP="x,y,z,yaw" puts the player there (feet) as play starts: a test aid, for
+                // looking at one place in a level without playing to it.
+                static bool warp_done = false;
+                if (!warp_done) {
+                    warp_done = true;
+                    float wx = 0.0f, wy = 0.0f, wz = 0.0f, wyaw = 0.0f;
+                    const char* warp = std::getenv("ME_WARP");
+                    if (warp && std::sscanf(warp, "%f,%f,%f,%f", &wx, &wy, &wz, &wyaw) == 4) {
+                        controller.reset(Vec3(wx, wy, wz), wyaw);
+                    }
+                }
                 controller.step(input, dt, active_scene);
+                // TdPlayerPawn.CalcCamera: the move checks the camera against the walls with the
+                // eye the first-person tree has for this frame.
+                Vec3 eye;
+                Rotator eye_rot;
+                renderer.player_camera(controller.get_telemetry(), eye, eye_rot);
+                const Vec3 off = controller.get_telemetry().camera_mesh_offset;
+                controller.update_camera_collision(eye - Vec3(off.x, off.y, 0.0f), dt, active_scene);
             }
             if (audio.is_vo_playing()) {
                 was_vo_playing = true;

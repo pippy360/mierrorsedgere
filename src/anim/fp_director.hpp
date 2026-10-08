@@ -38,9 +38,15 @@ struct PawnFrame {
     bool move_left = false;      // a sideways move going left (dodge jumps)
     bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
     bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)
+    bool ledge_sloped = false;   // the ledge's top is not level (TdMove_Grab.bSlopedLedge)
+    float ledge_slope_deg = 0.0f;  // how steeply it runs up to her right
     float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
+    int balance_danger = 0;      // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;        // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     bool climbing_pipe = false;  // on a pipe, not a ladder
+    float climb_top = -1.0f;     // uu up to the ladder's last step, down to its first (-1 not known)
+    float climb_bottom = -1.0f;
     // TdMove_Melee: which blow (0 right, 1 left, 2 the shove that ends a combo, 3 crouched) and
     // whether it lands. -1: the move names its animations itself (move_anim).
     int melee_variant = -1;
@@ -107,6 +113,8 @@ private:
     bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
     float climb_last_vz_ = 0.0f;
     float climb_step_z_ = 0.0f;      // where the step being climbed started
+    bool sloped_ledge_ = false;      // the ledge being caught or hung from is sloped
+    float climb_step_size_ = 32.0f;  // and how far it goes: one rung, or two on a pipe
     // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
     // hang's turn, and the shimmy step.
     int grab_turn_ = 0;

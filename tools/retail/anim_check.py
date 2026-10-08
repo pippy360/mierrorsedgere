@@ -99,11 +99,26 @@ def level_hints(run, names):
     end = [0] * n
     for i in range(n - 1, -1, -1):
         end[i] = i + 1 if i == n - 1 or run[i + 1]["move"] != run[i]["move"] else end[i + 1]
+    # The sample a fall meets a wall at, for every sample of the fall before it.
+    wall = [None] * n
+    for i in range(n - 1, 0, -1):
+        a, b = run[i - 1], run[i]
+        if a["move"] != MOVE_FALLING or b["move"] != MOVE_FALLING:
+            continue
+        sa, sb = math.hypot(a["vx"], a["vy"]), math.hypot(b["vx"], b["vy"])
+        wall[i - 1] = i if sa > 150.0 and sb < 0.4 * sa else wall[i]
     for i, d in enumerate(run):
         j = end[i]
         move = d["move"]
-        if move == MOVE_FALLING and j < n and run[j]["move"] in GROUND_MOVES:
-            out[i][0] = max(0.0, d["pz"] - run[j]["pz"])
+        # How far along the velocity the first thing in the way is: the ground the fall ends on,
+        # or a wall she flies into (her speed over the ground gone from one sample to the next).
+        if move == MOVE_FALLING and d["vz"] < -1.0:
+            speed = math.sqrt(d["vx"] ** 2 + d["vy"] ** 2 + d["vz"] ** 2)
+            if j < n and run[j]["move"] in GROUND_MOVES:
+                out[i][0] = max(0.0, d["pz"] - run[j]["pz"]) * speed / -d["vz"]
+            if wall[i] is not None:
+                along = speed * (run[wall[i]]["t"] - d["t"])
+                out[i][0] = along if out[i][0] < 0.0 else min(out[i][0], along)
         seen = set()
         for k in range(i, min(j, i + 40)):
             seen.update(leaf_names[k])
@@ -133,6 +148,25 @@ def level_hints(run, names):
             along = (d["px"] - x0) * math.cos(yaw) + (d["py"] - y0) * math.sin(yaw)
             out[k].append(("swing", "%.3f" % math.atan2(along, max(1.0, z0 - d["pz"]))))
         i = j
+    # On a beam: how far she leans and whether she is losing her balance are the player's doing
+    # (the keys are not in a recording), so they are read off what retail's own balance nodes show:
+    # the lean from the lean poses' weights, the lose-balance state from its pose gaining weight.
+    # What is left to compare on a beam is how the port blends them.
+    for i, d in enumerate(run):
+        if d["move"] != 29:
+            continue
+        w = {a[0].lower(): a[2] for a in d["anim1p"]}
+        prev = {a[0].lower(): a[2] for a in run[i - 1]["anim1p"]} if i else {}
+        left, right = w.get("walkbalancelosebalanceleft", 0.0), w.get("walkbalancelosebalanceright", 0.0)
+        rest = 1.0 - left - right
+        if rest > 0.05:
+            out[i].append(("lean", "%.3f" % max(-1.0, min(1.0, (w.get("walkbalancefwdleanright", 0.0) - w.get("walkbalancefwdleanleft", 0.0)) / rest))))
+        danger = 0
+        if left > 0.0 and (left >= 0.999 or left > prev.get("walkbalancelosebalanceleft", 0.0) + 1e-4):
+            danger = -1
+        elif right > 0.0 and (right >= 0.999 or right > prev.get("walkbalancelosebalanceright", 0.0) + 1e-4):
+            danger = 1
+        out[i].append(("danger", danger))
     # On a pipe or a ladder: the level says, and here the names of what retail plays on it do.
     i = 0
     while i < n:
@@ -143,8 +177,12 @@ def level_hints(run, names):
         while j < n and run[j]["move"] in (21, 22):
             j += 1
         pipe = any(name.startswith("pipe") for k in range(i, j) for name in leaf_names[k])
+        # How far up the last step is: where she is as she goes over the top, if she does.
+        over = next((k for k in range(i, j) if any("exittop" in name for name in leaf_names[k])), None)
         for k in range(i, j):
             out[k].append(("pipe", 1 if pipe else 0))
+            if over is not None:
+                out[k].append(("top", "%.1f" % max(0.0, run[over]["pz"] - run[k]["pz"])))
         i = j
     # The animation a move picked: the frame retail first shows one of the director's named
     # animations (or shows it started over). A move that picks its animation as it starts gets it

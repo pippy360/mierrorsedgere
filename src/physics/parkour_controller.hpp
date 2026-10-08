@@ -55,6 +55,9 @@ public:
 
     // Telemetry and State Accessors
     [[nodiscard]] const PlayerTelemetry& get_telemetry() const { return m_telemetry; }
+    // TdPlayerPawn.CalcCamera's last step, once a frame after the step: the move's
+    // CheckForCameraCollision with the eye of the first-person mesh as it is without any offset.
+    void update_camera_collision(const Vec3& eye, float dt, const LevelScene& scene);
     [[nodiscard]] PlayerTelemetry& get_telemetry() { return m_telemetry; }
 
     [[nodiscard]] const MovementConfig& get_config() const { return m_config; }
@@ -154,6 +157,7 @@ private:
         float top_z = 0.0f;             // walkable top
         float wall_distance = 0.0f;     // pawn centre -> wall face, along -normal
         Vec3 top_point{0.0f, 0.0f, 0.0f};
+        Vec3 top_normal{0.0f, 0.0f, 1.0f};  // of the surface the hands go on (TdPawn.MoveLedgeNormal)
     };
 
     // TdMove_GrabTransfer: an obstacle standing on a grabbed lip (a rail) that leaves no room to
@@ -304,6 +308,13 @@ private:
     int m_melee_combo_index = 0;
     float m_melee_combo_reset_timer = 0.0f;
     int m_weapon_cycle_index = 0;
+    // TdMove_Disarm: where AlignPawn flies her (DisarmOffset from the enemy) and how fast.
+    Vec3 m_snatch_target{0.0f, 0.0f, 0.0f};
+    float m_snatch_speed = 0.0f;
+    bool m_snatch_align = false;
+    int m_disarm_count = 0;
+    float m_snatch_attach = 0.0f;  // when in the move the weapon becomes hers to hold
+    bool m_snatch_fail = false;    // TdMove_Disarm.StartMiss: the grab that gets nothing
     bool m_jump_consumed = false;
     bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
 
@@ -378,6 +389,19 @@ private:
     float m_ignore_look_time = 0.0f;        // TdPawn.bIgnoreLookInput: > 0 seconds left, < 0 until the move ends
     float m_reset_look_time = -1.0f;        // TdMove.ResetCameraLook: seconds left (< 0 = inactive)
     bool m_look_at_active = false;          // TdMove.SetLookAtTargetAngle
+    Vec3 m_cam_mesh_offset{0.0f, 0.0f, 0.0f};  // what OffsetMeshXY has the mesh at
+    float m_balance_danger_time = 0.0f;     // how long she has been losing her balance on a beam
+    float m_balance_fall_time = -1.0f;      // since TdMove_Balance.Falloff, while she is still on it
+    float m_balance_fall_side = 0.0f;
+    float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
+    float m_smooth_last_z = 0.0f;
+    bool m_smooth_was_walking = false;
+    int m_against_wall = 0;                 // TdPlayerPawn.AgainstWallState
+    float m_against_wall_yaw = 0.0f;        // the way into that wall
+    float m_against_wall_off = 0.0f;        // how long the check has found no wall (StopAgainstWall)
+    void update_against_wall(float dt, const LevelScene& scene);
+    bool m_cam_constrain_look = false;      // TdMove_Walking.bConstrainLook from its camera check
+    float m_cam_min_pitch = 0.0f;           // and its MinLookConstraint.Pitch, in Unreal units
     float m_look_at_yaw = 0.0f;
     float m_look_at_pitch = 0.0f;
     float m_look_at_interp = 0.2f;          // LookAtTargetInterpolationTime

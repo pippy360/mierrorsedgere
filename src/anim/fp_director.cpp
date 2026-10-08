@@ -63,6 +63,14 @@ struct MoveAnim {
 // (which vault, which ledge, which rung), with the arguments its script gives. The controller
 // names the animation (PawnFrame::move_anim); how it is played is here.
 const MoveAnim kMoveAnims[] = {
+    // TdMove_Disarm.PlayDisarmStart: PlayMoveAnim(Canned, DisarmAnim, 1.0, 0.1, 0.0) out of the
+    // weapon's set (UpdateAnimSets(DisarmedWeapon) comes first).
+    {"snatchfwd", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchfwd2", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchfwd3", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    {"snatchback", Slot::Canned, 1.0f, 0.1f, 0.0f, false},
+    // TdMove_Disarm.StartMiss.
+    {"snatchfail", Slot::FullBody, 1.0f, 0.1f, 0.4f, false},
     // TdMove_SpeedVault / TdMove_VaultOver: VaultTypes[].AnimName, PlayMoveAnim(FullBody, AnimToPlay, 1.0, 0.15, 0.2).
     {"autostepuprightleg", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
     {"stepuprightleg88", Slot::FullBody, 1.0f, 0.15f, 0.2f, false},
@@ -231,21 +239,39 @@ void Director::tick_weapon(const PawnFrame& frame) {
     }
     const bool light = !frame.heavy_weapon;
     auto make_ready = [&]() {
+        // TdPawn.SetWeaponAnimState does nothing when the state is already the one asked for, so a
+        // shot fired at the ready does not start the time and the distance over again. (Retail, a
+        // pistol: ready, 250 uu walked, a shot, 8 s still, then it began to come down 750 uu into
+        // a run.)
+        if (pawn_.weapon_state == 2) return;
         pawn_.weapon_state = 2;
         ready_for_ = 0.0f;
         amount_til_unarmed_ = light ? 1000.0f : 0.0f;
     };
+    if (frame.movement == EMovement::MOVE_Snatch) {
+        // TdMove_Disarm.TakeDisarmedPawnsWeapon: the weapon's sets are in but the state is unarmed
+        // (SetWeaponAnimState(0)) while the canned animation takes it off the enemy; it is hers at
+        // the ready as the move ends, with nothing drawn from a holster.
+        was_armed_ = true;
+        make_ready();
+        pawn_.weapon_state = 0;
+        pawn_.armed_right = pawn_.armed_left = 0.0f;
+        return;
+    }
     if (!was_armed_) {
         was_armed_ = true;
         tree_.play_custom_anim(Slot::CannedUpperBody, "unholster", 1.0f, 0.0f, 0.2f, false, true);
         make_ready();
     }
+    if (pawn_.weapon_state == 0) make_ready();
     if (frame.fired) {
         // PlayCustomAnim(CNT_Weapon, 'standfire', 1.0, 0.1, 0.0). (The script gives no blend out and
         // marks the node as a firing animation for native code to clear; here it goes back to the
         // ready stance over 0.2 s as it ends.)
         tree_.stop_custom_anim(Slot::Weapon, 0.0f);
-        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.2f, false, true);
+        // Retail: in over 0.1 s, whole until its end (0.72 s after a pistol's shot), and the ready
+        // stance back over about 0.08 s.
+        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.08f, false, true);
         make_ready();
     }
     ready_for_ += frame.dt;
@@ -363,18 +389,25 @@ void Director::tick_climb(const PawnFrame& frame) {
     const bool moving = vz > 20.0f || step_down;
     const bool was_moving = climb_last_vz_ > 20.0f || (climb_last_vz_ <= -50.0f && climb_last_vz_ >= -150.0f);
     climb_last_vz_ = vz;
-    const float rungs = frame.climbing_pipe ? 64.0f : 32.0f;
-    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > rungs + 2.0f;
+    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > climb_step_size_ + 2.0f;
     if (!climb_exiting_ && moving && (!was_moving || past_step)) {
         // Where this step started: a frame's travel back from here.
-        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? rungs : -rungs) : frame.position.z - vz * frame.dt;
+        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? climb_step_size_ : -climb_step_size_) : frame.position.z - vz * frame.dt;
+        // HandleClimbAction: a pipe is climbed two rungs to the animation, the fast one, while more
+        // than one rung is left above her (going down, while she is past the second), and the last
+        // with the plain one.
+        const float left = step_down ? frame.climb_bottom : frame.climb_top;
+        const bool fast = frame.climbing_pipe && (left < 0.0f || left > (step_down ? 2.5f : 1.5f) * 32.0f);
+        climb_step_size_ = fast ? 64.0f : 32.0f;
         // Up: ClimbAnims[bClimbLeftHand ? right : left]; down, the other one at -1.
         const bool right_hand = step_down ? !climb_left_hand_ : climb_left_hand_;
-        const char* name = frame.climbing_pipe ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
-                                               : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
-        // At the speed the move climbs at (96 uu/s a ladder, 128 a pipe) the animation lasts as long
-        // as its step; a controller that climbs faster gets it played faster.
-        const float pace = std::clamp(std::fabs(vz) / (frame.climbing_pipe ? 128.0f : 96.0f), 1.0f, 2.0f);
+        const char* name = fast ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
+                           : frame.climbing_pipe ? (right_hand ? "PipeClimbUpRightHand" : "PipeClimbUpLeftHand")
+                                                 : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
+        // At the speed the move climbs at (96 uu/s a ladder, 64 a pipe, so 128 two rungs at a time)
+        // the animation lasts as long as its step; a controller that climbs faster gets it played
+        // faster.
+        const float pace = std::clamp(std::fabs(vz) / (fast ? 128.0f : frame.climbing_pipe ? 64.0f : 96.0f), 1.0f, 2.0f);
         play(Slot::FullBody, name, (step_down ? -1.0f : 1.0f) * pace, 0.1f, 0.075f);
         climb_step_time_ = 0.0f;
         climb_step_length_ = frame.climbing_pipe ? 0.5f : 1.0f / 3.0f;
@@ -499,9 +532,17 @@ void Director::update_walking_state(const PawnFrame& frame) {
 bool Director::play_named(const std::string& name) {
     const MoveAnim* a = find_move_anim(name);
     if (!a) return false;
+    Slot slot = a->slot;
+    float blend_out = a->blend_out;
+    // TdMove_IntoGrab.ReachedPreciseLocation on a sloped ledge: the lighter catches go to the camera
+    // alone, so the body keeps the hang the slope gives it, and the others take 0.8 s to leave.
+    if (sloped_ledge_ && std::strncmp(a->name, "hang", 4) == 0 && std::strstr(a->name, "hardstart")) {
+        if (std::strcmp(a->name, "hanghardstartvertical") == 0 || std::strcmp(a->name, "hanghardstart3") == 0) blend_out = 0.8f;
+        else slot = Slot::Camera;
+    }
     std::string playing;
-    if (tree_.custom_anim_playing(a->slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(a->slot) < 0.05f) return true;
-    tree_.play_custom_anim(a->slot, name, a->rate, a->blend_in, a->blend_out, a->looping, true);
+    if (tree_.custom_anim_playing(slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(slot) < 0.05f) return true;
+    tree_.play_custom_anim(slot, name, a->rate, a->blend_in, blend_out, a->looping, true);
     // TdMove_Climb.ExitAtTop: over the top, and the walking tree comes in under it.
     if (std::strstr(a->name, "exittop")) {
         climb_exiting_ = true;
@@ -509,7 +550,7 @@ bool Director::play_named(const std::string& name) {
         set_animation_state(EMovement::MOVE_Walking, 0.5f);
     }
     // TdMove_IntoGrab.ReachedPreciseLocation: the hardest catch also knocks the camera.
-    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, 0.2f, false, true);
+    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, sloped_ledge_ ? 0.8f : 0.2f, false, true);
     return true;
 }
 
@@ -599,6 +640,13 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::UpperBody, 0.2f);
             set_animation_state(EMovement::MOVE_None);
             break;
+        case EMovement::MOVE_Snatch:
+            // The disarm's animation is played with no blend out, so it holds its last frame, the
+            // weapon in her hands, and the move ends with it (OnCustomAnimEnd). Nothing in the
+            // script lets the slot go; here it gives way to the weapon's stance over 0.2 s, the time
+            // AbortDisarm takes it off in.
+            tree_.stop_custom_anim(Slot::Canned, 0.2f);
+            break;
         case EMovement::MOVE_MeleeAir:
         case EMovement::MOVE_MeleeWallrun:
             tree_.stop_custom_anim(Slot::FullBody, 0.15f);
@@ -611,18 +659,28 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
 void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame) {
     switch (move) {
         case EMovement::MOVE_Jump: {
-            // TdMove_Jump.StartJump.
-            const float forward = forward_speed(frame);
+            // TdMove_Jump.StartJump: vector(Rotation) Dot Velocity as the move starts, which is before
+            // this frame's physics, so the velocity is the frame before's. (Out of a vault on to a
+            // ledge she is still slowing down: 66 uu/s then, 29 a frame later.)
+            const float yaw = frame.yaw_deg * DEG2RAD;
+            const float forward = std::cos(yaw) * last_velocity_.x + std::sin(yaw) * last_velocity_.y;
             if (forward < 5.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.15f, 0.15f);
             else if (forward < kLongJumpNormalThreshold || !frame.long_jump_over_gap) play(Slot::FullBodyDir, "JumpSlow", 1.0f, kJumpBlendInTime, kJumpBlendOutTime);
             else play(Slot::FullBodyDir, "JumpFast", 1.0f, kJumpBlendInTime, kJumpBlendOutTime);
             break;
         }
         case EMovement::MOVE_Falling:
-            // TdMove_Falling.StartMove: walking off an edge.
+            // TdMove_Falling.StartMove: walking off an edge. Backing off one with room for her
+            // below it (CanStand a body's height down), the move stops her dead and plays JumpStill;
+            // backing off a lower one it plays nothing. The velocity it reads is the one she walked
+            // off with, and a stop shows as her speed gone by this frame.
             if (old == EMovement::MOVE_Walking) {
-                if (forward_speed(frame) < 0.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.3f, 0.2f);
-                else play(Slot::FullBodyDir, "JumpAir", 1.0f, 0.3f, 0.2f);
+                const float yaw = frame.yaw_deg * DEG2RAD;
+                const float forward = std::cos(yaw) * last_velocity_.x + std::sin(yaw) * last_velocity_.y;
+                const float was = std::hypot(last_velocity_.x, last_velocity_.y);
+                const float now = std::hypot(frame.velocity.x, frame.velocity.y);
+                if (forward >= 0.0f) play(Slot::FullBodyDir, "JumpAir", 1.0f, 0.3f, 0.2f);
+                else if (now < 0.5f * was || now < 30.0f) play(Slot::FullBodyDir, "JumpStill", 1.0f, 0.3f, 0.2f);
             } else if (old == EMovement::MOVE_DodgeJump) {
                 set_animation_state(EMovement::MOVE_DodgeJump);
             }
@@ -815,7 +873,9 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
         case EMovement::MOVE_Grabbing:
             // TdMove_Grab.StartMove: RootOffset.X += RelativeExtent + 1 with the legs on the wall (the
             // recordings have the eye 1 forward in 794 of 872 hanging frames), over 0.3 s.
+            // Hanging free from a sloped ledge it is 3 up instead.
             if (!frame.hanging_free) set_root_offset(Vec3(1.0f, 0.0f, 0.0f), 0.3f);
+            else if (frame.ledge_sloped) set_root_offset(Vec3(0.0f, 0.0f, 3.0f), 0.3f);
             grab_turn_ = 0;
             grab_timer_ = -1.0f;
             grab_free_turn_ = false;
@@ -893,6 +953,7 @@ void Director::tick(const PawnFrame& frame) {
     else if (!airborne_) fall_top_ = frame.position.z;
     airborne_ = airborne;
 
+    sloped_ledge_ = frame.ledge_sloped;
     // The animation the move's own checks chose, on the frame it chooses it.
     if (frame.move_anim == "@reached") {
         // TdMove_SpringBoard.ReachedPreciseLocation: off the other leg than the one in front.
@@ -919,11 +980,12 @@ void Director::tick(const PawnFrame& frame) {
     else pawn_.grab_turn_type = 0;
     if (frame.movement == EMovement::MOVE_Melee || frame.movement == EMovement::MOVE_MeleeCrouch) tick_melee(frame);
 
-    // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before the
-    // feet arrive. Measured: it fires while falling faster than 400 with the ground less than 0.4 s
-    // away at the speed she is falling.
-    if (frame.movement == EMovement::MOVE_Falling && !close_to_ground_ && frame.ground_distance >= 0.0f && frame.velocity.z < -400.0f &&
-        frame.ground_distance <= -frame.velocity.z * 0.4f) {
+    // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before
+    // she arrives. Measured: it fires in a fall with something less than 0.4 s away along the
+    // velocity, the ground or a wall (ground_distance is the distance along it), at any speed: a
+    // step off a low ledge fires it 0.17 s in, falling at 240.
+    if (frame.movement == EMovement::MOVE_Falling && !close_to_ground_ && frame.ground_distance >= 0.0f && frame.velocity.z < 0.0f &&
+        frame.ground_distance <= frame.velocity.length() * 0.4f) {
         close_to_ground_ = true;
         tree_.stop_custom_anim(Slot::FullBodyDir, 0.3f);
     }
@@ -947,7 +1009,10 @@ void Director::tick(const PawnFrame& frame) {
     // The swing's angle stays where it was when she lets go (the poses fade under the jump off).
     if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
+    pawn_.balance_danger = frame.balance_danger;
+    pawn_.against_wall = frame.against_wall;
     pawn_.hanging_free = frame.hanging_free;
+    pawn_.grab_slope_deg = frame.ledge_slope_deg;
     pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
     tick_weapon(frame);

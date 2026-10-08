@@ -1564,9 +1564,15 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.long_jump_over_gap = telemetry.jump_over_gap;
         frame.move_left = telemetry.move_left;
         frame.hanging_free = telemetry.hanging_free;
+        frame.ledge_sloped = telemetry.ledge_sloped;
+        frame.ledge_slope_deg = telemetry.ledge_slope_deg;
         frame.swing_angle = telemetry.swing_angle;
         frame.balance_lean = telemetry.balance_lean;
+        frame.balance_danger = telemetry.balance_danger;
+        frame.against_wall = telemetry.against_wall;
         frame.climbing_pipe = telemetry.climbing_pipe;
+        frame.climb_top = telemetry.climb_top;
+        frame.climb_bottom = telemetry.climb_bottom;
         // The controller's blows: 0 right, 1 left, 2 the combo's third, 3 crouched.
         frame.melee_variant = telemetry.move_state == EMovement::MOVE_Melee ? telemetry.melee_variant : -1;
         frame.melee_hit = telemetry.melee_hit_confirmed;
@@ -1590,10 +1596,13 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         fp.last_frame = frame;
         // At the ready the weapon arm follows the view (TdSkelControlAim1p), both arms with a two-handed weapon.
         fp::PoseEvaluator::Aim aim;
+        fp.poser.set_grip_enabled(telemetry.move_state != EMovement::MOVE_Snatch);
         aim.pitch_deg = telemetry.pitch_deg;
         aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready();
         aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready();
         aim.hips = fp.director.hips_offset();
+        aim.swan_forward = fp.director.swan_forward();
+        aim.swan_down = fp.director.swan_down();
         // The two light weapons whose class sets a shoulder offset (TdSharedContent.u).
         if (fp.weapon_name == "BerettaM93R") aim.shoulder = Vec3(0.0f, 0.8f, -1.43f);
         else if (fp.weapon_name == "SteyrTMP") aim.shoulder = Vec3(0.0f, 4.0f, -1.0f);
@@ -1611,11 +1620,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
     // A level intro and the death fall carry their own camera and body.
     if (fp.pose.pos.empty() || telemetry.intro_active || telemetry.falling_to_death) return use;
     use.camera = true;
-    // Snatching a weapon the arms are still posed by hand (evaluate_faith_1p); the legs and the eye
-    // are the tree's.
-    const bool by_hand = telemetry.move_state == EMovement::MOVE_Snatch;
-    use.body = !by_hand;
-    use.legs = by_hand;
+    use.body = true;
     return use;
 }
 
@@ -2404,7 +2409,8 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         }
     };
 
-    const SkeletalMeshAsset* equipped_wmesh = (telemetry.weapon.equipped || state == EMovement::MOVE_Snatch)
+    // Through a disarm the weapon is not in her hand until the move attaches it.
+    const SkeletalMeshAsset* equipped_wmesh = (state == EMovement::MOVE_Snatch ? telemetry.snatch_weapon_attached : telemetry.weapon.equipped)
                                                   ? get_weapon_mesh(telemetry.weapon.name)
                                                   : nullptr;
     size_t w_idx_cnt = equipped_wmesh ? equipped_wmesh->indices.size() : 0;
@@ -2641,8 +2647,9 @@ void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, 
     if (tick_first_person(telemetry).camera) {
         const fp::ViewFrame& v = fp_->view;
         const Rotator body = Rotator::from_degrees(0.0f, telemetry.body_yaw_deg, 0.0f);
+        // ... moved with the mesh where a wall is too close in front of it (TdPawn.OffsetMeshXY).
         out_pos = telemetry.position + Vec3(0.0f, 0.0f, v.eye_pawn.z - kMeshOriginBelowFeet) + body.forward() * v.eye_pawn.x +
-                  body.right() * v.eye_pawn.y;
+                  body.right() * v.eye_pawn.y + telemetry.camera_mesh_offset;
         out_rot = Rotator::from_degrees(telemetry.pitch_deg + v.anim_pitch, telemetry.yaw_deg + v.anim_yaw, v.anim_roll);
         return;
     }
@@ -2848,7 +2855,8 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         skinned_norm[i] = Vec3(n_acc.z, -n_acc.x, -n_acc.y).normalized();
     }
 
-    const SkeletalMeshAsset* bot_wmesh = (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
+    const SkeletalMeshAsset* bot_wmesh = !bot.disarm_weapon.empty() ? get_weapon_mesh(bot.disarm_weapon)
+                                         : (bot.alive && !bot.stunned && bot.weapon_name != "None" && !bot.weapon_name.empty())
                                              ? get_weapon_mesh(bot.weapon_name)
                                              : nullptr;
 
