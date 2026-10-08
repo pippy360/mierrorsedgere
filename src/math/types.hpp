@@ -1147,6 +1147,7 @@ struct PlayerTelemetry {
     float climb_bottom = -1.0f;     // uu down to its first
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
     int balance_danger = 0;         // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;           // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     int active_checkpoint = 0;

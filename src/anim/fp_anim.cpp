@@ -485,6 +485,18 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         for (size_t k = 0; k < n.state_mapping.size(); ++k) {
             if (n.state_mapping[k] == pawn.weapon_state) want = static_cast<int>(k) + 1;
         }
+    } else if (n.cls == "TdAnimNodeAgainstWallState") {
+        // Three of them, by TdPlayerPawn.AgainstWallState (0 none, 1 both hands on the wall, 2 the
+        // left, 3 the right): one under each arm's per-bone blend, whose listed states put that arm
+        // on `againstwall`, and one for the camera, on its Default (the AgainstWallCam aim node)
+        // in every state but 0. Up against a fence retail has the left palm flat on it and the
+        // pistol pointing up in the right hand. To the wall takes 0.35 s, back 0.55 (BlendWeight).
+        want = 0;
+        for (size_t k = 0; k < n.state_mapping.size(); ++k) {
+            if (n.state_mapping[k] == pawn.against_wall) want = static_cast<int>(k) + 1;
+        }
+        const size_t w = static_cast<size_t>(want);
+        blend = w < n.blend_in.size() ? n.blend_in[w] : (want == 0 ? 0.55f : 0.35f);
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;
@@ -744,7 +756,9 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 // A bone mask: the source is always whole underneath.
                 if (n.weight.size() >= 2) {
                     n.weight[0] = 1.0f;
-                    n.weight[1] = n.name == "ArmedLeft" ? pawn.armed_left : (n.name == "ArmedRight" ? pawn.armed_right : n.child2_weight);
+                    // (ArmedLeft and ArmedRight too: each arm is always its own branch, which is the
+                    // body's own again unless the weapon's stance or the wall has it.)
+                    n.weight[1] = n.child2_weight;
                 }
                 break;
             case TreeNode::Kind::Passthrough:

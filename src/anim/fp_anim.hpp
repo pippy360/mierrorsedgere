@@ -50,6 +50,7 @@ struct PawnAnimState {
     float swing_angle = 0.0f;     // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;    // -1 .. 1 off the beam
     int balance_danger = 0;       // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;         // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     bool hanging_free = false;
     bool climbing_pipe = false;
     int climb_hand = 0;           // 0 left hand up, 1 right

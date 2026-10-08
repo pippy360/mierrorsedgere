@@ -157,6 +157,7 @@ int main(int argc, char** argv) {
             else if (key == "swing") f.swing_angle = std::stof(value);
             else if (key == "lean") f.balance_lean = std::stof(value);
             else if (key == "danger") f.balance_danger = std::stoi(value);
+            else if (key == "wall") f.against_wall = std::stoi(value);
             else if (key == "pipe") f.climbing_pipe = value != "0";
             else if (key == "top") f.climb_top = std::stof(value);
         }

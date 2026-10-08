@@ -43,6 +43,7 @@ struct PawnFrame {
     float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     int balance_danger = 0;      // losing her balance to the left (-1) or the right (1)
+    int against_wall = 0;        // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
     bool climbing_pipe = false;  // on a pipe, not a ladder
     float climb_top = -1.0f;     // uu up to the ladder's last step, down to its first (-1 not known)
     float climb_bottom = -1.0f;

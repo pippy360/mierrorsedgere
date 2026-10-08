@@ -1006,6 +1006,7 @@ void Director::tick(const PawnFrame& frame) {
     if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
     pawn_.balance_danger = frame.balance_danger;
+    pawn_.against_wall = frame.against_wall;
     pawn_.hanging_free = frame.hanging_free;
     pawn_.grab_slope_deg = frame.ledge_slope_deg;
     pawn_.climbing_pipe = frame.climbing_pipe;
