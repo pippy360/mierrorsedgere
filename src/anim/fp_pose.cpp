@@ -77,6 +77,7 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
         if (key == "eyejoint") eye_ = camera_ = static_cast<int>(b);
         if (key == "spinexright") spine_right_ = static_cast<int>(b);
         if (key == "spinexleft") spine_left_ = static_cast<int>(b);
+        if (key == "rightshoulder") shoulder_right_ = static_cast<int>(b);
     }
     for (size_t b = 0; b < bones; ++b) {
         if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
@@ -287,6 +288,10 @@ void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) co
     }
     atoms(tree, root, out, 0);
     // The aim controls: the weapon arm (both, with a two-handed weapon) follows the view's pitch.
+    if (shoulder_right_ >= 0 && aim.right > 0.0f) {
+        const size_t b = static_cast<size_t>(shoulder_right_);
+        out.pos[b] += out.rot[b].rotate(aim.shoulder) * aim.right;
+    }
     turn_arm(spine_right_, aim.pitch_deg * aim.right, out);
     turn_arm(spine_left_, aim.pitch_deg * aim.left, out);
 }
