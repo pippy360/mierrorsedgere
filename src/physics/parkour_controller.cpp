@@ -3792,7 +3792,7 @@ bool ParkourController::try_initiate_swing_bar(const InputFrame& input, const Le
         }
 
         // Initial pendulum angle measured from straight down (-Z) toward +swing_dir
-        const Vec3 rel = (m_telemetry.position + Vec3(0.0f, 0.0f, 60.0f)) - anchor;
+        const Vec3 rel = (m_telemetry.position + Vec3(0.0f, 0.0f, 90.0f)) - anchor;
         m_swing_anchor = anchor;
         m_swing_bar_start = a;
         m_swing_bar_end = b;
@@ -3803,7 +3803,7 @@ bool ParkourController::try_initiate_swing_bar(const InputFrame& input, const Le
 
         m_telemetry.position = m_swing_anchor
                              + m_swing_dir * (kSwingPendulumLength * std::sin(m_swing_angle))
-                             - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle));
+                             - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle) + 90.0f);  // the capsule centre is on the arc (retail: radius 120 to 0.001), the feet 90 under it
         m_telemetry.velocity = m_swing_dir * (m_swing_angular_vel * kSwingPendulumLength * std::cos(m_swing_angle));
         m_telemetry.move_state = EMovement::MOVE_Swing;
         m_telemetry.grounded = false;
@@ -3898,7 +3898,7 @@ void ParkourController::update_swing_bar(const InputFrame& input, float dt, cons
     const Vec3 prev_pos = m_telemetry.position;
     const Vec3 target_pos = m_swing_anchor
                           + m_swing_dir * (kSwingPendulumLength * std::sin(m_swing_angle))
-                          - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle));
+                          - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle) + 90.0f);
     m_telemetry.position = target_pos;
     m_telemetry.velocity = (target_pos - prev_pos) / std::max(dt, 1e-4f);
     m_fall_peak_z = m_telemetry.position.z;
