@@ -147,6 +147,41 @@ struct StringListData {
     std::vector<std::string> strings;
 };
 
+// One UIDataProvider_TdKeyBinding of DefaultGame.ini: a row of the CONTROLS screen.
+struct KeyAction {
+    std::string id;        // "MoveForward": the widgets are KeyBindLabel_<id> and KeyBindButton_<id>_0 / _1
+    std::string command;   // "GBA_MoveForward"
+    std::string friendly;  // "MOVE FORWARD"
+};
+
+// One UIDataProvider_TdTimeTrialStretch or UIDataProvider_TdLevelRaceStretch of DefaultGame.ini: a
+// course of TIME TRIAL, a chapter of SPEED RUN.
+struct RaceStretch {
+    std::string id;        // "TT_STRETCH0"
+    std::string map;       // MapFilename: "tt_TutorialA01_p", "edge_p?LoadCheckpoint=Edge_Start"
+    std::string name;      // FriendlyName: "PLAYGROUND ONE"
+    std::string unlock;    // UnlockDesc
+    float qualifying = 0.0f;                 // QualifyingTime, seconds
+    float rating[3] = {0.0f, 0.0f, 0.0f};    // Rating1Time..Rating3Time: one, two and three stars
+};
+
+// One UIDataProvider_ArtworkUnlocks, _VideosUnlocks or _MusicUnlocks of DefaultGame.ini: an entry
+// of UNLOCKABLES.
+struct UnlockItem {
+    std::string id;           // "ArtworkUnlock_1"
+    std::string resource;     // ResourcePath: a texture, "<bink>;<preview texture>", or a music cue's name
+    int level = 0;            // LevelId: the chapter that unlocks it; 0 is there from the start
+    int unlock_id = 0;        // UnlockId, the bit the profile keeps for "viewed"
+    std::string name;         // FriendlyName
+    std::string description;
+};
+
+// One PlayerInput.Bindings entry.
+struct KeyBinding {
+    std::string key;      // "W", "SpaceBar", "LeftMouseButton"
+    std::string command;  // "GBA_MoveForward"
+};
+
 struct Assets {
     // `viewport_height` picks the font tier. Returns false and sets `error` when the retail
     // install is missing something the front end cannot do without.
@@ -181,6 +216,13 @@ struct Assets {
 
     std::vector<MapProvider> maps;  // in DefaultGame.ini order: the Training Area, then the story
     std::vector<StringListData> string_lists;
+    std::vector<KeyAction> key_actions;
+    std::vector<RaceStretch> time_trials;
+    std::vector<UnlockItem> artwork, videos, music;
+    std::vector<RaceStretch> level_races;
+    std::vector<KeyBinding> default_bindings;  // DefaultInput.ini [Engine.PlayerInput] Bindings, in file order
+    // What a key is called on the CONTROLS screen ("SpaceBar" -> "SPACE"); "" for a key that cannot be bound.
+    [[nodiscard]] std::string key_label(const std::string& key) const;
 
     City city;
     KismetGraph kismet;  // the menu level's Main_Sequence and its Matinees

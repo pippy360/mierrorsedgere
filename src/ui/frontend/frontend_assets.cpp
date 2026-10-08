@@ -168,8 +168,10 @@ bool load_font(PackageManager& pm, const UPKPackage& pkg, const std::string& nam
         }
     }
 
-    // Native tail: CharRemap count, then N kerning pairs {u16 first, u16 second, float}, then an
-    // int32 array of offsets that splits those pairs between the tiers.
+    // Native tail: CharRemap count, then N kerning pairs {u16 second, u16 first, float}, then an
+    // int32 array of offsets that splits those pairs between the tiers. The pair is stored with
+    // the following character first: ('A', 'F', -1) pulls an A in under the F before it, which is
+    // what retail's DEFAULTS button shows.
     const auto& exp = pkg.get_exports()[static_cast<size_t>(index - 1)];
     const size_t end = static_cast<size_t>(exp.serial_offset) + static_cast<size_t>(exp.serial_size);
     auto rd_i32 = [&](size_t off) {
@@ -195,7 +197,7 @@ bool load_font(PackageManager& pm, const UPKPackage& pkg, const std::string& nam
                 std::memcpy(&a, p, 2);
                 std::memcpy(&b, p + 2, 2);
                 std::memcpy(&amount, p + 4, 4);
-                if (a < 256 && b < 256) out.pairs[(static_cast<uint32_t>(a) << 16) | b] = amount;
+                if (a < 256 && b < 256) out.pairs[(static_cast<uint32_t>(b) << 16) | a] = amount;
             }
         }
     }
@@ -390,6 +392,10 @@ std::string Assets::localized(const std::string& path) const {
     return it == localized_.end() ? std::string() : it->second;
 }
 
+std::string Assets::key_label(const std::string& key) const {
+    return key.empty() ? std::string() : localized("TdGameUI.TdGameMappedStrings.GMS_" + key);
+}
+
 const Font* Assets::font(const std::string& name) {
     auto it = fonts_.find(name);
     if (it != fonts_.end()) return it->second.get();
@@ -537,6 +543,116 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
                 }
                 string_lists.push_back(std::move(list));
             }
+        }
+    }
+    // The courses of TIME TRIAL and the chapters of SPEED RUN.
+    {
+        std::ifstream game_ini(get_config_path(game_root, "DefaultGame.ini"));
+        std::string line;
+        RaceStretch* current = nullptr;
+        while (std::getline(game_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                current = nullptr;
+                for (const char* cls : {"UIDataProvider_TdTimeTrialStretch", "UIDataProvider_TdLevelRaceStretch"}) {
+                    const std::string suffix = std::string(" ") + cls + "]";
+                    if (line.size() <= suffix.size() || line.compare(line.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+                    std::vector<RaceStretch>& list = cls[17] == 'T' ? time_trials : level_races;
+                    list.emplace_back();
+                    current = &list.back();
+                    current->id = line.substr(1, line.size() - suffix.size() - 1);
+                    const std::string section = "TdGame." + current->id + " " + cls + ".";
+                    current->name = localized(section + "FriendlyName");
+                    current->unlock = localized(section + "UnlockDesc");
+                }
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (!current || eq == std::string::npos) continue;
+            const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+            if (key == "MapFilename") current->map = value;
+            else if (key == "QualifyingTime") current->qualifying = static_cast<float>(std::atof(value.c_str()));
+            else if (key == "Rating1Time") current->rating[0] = static_cast<float>(std::atof(value.c_str()));
+            else if (key == "Rating2Time") current->rating[1] = static_cast<float>(std::atof(value.c_str()));
+            else if (key == "Rating3Time") current->rating[2] = static_cast<float>(std::atof(value.c_str()));
+        }
+    }
+    // UNLOCKABLES: the artwork, the videos and the music.
+    {
+        std::ifstream game_ini(get_config_path(game_root, "DefaultGame.ini"));
+        std::string line;
+        UnlockItem* current = nullptr;
+        auto unquote = [](std::string v) {
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+            return v;
+        };
+        while (std::getline(game_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                current = nullptr;
+                const std::pair<const char*, std::vector<UnlockItem>*> kinds[3] = {
+                    {"UIDataProvider_ArtworkUnlocks", &artwork}, {"UIDataProvider_VideosUnlocks", &videos}, {"UIDataProvider_MusicUnlocks", &music}};
+                for (const auto& [cls, list] : kinds) {
+                    const std::string suffix = std::string(" ") + cls + "]";
+                    if (line.size() <= suffix.size() || line.compare(line.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+                    list->emplace_back();
+                    current = &list->back();
+                    current->id = line.substr(1, line.size() - suffix.size() - 1);
+                    const std::string section = "TdGame." + current->id + " " + cls + ".";
+                    current->name = unquote(localized(section + "FriendlyName"));
+                    current->description = unquote(localized(section + "Description"));
+                }
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (!current || eq == std::string::npos) continue;
+            const std::string key = line.substr(0, eq), value = unquote(line.substr(eq + 1));
+            if (key == "ResourcePath") current->resource = value;
+            else if (key == "LevelId") current->level = std::atoi(value.c_str());
+            else if (key == "UnlockId") current->unlock_id = std::atoi(value.c_str());
+        }
+    }
+    // The key bindings: the actions ("[<Id> UIDataProvider_TdKeyBinding]" of DefaultGame.ini) and
+    // the keys they start on ([Engine.PlayerInput] of DefaultInput.ini; the "GBA_" entries there
+    // are the aliases themselves, not keys).
+    {
+        std::ifstream game_ini(get_config_path(game_root, "DefaultGame.ini"));
+        std::string line;
+        KeyAction* current = nullptr;
+        const std::string suffix = " UIDataProvider_TdKeyBinding]";
+        while (std::getline(game_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                current = nullptr;
+                if (line.size() > suffix.size() && line.compare(line.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    key_actions.emplace_back();
+                    current = &key_actions.back();
+                    current->id = line.substr(1, line.size() - suffix.size() - 1);
+                    current->friendly = localized("TdGame." + current->id + " UIDataProvider_TdKeyBinding.FriendlyName");
+                }
+                continue;
+            }
+            if (current && line.compare(0, 8, "Command=") == 0) {
+                current->command = line.substr(8);
+                if (current->command.size() >= 2 && current->command.front() == '"') current->command = current->command.substr(1, current->command.size() - 2);
+            }
+        }
+        std::ifstream input_ini(get_config_path(game_root, "DefaultInput.ini"));
+        bool player_input = false;
+        while (std::getline(input_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                player_input = line == "[Engine.PlayerInput]";
+                continue;
+            }
+            // ".Bindings=" and "+Bindings=" add an entry. "-Bindings=" takes one of the engine's own
+            // away, and ";" is a comment.
+            const size_t at = line.find("Bindings=(");
+            if (!player_input || at == std::string::npos || at > 1 || line.front() == '-' || line.front() == ';') continue;
+            KeyBinding b;
+            b.key = struct_field(line, "Name");
+            b.command = struct_field(line, "Command");
+            if (!b.key.empty() && b.key.compare(0, 4, "GBA_") != 0) default_bindings.push_back(std::move(b));
         }
     }
     IniConfig ui_ini;

@@ -79,7 +79,51 @@ struct UiImageComp {
     const UiStyle* style = nullptr;
     const Image* texture = nullptr;  // ImageRef.ImageTexture, which replaces the style's DefaultImage
     float opacity = 1.0f;
+    int8_t adjust[2] = {-1, -1};     // StyleCustomization.Formatting where it overrides the style
+    int8_t align[2] = {-1, -1};
     std::string resolver;            // StyleResolverTag: "IncrementStyle" means the owner widget supplies the style
+};
+
+// A piece of a string drawn in its own font or colour: "<Fonts:UI_Fonts_Final.Symbols>B<Fonts:/>"
+// is the padlock of a locked course.
+struct UiRun {
+    std::string text;
+    const Font* font = nullptr;  // null: the style's font
+    bool colored = false;
+    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+};
+
+// UIList with its UIComp_ListPresenter.
+struct UiListColumn {
+    std::string field;         // CellDataField: "FriendlyName"
+    float width = 0.0f;        // CellSize
+    bool percent = false;      // UIEXTENTEVAL_PercentSelf: of the list's width
+};
+
+struct UiListRow {
+    std::vector<std::vector<UiRun>> cells;  // one per column
+    bool enabled = true;                    // a disabled element is drawn in the Disabled state
+};
+
+struct UiList {
+    float row_height = 0.0f;  // RowHeight
+    bool row_percent = false; // UIEXTENTEVAL_PercentSelf: of the list's height
+    float cell_padding = 0.0f;
+    std::vector<UiListColumn> columns;
+    const UiStyle* cell[4] = {nullptr, nullptr, nullptr, nullptr};     // GlobalCellStyle: normal, active, selected, under the cursor
+    const UiStyle* overlay[4] = {nullptr, nullptr, nullptr, nullptr};  // ItemOverlayStyle, the same four
+    bool every_other = false;  // bOnlyDrawEveryOtherElementOverlay
+    int scrollbar = -1;        // VerticalScrollbar, a child widget
+    std::vector<UiListRow> rows;
+    int index = 0;  // the selected element
+    int top = 0;    // the first element shown
+
+    // A row and the padding under it, and how many of them fit, for a list this tall (scene pixels).
+    [[nodiscard]] float pitch(float list_height) const { return (row_percent ? row_height * list_height : row_height) + cell_padding; }
+    [[nodiscard]] int visible(float list_height) const {
+        const float p = pitch(list_height);
+        return p > 0.0f ? static_cast<int>(list_height / p) : 0;
+    }
 };
 
 struct UiWidget {
@@ -102,6 +146,8 @@ struct UiWidget {
     float zdepth = 0.0f;
     int tab_index = 0;
     int forced_nav[4] = {-1, -1, -1, -1};  // NavigationTargets.ForcedNavigationTarget by face
+    std::vector<int> pages;                // UITabControl.Pages
+    int tab_button = -1;                   // UITabPage.TabButton
 
     std::string markup;  // DataSource.MarkupString as authored
     std::string text;    // what the string component draws now
@@ -109,8 +155,10 @@ struct UiWidget {
     UiImageComp image;       // BackgroundImageComponent / ImageComponent
     UiImageComp bar;         // UISlider.SliderBarImageComponent
     UiImageComp marker;      // UISlider.MarkerImageComponent
-    const UiStyle* increment = nullptr;  // UITdOptionButton.IncrementStyle
+    const UiStyle* increment = nullptr;  // UITdOptionButton.IncrementStyle, UIScrollbar.IncrementStyle
     const UiStyle* decrement = nullptr;
+    const UiStyle* marker_style = nullptr;  // UIScrollbar.MarkerStyle
+    std::shared_ptr<UiList> list;           // UIList
     float slider[4] = {0.0f, 1.0f, 0.0f, 1.0f};  // UISlider.SliderValue: min, max, current, nudge
     float bar_size = 8.0f;
     float marker_width = 0.1f;   // of the slider's width
@@ -176,18 +224,23 @@ public:
     // SetDataStoreBinding / SetValue: markup is resolved, plain text taken as it is.
     void set_text(UiSystem& ui, const std::string& widget, const std::string& markup);
     void set_visible(const std::string& widget, bool visible);
+    // UIList.SetIndex: selects an element, scrolls it into view and moves the scrollbar's marker.
+    void list_select(int widget, int index);
     [[nodiscard]] bool visible(int widget) const;  // it and every ancestor
 
     // Resolves every widget's rectangle. Call after text or visibility changed.
     void layout();
     // The scene as draw operations. `scale` and `origin_x` place the 1280x720 scene in the viewport.
-    void draw(Frame& f, float scale, float origin_x, float gamma) const;
+    // `opacity` is what a scene under the top one is drawn with.
+    void draw(Frame& f, float scale, float origin_x, float gamma, float opacity = 1.0f);
 
     // A TdUIButtonBar's visible buttons, right to left as AppendButton fills them.
     struct BarButton {
         std::string label;
         bool disabled = false;
-        Rect rect;  // the red box, scene pixels (set by draw's layout)
+        bool hidden = false;  // ToggleAllButtons(false): the scene is not the top one
+        uint8_t key = 0;      // the host key that does what clicking the button does (a Key; 0 for none)
+        Rect rect;            // the red box, viewport pixels, as last drawn
     };
     std::vector<std::pair<int, std::vector<BarButton>>> button_bars;  // widget index, its buttons
     std::vector<BarButton>& bar(const std::string& widget);
@@ -196,12 +249,12 @@ public:
     const Font* bar_font = nullptr;    // TdUIButtonBarButton's string style
     const Image* bar_image = nullptr;  // TdImageButtonBarBackground
     float bar_padding[2] = {20.0f, 3.0f};  // how far the box reaches past the label (the StylePadding of that style)
-    float bar_text[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    float bar_shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const UiStyle* bar_text = nullptr;    // its colours, enabled and disabled
+    const UiStyle* bar_shadow = nullptr;  // DropShadowStyle
 
 private:
     friend class UiSystem;
-    void draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) const;
+    void draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity);
     std::vector<float> face_value_;  // every widget's four faces as last resolved
 };
 
@@ -216,6 +269,8 @@ public:
     std::unique_ptr<UiScene> load_scene(const std::string& package, const std::string& scene);
     // "<Strings:TdGameUI.TdMainMenu.StoryCaptionText>" -> "STORY". Unknown tags are dropped; "\n" becomes a line break.
     [[nodiscard]] std::string resolve_markup(const std::string& markup) const;
+    // The same, keeping what the inline tags ask for: <Fonts:Package.Font>, <Styles:Tag>, <Color:R=,G=,B=,A=>.
+    std::vector<UiRun> parse_runs(const std::string& markup);
     const UiStyle* style_by_tag(const std::string& tag);
     // TdGame.Default__TdProfileSettings: every setting with its values and default.
     bool load_profile_settings(ProfileSettings& out);
@@ -233,11 +288,13 @@ std::vector<std::string> ui_wrap(const Font& font, const std::string& text, floa
 // Draws `text` in `box` (viewport pixels): alignment 0 left/top, 1 centre, 2 right/bottom. `color` is linear.
 void ui_draw_text(Frame& f, const Font& font, const std::string& text, const Rect& box, int halign, int valign, bool wrap,
                   const float color[4], const float* shadow_color, float shadow_h, float shadow_v, float gamma, const Rect* clip = nullptr);
-// Draws `image` over `box` (viewport pixels) scaled to fit, tinted with a linear colour.
+// Draws `image` over `box` (viewport pixels) scaled to fit, tinted with a linear colour. A negative
+// UL or VL mirrors the image.
 void ui_draw_image(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma, const Rect* clip = nullptr);
 // UCanvas::DrawTileStretched: the four quarters of the image keep their size in the corners of
-// `box` and its middle row and column are stretched between them.
+// `box` and its middle row and column are stretched between them. An axis that is not stretched
+// is scaled to the box instead.
 void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma,
-                             const Rect* clip = nullptr);
+                             const Rect* clip = nullptr, bool stretch_h = true, bool stretch_v = true);
 
 }  // namespace me::fe

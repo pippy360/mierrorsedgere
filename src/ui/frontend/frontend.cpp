@@ -120,6 +120,7 @@ bool Frontend::init(const std::string& game_root, int width, int height, std::st
         l.values = list.strings;
         l.index = list.default_index;
     }
+    bindings_ = assets_.default_bindings;
     // What a PC reports at run time; a host replaces these with its own.
     string_lists_["ScreenResolution"].values = {std::to_string(width_) + "x" + std::to_string(height_)};
     string_lists_["ScreenResolution"].index = 0;
@@ -257,9 +258,11 @@ void Frontend::open_main_menu() {
     build_panels();
 }
 
-void Frontend::key_down(Key key) {
+void Frontend::key_down(Key key, const std::string& name) {
     if (screen_ == Screen::MainMenu && !scenes_.empty()) {
-        scenes_.back()->key_pressed(key);
+        SubMenu* top = scenes_.back().get();
+        if (!name.empty() && top->raw_key(name, false)) return;
+        top->key_pressed(key);
         return;
     }
     if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
@@ -286,14 +289,16 @@ void Frontend::key_down(Key key) {
     }
 }
 
-void Frontend::key_up(Key key) {
+void Frontend::key_up(Key key, const std::string& name) {
     if (screen_ == Screen::Start) {
         // TdUIScene_Start.HandleInputKey: any key released, once the start button is up.
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
     }
     if (!scenes_.empty()) {
-        scenes_.back()->key_released(key);
+        SubMenu* top = scenes_.back().get();
+        if (!name.empty() && top->raw_key(name, true)) return;
+        top->key_released(key);
         return;
     }
     if (current_panel_ < 0) return;
@@ -433,7 +438,7 @@ int Frontend::button_at(float x, float y) const {
 }
 
 void Frontend::mouse_move(float x, float y) {
-    if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
+    if (screen_ != Screen::MainMenu || current_panel_ < 0 || !scenes_.empty()) return;
     // A button entering the Active state rebinds the description; focus stays where it was.
     const int b = button_at(x, y);
     if (b != hovered_ && b >= 0) description_ = panels_[static_cast<size_t>(current_panel_)].buttons[static_cast<size_t>(b)].description;
@@ -445,6 +450,11 @@ void Frontend::mouse_click(float x, float y) {
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
     }
+    if (!scenes_.empty()) {
+        SubMenu* top = scenes_.back().get();
+        if (!top->raw_key("LeftMouseButton", true)) top->mouse_click(x, y);
+        return;
+    }
     if (current_panel_ < 0) return;
     const int b = button_at(x, y);
     if (b >= 0) {
@@ -452,10 +462,7 @@ void Frontend::mouse_click(float x, float y) {
         if (p.focus != b) fade_timer_ = 0.0f;
         p.focus = b;
         description_ = p.buttons[static_cast<size_t>(b)].description;
-        if (!animating_) {
-            action_ = p.buttons[static_cast<size_t>(b)].widget;
-            sound("Accept");
-        }
+        button_clicked(p.buttons[static_cast<size_t>(b)].widget);
         return;
     }
     // The small caption of another column: OnButtonClicked_Panel<N>.
@@ -546,7 +553,8 @@ void Frontend::draw_label(Frame& f, const Font& font, const std::string& text, c
     y = std::round(y);
     if (shadow_color && shadow_color[3] > 0.0f) {
         // UIComp_TdDropShadowString: the offsets are fractions of the line height.
-        draw_text(f, font, text, x + std::round(shadow_dx * line), y + std::round(shadow_dy * line), shadow_color);
+        // and are not put back on whole pixels; down, one pixel less (docs/SUB_MENUS_RE.md, 2.5).
+        draw_text(f, font, text, x + shadow_dx * line, y + shadow_dy * line - 1.0f, shadow_color);
     }
     draw_text(f, font, text, x, y, color);
 }
@@ -661,25 +669,10 @@ void Frontend::draw_menu(Frame& f) const {
             float shadow[4];
             ui_color(kNavyRGB[0], kNavyRGB[1], kNavyRGB[2], opacity, navy);
             ui_color(kShadowRGB[0], kShadowRGB[1], kShadowRGB[2], 0.34f * opacity, shadow);
-            // CLIP_Wrap, right-aligned: break on spaces to the label's width.
+            // CLIP_Wrap, right-aligned: broken on spaces to the label's width, each broken line
+            // keeping its space (so it ends one space short of the right edge, as retail's does).
             const Font& font = assets_.small_normal;
-            std::vector<std::string> lines;
-            std::string line;
-            size_t pos = 0;
-            while (pos <= description_.size()) {
-                const size_t sp = description_.find(' ', pos);
-                const std::string word = description_.substr(pos, sp == std::string::npos ? std::string::npos : sp - pos);
-                const std::string trial = line.empty() ? word : line + " " + word;
-                if (!line.empty() && font.width(trial) > box.w()) {
-                    lines.push_back(line);
-                    line = word;
-                } else {
-                    line = trial;
-                }
-                if (sp == std::string::npos) break;
-                pos = sp + 1;
-            }
-            if (!line.empty()) lines.push_back(line);
+            const std::vector<std::string> lines = ui_wrap(font, description_, box.w(), true);
             const float lh = static_cast<float>(font.line_height) * font.scale;
             for (size_t i = 0; i < lines.size(); ++i) {
                 const Rect row{box.l, box.t + lh * static_cast<float>(i), box.r, box.t + lh * static_cast<float>(i + 1)};
@@ -702,15 +695,14 @@ void Frontend::draw_menu(Frame& f) const {
         const float w = bfont.width(label);
         const Rect text{right - w, bar_view.t, right, bar_view.b};
         if (assets_.button.valid()) {
-            // TdImageButtonBarBackground: button_full stretched around the auto-sized label.
-            // StylePadding is -20; measured on a retail frame that is 20 px a side and 4.7 px
-            // above and below at 720 lines.
-            DrawOp op;
-            op.kind = DrawOp::Kind::Image;
-            op.image = &assets_.button;
-            op.quads.push_back(Quad{text.l - 20.0f * scale_, text.t - 4.7f * scale_, text.r + 20.0f * scale_,
-                                    text.b + 4.7f * scale_, 0.0f, 0.0f, 1.0f, 1.0f});
-            f.ui.push_back(std::move(op));
+            // TdImageButtonBarBackground: button_full drawn with DrawTileStretched around the
+            // auto-sized label, grown by the style's padding, 20 px a side and 3 px above and
+            // below (docs/SUB_MENUS_RE.md, 2.6).
+            const float whole[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const float tint[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            ui_draw_image_stretched(f, assets_.button,
+                                    Rect{text.l - 20.0f * scale_, text.t - 3.0f * scale_, text.r + 20.0f * scale_, text.b + 3.0f * scale_}, whole,
+                                    tint, gamma());
         }
         draw_label(f, bfont, label, text, 0, 1, white, shadow, 0.06f, 0.06f);
         right = text.l - 50.0f * scale_;
@@ -736,9 +728,16 @@ const Frame& Frontend::frame() {
         f.roll = view->euler.x;
         f.fov = view->fov;
     }
-    if (screen_ == Screen::Start) draw_start(f);
-    else if (!scenes_.empty()) scenes_.back()->draw(f, scale_, origin_x_, gamma());
-    else draw_menu(f);
+    if (screen_ == Screen::Start) {
+        draw_start(f);
+    } else if (!scenes_.empty()) {
+        // The top scene, over the ones it lets show through.
+        size_t first = scenes_.size() - 1;
+        while (first > 0 && scenes_[first]->draws_parent()) --first;
+        for (size_t i = first; i < scenes_.size(); ++i) scenes_[i]->draw(f, scale_, origin_x_, gamma(), i + 1 == scenes_.size());
+    } else {
+        draw_menu(f);
+    }
     return f;
 }
 

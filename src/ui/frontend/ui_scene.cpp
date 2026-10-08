@@ -112,9 +112,10 @@ struct View {
         return nullptr;
     }
     // A member of a struct inside a struct (DockTargets.DockPadding.PaddingValue[k]).
-    const UProperty* field2(const std::string& prop, const std::string& inner, const std::string& member, int member_index = 0) const {
+    const UProperty* field2(const std::string& prop, const std::string& inner, const std::string& member, int member_index = 0,
+                            int prop_index = 0) const {
         for (const UPropertyList* list : lists) {
-            const UProperty* p = find_prop(*list, prop);
+            const UProperty* p = find_prop(*list, prop, prop_index);
             if (!p) continue;
             const UProperty* q = find_prop(p->fields, inner);
             if (!q) continue;
@@ -375,18 +376,18 @@ struct UiSystem::Impl {
     }
 
     // A UIStyleReference property of an object.
-    const UiStyle* style_ref(const View& v, const char* prop) {
+    const UiStyle* style_ref(const View& v, const char* prop, int prop_index = 0) {
         load_skin();
         std::array<int32_t, 4> id{0, 0, 0, 0};
         static const char* const kParts[4] = {"A", "B", "C", "D"};
         for (int k = 0; k < 4; ++k) {
-            if (const UProperty* part = v.field2(prop, "AssignedStyleID", kParts[k])) id[static_cast<size_t>(k)] = part->i;
+            if (const UProperty* part = v.field2(prop, "AssignedStyleID", kParts[k], 0, prop_index)) id[static_cast<size_t>(k)] = part->i;
         }
         if (id[0] || id[1] || id[2] || id[3]) {
             auto it = style_by_id.find(id);
             if (it != style_by_id.end()) return resolve_style(it->second);
         }
-        if (const UProperty* tag = v.field(prop, "DefaultStyleTag")) {
+        if (const UProperty* tag = v.field(prop, "DefaultStyleTag", 0, nullptr, prop_index)) {
             auto it = style_by_tag.find(to_lower(tag->s));
             if (it != style_by_tag.end()) return resolve_style(it->second);
         }
@@ -430,6 +431,18 @@ struct UiSystem::Impl {
         }
         if (is_true(v.field("StyleCustomization", "bOverrideOpacity"), false)) {
             if (const UProperty* p = v.field("StyleCustomization", "Opacity")) out.opacity = p->f;
+        }
+        if (is_true(v.field("StyleCustomization", "bOverrideFormatting"), false)) {
+            for (int k = 0; k < 2; ++k) {
+                for (const UPropertyList* list : v.lists) {
+                    const UProperty* custom = find_prop(*list, "StyleCustomization");
+                    const UProperty* fmt = custom ? find_prop(custom->fields, "Formatting", k) : nullptr;
+                    if (!fmt) continue;
+                    if (const UProperty* a = find_prop(fmt->fields, "AdjustmentType")) out.adjust[k] = static_cast<int8_t>(adjust_of(a->s));
+                    if (const UProperty* a = find_prop(fmt->fields, "Alignment")) out.align[k] = static_cast<int8_t>(align_of(a->s, kAlignLeft));
+                    break;
+                }
+            }
         }
     }
 };
@@ -516,6 +529,77 @@ std::string UiSystem::resolve_markup(const std::string& markup) const {
     return out;
 }
 
+std::vector<UiRun> UiSystem::parse_runs(const std::string& markup) {
+    std::vector<UiRun> runs;
+    UiRun state;  // the font and colour in force
+    std::vector<UiRun> saved;
+    auto emit = [&](const std::string& text) {
+        if (text.empty()) return;
+        if (!runs.empty() && runs.back().font == state.font && runs.back().colored == state.colored &&
+            std::equal(state.color, state.color + 4, runs.back().color)) {
+            runs.back().text += text;
+            return;
+        }
+        UiRun r = state;
+        r.text = text;
+        runs.push_back(std::move(r));
+    };
+    std::string text;
+    for (size_t i = 0; i < markup.size();) {
+        const size_t close = markup[i] == '<' ? markup.find('>', i) : std::string::npos;
+        if (close == std::string::npos) {
+            text.push_back(markup[i++]);
+            continue;
+        }
+        emit(text);
+        text.clear();
+        const std::string tag = markup.substr(i + 1, close - i - 1);
+        i = close + 1;
+        const size_t colon = tag.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string kind = tag.substr(0, colon), value = tag.substr(colon + 1);
+        if (kind == "Strings") {
+            if (!assets_) continue;
+            // The string's own tags apply inside it only.
+            const UiRun outer = state;
+            for (UiRun& r : parse_runs(assets_->localized(value))) {
+                if (!r.font) r.font = outer.font;
+                if (!r.colored && outer.colored) {
+                    r.colored = true;
+                    std::copy(outer.color, outer.color + 4, r.color);
+                }
+                state = r;
+                emit(r.text);
+            }
+            state = outer;
+        } else if (value == "/") {
+            if (!saved.empty()) {
+                state = saved.back();
+                saved.pop_back();
+            }
+        } else if (kind == "Fonts") {
+            saved.push_back(state);
+            const size_t dot = value.rfind('.');
+            if (assets_) state.font = assets_->font(dot == std::string::npos ? value : value.substr(dot + 1));
+        } else if (kind == "Styles") {
+            saved.push_back(state);
+            if (const UiStyle* style = style_by_tag(value)) {
+                const UiTextStyle& ts = style->text_for(UiState::Enabled);
+                if (ts.font) state.font = ts.font;
+            }
+        } else if (kind == "Color") {
+            saved.push_back(state);
+            state.colored = true;
+            for (int k = 0; k < 4; ++k) {
+                const size_t at = value.find(std::string(1, "RGBA"[k]) + "=");
+                if (at != std::string::npos) state.color[k] = static_cast<float>(std::atof(value.c_str() + at + 2));
+            }
+        }
+    }
+    emit(text);
+    return runs;
+}
+
 std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const std::string& scene_name) {
     if (!impl_->pm) return nullptr;
     std::shared_ptr<UPKPackage> pkg = impl_->pm->load(package);
@@ -595,6 +679,9 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
         if (w.markup.empty()) {
             if (const UProperty* p = v.field("ImageDataSource", "MarkupString")) w.markup = p->s;
         }
+        if (w.markup.empty()) {
+            if (const UProperty* p = v.field("CaptionDataSource", "MarkupString")) w.markup = p->s;  // UILabelButton
+        }
         w.text = resolve_markup(w.markup);
 
         ObjRef owner;
@@ -614,9 +701,81 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
             if (const UProperty* p = v.field("MarkerWidth", "Value")) w.marker_width = p->f;
             if (const UProperty* p = v.field("MarkerHeight", "Value")) w.marker_height = p->f;
         }
-        if (w.cls == "UITdOptionButton") {
+        if (w.cls == "UITdOptionButton" || w.cls == "UIScrollbar") {
             w.increment = impl_->style_ref(v, "IncrementStyle");
             w.decrement = impl_->style_ref(v, "DecrementStyle");
+            if (w.cls == "UIScrollbar") w.marker_style = impl_->style_ref(v, "MarkerStyle");
+        }
+        if (w.cls == "UIList") {
+            auto list = std::make_shared<UiList>();
+            if (const UProperty* p = v.field("RowHeight", "Value")) list->row_height = p->f;
+            if (const UProperty* p = v.field("RowHeight", "ScaleType")) list->row_percent = p->s == "UIEXTENTEVAL_PercentSelf";
+            if (const UProperty* p = v.field("CellPadding", "Value")) list->cell_padding = p->f;
+            for (int k = 0; k < 4; ++k) {
+                list->cell[k] = impl_->style_ref(v, "GlobalCellStyle", k);
+                list->overlay[k] = impl_->style_ref(v, "ItemOverlayStyle", k);
+            }
+            // RowAutoSizeMode other than CELLAUTOSIZE_None: a row is as tall as its text.
+            const UProperty* auto_size = v.find("RowAutoSizeMode");
+            if ((!auto_size || auto_size->s != "CELLAUTOSIZE_None") && list->cell[0]) {
+                const UiTextStyle& ts = list->cell[0]->text_for(UiState::Enabled);
+                if (ts.font && ts.font->valid()) {
+                    list->row_height = static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale_;
+                    list->row_percent = false;
+                }
+            }
+            if (const UProperty* p = v.find("VerticalScrollbar")) {
+                auto it = widget_of.find(p->i);
+                if (it != widget_of.end()) list->scrollbar = it->second;
+            }
+            if (const UProperty* p = v.find("CellDataComponent", 0, &owner)) {
+                const ObjRef presenter = impl_->resolve(owner, p->i);
+                if (presenter.ok()) {
+                    const View pv = impl_->view(presenter);
+                    list->every_other = is_true(pv.find("bOnlyDrawEveryOtherElementOverlay"), false);
+                    if (const UProperty* cells = pv.field("ElementSchema", "Cells")) {
+                        for (const auto& cell : cells->elements) {
+                            UiListColumn column;
+                            column.field = prop_name(cell, "CellDataField");
+                            if (const UProperty* size = find_prop(cell, "CellSize")) {
+                                if (const UProperty* value = find_prop(size->fields, "Value")) column.width = value->f;
+                                if (const UProperty* type = find_prop(size->fields, "ScaleType")) column.percent = type->s == "UIEXTENTEVAL_PercentSelf";
+                            }
+                            list->columns.push_back(std::move(column));
+                        }
+                    }
+                }
+            }
+            w.list = std::move(list);
+        }
+        if (w.cls.find("TabControl") != std::string::npos) {
+            if (const UProperty* pages = v.find("Pages")) {
+                for (int32_t page : pages->ints) {
+                    auto it = widget_of.find(page);
+                    if (it != widget_of.end()) w.pages.push_back(it->second);
+                }
+            }
+        }
+        if (w.cls.find("TabPage") != std::string::npos) {
+            if (const UProperty* p = v.find("TabButton")) {
+                auto it = widget_of.find(p->i);
+                if (it != widget_of.end()) w.tab_button = it->second;
+            }
+            // UITabPage.ButtonCaption is what the page's button says.
+            if (const UProperty* caption = v.field("ButtonCaption", "MarkupString")) {
+                if (w.tab_button >= 0 && !caption->s.empty()) {
+                    UiWidget& button = scene->widgets[static_cast<size_t>(w.tab_button)];
+                    button.markup = caption->s;
+                    button.text = resolve_markup(caption->s);
+                }
+            }
+        }
+        // A tab button is drawn in its tab control's styles.
+        if (w.cls.find("TabButton") != std::string::npos && w.parent >= 0 &&
+            scene->widgets[static_cast<size_t>(w.parent)].cls.find("TabControl") != std::string::npos) {
+            const View control = impl_->view(ObjRef{pkg, export_of[static_cast<size_t>(w.parent)]});
+            if (const UiStyle* caption = impl_->style_ref(control, "TabButtonCaptionStyle")) w.string.style = caption;
+            if (const UiStyle* background = impl_->style_ref(control, "TabButtonBackgroundStyle")) w.image.style = background;
         }
     }
 
@@ -624,14 +783,10 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
     for (const UiWidget& w : scene->widgets) {
         if (w.cls != "TdUIButtonBarButton") continue;
         if (w.string.style) {
-            const UiTextStyle& t = w.string.style->text_for(UiState::Enabled);
-            scene->bar_font = t.font;
-            std::copy(t.color, t.color + 4, scene->bar_text);
+            scene->bar_font = w.string.style->text_for(UiState::Enabled).font;
+            scene->bar_text = w.string.style;
         }
-        if (w.string.shadow) {
-            const UiTextStyle& t = w.string.shadow->text_for(UiState::Enabled);
-            std::copy(t.color, t.color + 4, scene->bar_shadow);
-        }
+        scene->bar_shadow = w.string.shadow;
         if (w.image.style) scene->bar_image = w.image.style->image_for(UiState::Enabled).image;
         break;
     }
@@ -754,8 +909,11 @@ void ui_draw_text(Frame& f, const Font& font, const std::string& text, const Rec
         // The canvas places a string on whole pixels.
         const float px = std::round(x), py = std::round(y + line * static_cast<float>(i));
         if (shadow_color && shadow[3] > 0.0f) {
-            // UIComp_TdDropShadowString: the offsets are fractions of the line height.
-            draw_line(f, font, lines[i], px + std::round(shadow_h * line), py + std::round(shadow_v * line), shadow, clip);
+            // UIComp_TdDropShadowString: the same glyphs again, moved by fractions of the line
+            // height and not put back on whole pixels, so the filter softens them: 1.44 pixels
+            // right for the 24 pixel font. Down it is that less one pixel (measured: the button
+            // bar's and the labels' shadows start 0.44 below their text, the big title's 1.2).
+            draw_line(f, font, lines[i], px + shadow_h * line, py + shadow_v * line - 1.0f, shadow, clip);
         }
         draw_line(f, font, lines[i], px, py, main_color, clip);
     }
@@ -772,14 +930,29 @@ void ui_draw_image(Frame& f, const Image& image, const Rect& box, const float uv
         op.clip = *clip;
     }
     const float w = static_cast<float>(image.w), h = static_cast<float>(image.h);
-    const float ul = uv[2] > 0.0f ? uv[2] : w, vl = uv[3] > 0.0f ? uv[3] : h;
-    op.quads.push_back(Quad{box.l, box.t, box.r, box.b, uv[0] / w, uv[1] / h, (uv[0] + ul) / w, (uv[1] + vl) / h});
+    const float ul = uv[2] != 0.0f ? uv[2] : w, vl = uv[3] != 0.0f ? uv[3] : h;
+    // A negative extent runs backwards from the origin, which wraps: UL = -1024 at U = 0 is the
+    // whole 1024 wide texture mirrored.
+    float u0 = uv[0], u1 = uv[0] + ul, v0 = uv[1], v1 = uv[1] + vl;
+    if (ul < 0.0f) {
+        u0 += w;
+        u1 += w;
+    }
+    if (vl < 0.0f) {
+        v0 += h;
+        v1 += h;
+    }
+    op.quads.push_back(Quad{box.l, box.t, box.r, box.b, u0 / w, v0 / h, u1 / w, v1 / h});
     f.ui.push_back(std::move(op));
 }
 
 void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, const float uv[4], const float color[4], float gamma,
-                             const Rect* clip) {
+                             const Rect* clip, bool stretch_h, bool stretch_v) {
     if (!image.valid() || color[3] <= 0.0f || box.w() <= 0.0f || box.h() <= 0.0f) return;
+    if (uv[2] < 0.0f || uv[3] < 0.0f || (!stretch_h && !stretch_v)) {
+        ui_draw_image(f, image, box, uv, color, gamma, clip);
+        return;
+    }
     DrawOp op;
     op.kind = DrawOp::Kind::Image;
     op.image = &image;
@@ -790,19 +963,20 @@ void ui_draw_image_stretched(Frame& f, const Image& image, const Rect& box, cons
     }
     const float tw = static_cast<float>(image.w), th = static_cast<float>(image.h);
     const float ul = uv[2] > 0.0f ? uv[2] : tw, vl = uv[3] > 0.0f ? uv[3] : th;
-    // Unscaled, the canvas draws on whole pixels: texels land on screen pixels.
-    const float left = std::floor(box.l), top = std::floor(box.t);
     const float width = box.w(), height = box.h();
     const float mid_u = std::floor(ul * 0.5f), mid_v = std::floor(vl * 0.5f);
     // A corner is half the image. Where the box is larger than the image the halves keep their
     // size and the gap is filled from the middle; where it is smaller they are scaled down to
     // meet (a 1024x256 panel behind a short message box is drawn at 0.7 of its size, frame and all).
-    const float fx = std::min(mid_u, width * 0.5f);
-    const float fy = std::min(mid_v, height * 0.5f);
-    const float right = fx < mid_u ? left + width - fx : std::floor(left + width - fx);
-    const float bottom = fy < mid_v ? top + height - fy : std::floor(top + height - fy);
-    const float xs[4] = {left, left + fx, right, right + fx};
-    const float ys[4] = {top, top + fy, bottom, bottom + fy};
+    // An axis that is not stretched has no middle: its halves meet in the middle of the box.
+    const float fx = stretch_h ? std::min(mid_u, width * 0.5f) : width * 0.5f;
+    const float fy = stretch_v ? std::min(mid_v, height * 0.5f) : height * 0.5f;
+    // Nothing is put on whole pixels: the quads sit where the layout left the widget, and a box
+    // that starts between two pixels has its image filtered across them. (Fitted on retail's
+    // frames: the tab frame of CONTROLS and the button bar's boxes both come out wrong, by up to
+    // a pixel, with the near edges floored.)
+    const float xs[4] = {box.l, box.l + fx, box.r - fx, box.r};
+    const float ys[4] = {box.t, box.t + fy, box.b - fy, box.b};
     const float us[4] = {uv[0], uv[0] + mid_u, uv[0] + ul - mid_u, uv[0] + ul};
     const float vs[4] = {uv[1], uv[1] + mid_v, uv[1] + vl - mid_v, uv[1] + vl};
     for (int row = 0; row < 3; ++row) {
@@ -835,6 +1009,38 @@ void UiScene::set_text(UiSystem& ui, const std::string& widget, const std::strin
 
 void UiScene::set_visible(const std::string& widget, bool visible) {
     if (UiWidget* w = get(widget)) w->hidden = !visible;
+}
+
+void UiScene::list_select(int widget, int index) {
+    if (widget < 0 || !widgets[static_cast<size_t>(widget)].list) return;
+    UiWidget& w = widgets[static_cast<size_t>(widget)];
+    UiList& list = *w.list;
+    const int count = static_cast<int>(list.rows.size());
+    const int shown = std::max(list.visible(w.rect.h()), 1);
+    list.index = count > 0 ? std::clamp(index, 0, count - 1) : 0;
+    // The selection is kept in view.
+    if (list.index < list.top) list.top = list.index;
+    if (list.index >= list.top + shown) list.top = list.index - shown + 1;
+    list.top = std::clamp(list.top, 0, std::max(count - shown, 0));
+    if (list.scrollbar < 0) return;
+    // UIScrollbar: the marker's place and size along the track between the two buttons are the
+    // part of the list that is shown.
+    const UiWidget& bar = widgets[static_cast<size_t>(list.scrollbar)];
+    for (int child : bar.children) {
+        UiWidget& c = widgets[static_cast<size_t>(child)];
+        if (c.cls != "UIScrollbarMarkerButton") continue;
+        const float button = bar.rect.w();
+        const float track = std::max(bar.rect.h() - 2.0f * button, 0.0f);
+        const float total = static_cast<float>(std::max(count, 1));
+        c.pos[1] = button + track * static_cast<float>(list.top) / total;
+        c.pos[3] = track * std::min(static_cast<float>(shown) / total, 1.0f);
+        // Nothing hangs off the marker: it is put in place here rather than by a new layout.
+        c.rect = Rect{bar.rect.l, bar.rect.t + c.pos[1], bar.rect.r, bar.rect.t + c.pos[1] + c.pos[3]};
+        if (face_value_.size() == widgets.size() * 4) {
+            const float faces[4] = {c.rect.l, c.rect.t, c.rect.r, c.rect.b};
+            std::copy(faces, faces + 4, face_value_.begin() + static_cast<std::ptrdiff_t>(child) * 4);
+        }
+    }
 }
 
 bool UiScene::visible(int widget) const {
@@ -1045,7 +1251,7 @@ Rect to_view(const Rect& s, float scale, float origin_x) {
 
 }  // namespace
 
-void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) const {
+void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, float gamma, float opacity) {
     const UiWidget& w = widgets[static_cast<size_t>(index)];
     if (w.hidden) return;
     opacity *= w.opacity;
@@ -1060,16 +1266,21 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
             const UiWidget& parent = widgets[static_cast<size_t>(w.parent)];
             if (comp.resolver == "IncrementStyle" && parent.increment) style = parent.increment;
             if (comp.resolver == "DecrementStyle" && parent.decrement) style = parent.decrement;
+            if (w.cls == "UIScrollbarMarkerButton" && parent.marker_style) style = parent.marker_style;
         }
         if (!style) return;
-        const UiImageStyle& is = style->image_for(st);
+        UiImageStyle is = style->image_for(st);
+        for (int k = 0; k < 2; ++k) {
+            if (comp.adjust[k] >= 0) is.adjust[k] = static_cast<uint8_t>(comp.adjust[k]);
+            if (comp.align[k] >= 0) is.align[k] = static_cast<uint8_t>(comp.align[k]);
+        }
         const Image* image = comp.texture ? comp.texture : is.image;
         if (!image || !image->valid()) return;
         float color[4] = {is.color[0], is.color[1], is.color[2], is.color[3] * comp.opacity * opacity};
         // StylePadding is taken off each side of the widget (it is negative on the panel styles).
         Rect r{where.l + is.padding[0], where.t + is.padding[1], where.r - is.padding[0], where.b - is.padding[1]};
-        if (is.adjust[0] == kAdjustStretch && is.adjust[1] == kAdjustStretch) {
-            ui_draw_image_stretched(f, *image, r, is.uv, color, gamma);
+        if (is.adjust[0] == kAdjustStretch || is.adjust[1] == kAdjustStretch) {
+            ui_draw_image_stretched(f, *image, r, is.uv, color, gamma, nullptr, is.adjust[0] == kAdjustStretch, is.adjust[1] == kAdjustStretch);
             return;
         }
         // EMaterialAdjustmentType: Normal scales the image to the widget, Justified keeps its
@@ -1094,23 +1305,36 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
 
     if (w.cls == "TdUIButtonBar") {
         // The six button templates are placed by TdUIButtonBar.AppendButton, not by the scene.
-        for (const auto& [bar_index, buttons] : button_bars) {
+        for (auto& [bar_index, buttons] : button_bars) {
             if (bar_index != index || !bar_font || !bar_font->valid()) continue;
             float right = box.r;
-            for (const BarButton& b : buttons) {
-                if (b.label.empty()) continue;
+            for (BarButton& b : buttons) {
+                b.rect = Rect{};
+                if (b.label.empty() || b.hidden) continue;
                 const float width = bar_font->width(b.label);
                 const Rect text{right - width, box.t, right, box.b};
+                b.rect = Rect{text.l - bar_padding[0], text.t - bar_padding[1], text.r + bar_padding[0], text.b + bar_padding[1]};
                 if (bar_image && bar_image->valid()) {
                     // TdImageButtonBarBackground around the auto-sized label: StylePadding (-20, -3).
                     const float white[4] = {1.0f, 1.0f, 1.0f, opacity};
                     const float full[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    ui_draw_image_stretched(f, *bar_image, Rect{text.l - bar_padding[0], text.t - bar_padding[1], text.r + bar_padding[0], text.b + bar_padding[1]},
-                                            full, white, gamma);
+                    ui_draw_image_stretched(f, *bar_image, b.rect, full, white, gamma);
                 }
-                float color[4] = {bar_text[0], bar_text[1], bar_text[2], bar_text[3] * opacity * (b.disabled ? 0.5f : 1.0f)};
-                float shadow[4] = {bar_shadow[0], bar_shadow[1], bar_shadow[2], bar_shadow[3] * opacity};
-                ui_draw_text(f, *bar_font, b.label, text, 0, 1, false, color, shadow, 0.06f, 0.06f, gamma);
+                // A disabled button is its label in the Disabled state: paler, and without the shadow.
+                const UiState st = b.disabled ? UiState::Disabled : UiState::Enabled;
+                float color[4] = {1.0f, 1.0f, 1.0f, opacity};
+                float shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (bar_text) {
+                    const UiTextStyle& ts = bar_text->text_for(st);
+                    std::copy(ts.color, ts.color + 3, color);
+                    color[3] = ts.color[3] * opacity;
+                }
+                if (bar_shadow) {
+                    const UiTextStyle& ss = bar_shadow->text_for(st);
+                    std::copy(ss.color, ss.color + 3, shadow);
+                    shadow[3] = ss.color[3] * opacity;
+                }
+                ui_draw_text(f, *bar_font, b.label, text, 0, 1, false, color, shadow[3] > 0.0f ? shadow : nullptr, 0.06f, 0.06f, gamma);
                 right = text.l - 50.0f * scale;
             }
         }
@@ -1145,6 +1369,63 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
         draw_comp(w.image, box, state);
     }
 
+    if (w.list) {
+        // UIComp_ListPresenter: each element that fits, top down. An element is its overlay (every
+        // other one has the normal overlay, the selected one its bar) and its cells left to right.
+        const UiList& list = *w.list;
+        const float pitch = list.pitch(w.rect.h());
+        const int shown = list.visible(w.rect.h());
+        // The elements stop at the scrollbar, where one is shown.
+        const bool scrollbar = list.scrollbar >= 0 && !widgets[static_cast<size_t>(list.scrollbar)].hidden;
+        const float right = scrollbar ? widgets[static_cast<size_t>(list.scrollbar)].rect.l : w.rect.r;
+        for (int k = 0; k < shown && list.top + k < static_cast<int>(list.rows.size()); ++k) {
+            const int element = list.top + k;
+            const UiListRow& row = list.rows[static_cast<size_t>(element)];
+            const bool selected = element == list.index;
+            const Rect cell_rect{w.rect.l, w.rect.t + pitch * static_cast<float>(k), right, w.rect.t + pitch * static_cast<float>(k + 1)};
+            const UiStyle* overlay = selected ? list.overlay[2] : ((!list.every_other || (element & 1)) ? list.overlay[0] : nullptr);
+            if (overlay) {
+                const UiImageStyle& is = overlay->image_for(UiState::Enabled);
+                if (is.image && is.image->valid()) {
+                    const float color[4] = {is.color[0], is.color[1], is.color[2], is.color[3] * opacity};
+                    ui_draw_image(f, *is.image, to_view(cell_rect, scale, origin_x), is.uv, color, gamma);
+                }
+            }
+            const UiStyle* style = list.cell[selected ? 2 : 0];
+            if (!style) continue;
+            const UiTextStyle& ts = style->text_for(row.enabled ? UiState::Enabled : UiState::Disabled);
+            if (!ts.font || !ts.font->valid()) continue;
+            float x = w.rect.l;
+            for (size_t c = 0; c < list.columns.size() && c < row.cells.size(); ++c) {
+                const float width = list.columns[c].percent ? list.columns[c].width * w.rect.w() : list.columns[c].width;
+                // A cell's text starts half the padding in from the cell's left and top (measured:
+                // five pixels each way with CellPadding 10).
+                const float inset = list.cell_padding * 0.5f;
+                const Rect text = to_view(Rect{x + inset, cell_rect.t + inset, x + width, cell_rect.b}, scale, origin_x);
+                float pen = text.l;
+                // Pieces in a smaller font sit in the middle of the line's height.
+                float line = 0.0f;
+                for (const UiRun& run : row.cells[c]) {
+                    const Font& font = run.font && run.font->valid() ? *run.font : *ts.font;
+                    line = std::max(line, static_cast<float>(font.line_height) * font.scale);
+                }
+                for (const UiRun& run : row.cells[c]) {
+                    const Font& font = run.font && run.font->valid() ? *run.font : *ts.font;
+                    const float drop = (line - static_cast<float>(font.line_height) * font.scale) * 0.5f;
+                    float color[4] = {ts.color[0], ts.color[1], ts.color[2], ts.color[3] * opacity};
+                    if (run.colored) {
+                        std::copy(run.color, run.color + 3, color);
+                        color[3] = run.color[3] * ts.color[3] * opacity;
+                    }
+                    const float run_width = font.width(run.text);
+                    ui_draw_text(f, font, run.text, Rect{pen, text.t + drop, pen + run_width, text.b}, 0, 0, false, color, nullptr, 0.0f, 0.0f, gamma);
+                    pen += run_width;
+                }
+                x += width;
+            }
+        }
+    }
+
     if (w.string.present && w.string.style && !w.text.empty()) {
         const UiTextStyle& ts = w.string.style->text_for(state);
         if (ts.font && ts.font->valid()) {
@@ -1174,8 +1455,8 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
     for (int child : order) draw_widget(f, child, scale, origin_x, gamma, opacity);
 }
 
-void UiScene::draw(Frame& f, float scale, float origin_x, float gamma) const {
-    if (!widgets.empty()) draw_widget(f, 0, scale, origin_x, gamma, 1.0f);
+void UiScene::draw(Frame& f, float scale, float origin_x, float gamma, float opacity) {
+    if (!widgets.empty()) draw_widget(f, 0, scale, origin_x, gamma, opacity);
 }
 
 }  // namespace me::fe
