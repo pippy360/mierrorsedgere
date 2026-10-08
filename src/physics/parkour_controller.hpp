@@ -240,6 +240,8 @@ private:
     bool try_initiate_springboard(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_ledge_grab(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_zipline(const LevelScene& scene);
+    // TdMove_ZipLine.StopMove: let go of the cable into `next` (falling or the jump off).
+    void stop_zipline(EMovement next);
     bool try_initiate_swing_bar(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_climb(const InputFrame& input, const LevelScene& scene);
     bool try_initiate_balance(const LevelScene& scene);
@@ -313,8 +315,17 @@ private:
     Vec3 m_last_wallrun_normal{0.0f, 0.0f, 0.0f};
     float m_into_wallclimb_speed = 0.0f;           // TdMove_WallClimb.IntoWallClimbSpeed
     bool m_wallclimb_reached = false;              // TdMove_WallClimb.bHasReachedWall
-    Vec3 m_zipline_start{0.0f, 0.0f, 0.0f};
-    Vec3 m_zipline_end{0.0f, 0.0f, 0.0f};
+    // TdMove_ZipLine: the cable ridden (TdZiplineVolume.SplineLocations) and the native move's state.
+    std::vector<Vec3> m_zip_points;
+    float m_zip_param = 0.0f;              // CurrentParamOnCurve: segment index + fraction along the cable
+    int m_zip_status = 0;                  // ZipLineStatus: 0 ZLS_Moving, 1 ZLS_CloseToEnd, 2 ZLS_Impact
+    float m_zip_impact_timer = 0.0f;       // PlayForwardImpact's SetTimer(0.8): then OnTimer lets go
+    float m_zip_body_yaw = 0.0f;           // the body faces down the cable from where it was grabbed
+    Vec3 m_zip_look_at{0.0f, 0.0f, 0.0f};  // CurrentLookAtPoint: the impact trace's reach ahead
+    bool m_zip_look_assist = false;        // bZipLineLookAssist: the view follows the ride until turned
+    int32_t m_zip_last_actor = -1;         // TdMove_IntoZipLine.LastZipLineVolumeName (actors index)
+    float m_zip_last_stop_time = -100.0f;  // TdMove_ZipLine.LastStopMoveTime (sim time)
+    float m_zip_exit_z = 1e30f;            // where the last ride ended, until the pawn lands again
     float m_zipline_cooldown = 0.0f;
     Vec3 m_climb_base{0.0f, 0.0f, 0.0f};
     Vec3 m_climb_top{0.0f, 0.0f, 0.0f};

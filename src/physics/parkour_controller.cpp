@@ -134,6 +134,62 @@ bool coil_allowed_from(EMovement m) {
     }
 }
 
+// TdMove_ZipLine / TdMove_IntoZipLine / TdZiplineVolume (TdGame.u defaults) and the native move
+// (MirrorsEdge.exe 0x1209400: TdMove_ZipLine's per-tick physics, after which the pawn runs
+// PHYS_Flying). HangOffset (0, 0, -90) holds the pawn's centre 90 below the cable, so the bottom of
+// its 180-tall cylinder - the feet - rides 180 below it.
+constexpr float kZipHangHeight = 180.0f;
+constexpr float kZipMinVelocity = 300.0f;      // TdMove_ZipLine.MinZipVelocity
+constexpr float kZipMinAcceleration = 400.0f;  // TdMove_ZipLine.MinZipAcceleration
+// PHYS_Flying's friction on the ride. calcVelocity applies half the PhysicsVolume's FluidFriction
+// (0.3); 0.163 reproduces the retail Edge_p ride (recordings/20261002_102817_edge_pt1.jsonl.gz,
+// t 111.47-115.03: 446 -> 1783 uu/s, the simulated path within 31 uu of the recorded one).
+constexpr float kZipFlyingFriction = 0.163f;
+// The native move's trace ahead of the hands, by ZipLineStatus: 600 (Moving: PrepareForForwardImpact
+// at a hit), 20 (CloseToEnd: PlayForwardImpact), 2 (Impact: the pawn is held still). It sweeps the
+// pawn's extent with half its height, centred 40 below the cable; CurrentLookAtPoint is its far end.
+constexpr float kZipTraceDrop = 40.0f;
+constexpr float kZipTraceHalfHeight = 45.0f;
+constexpr float kZipTraceReach[3] = {600.0f, 20.0f, 2.0f};
+constexpr float kZipImpactTime = 0.8f;         // PlayForwardImpact: SetTimer / SetIgnoreLookInput(0.8)
+constexpr float kZipLandingStrip = 500.0f;     // TdZiplineVolume.LandingStrip
+constexpr float kZipRedoTime = 0.5f;           // TdMove_IntoZipLine.RedoMoveTime
+constexpr float kZipSameLineRedoTime = 3.0f;   // TdMove_IntoZipLine.SameZipLineRedoMoveTime
+constexpr float kZipFallLimitZ = -600.0f;      // TdMove_IntoZipLine.ZVelocityFallLimit
+// Retail catches the cable anywhere inside the TdZiplineVolume brush wrapped around it; the port
+// catches it when the hands come this close.
+constexpr float kZipGrabReach = 135.0f;
+
+// TdZiplineVolume.FindClosestPointOnDSpline: the point of the cable polyline closest to `p`, and its
+// parameter (segment index + fraction along that segment, 0 .. N-1).
+Vec3 closest_on_cable(const std::vector<Vec3>& pts, const Vec3& p, float& param) {
+    param = 0.0f;
+    if (pts.empty()) return p;
+    Vec3 best_point = pts.front();
+    float best = (p - best_point).length_sq();
+    for (size_t i = 0; i + 1 < pts.size(); ++i) {
+        const Vec3 d = pts[i + 1] - pts[i];
+        const float l2 = d.length_sq();
+        const float s = l2 > 1e-6f ? std::clamp((p - pts[i]).dot(d) / l2, 0.0f, 1.0f) : 0.0f;
+        const Vec3 c = pts[i] + d * s;
+        const float dist = (p - c).length_sq();
+        if (dist < best) {
+            best = dist;
+            best_point = c;
+            param = static_cast<float>(i) + s;
+        }
+    }
+    return best_point;
+}
+
+// TdZiplineVolume.GetSlopeOnSpline: the direction of the cable at `param` (its segment's).
+Vec3 cable_slope(const std::vector<Vec3>& pts, float param) {
+    if (pts.size() < 2) return Vec3(1.0f, 0.0f, 0.0f);
+    const size_t i = std::min(pts.size() - 2, static_cast<size_t>(std::max(0.0f, param)));
+    const Vec3 d = (pts[i + 1] - pts[i]).normalized();
+    return d.length_sq() > 0.5f ? d : (pts.back() - pts.front()).normalized();
+}
+
 // -----------------------------------------------------------------------------
 // Per-move camera rules: the TdMove_* class defaults in TdGame.u.
 //   bConstrainLook + MinLookConstraint / MaxLookConstraint: how far the view may pitch / yaw away
@@ -319,6 +375,16 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
     m_into_wallclimb_speed = 0.0f;
     m_wallclimb_reached = false;
+    m_zip_points.clear();
+    m_zip_param = 0.0f;
+    m_zip_status = 0;
+    m_zip_impact_timer = 0.0f;
+    m_zip_body_yaw = spawn_yaw;
+    m_zip_look_at = Vec3(0.0f, 0.0f, 0.0f);
+    m_zip_look_assist = false;
+    m_zip_last_actor = -1;
+    m_zip_last_stop_time = -100.0f;
+    m_zip_exit_z = 1e30f;
     m_zipline_cooldown = 0.0f;
     m_climb_base = Vec3(0.0f, 0.0f, 0.0f);
     m_climb_top = Vec3(0.0f, 0.0f, 0.0f);
@@ -948,12 +1014,9 @@ bool ParkourController::camera_body_yaw(float& yaw) const {
             if (horiz(m_ledge_walk_normal).length() < 0.5f) return false;
             yaw = yaw_of(m_ledge_walk_normal);  // back to the wall
             return true;
-        case EMovement::MOVE_ZipLine: {
-            const Vec3 line = horiz(m_zipline_end - m_zipline_start);
-            if (line.length() < 1.0f) return false;
-            yaw = yaw_of(line);
+        case EMovement::MOVE_ZipLine:
+            yaw = m_zip_body_yaw;  // TdMove_IntoZipLine.ReachedPreciseLocation: SetRotation(slope)
             return true;
-        }
         case EMovement::MOVE_Balance: {
             // The beam direction the walk uses (the end the view faces).
             const Vec3 ab = horiz(m_balance_end - m_balance_start);
@@ -1087,6 +1150,7 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
         pitch_d = 0.0f;
         if (m_ignore_look_time > 0.0f) m_ignore_look_time = std::max(0.0f, m_ignore_look_time - dt);
     }
+    const bool turned = (yaw_d != 0.0f);  // DeltaRot.Yaw as the moves see it
 
     // TdPlayerController.UpdateRotation: the view turns at 40% while it pitches 63 deg or more away
     // from the body (RotSpeedMod).
@@ -1134,6 +1198,16 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
     }
     // TdMove_180TurnInAir.UpdateViewRotation: any yaw turn drops the look back at the take-off.
     if (m == EMovement::MOVE_180TurnInAir && yaw_d != 0.0f) m_look_at_active = false;
+    // TdMove_ZipLine.UpdateViewRotation: until the player turns the view (bZipLineLookAssist), it is
+    // drawn along the ride to CurrentLookAtPoint, the far end of the impact trace ahead.
+    if (m == EMovement::MOVE_ZipLine && m_telemetry.move_state == EMovement::MOVE_ZipLine) {
+        if (turned) {
+            m_zip_look_assist = false;
+            m_look_at_active = false;
+        } else if (m_zip_look_assist) {
+            camera_look_at_location(m_zip_look_at, 0.2f, -1.0f);
+        }
+    }
 
     // ... and ResetCameraLook swings it back to the body, level, linearly over the time left.
     if (m_reset_look_time >= 0.0f) {
@@ -3420,81 +3494,171 @@ void ParkourController::update_vault(const InputFrame& input, float dt, const Le
 // -----------------------------------------------------------------------------
 bool ParkourController::try_initiate_zipline(const LevelScene& scene) {
     if (m_zipline_cooldown > 0.0f || m_telemetry.weapon.is_heavy) return false;
-    // The hands reach up to about 200 above the feet; the pawn hangs with them on the handle.
-    constexpr float kHandHeight = 200.0f;
-    for (const auto& act : scene.actors) {
-        if (act.is_zipline && act.end_point.length_sq() > 1.0f) {
-            Vec3 start = act.location;
-            Vec3 end = act.end_point;
-            float line_len = (end - start).length();
-            if (line_len < 50.0f) continue;
-            Vec3 line_dir = (end - start) / line_len;
-            Vec3 to_player = m_telemetry.position - start;
-            float t = to_player.dot(line_dir);
+    const Vec3 centre = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * kPawnHeight);  // retail's Location
+    const Vec3 hand = m_telemetry.position + Vec3(0.0f, 0.0f, kZipHangHeight);
+    const Vec3 body_fwd = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();
+    for (size_t ai = 0; ai < scene.actors.size(); ++ai) {
+        const LevelActor& act = scene.actors[ai];
+        if (!act.is_zipline || act.end_point.length_sq() <= 1.0f) continue;
+        std::vector<Vec3> pts = act.spline_points;
+        if (pts.size() < 2) pts = {act.location, act.end_point};
+        if ((pts.back() - pts.front()).length() < 50.0f) continue;
 
-            if (t >= -60.0f && t <= line_len - 100.0f) {
-                Vec3 closest_pt = start + line_dir * std::max(0.0f, t);
-                if (closest_pt.distance(m_telemetry.position + Vec3(0, 0, kHandHeight)) < 135.0f) {
-                    m_telemetry.move_state = EMovement::MOVE_ZipLine;
-                    m_zipline_start = start;
-                    m_zipline_end = end;
-                    m_state_timer = 0.0f;
-                    m_telemetry.position = closest_pt - Vec3(0.0f, 0.0f, kHandHeight);
-                    m_telemetry.velocity = line_dir * 350.0f;
-                    m_telemetry.grounded = false;
-                    m_base_actor = -1;
-                    m_coil_timer = 0.0f;
-                    set_stance(kEyeHeightStand);
-                    return true;
-                }
-            }
-        }
+        // TdZiplineVolume.PawnUpdate: the pawn is inside the volume wrapped around the cable.
+        float param = 0.0f;
+        if (closest_on_cable(pts, hand, param).distance(hand) >= kZipGrabReach) continue;
+        // TdMove_IntoZipLine.CanDoMove: the body faces the way the cable is ridden, the pawn is clear
+        // of the landing strip at its bottom end, and it is not back on the cable it let go of within
+        // SameZipLineRedoMoveTime. (Retail grabs only from the air; the port also takes a cable within
+        // reach from the ground.)
+        Vec3 move_dir = act.move_direction;
+        if (move_dir.length_sq() < 0.25f) move_dir = horiz(pts.back() - pts.front()).normalized();
+        if (move_dir.dot(body_fwd) <= 0.0f) continue;
+        if (horiz(centre - pts.back()).length() < kZipLandingStrip) continue;
+        const int32_t id = static_cast<int32_t>(ai);
+        if (id == m_zip_last_actor && m_telemetry.sim_time - m_zip_last_stop_time < kZipSameLineRedoTime) continue;
+
+        // TdMove_IntoZipLine.StartMove: the hands go to the cable 100 ahead (along MoveDirection) of
+        // the point nearest the pawn, its centre HangOffset below them. Retail glides there at
+        // IntoClimbSpeed (about 0.3 s); the port puts the pawn there at once.
+        float enter_param = 0.0f;
+        const Vec3 nearest = closest_on_cable(pts, centre, enter_param);
+        const Vec3 grab = closest_on_cable(pts, nearest + move_dir * 100.0f, enter_param);
+        // The body has to fit there (retail only grabs from the air, with the cable clear below it).
+        if (!has_room_at(grab - Vec3(0.0f, 0.0f, kZipHangHeight), kPawnHeight, scene)) continue;
+        // ReachedPreciseLocation: the body turns down the cable, and the ride starts with the part of
+        // the horizontal velocity along it (none out of a fall faster than ZVelocityFallLimit).
+        const Vec3 slope = cable_slope(pts, enter_param);
+        Vec3 v2d = horiz(m_telemetry.velocity);
+        if (m_telemetry.velocity.z < kZipFallLimitZ) v2d = Vec3(0.0f, 0.0f, 0.0f);
+        const float v2d_len = v2d.length();
+        m_telemetry.velocity = v2d_len > 1e-3f ? slope * (v2d_len * std::max(slope.dot(v2d / v2d_len), 0.0f))
+                                               : Vec3(0.0f, 0.0f, 0.0f);
+        m_telemetry.position = grab - Vec3(0.0f, 0.0f, kZipHangHeight);
+        m_telemetry.move_state = EMovement::MOVE_ZipLine;
+        m_telemetry.grounded = false;
+        m_base_actor = -1;
+        m_coil_timer = 0.0f;
+        m_state_timer = 0.0f;
+        m_zip_points = std::move(pts);
+        m_zip_param = enter_param;
+        m_zip_status = 0;
+        m_zip_impact_timer = 0.0f;
+        m_zip_body_yaw = yaw_of(slope);
+        m_zip_last_actor = id;     // LastZipLineVolumeName
+        m_zip_look_assist = true;  // TdMove_ZipLine.StartMove: bZipLineLookAssist
+        m_zip_look_at = grab - Vec3(0.0f, 0.0f, kZipTraceDrop) + slope * kZipTraceReach[0];
+        m_zip_exit_z = 1e30f;
+        set_stance(kEyeHeightStand);
+        return true;
     }
     return false;
 }
 
-void ParkourController::update_zipline(const InputFrame& input, float dt, const LevelScene& scene) {
-    (void)scene;
-    constexpr float kHandHeight = 200.0f;
-    const Vec3 zip_vec = m_zipline_end - m_zipline_start;
-    const float line_len = zip_vec.length();
-    const Vec3 zip_dir = line_len > 1e-4f ? zip_vec / line_len : Vec3(1.0f, 0.0f, 0.0f);
+void ParkourController::stop_zipline(EMovement next) {
+    m_zip_status = 0;                             // ZLS_Moving
+    m_zip_impact_timer = 0.0f;
+    m_zip_look_assist = false;
+    m_zip_last_stop_time = m_telemetry.sim_time;  // LastStopMoveTime
+    m_zip_exit_z = m_telemetry.position.z;
+    m_zipline_cooldown = kZipRedoTime;
+    leave_ground(next);                           // SetPhysics(PHYS_Falling) resets EnterFallingHeight
+    m_fall_peak_z -= 80.0f;                       // EnterFallingHeight -= 80.0
+}
 
-    // Detach with jump or crouch/shift (TdMove_ZipLine.HandleMoveAction).
-    // Set m_zipline_cooldown so subsequent 120Hz substeps or frames do not immediately re-attach to the wire.
+// TdMove_ZipLine's native tick (MirrorsEdge.exe 0x1209400): each physics step the velocity is steered
+// along the cable polyline (SplineLocations), at least MinZipVelocity; gravity pulls along the cable's
+// pitch and an acceleration of at least MinZipAcceleration drives the pawn down it. Then the pawn
+// flies (PHYS_Flying) with that velocity. A box trace ahead of the hands stops the ride at the end
+// wall: ZLS_CloseToEnd at 600, the impact (held still for 0.8 s, then a drop) at 20.
+void ParkourController::update_zipline(const InputFrame& input, float dt, const LevelScene& scene) {
+    // TdPlayerMoveManager.HandleMoveAction: a crouch press lets go, keeping the ride's velocity (the
+    // port also lets go while crouch is held). Retail ignores jump on the cable; the port hops off.
     if (jump_pressed()) {
         consume_jump();
-        m_zipline_cooldown = 0.65f;
-        m_telemetry.velocity = zip_dir * 500.0f + Vec3(0, 0, 250.0f);
+        m_pre_jump_momentum = m_telemetry.velocity.length_xy();
+        m_telemetry.velocity.z += 250.0f;
         m_last_jump_location = m_telemetry.position;
-        leave_ground(EMovement::MOVE_Jump);
-        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
+        stop_zipline(EMovement::MOVE_Jump);
         return;
     }
     if (m_crouch_pressed || (input.crouch && m_state_timer > 0.12f)) {
         m_crouch_pressed = false;
-        m_zipline_cooldown = 0.65f;
-        const float drop_spd = std::max(420.0f, horiz(m_telemetry.velocity).length());
-        m_telemetry.velocity = Vec3(zip_dir.x * drop_spd, zip_dir.y * drop_spd, std::min(0.0f, m_telemetry.velocity.z));
-        leave_ground(EMovement::MOVE_Falling);
-        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
+        stop_zipline(EMovement::MOVE_Falling);
+        return;
+    }
+    // PlayForwardImpact's SetTimer(0.8): OnTimer drops the pawn off the cable.
+    if (m_zip_status == 2) {
+        m_zip_impact_timer -= dt;
+        if (m_zip_impact_timer <= 0.0f) {
+            stop_zipline(EMovement::MOVE_Falling);
+            return;
+        }
+    }
+    const std::vector<Vec3>& pts = m_zip_points;
+    const int n = static_cast<int>(pts.size());
+    if (n < 2) {
+        stop_zipline(EMovement::MOVE_Falling);
         return;
     }
 
-    // Accelerate down zipline
-    float spd = m_telemetry.velocity.length();
-    spd = std::min(850.0f, spd + 450.0f * dt);
-    m_telemetry.velocity = zip_dir * spd;
-    m_telemetry.position += m_telemetry.velocity * dt;
+    // Gravity, scaled by how steeply the pawn is moving.
+    Vec3 vel = m_telemetry.velocity;
+    const Vec3 vel_dir = vel.normalized();
+    vel.z -= std::abs(vel_dir.z) * m_config.script_gravity * dt;
 
-    const Vec3 hand_pos = m_telemetry.position + Vec3(0.0f, 0.0f, kHandHeight);
-    const float along_dist = (hand_pos - m_zipline_start).dot(zip_dir);
-    if (along_dist >= line_len - 90.0f || hand_pos.distance(m_zipline_end) < 90.0f) {
-        m_zipline_cooldown = 0.50f;
-        m_telemetry.velocity = Vec3(zip_dir.x * 320.0f, zip_dir.y * 320.0f, 0.0f);
-        leave_ground(EMovement::MOVE_Falling);
-        m_fall_peak_z -= 80.0f;  // TdMove_ZipLine.StopMove: EnterFallingHeight -= 80.0
+    // This step runs from the hands back onto the cable and along it, towards the first spline point
+    // at least a step away; with none left the pawn flies off the end of the cable.
+    const Vec3 hand = m_telemetry.position + Vec3(0.0f, 0.0f, kZipHangHeight);
+    closest_on_cable(pts, hand, m_zip_param);  // CurrentParamOnCurve
+    const float step = std::max(vel.length(), kZipMinVelocity) * dt;
+    int i = static_cast<int>(m_zip_param) + 1;
+    while (i < n && (pts[i] - hand).length() < step) ++i;
+    if (i >= n) {
+        m_telemetry.velocity = vel;
+        stop_zipline(EMovement::MOVE_Falling);
+        return;
     }
+    const Vec3 seg = pts[i] - pts[i - 1];
+    const Vec3 to_next = pts[i] - hand;
+    const float seg_len2 = seg.length_sq();
+    const Vec3 to_line = seg_len2 > 1e-6f ? to_next - seg * (to_next.dot(seg) / seg_len2) : to_next;
+    const float along = std::sqrt(std::max(0.0f, step * step - to_line.length_sq()));
+    vel = (to_line + seg.normalized() * along) / dt;
+    if (vel.length() < kZipMinVelocity) {
+        vel = (vel.length_sq() > 1e-6f ? vel.normalized() : vel_dir) * kZipMinVelocity;
+    }
+    const Vec3 dir = vel.normalized();
+    Vec3 accel = dir * std::max(kZipMinAcceleration, std::abs(m_config.script_gravity * dir.z));
+
+    // The impact trace ahead of the hands; its far end is where the view is drawn (CurrentLookAtPoint).
+    // A box that starts out touching the anchor near the top of the cable does not count as a wall.
+    const Vec3 trace_start = hand - Vec3(0.0f, 0.0f, kZipTraceDrop);
+    const TraceHit ahead = sweep_box(trace_start, Vec3(kPawnRadius, kPawnRadius, kZipTraceHalfHeight),
+                                     dir * kZipTraceReach[m_zip_status], scene);
+    if (ahead.hit && (!ahead.start_penetrating || m_zip_status > 0)) {
+        if (m_zip_status == 0) {
+            m_zip_status = 1;  // PrepareForForwardImpact (ziplineintohitwall)
+        } else if (m_zip_status == 1) {
+            m_zip_status = 2;  // PlayForwardImpact (ziplinehitwall): no look input for 0.8 s
+            m_zip_impact_timer = kZipImpactTime;
+            camera_ignore_look(kZipImpactTime);
+        } else {
+            vel = Vec3(0.0f, 0.0f, 0.0f);  // against the wall: held still
+            accel = Vec3(0.0f, 0.0f, 0.0f);
+        }
+    }
+    m_zip_look_at = trace_start + dir * kZipTraceReach[0];
+
+    // PHYS_Flying: friction, the acceleration, a swept move sliding along what it hits, and the
+    // velocity taken from how far the pawn actually moved.
+    vel = vel * (1.0f - kZipFlyingFriction * dt) + accel * dt;
+    const Vec3 before = m_telemetry.position;
+    const TraceHit moved = move_and_slide(vel * dt, kPawnHeight, 0.0f, scene);
+    m_telemetry.velocity = (m_telemetry.position - before) / dt;
+    // TdMove_ZipLine.HitWall: running into a floor or a slope knocks the pawn off the cable
+    // (TdMove_Stumble, a fall here).
+    if (moved.hit && moved.normal.z > 0.1f) stop_zipline(EMovement::MOVE_Falling);
 }
 
 bool ParkourController::try_initiate_swing_bar(const InputFrame& input, const LevelScene& scene) {
@@ -4762,8 +4926,12 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
     if (m_telemetry.grounded && m_telemetry.health > 0.0f && m_telemetry.position.z < m_last_checkpoint_pos.z) {
         m_last_checkpoint_pos.z = m_telemetry.position.z;
     }
-    const bool void_fall = !m_telemetry.grounded &&
-                           (m_telemetry.position.z < m_last_checkpoint_pos.z - 2200.0f) &&
+    // A zipline carries the pawn far below its checkpoint: no void kill while riding one, and after
+    // letting go the drop is measured from where it let go until it lands.
+    if (m_telemetry.grounded) m_zip_exit_z = 1e30f;
+    const float void_ref_z = std::min(m_last_checkpoint_pos.z, m_zip_exit_z);
+    const bool void_fall = !m_telemetry.grounded && m_telemetry.move_state != EMovement::MOVE_ZipLine &&
+                           (m_telemetry.position.z < void_ref_z - 2200.0f) &&
                            !has_soft_landing_below(scene);
 
     // 1. Fall Death (WorldInfo.KillZ, lethal drop into void below checkpoint, or health <= 0) -> Play Death Sequence -> Respawn

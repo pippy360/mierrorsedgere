@@ -576,6 +576,13 @@ struct LevelActor {
     std::string source_package;
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
+    // TdZiplineVolume.SplineLocations: the cable the pawn rides, NumSplineSegments + 1 points on the
+    // quadratic Bezier Start -> Middle -> End (location / end_point keep Start / End). Empty for
+    // every other actor; a zipline without it is ridden along the straight Start -> End line.
+    std::vector<Vec3> spline_points;
+    // TdZiplineVolume.MoveDirection: the way the cable is ridden (the volume's X axis); the pawn grabs
+    // it only facing within 90 deg of this (TdMove_IntoZipLine.CanDoMove). Zero when not serialized.
+    Vec3 move_direction{0.0f, 0.0f, 0.0f};
     // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
     std::vector<std::string> material_overrides;
     // BlockingVolume BrushComponent.BrushAggGeom hulls, world space, 3 vertices per triangle.
