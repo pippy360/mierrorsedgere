@@ -53,6 +53,7 @@ private:
     AnimTree tree_;
     PawnAnimState pawn_;
     bool started_ = false;
+    Vec3 last_velocity_{0.0f, 0.0f, 0.0f};  // the velocity the pawn's Tick sees: last frame's physics
     EMovement pending_animation_state_ = EMovement::MOVE_None;
     float animation_state_timer_ = -1.0f;
 };

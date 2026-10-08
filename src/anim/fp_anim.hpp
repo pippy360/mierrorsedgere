@@ -39,6 +39,9 @@ struct PawnAnimState {
     float view_yaw_deg = 0.0f;    // the controller's view
     float view_pitch_deg = 0.0f;
     bool heavy_weapon = false;    // GetWeaponType() == EWT_Heavy
+    // How far the weapon arms are laid over the body (ArmedLeft / ArmedRight's Child2Weight): 0 unarmed.
+    float armed_left = 0.0f;
+    float armed_right = 0.0f;
 };
 
 // One node of the tree: its fixed properties and its state this frame.
@@ -85,6 +88,8 @@ struct TreeNode {
     bool relevant = false;
     float time = 0.0f;           // CurrentTime
     float pending_blend_out = -1.0f;  // a slot: blend back to the source when this much of the animation is left
+    float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
+    float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
     const AnimSequenceAsset* seq = nullptr;
 };
 
@@ -122,6 +127,7 @@ public:
 private:
     void set_active(TreeNode& n, int child, float blend_time);
     void update_list(TreeNode& n, const PawnAnimState& pawn, bool became_relevant);
+    void update_directional(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant);
     void advance(TreeNode& n, const PawnAnimState& pawn, float dt);
     int slot_node(Slot slot) const;
     const AnimSequenceAsset* find_sequence(const std::string& name) const;

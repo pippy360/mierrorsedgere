@@ -32,6 +32,7 @@ void Director::reset() {
     started_ = false;
     pending_animation_state_ = EMovement::MOVE_None;
     animation_state_timer_ = -1.0f;
+    last_velocity_ = Vec3(0.0f, 0.0f, 0.0f);
 }
 
 void Director::set_animation_state(EMovement state, float delay) {
@@ -44,14 +45,17 @@ void Director::set_animation_state(EMovement state, float delay) {
     }
 }
 
-// TdPawn.UpdateWalkingState is native. These thresholds are fitted to the recordings
-// (docs/FIRST_PERSON_ANIMATION_RE.md, the walking state).
+// TdPawn.UpdateWalkingState is native. The pawn's Tick runs before its physics, so the state
+// follows the velocity of the frame before. The thresholds are measured on the recordings while
+// accelerating: Sneak from the first movement, Walk from about 50, Jog from about 260, Run from
+// 380 (RunVel in DefaultAnimation.ini), Sprint from about 625.
 void Director::update_walking_state(const PawnFrame& frame) {
-    const float speed = std::sqrt(frame.velocity.x * frame.velocity.x + frame.velocity.y * frame.velocity.y);
+    (void)frame;
+    const float speed = std::sqrt(last_velocity_.x * last_velocity_.x + last_velocity_.y * last_velocity_.y);
     uint8_t state = kWasIdle;
-    if (speed >= 650.0f) state = kWasSprint;
-    else if (speed >= 350.0f) state = kWasRun;
-    else if (speed >= 200.0f) state = kWasJog;
+    if (speed >= 625.0f) state = kWasSprint;
+    else if (speed >= 380.0f) state = kWasRun;
+    else if (speed >= 260.0f) state = kWasJog;
     else if (speed >= 50.0f) state = kWasWalk;
     else if (speed >= 1.0f) state = kWasSneak;
     pawn_.walking_state = state;
@@ -123,6 +127,7 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.heavy_weapon = frame.heavy_weapon;
     update_walking_state(frame);
     tree_.tick(pawn_, frame.dt);
+    last_velocity_ = frame.velocity;
 }
 
 }  // namespace me::fp

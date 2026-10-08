@@ -125,9 +125,15 @@ def score(rows):
         pw = {a[0].lower(): a[2] for a in port}
         total = sum(rw.values())
         s["overlap"] += sum(min(w, pw.get(n, 0.0)) for n, w in rw.items()) / total if total > 0 else 0.0
-        if port and port[0][0].lower() == retail[0][0].lower():
-            s["lead"] += 1
-            s["dt"].append(abs(port[0][1] - retail[0][1]))
+        # The lead: the port's heaviest sequence is retail's, or one retail has within 0.02 of it
+        # (two sequences at full weight are in no particular order).
+        if port:
+            name = port[0][0].lower()
+            for a in retail:
+                if a[0].lower() == name and a[2] >= retail[0][2] - 0.02:
+                    s["lead"] += 1
+                    s["dt"].append(abs(port[0][1] - a[1]))
+                    break
     return per
 
 

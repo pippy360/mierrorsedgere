@@ -264,6 +264,41 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
     }
 }
 
+// TdAnimNodeBlendDirectional: Forward, ForwardRight, ForwardLeft, Backward, BackWardRight, BackWardLeft.
+// Measured on the recordings: the weight goes from the straight child to the sideways one in
+// proportion to the angle between the velocity and the way the pawn faces (45 degrees is half
+// and half), within the forward three or the backward three, and ForwardBlend moves between the
+// two threes. DirInterpTime 0.1 and ForwardInterpTime 0.4 are the class defaults.
+void AnimTree::update_directional(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant) {
+    if (n.weight.size() < 6) return;
+    const float yaw = pawn.yaw_deg * DEG2RAD;
+    const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+    const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
+    float angle = 0.0f;
+    if (forward * forward + right * right > 1.0f) angle = std::atan2(right, forward) / DEG2RAD;
+    const float off = std::fabs(angle);
+    const bool going_forward = off <= 90.0f;
+    const float side_target = going_forward ? off / 90.0f : (180.0f - off) / 90.0f;
+    const float forward_target = going_forward ? 1.0f : 0.0f;
+    if (became_relevant) {
+        n.forward_blend = forward_target;
+        n.side_blend = side_target;
+    } else {
+        auto approach = [dt](float value, float target, float time) {
+            const float step = time > 0.0f ? dt / time : 1.0f;
+            return value < target ? std::min(value + step, target) : std::max(value - step, target);
+        };
+        n.forward_blend = approach(n.forward_blend, forward_target, 0.4f);
+        n.side_blend = approach(n.side_blend, side_target, 0.1f);
+    }
+    const int side = right >= 0.0f ? 1 : 2;
+    std::fill(n.weight.begin(), n.weight.end(), 0.0f);
+    n.weight[0] = n.forward_blend * (1.0f - n.side_blend);
+    n.weight[static_cast<size_t>(side)] = n.forward_blend * n.side_blend;
+    n.weight[3] = (1.0f - n.forward_blend) * (1.0f - n.side_blend);
+    n.weight[static_cast<size_t>(3 + side)] = (1.0f - n.forward_blend) * n.side_blend;
+}
+
 void AnimTree::advance(TreeNode& n, const PawnAnimState& pawn, float dt) {
     if (!n.seq && !n.seq_name.empty()) n.seq = find_sequence(n.seq_name);
     if (!n.seq || !n.playing) return;
@@ -332,13 +367,15 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 // A bone mask: the source is always whole underneath.
                 if (n.weight.size() >= 2) {
                     n.weight[0] = 1.0f;
-                    n.weight[1] = n.child2_weight;
+                    n.weight[1] = n.name == "ArmedLeft" ? pawn.armed_left : (n.name == "ArmedRight" ? pawn.armed_right : n.child2_weight);
                 }
                 break;
             case TreeNode::Kind::Passthrough:
                 if (!n.weight.empty()) n.weight[0] = 1.0f;
                 break;
             case TreeNode::Kind::Directional:
+                update_directional(n, pawn, dt, became_relevant);
+                break;
             case TreeNode::Kind::Fixed:
                 break;
         }
