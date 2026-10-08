@@ -1604,8 +1604,10 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         // (An arm that is on the wall is not the weapon's to aim.)
         aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_right());
         aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_left());
-        aim.wall_left = fp.director.tree().wall_left();
-        aim.wall_right = fp.director.tree().wall_right();
+        // (With a two-handed weapon both hands stay on it: its own `againstwall` has them there.)
+        const bool both_on_weapon = fp.director.pawn().heavy_weapon && fp.director.pawn().weapon_state != 0;
+        aim.wall_left = both_on_weapon ? 0.0f : fp.director.tree().wall_left();
+        aim.wall_right = both_on_weapon ? 0.0f : fp.director.tree().wall_right();
         aim.wall_ahead_left = fp.last_frame.against_wall_left;
         aim.wall_ahead_right = fp.last_frame.against_wall_right;
         aim.wall_height = fp.last_frame.against_wall_height;
