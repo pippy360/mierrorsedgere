@@ -19,6 +19,7 @@
 namespace me {
 
 struct AnimSequenceAsset;
+struct AnimSetAsset;
 
 namespace fp {
 
@@ -35,6 +36,9 @@ struct PawnAnimState {
     EMovement animation_movement = EMovement::MOVE_None;    // AnimationMovementState: what SetAnimationMovementState forces
     uint8_t walking_state = kWasIdle;                       // CurrentWalkingState
     Vec3 velocity{0.0f, 0.0f, 0.0f};
+    // The velocity of the frame before: the pawn's Tick runs before its physics, and what it works
+    // out there (the walking state, the speed the play rates scale by) is a frame behind.
+    Vec3 last_velocity{0.0f, 0.0f, 0.0f};
     float yaw_deg = 0.0f;         // the pawn's Rotation.Yaw
     float view_yaw_deg = 0.0f;    // the controller's view
     float view_pitch_deg = 0.0f;
@@ -42,6 +46,7 @@ struct PawnAnimState {
     // How far the weapon arms are laid over the body (ArmedLeft / ArmedRight's Child2Weight): 0 unarmed.
     float armed_left = 0.0f;
     float armed_right = 0.0f;
+    int weapon_state = 0;         // TdPawn.WeaponAnimState: 0 unarmed, 1 relaxed, 2 ready, 3 reload, 4 throwing, 5 heavy armed
     float swing_angle = 0.0f;     // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;    // -1 .. 1 off the beam
     bool hanging_free = false;
@@ -49,6 +54,7 @@ struct PawnAnimState {
     int climb_hand = 0;           // 0 left hand up, 1 right
     bool climb_sliding = false;
     int grab_turn_type = 0;       // TdPawn.CurrentGrabTurnType: 0 none, 1 start, 2 end, 3 idle
+    float look_deg = 0.0f;        // the view's yaw off the body's, positive to the right
     float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
 };
 
@@ -102,6 +108,7 @@ struct TreeNode {
     std::vector<float> target;
     float blend_to_go = 0.0f;
     int active = 0;
+    int last_state = -1;         // TdAnimNodeMovementState: the state it last blended to (GetBlendValue's previous state)
     float total = 0.0f;          // NodeTotalWeight
     float incoming = 0.0f;       // what the parents ticked so far this frame have passed down
     bool relevant = false;
@@ -110,20 +117,33 @@ struct TreeNode {
     float hold = -1.0f;               // TdAnimNodeCustomBlend.Duration: how long it stays before blending back
     float hold_blend_out = 0.0f;      // TdAnimNodeCustomBlend.BlendOutTime
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
-    float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
+    float side_blend = 0.0f;          // 0 straight ahead (or back), 0.9 straight sideways
+    float dir_side = 0.0f, dir_forward = 1.0f;  // TdAnimNodeBlendDirectional.Direction: |side| + |forward| = 1
+    bool going_forward = true;        // bGoingForward
     float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
     bool root_motion = false;         // a slot's channel: the animation's root movement goes to the pawn
     bool unlisted = false;            // a channel of the Camera or Canned slot: not in the retail recorder's list
     const AnimSequenceAsset* seq = nullptr;
+    const AnimSetAsset* seq_set = nullptr;  // the AnimSet `seq` is from (its tracks are in that set's bone order)
 };
 
 class AnimTree {
 public:
     // Looks a sequence up by name in the mesh's AnimSets.
-    using SequenceLookup = std::function<const AnimSequenceAsset*(const std::string&)>;
+    // The mesh's AnimSets are searched last to first, so a weapon's sequences shadow the unarmed
+    // ones of the same name; the set a sequence came from is handed back too.
+    using SequenceLookup = std::function<const AnimSequenceAsset*(const std::string&, const AnimSetAsset**)>;
 
     bool load(const std::string& game_root, std::string& error);
     void set_sequence_lookup(SequenceLookup lookup) { lookup_ = std::move(lookup); }
+    // The AnimSets changed (a weapon taken or dropped): every node looks its sequence up again.
+    void invalidate_sequences();
+    // TdAnimNodeWeaponPoseOffset.Profiles: the bones each weapon's pose profile holds, by profile name.
+    [[nodiscard]] const std::vector<std::pair<std::string, std::vector<int>>>& weapon_pose_profiles() const { return weapon_pose_profiles_; }
+    // TdPawn.LegRotation: where the legs point (degrees).
+    [[nodiscard]] float leg_yaw() const { return leg_yaw_; }
+    // How much of the ready stance the weapon state node shows (its Default child's weight).
+    [[nodiscard]] float weapon_ready() const { return weapon_ready_; }
     [[nodiscard]] bool loaded() const { return root_ >= 0; }
 
     // Everything back to how the package saved it.
@@ -168,13 +188,15 @@ private:
     void advance(TreeNode& n, const PawnAnimState& pawn, float dt);
     void tick_walk_group(const PawnAnimState& pawn, float dt);
     int slot_node(Slot slot) const;
-    const AnimSequenceAsset* find_sequence(const std::string& name) const;
+    void resolve(TreeNode& n) const;
 
     std::vector<TreeNode> nodes_;
     std::vector<int> order_;  // parents before children
     int root_ = -1;
     int slots_[static_cast<size_t>(Slot::Count)];
     SequenceLookup lookup_;
+    std::vector<std::pair<std::string, std::vector<int>>> weapon_pose_profiles_;
+    float weapon_ready_ = 0.0f;
     // The "Walk" synch group: its members, and the one leading it this frame.
     std::vector<int> walk_group_;
     std::vector<char> in_walk_group_;

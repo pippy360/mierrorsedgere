@@ -25,6 +25,8 @@ struct PawnFrame {
     float view_yaw_deg = 0.0f;
     float view_pitch_deg = 0.0f;
     bool heavy_weapon = false;
+    bool armed = false;          // a weapon in hand
+    bool fired = false;          // it fired this frame
     // TdMove_Jump.StartJump: nothing to land on 1.1 x the forward speed ahead and up to 200 below.
     bool long_jump_over_gap = false;
     // How far the feet are above what is under them; negative when not known.
@@ -61,6 +63,10 @@ public:
     // Moves the eye and turns the camera of `view` accordingly; the body's place against its own
     // eye is not changed by either.
     void apply_mesh_transform(ViewFrame& view) const;
+    // The swan neck's reach this frame (TdSwanNeck.UpdateSwanNeck), and the hips' offset (SetHipsOffset).
+    [[nodiscard]] float swan_forward() const { return swan_forward_; }
+    [[nodiscard]] float swan_down() const { return swan_down_; }
+    [[nodiscard]] Vec3 hips_offset() const { return hips_offset_; }
 
 private:
     void stop_move(EMovement move, EMovement pending, const PawnFrame& frame);
@@ -72,6 +78,8 @@ private:
     void tick_grab(const PawnFrame& frame);
     void tick_melee(const PawnFrame& frame);
     void set_root_offset(const Vec3& offset, float blend_time);
+    void tick_weapon(const PawnFrame& frame);
+    void tick_swan_neck(const PawnFrame& frame);
     // TdMove.PlayMoveAnim.
     void play(Slot slot, const char* name, float rate, float blend_in, float blend_out) {
         tree_.play_custom_anim(slot, name, rate, blend_in, blend_out, false, true);
@@ -97,6 +105,8 @@ private:
     float climb_step_length_ = 0.0f;
     bool climb_hand_switched_ = false;
     bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
+    float climb_last_vz_ = 0.0f;
+    float climb_step_z_ = 0.0f;      // where the step being climbed started
     // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
     // hang's turn, and the shimmy step.
     int grab_turn_ = 0;
@@ -113,6 +123,13 @@ private:
     float swing_target_ = 0.0f;
     float swing_blend_ = 0.0f;
     float swing_angle_ = 0.0f;
+    float swan_forward_ = 0.0f, swan_down_ = 0.0f;
+    Vec3 hips_offset_{0.0f, 0.0f, 0.0f};
+    float slide_ended_ = 1.0f;       // seconds since a slide ended (the crouch's hips wait 0.3 s)
+    // TdPawn.WeaponAnimState's bookkeeping (UpdateWeaponAnimState): BecameReadyTime, AmountTilUnarmed.
+    bool was_armed_ = false;
+    float ready_for_ = 0.0f;
+    float amount_til_unarmed_ = 0.0f;
     // TdMove_Melee: 1 while the wind-up plays, 2 after the blow.
     int melee_phase_ = 0;
     int melee_variant_ = -1;

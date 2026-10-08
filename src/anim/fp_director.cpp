@@ -34,6 +34,7 @@ bool is_airborne(EMovement m) {
         case EMovement::MOVE_SwingJump:
         case EMovement::MOVE_AirBarge:
         case EMovement::MOVE_FallingUncontrolled:
+        case EMovement::MOVE_IntoGrab:  // reaching for a ledge she may miss: the fall goes on
             return true;
         default:
             return false;
@@ -199,6 +200,7 @@ void Director::reset() {
     was_accelerating_ = false;
     airborne_ = false;
     fall_top_ = 0.0f;
+    was_armed_ = false;
     climb_left_hand_ = false;
     climb_step_time_ = -1.0f;
     grab_turn_ = 0;
@@ -211,6 +213,103 @@ void Director::reset() {
     root_timer_ = -1.0f;
     swing_strength_ = swing_target_ = 0.0f;
     swing_blend_ = 0.0f;
+    swan_forward_ = swan_down_ = 0.0f;
+    hips_offset_ = Vec3(0.0f, 0.0f, 0.0f);
+    slide_ended_ = 1.0f;
+}
+
+// The weapon in hand: TdPawn.SetArmed / PlayWeaponDeploy, PlayFireAnimation, UpdateWeaponAnimState.
+// Taken up or fired it is at the ready (the weapon arm on the ready stances); a light one is let
+// down again (relaxed: the arm goes with the run, in the armed sets' versions of it) once 5 s have
+// passed and she has moved 1000 uu.
+void Director::tick_weapon(const PawnFrame& frame) {
+    if (!frame.armed) {
+        was_armed_ = false;
+        pawn_.weapon_state = 0;
+        pawn_.armed_right = pawn_.armed_left = 0.0f;
+        return;
+    }
+    const bool light = !frame.heavy_weapon;
+    auto make_ready = [&]() {
+        pawn_.weapon_state = 2;
+        ready_for_ = 0.0f;
+        amount_til_unarmed_ = light ? 1000.0f : 0.0f;
+    };
+    if (!was_armed_) {
+        was_armed_ = true;
+        tree_.play_custom_anim(Slot::CannedUpperBody, "unholster", 1.0f, 0.0f, 0.2f, false, true);
+        make_ready();
+    }
+    if (frame.fired) {
+        // PlayCustomAnim(CNT_Weapon, 'standfire', 1.0, 0.1, 0.0). (The script gives no blend out and
+        // marks the node as a firing animation for native code to clear; here it goes back to the
+        // ready stance over 0.2 s as it ends.)
+        tree_.stop_custom_anim(Slot::Weapon, 0.0f);
+        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.2f, false, true);
+        make_ready();
+    }
+    ready_for_ += frame.dt;
+    amount_til_unarmed_ -= frame.velocity.length() * frame.dt;
+    if (pawn_.weapon_state == 2 && amount_til_unarmed_ <= 0.0f && ready_for_ > (light ? 5.0f : 1.0f) && light) pawn_.weapon_state = 1;
+    pawn_.armed_right = 1.0f;
+    pawn_.armed_left = light ? 0.0f : 1.0f;
+}
+
+// TdSwanNeck (script): looking down past the move's SwanNeckEnableAtPitch the camera cranes forward
+// and down off the eye, so she sees her feet and not her chest. With P the pitch below level in
+// Unreal units, thr = int(Start * 182.044) and t = (P - thr) / (17385 - thr):
+//     forward = SwanNeckForward * t * cos(t * pi / 4),  down = SwanNeckDown * t * sin(t * pi / 4)
+// and the neck follows that, a fraction dt / 0.07 of the way each tick. TdMove.StartMove sets the
+// move's constants (15, 35, 30 unless it has its own), StopMove puts the defaults back.
+// TdPlayerPawn.SetHipsOffset moves the hips and legs (not the eye): running, back by four times
+// the neck's reach up to 20 (TdMove_Walking.UpdateViewRotation); crouched, with the turn of the
+// view off the legs (TdMove_Crouch.UpdateViewRotation).
+void Director::tick_swan_neck(const PawnFrame& frame) {
+    float start = 15.0f, forward = 35.0f, down = 30.0f;
+    switch (frame.movement) {
+        case EMovement::MOVE_Grabbing:
+            start = 0.0f;
+            forward = 70.0f;
+            break;
+        case EMovement::MOVE_Climb:
+            forward = 40.0f;
+            break;
+        case EMovement::MOVE_LayOnGround:
+        case EMovement::MOVE_180TurnInAir:
+            start = forward = down = 0.0f;
+            break;
+        case EMovement::MOVE_SkillRoll:
+            if (time_in_move_ >= 0.2f) start = forward = down = 0.0f;  // the DisableSwanneck timer
+            break;
+        default:
+            break;
+    }
+    const float pitch_units = -frame.view_pitch_deg * (65536.0f / 360.0f);
+    const float threshold = std::floor(start * 182.044f);
+    float want_forward = 0.0f, want_down = 0.0f;
+    if (pitch_units > threshold && (forward != 0.0f || down != 0.0f)) {
+        const float t = (pitch_units - threshold) / (17385.0f - threshold);
+        want_forward = forward * t * std::cos(t * PI * 0.25f);
+        want_down = down * t * std::sin(t * PI * 0.25f);
+    }
+    const float step = std::min(1.0f, frame.dt / 0.07f);
+    swan_forward_ += (want_forward - swan_forward_) * step;
+    swan_down_ += (want_down - swan_down_) * step;
+
+    slide_ended_ += frame.dt;
+    Vec3 hips(0.0f, 0.0f, 0.0f);
+    if (frame.movement == EMovement::MOVE_Walking && pawn_.walking_state > kWasWalk) {
+        hips.x = -std::min(swan_forward_, 5.0f) * 4.0f;
+    } else if (frame.movement == EMovement::MOVE_Crouch && slide_ended_ > 0.3f) {
+        float turn = frame.view_yaw_deg - tree_.leg_yaw();
+        while (turn > 180.0f) turn -= 360.0f;
+        while (turn < -180.0f) turn += 360.0f;
+        hips.x = 25.0f * std::fabs(turn) / 90.0f;
+        hips.y = 30.0f * turn / 90.0f;
+    }
+    // SetHipsOffset(Offset, 0.3).
+    const float blend = std::min(1.0f, frame.dt / 0.1f);
+    hips_offset_ += (hips - hips_offset_) * blend;
 }
 
 void Director::set_root_offset(const Vec3& offset, float blend_time) {
@@ -249,15 +348,34 @@ void Director::tick_climb(const PawnFrame& frame) {
         }
         if (climb_step_time_ >= climb_step_length_) climb_step_time_ = -1.0f;
     }
-    // Going down is the slide (bClimbDownFast: the stick held right down, which a key always is);
-    // the tree's Climb node shows it. Stepping down, the up animations backwards, is not played.
-    pawn_.climb_sliding = frame.velocity.z < -1.0f;
-    if (climb_step_time_ < 0.0f && !climb_exiting_ && frame.velocity.z > 20.0f) {
-        // ClimbAnims[bClimbLeftHand ? right : left].
-        const bool right_hand = climb_left_hand_;
+    // Going down: a slide (bClimbDownFast: backward at full deflection more than four rungs up),
+    // which the tree's Climb node shows, or near the bottom a step down: the up animation of the
+    // other hand played backwards (HandleClimbAction). The slide gathers speed from nothing, while a
+    // step moves at its own speed from its first frame, which is how the two are told apart here.
+    const float vz = frame.velocity.z;
+    const bool stepping_speed = vz <= -50.0f && vz >= -150.0f;
+    if (vz >= -1.0f) pawn_.climb_sliding = false;
+    else if (climb_step_time_ < 0.0f && !stepping_speed) pawn_.climb_sliding = true;
+    const bool step_down = !pawn_.climb_sliding && stepping_speed;
+    // A step starts as she starts to move, and the next when she has climbed the rungs this one
+    // covers and is still going: one rung of 32 uu on a ladder, two on a pipe. (Retail stands still
+    // for a frame between steps, so a tap climbs one step and no more.)
+    const bool moving = vz > 20.0f || step_down;
+    const bool was_moving = climb_last_vz_ > 20.0f || (climb_last_vz_ <= -50.0f && climb_last_vz_ >= -150.0f);
+    climb_last_vz_ = vz;
+    const float rungs = frame.climbing_pipe ? 64.0f : 32.0f;
+    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > rungs + 2.0f;
+    if (!climb_exiting_ && moving && (!was_moving || past_step)) {
+        // Where this step started: a frame's travel back from here.
+        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? rungs : -rungs) : frame.position.z - vz * frame.dt;
+        // Up: ClimbAnims[bClimbLeftHand ? right : left]; down, the other one at -1.
+        const bool right_hand = step_down ? !climb_left_hand_ : climb_left_hand_;
         const char* name = frame.climbing_pipe ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
                                                : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
-        play(Slot::FullBody, name, 1.0f, 0.1f, 0.075f);
+        // At the speed the move climbs at (96 uu/s a ladder, 128 a pipe) the animation lasts as long
+        // as its step; a controller that climbs faster gets it played faster.
+        const float pace = std::clamp(std::fabs(vz) / (frame.climbing_pipe ? 128.0f : 96.0f), 1.0f, 2.0f);
+        play(Slot::FullBody, name, (step_down ? -1.0f : 1.0f) * pace, 0.1f, 0.075f);
         climb_step_time_ = 0.0f;
         climb_step_length_ = frame.climbing_pipe ? 0.5f : 1.0f / 3.0f;
         climb_hand_switched_ = false;
@@ -362,8 +480,9 @@ void Director::set_animation_state(EMovement state, float delay) {
 
 // TdPawn.UpdateWalkingState is native. The pawn's Tick runs before its physics, so the state
 // follows the velocity of the frame before. The thresholds are measured on the recordings (the
-// recorder logs CurrentWalkingState): Sneak from the first movement, Walk from 50, Jog from 260,
-// Run from 400, Sprint from 630, the same speeding up and slowing down.
+// recorder logs CurrentWalkingState): Sneak from 5 (idle up to 4.86, sneak from 5.05; standing she
+// drifts at 1 to 4 and stays idle), Walk from 50, Jog from 260, Run from 400, Sprint from 630, the
+// same speeding up and slowing down.
 void Director::update_walking_state(const PawnFrame& frame) {
     (void)frame;
     const float speed = std::sqrt(last_velocity_.x * last_velocity_.x + last_velocity_.y * last_velocity_.y);
@@ -372,7 +491,7 @@ void Director::update_walking_state(const PawnFrame& frame) {
     else if (speed >= 400.0f) state = kWasRun;
     else if (speed >= 260.0f) state = kWasJog;
     else if (speed >= 50.0f) state = kWasWalk;
-    else if (speed >= 1.0f) state = kWasSneak;
+    else if (speed >= 5.0f) state = kWasSneak;
     pawn_.walking_state = state;
 }
 
@@ -436,9 +555,10 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBody, 0.25f);
             break;
         case EMovement::MOVE_Slide:
-            // TdMove_Slide.StopMove: out of the slide, and into the crouch if that is what follows.
+            // TdMove_Slide.StopMove: out of the slide through CrouchSlideToCrouch, whatever follows
+            // (every slide recorded shows it, the two that end standing as well).
             tree_.stop_custom_anim(Slot::FullBody, 0.2f);
-            if (pending == EMovement::MOVE_Crouch) play(Slot::FullBody, "CrouchSlideToCrouch", 1.0f, 0.1f, 0.2f);
+            play(Slot::FullBody, "CrouchSlideToCrouch", 1.0f, 0.1f, 0.2f);
             break;
         case EMovement::MOVE_Crouch:
             play(Slot::Camera, "CrouchIntoStand", 1.0f, 0.2f, 0.2f);
@@ -689,8 +809,13 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             climb_left_hand_ = false;
             climb_step_time_ = -1.0f;
             climb_exiting_ = false;
+            climb_last_vz_ = 0.0f;
+            climb_step_z_ = frame.position.z;
             break;
         case EMovement::MOVE_Grabbing:
+            // TdMove_Grab.StartMove: RootOffset.X += RelativeExtent + 1 with the legs on the wall (the
+            // recordings have the eye 1 forward in 794 of 872 hanging frames), over 0.3 s.
+            if (!frame.hanging_free) set_root_offset(Vec3(1.0f, 0.0f, 0.0f), 0.3f);
             grab_turn_ = 0;
             grab_timer_ = -1.0f;
             grab_free_turn_ = false;
@@ -721,6 +846,7 @@ void Director::tick(const PawnFrame& frame) {
             set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.3f);
         }
         root_timer_ = -1.0f;
+        if (old == EMovement::MOVE_Slide) slide_ended_ = 0.0f;
         stop_move(old, frame.movement, frame);
         // TdMove.StopMove: ClearAnimationMovementState.
         pawn_.animation_movement = EMovement::MOVE_None;
@@ -807,16 +933,25 @@ void Director::tick(const PawnFrame& frame) {
         if (animation_state_timer_ <= 0.0f) pawn_.animation_movement = pending_animation_state_;
     }
     pawn_.velocity = frame.velocity;
+    pawn_.last_velocity = last_velocity_;
     pawn_.yaw_deg = frame.yaw_deg;
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;
     pawn_.heavy_weapon = frame.heavy_weapon;
+    {
+        float look = frame.view_yaw_deg - frame.yaw_deg;
+        while (look > 180.0f) look -= 360.0f;
+        while (look < -180.0f) look += 360.0f;
+        pawn_.look_deg = look;
+    }
     // The swing's angle stays where it was when she lets go (the poses fade under the jump off).
     if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
     pawn_.hanging_free = frame.hanging_free;
     pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
+    tick_weapon(frame);
+    tick_swan_neck(frame);
     tree_.tick(pawn_, frame.dt);
     last_velocity_ = frame.velocity;
 }

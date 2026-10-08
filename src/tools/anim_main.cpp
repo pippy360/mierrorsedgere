@@ -83,7 +83,11 @@ int main(int argc, char** argv) {
     }
     me::fp::Director director;
     std::string error;
-    if (!director.init(game_root, [&](const std::string& name) { return unarmed.find_sequence(name); }, error)) {
+    auto lookup = [&](const std::string& name, const me::AnimSetAsset** set) {
+        if (set) *set = &unarmed;
+        return unarmed.find_sequence(name);
+    };
+    if (!director.init(game_root, lookup, error)) {
         std::cerr << "me_anim: " << error << "\n";
         return 1;
     }
@@ -155,9 +159,12 @@ int main(int argc, char** argv) {
         last_t = t;
         director.tick(f);
         if (eye_file.is_open()) {
-            poser.evaluate(director.tree(), pose);
+            me::fp::PoseEvaluator::Aim aim;
+            aim.hips = director.hips_offset();
+            poser.evaluate(director.tree(), pose, aim);
             poser.component_space(pose, comp_pos, comp_rot);
-            me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg);
+            me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg, director.swan_forward(),
+                                             director.swan_down());
             director.apply_mesh_transform(v);
             char line[160];
             std::snprintf(line, sizeof line, "%.6f %.3f %.3f %.3f %.3f %.3f %.3f", t, v.eye_pawn.x, v.eye_pawn.y, v.eye_pawn.z, v.anim_pitch,
