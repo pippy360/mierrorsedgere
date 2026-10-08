@@ -208,8 +208,10 @@ public:
     // moves return weight 0.
     [[nodiscard]] CameraAnimation camera_animation(const PlayerTelemetry& telemetry) const;
 
-    // The first-person camera for `telemetry`: the eyes eye_height above the feet looking along the
-    // view rotation, moved onto the animated EyeJoint and turned by camera_animation() while it plays.
+    // The first-person camera for `telemetry`. In play it is the first-person tree's: at its EyeJoint
+    // (bobbing with the run, dipping on a landing, craning forward looking down), looking along the
+    // view rotation turned by what the animation does to the camera bone. In a level intro, the death
+    // fall, or without the tree: the eyes eye_height above the feet, with camera_animation().
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
 
     // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
@@ -293,7 +295,14 @@ private:
     // (fp_anim / fp_director / fp_pose). Ticked once per simulation time from evaluate_faith_1p.
     struct FirstPerson;
     mutable std::shared_ptr<FirstPerson> fp_;
-    bool tick_first_person(const PlayerTelemetry& telemetry) const;
+    // What of the tree is used this frame: its eye for the world camera, its whole body for the
+    // viewmodel, or only its legs under arms that are still posed by hand (a weapon in hand).
+    struct FirstPersonUse {
+        bool camera = false;
+        bool body = false;
+        bool legs = false;
+    };
+    FirstPersonUse tick_first_person(const PlayerTelemetry& telemetry) const;
 
     SkeletalMeshAsset faith_upper_;
     SkeletalMeshAsset faith_lower_;

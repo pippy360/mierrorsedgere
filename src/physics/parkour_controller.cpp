@@ -565,6 +565,7 @@ void ParkourController::equip_weapon(const std::string& weapon_name) {
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
     if (dt <= 0.0f) return;
     m_telemetry.move_input = std::fabs(input.forward) > 0.01f || std::fabs(input.strafe) > 0.01f;
+    if (m_telemetry.grounded) m_telemetry.ground_distance = -1.0f;
 
     // Input edges. TdPlayerInput: Jump and Crouch are press actions (holding a key never
     // retriggers a move); a jump press is buffered for JumpTapTime.
@@ -841,6 +842,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_prev_turn_180 = input.turn_180;
     m_telemetry.tick++;
     m_telemetry.sim_time += effective_dt;
+    m_telemetry.swing_angle = m_swing_angle;
+    m_telemetry.body_yaw_deg = m_pawn_yaw;
+    m_telemetry.balance_lean = m_balance_lean;
     m_telemetry.speed_2d = m_telemetry.velocity.length_xy();
     m_telemetry.speed_3d = m_telemetry.velocity.length();
 
@@ -2100,6 +2104,12 @@ void ParkourController::start_jump(const LevelScene& scene) {
     m_telemetry.velocity = vel;
     m_last_jump_location = m_telemetry.position;
     set_stance(kEyeHeightStand);
+    // TdMove_Jump.StartJump: a long jump (JumpFast) is one with nothing to land on within 200 below
+    // the point 1.1 x her speed ahead.
+    {
+        const Vec3 ahead = m_telemetry.position + fwd * (1.1f * m_pre_jump_momentum) + Vec3(0.0f, 0.0f, 10.0f);
+        m_telemetry.jump_over_gap = !trace_ray(ahead, ahead - Vec3(0.0f, 0.0f, 210.0f), scene).hit;
+    }
     leave_ground(EMovement::MOVE_Jump);
 }
 
@@ -2115,6 +2125,7 @@ bool ParkourController::try_initiate_dodge_jump(const InputFrame& input) {
     m_telemetry.velocity = vel;
     m_last_jump_location = m_telemetry.position;
     set_stance(kEyeHeightStand);
+    m_telemetry.move_left = input.strafe < 0.0f;
     leave_ground(EMovement::MOVE_DodgeJump);
     return true;
 }
@@ -2419,6 +2430,13 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     if (m_telemetry.velocity.z > 0.0f && m_telemetry.position.z > m_fall_peak_z) {
         m_fall_peak_z = m_telemetry.position.z;
     }
+    // TdMove_Falling.CloseToGround lets the jump animation go a little before the feet arrive.
+    m_telemetry.ground_distance = -1.0f;
+    if (m_telemetry.velocity.z < -400.0f) {
+        const Vec3 from = m_telemetry.position + Vec3(0.0f, 0.0f, 5.0f);
+        const TraceHit below = trace_ray(from, from - Vec3(0.0f, 0.0f, 1200.0f), scene);
+        if (below.hit) m_telemetry.ground_distance = std::max(0.0f, m_telemetry.position.z - below.point.z);
+    }
     update_fall_height_volumes(scene);
 
     const float fall_dist = std::max(0.0f, m_fall_peak_z - m_telemetry.position.z);
@@ -2662,6 +2680,8 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
             m_last_wallrun_normal = n;
             m_illegal_wall_timer = 2.0f;
             m_wallrun_cooldown = 0.15f;
+            // Away from the wall: left off a wall on the right.
+            m_telemetry.move_left = m_telemetry.move_state == EMovement::MOVE_WallRunningRight;
             leave_ground(EMovement::MOVE_DodgeJump);
             return;
         }
@@ -2679,6 +2699,11 @@ void ParkourController::update_wallrun(const InputFrame& input, float dt, const 
         m_last_wallrun_normal = n;
         m_illegal_wall_timer = 2.0f;
         m_wallrun_cooldown = 0.15f;
+        // TdMove_WallrunJump.StartMove: pushing off hard (PushSpeed > 0.6) is the wall run jump
+        // proper, anything less a plain jump.
+        if (push > 0.6f) {
+            set_move_anim(m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ? "WallrunJumpLeft" : "WallrunJumpRight");
+        }
         leave_ground(EMovement::MOVE_WallRunJump);
         return;
     }
@@ -3081,6 +3106,15 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     move_swept(Vec3(0.0f, 0.0f, target_z - m_telemetry.position.z), kPawnHeight, 0.0f, scene);
     if (gap > 0.0f) move_swept(into * gap, kPawnHeight, 0.0f, scene);
 
+    // TdMove_Grab.bIsHangingFree: nothing in front of the legs to put the feet against.
+    m_telemetry.hanging_free = !probe_wall(ledge.normal * -1.0f, kPawnRadius + 45.0f, 60.0f, scene).found;
+    // TdMove_IntoGrab.ReachedPreciseLocation: how she catches the ledge, by where she came from and
+    // how fast she was falling (HangImpactMinZSpeed -600, HangHardImpactMinZSpeed -1000).
+    set_move_anim(m_telemetry.move_state == EMovement::MOVE_WallClimbing ? "hanghardstartvertical"
+                  : m_telemetry.hanging_free ? "HangFreeHardStart"
+                  : m_telemetry.velocity.z < -1000.0f ? "HangHardStart3"
+                  : m_telemetry.velocity.z < -600.0f ? "HangHardStart2"
+                  : "HangHardStart");
     m_telemetry.move_state = EMovement::MOVE_Grabbing;
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
     m_telemetry.wall_normal = ledge.normal;
@@ -3152,6 +3186,14 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
             st = EMovement::MOVE_GrabPullUp;
             m_state_timer = 0.0f;
             m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+            {
+                // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
+                // room to stand on top.
+                const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+                const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
+                set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
+                                                       : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
+            }
             return;
         }
         const float push = std::clamp(fwd.dot(n), 0.0f, 1.0f);
@@ -3169,6 +3211,14 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         st = EMovement::MOVE_GrabPullUp;
         m_state_timer = 0.0f;
         m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+        {
+            // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
+            // room to stand on top.
+            const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+            const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
+            set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
+                                                   : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
+        }
         return;
     }
     if (m_crouch_pressed || (input.forward < -0.8f && m_hang_time > 0.2f)) {
@@ -3326,6 +3376,7 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
 
     m_pre_jump_momentum = speed;
     m_telemetry.move_state = EMovement::MOVE_SpringBoarding;
+    m_path_planted = false;
     m_takeoff_move = EMovement::MOVE_SpringBoarding;
     m_state_timer = 0.0f;
     m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
@@ -3464,6 +3515,12 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     // Retail records every vault - onto or over, walking pace or full sprint - as MOVE_VaultOver
     // (3,454 samples in 61 runs across the recordings); MOVE_SpeedVaulting never appears.
     m_telemetry.move_state = EMovement::MOVE_VaultOver;
+    // TdMove_SpeedVault.VaultTypes[].AnimName: by the ledge's height, whether she lands on top, and
+    // (for the low step up) how little momentum she has.
+    set_move_anim(handplant < 48.0f ? "autostepuprightleg"
+                  : high_vault ? (over ? "VaultOverHigh" : "VaultOntoHigh")
+                  : over ? "VaultOver"
+                  : (speed <= 200.0f ? "stepuprightleg88" : "VaultOnto"));
     m_takeoff_move = EMovement::MOVE_VaultOver;
     m_state_timer = 0.0f;
     m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
@@ -3486,6 +3543,11 @@ void ParkourController::update_vault(const InputFrame& input, float dt, const Le
         // Out of a GrabTransfer the rise eases out: retail's vertical speed falls linearly to 0.
         if (m_path_hang_vault) target.z = m_path_p0.z + (m_path_p1.z - m_path_p0.z) * s * (2.0f - s);
     } else if (t < m_path_t1 + m_path_t2) {
+        // TdMove_SpringBoard.ReachedPreciseLocation: the foot is on the step.
+        if (m_telemetry.move_state == EMovement::MOVE_SpringBoarding && !m_path_planted) {
+            m_path_planted = true;
+            set_move_anim("@reached");
+        }
         const float s = (t - m_path_t1) / std::max(m_path_t2, 1e-4f);
         target = m_path_p1 + (m_path_p2 - m_path_p1) * s;
         // ... and the drop beyond the rail eases in from the apex.
@@ -3730,7 +3792,7 @@ bool ParkourController::try_initiate_swing_bar(const InputFrame& input, const Le
         }
 
         // Initial pendulum angle measured from straight down (-Z) toward +swing_dir
-        const Vec3 rel = (m_telemetry.position + Vec3(0.0f, 0.0f, 60.0f)) - anchor;
+        const Vec3 rel = (m_telemetry.position + Vec3(0.0f, 0.0f, 90.0f)) - anchor;
         m_swing_anchor = anchor;
         m_swing_bar_start = a;
         m_swing_bar_end = b;
@@ -3741,7 +3803,7 @@ bool ParkourController::try_initiate_swing_bar(const InputFrame& input, const Le
 
         m_telemetry.position = m_swing_anchor
                              + m_swing_dir * (kSwingPendulumLength * std::sin(m_swing_angle))
-                             - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle));
+                             - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle) + 90.0f);  // the capsule centre is on the arc (retail: radius 120 to 0.001), the feet 90 under it
         m_telemetry.velocity = m_swing_dir * (m_swing_angular_vel * kSwingPendulumLength * std::cos(m_swing_angle));
         m_telemetry.move_state = EMovement::MOVE_Swing;
         m_telemetry.grounded = false;
@@ -3836,7 +3898,7 @@ void ParkourController::update_swing_bar(const InputFrame& input, float dt, cons
     const Vec3 prev_pos = m_telemetry.position;
     const Vec3 target_pos = m_swing_anchor
                           + m_swing_dir * (kSwingPendulumLength * std::sin(m_swing_angle))
-                          - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle));
+                          - Vec3(0.0f, 0.0f, kSwingPendulumLength * std::cos(m_swing_angle) + 90.0f);
     m_telemetry.position = target_pos;
     m_telemetry.velocity = (target_pos - prev_pos) / std::max(dt, 1e-4f);
     m_fall_peak_z = m_telemetry.position.z;
@@ -3910,6 +3972,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         m_climb_top = top;
         m_climb_normal = wall_out;
         m_climb_can_exit_top = act.can_exit_at_top;
+        m_telemetry.climbing_pipe = act.is_pipe;
         m_telemetry.wall_normal = wall_out;
         m_state_timer = 0.0f;
         m_coil_timer = 0.0f;

@@ -16,9 +16,9 @@ Scores, per movement state:
 
 A recording has the pawn but not the level, and some of what the moves play depends on what
 they found in the level: which vault, which way of catching a ledge, whether a long jump is over
-a gap, how far the ground is. Those come from the recording itself, as the controller would give
-them in the game: the ground distance from where the fall ends, the rest from the name of the
-animation retail went on to play. `--no-hints` runs without them. The hints say which of a move's
+a gap, how far the ground is, whether the stick is pushed. Those come from the recording itself, as
+the controller would give them in the game: the ground distance from where the fall ends, the rest
+from the name of the animation retail went on to play. `--no-hints` runs without them. The hints say which of a move's
 animations to play, never when or how: the slot, the rate, the blend times and the frame are the
 port's.
 
@@ -84,20 +84,16 @@ def level_hints(run, names):
     direction, animation)."""
     n = len(run)
     out = [[-1.0, 0, 0, 0, 1, "-"] for _ in range(n)]
-    # Braking is the ground friction alone, 8 a second off the speed; anything gentler is the player
-    # still pushing.
-    # (The recorder sometimes samples one game frame twice: no change in speed says nothing.)
-    speed = [math.hypot(d["vx"], d["vy"]) for d in run]
-    pushing = 0
+    # Whether the stick is pushed is not recorded. The one thing it decides here is the stopping step,
+    # which letting go of the stick plays, so the frame retail starts one is the frame it was let go.
+    # (Telling it from the speed alone, by the braking, finds too many: a landing or a wall brakes
+    # her as hard.)
     for i in range(n):
-        dt = run[i]["t"] - run[i - 1]["t"] if i else 0.0
-        if speed[i] < 1.0:
-            pushing = 0
-        elif i > 0 and dt > 0.0 and abs(speed[i] - speed[i - 1]) > 0.05:
-            pushing = 0 if speed[i] < speed[i - 1] * 0.93 else 1
-        elif i == 0:
-            pushing = 1
-        out[i][4] = pushing
+        before = {a[0].lower(): a[1] for a in run[i - 1]["anim1p"]} if i else {}
+        fresh = [a for a in run[i]["anim1p"] if a[0].lower().startswith("walktostandpass") and a[1] < 0.07
+                 and (a[0].lower() not in before or a[1] < before[a[0].lower()] - 0.1)]
+        if fresh:
+            out[i][4] = 0
     leaf_names = [[a[0].lower() for a in d["anim1p"]] for d in run]
     # Where each stretch of one movement state ends.
     end = [0] * n
@@ -117,6 +113,39 @@ def level_hints(run, names):
             out[i][2] = 1
         if any(s.startswith("hangfree") for s in seen):
             out[i][3] = 1
+    # The swing's angle. The bar is not in the recording, but she hangs SwingPendulumLength (120)
+    # under it: the lowest point of the swing puts the bar 120 above it, and the angle is where she
+    # is on that arc, positive ahead of the bar the way she faces. (The recorded velocity is zero
+    # all through a swing: the move places her.)
+    i = 0
+    while i < n:
+        if run[i]["move"] != 60:
+            i += 1
+            continue
+        j = i
+        while j < n and run[j]["move"] == 60:
+            j += 1
+        low = min(range(i, j), key=lambda k: run[k]["pz"])
+        x0, y0, z0 = run[low]["px"], run[low]["py"], run[low]["pz"] + 120.0
+        for k in range(i, j):
+            d = run[k]
+            yaw = math.radians(d.get("pyaw", 0.0))
+            along = (d["px"] - x0) * math.cos(yaw) + (d["py"] - y0) * math.sin(yaw)
+            out[k].append(("swing", "%.3f" % math.atan2(along, max(1.0, z0 - d["pz"]))))
+        i = j
+    # On a pipe or a ladder: the level says, and here the names of what retail plays on it do.
+    i = 0
+    while i < n:
+        if run[i]["move"] not in (21, 22):
+            i += 1
+            continue
+        j = i
+        while j < n and run[j]["move"] in (21, 22):
+            j += 1
+        pipe = any(name.startswith("pipe") for k in range(i, j) for name in leaf_names[k])
+        for k in range(i, j):
+            out[k].append(("pipe", 1 if pipe else 0))
+        i = j
     # The animation a move picked: the frame retail first shows one of the director's named
     # animations (or shows it started over). A move that picks its animation as it starts gets it
     # on its first frame when retail shows it within 2 frames of that.
@@ -176,7 +205,12 @@ def write_frames(samples, path, hints=True):
                     d["t"], d["move"], d["px"], d["py"], d["pz"], d["vx"], d["vy"], d["vz"],
                     d.get("pyaw", d.get("yaw", 0.0)), d.get("cyaw", d.get("yaw", 0.0)), d.get("cpitch", d.get("pitch", 0.0))))
                 if extra:
-                    f.write(" %.2f %d %d %d %d %s" % tuple(extra[k]))
+                    g, gap, left, free, acc, anim = extra[k][:6]
+                    f.write(" g=%.2f gap=%d left=%d free=%d acc=%d" % (g, gap, left, free, acc))
+                    if anim != "-":
+                        f.write(" anim=%s" % anim)
+                    for name, value in extra[k][6:]:
+                        f.write(" %s=%s" % (name, value))
                 f.write("\n")
             i = j
     return kept

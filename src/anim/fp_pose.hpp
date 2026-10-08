@@ -62,6 +62,7 @@ private:
     std::vector<int> track_of_;               // the AnimSet track of each bone, -1 for none
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;
+    int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn
     // The pawn's axes in the mesh component's space, read off the reference pose's eye.
     Vec3 fwd_{1.0f, 0.0f, 0.0f}, right_{0.0f, 1.0f, 0.0f}, up_{0.0f, 0.0f, 1.0f};
     mutable std::vector<Pose> scratch_;

@@ -42,6 +42,14 @@ struct PawnAnimState {
     // How far the weapon arms are laid over the body (ArmedLeft / ArmedRight's Child2Weight): 0 unarmed.
     float armed_left = 0.0f;
     float armed_right = 0.0f;
+    float swing_angle = 0.0f;     // radians from hanging straight down, positive ahead of the bar
+    float balance_lean = 0.0f;    // -1 .. 1 off the beam
+    bool hanging_free = false;
+    bool climbing_pipe = false;
+    int climb_hand = 0;           // 0 left hand up, 1 right
+    bool climb_sliding = false;
+    int grab_turn_type = 0;       // TdPawn.CurrentGrabTurnType: 0 none, 1 start, 2 end, 3 idle
+    float grab_turn_deg = 0.0f;   // the view's yaw off the body's while hanging
 };
 
 // One node of the tree: its fixed properties and its state this frame.
@@ -86,6 +94,8 @@ struct TreeNode {
         float trans[9][3];
     };
     std::vector<AimBone> aim;
+    float aim_range_neg = 1.0f, aim_range_pos = 1.0f;  // the profile's HorizontalRange: the Aim.X at which its left and right poses are whole
+    bool aim_from_legs = false;                         // TdAnimNodeAimOffset.bAimSourceIsLegRotation
 
     // State.
     std::vector<float> weight;   // per child
@@ -102,6 +112,8 @@ struct TreeNode {
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
     float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
     float aim_x = 0.0f, aim_y = 0.0f; // AnimNodeAimOffset.Aim
+    bool root_motion = false;         // a slot's channel: the animation's root movement goes to the pawn
+    bool unlisted = false;            // a channel of the Camera or Canned slot: not in the retail recorder's list
     const AnimSequenceAsset* seq = nullptr;
 };
 
@@ -119,7 +131,8 @@ public:
     void tick(const PawnAnimState& pawn, float dt);
 
     // TdPawn.PlayCustomAnim / StopCustomAnim.
-    void play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping, bool override_playing);
+    void play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping, bool override_playing,
+                          bool root_motion = false);
     void stop_custom_anim(Slot slot, float blend_out);
     [[nodiscard]] bool custom_anim_playing(Slot slot, std::string* name = nullptr) const;
     // How far into its animation the slot's active channel is (0 with none).
@@ -169,6 +182,14 @@ private:
     int walk_synch_ = -1;  // the AnimNodeSynch that owns it ("MasterSync")
     float land_amount_ = 0.0f;
     float land_time_ = -1.0f;
+    // TdAnimNodeTurn (native; measured): where the legs point, and the standing turn that brings
+    // them round when the view has left them more than 65 degrees behind.
+    float leg_yaw_ = 0.0f;
+    bool leg_yaw_set_ = false;
+    bool turning_ = false;
+    float turn_time_ = 0.0f;
+    float turn_side_ = 0.0f;
+    void tick_turn(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant);
 };
 
 }  // namespace fp

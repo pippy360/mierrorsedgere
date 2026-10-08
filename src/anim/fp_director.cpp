@@ -94,22 +94,14 @@ const MoveAnim kMoveAnims[] = {
     {"hanghardstart2", Slot::FullBody, 1.0f, 0.1f, 0.2f, false},
     {"hanghardstart", Slot::FullBody, 1.0f, 0.1f, 0.2f, false},
     // TdMove_Grab.
-    {"hangstrafeleft", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangstraferight", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangfreestrafeleft", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangfreestrafe", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
     {"hangfoldedstart", Slot::FullBody, 1.0f, 0.2f, 0.0f, false},
     {"hangend", Slot::FullBody, 1.0f, 0.1f, 0.2f, false},
     {"hangfreeend", Slot::FullBody, 1.0f, 0.1f, 0.2f, false},
-    {"hangturnrightstart", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangturnleftstart", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangturnrightend", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangturnleftend", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangfreeturnright", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
-    {"hangfreeturnleft", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
     {"hangfreefoldedendhangfree", Slot::FullBody, 1.0f, 0.0f, 0.2f, false},
     {"hangfoldedendhang", Slot::FullBody, 1.0f, 0.0f, 0.2f, false},
-    // TdMove_GrabTransfer.
+    // TdMove_GrabTransfer (the same turns TdMove_Grab plays by its own rules while hanging).
+    {"hangturnrightstart", Slot::FullBody, 1.0f, 0.2f, 0.1f, false},
+    {"hangturnleftstart", Slot::FullBody, 1.0f, 0.2f, 0.1f, false},
     {"hangfreetransferup", Slot::FullBody, 1.0f, 0.1f, 0.1f, false},
     {"hangtransferup", Slot::FullBody, 1.0f, 0.1f, 0.1f, false},
     {"hangturnjump", Slot::FullBody, 1.0f, 0.2f, 0.2f, false},
@@ -207,6 +199,155 @@ void Director::reset() {
     was_accelerating_ = false;
     airborne_ = false;
     fall_top_ = 0.0f;
+    climb_left_hand_ = false;
+    climb_step_time_ = -1.0f;
+    grab_turn_ = 0;
+    grab_timer_ = -1.0f;
+    grab_free_turn_ = false;
+    shimmy_ = false;
+    melee_phase_ = 0;
+    root_offset_ = root_target_ = Vec3(0.0f, 0.0f, 0.0f);
+    root_blend_ = 0.0f;
+    root_timer_ = -1.0f;
+    swing_strength_ = swing_target_ = 0.0f;
+    swing_blend_ = 0.0f;
+}
+
+void Director::set_root_offset(const Vec3& offset, float blend_time) {
+    root_target_ = offset;
+    root_blend_ = blend_time;
+    if (blend_time <= 0.0f) root_offset_ = offset;
+}
+
+void Director::apply_mesh_transform(ViewFrame& view) const {
+    // The root offset is in the root bone's space, so it turns with the body.
+    Vec3 eye = view.eye_pawn + root_offset_;
+    const float angle = swing_angle_ * swing_strength_;
+    if (angle != 0.0f) {
+        // SetPawnRotation: the body turns by the swing's angle about a point 94 above the mesh's
+        // origin (the capsule's centre), feet forward when she is ahead of the bar.
+        constexpr float kPivot = 94.0f;
+        const float c = std::cos(angle), sn = std::sin(angle);
+        const float x = eye.x, z = eye.z - kPivot;
+        eye.x = x * c - z * sn;
+        eye.z = kPivot + x * sn + z * c;
+        view.anim_pitch += angle * RAD2DEG;
+    }
+    view.eye_pawn = eye;
+}
+
+// TdMove_Climb.HandleClimbAction / Climb / OnTimer: one step at a time, hand over hand. A pipe is
+// climbed two steps to the animation (the "fast" ones), a ladder one; down is the same animation
+// backwards with the other hand's. A step is 32 uu, and the move flies it at 64 (pipe) or 96
+// (ladder) uu/s a step, so each animation lasts as long as its step.
+void Director::tick_climb(const PawnFrame& frame) {
+    if (climb_step_time_ >= 0.0f) {
+        climb_step_time_ += frame.dt;
+        if (!climb_hand_switched_ && climb_step_time_ >= 0.1f) {
+            climb_hand_switched_ = true;
+            climb_left_hand_ = !climb_left_hand_;
+        }
+        if (climb_step_time_ >= climb_step_length_) climb_step_time_ = -1.0f;
+    }
+    // Going down is the slide (bClimbDownFast: the stick held right down, which a key always is);
+    // the tree's Climb node shows it. Stepping down, the up animations backwards, is not played.
+    pawn_.climb_sliding = frame.velocity.z < -1.0f;
+    if (climb_step_time_ < 0.0f && !climb_exiting_ && frame.velocity.z > 20.0f) {
+        // ClimbAnims[bClimbLeftHand ? right : left].
+        const bool right_hand = climb_left_hand_;
+        const char* name = frame.climbing_pipe ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
+                                               : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
+        play(Slot::FullBody, name, 1.0f, 0.1f, 0.075f);
+        climb_step_time_ = 0.0f;
+        climb_step_length_ = frame.climbing_pipe ? 0.5f : 1.0f / 3.0f;
+        climb_hand_switched_ = false;
+    }
+    pawn_.climb_hand = climb_left_hand_ ? 1 : 0;
+}
+
+// TdMove_Grab: the shimmy (StartShimmy / AbortShimmy) and looking back over a shoulder
+// (UpdateViewRotation, OnTimer, OnCustomAnimEnd).
+void Director::tick_grab(const PawnFrame& frame) {
+    const float yaw = frame.yaw_deg * DEG2RAD;
+    const float side = -std::sin(yaw) * frame.velocity.x + std::cos(yaw) * frame.velocity.y;
+    std::string playing;
+    const bool custom = tree_.custom_anim_playing(Slot::FullBody, &playing);
+
+    // One strafe animation a step, started again from its first frame while she keeps going.
+    if (shimmy_ && !custom) shimmy_ = false;
+    if (!shimmy_ && std::fabs(side) > 5.0f && grab_turn_ == 0) {
+        const bool left = side < 0.0f;
+        play(Slot::FullBody, frame.hanging_free ? (left ? "HangFreeStrafeLeft" : "HangFreeStrafe") : (left ? "HangStrafeLeft" : "HangStrafeRight"),
+             1.0f, 0.2f, 0.0f);
+        shimmy_ = true;
+    } else if (shimmy_ && std::fabs(side) <= 5.0f) {
+        // Let go of the stick: it stops only early in the step or near its end.
+        const float at = tree_.custom_anim_time(Slot::FullBody) / 1.0667f;
+        if ((at > 0.1f && at < 0.25f) || at > 0.8f) {
+            tree_.stop_custom_anim(Slot::FullBody, 0.4f);
+            shimmy_ = false;
+        }
+    }
+
+    float turn = frame.view_yaw_deg - frame.yaw_deg;
+    while (turn > 180.0f) turn -= 360.0f;
+    while (turn < -180.0f) turn += 360.0f;
+    const bool forward = turn > -90.0f && turn < 90.0f;
+    const bool right = turn >= 0.0f;
+    if (grab_timer_ >= 0.0f) {
+        grab_timer_ -= frame.dt;
+        if (grab_timer_ < 0.0f) {
+            if (grab_turn_ == 2) grab_turn_ = 0;
+            else if (grab_turn_ == 1) grab_turn_ = 3;
+        }
+    }
+    if (!frame.hanging_free) {
+        if (grab_turn_ == 0 && !forward) {
+            play(Slot::FullBody, right ? "HangTurnRightStart" : "HangTurnLeftStart", 1.0f, 0.2f, 0.2f);
+            grab_turn_ = 1;
+            grab_timer_ = 0.2f;
+            grab_turned_right_ = right;
+        } else if (grab_turn_ == 3 && forward) {
+            play(Slot::FullBody, right ? "HangTurnRightEnd" : "HangTurnLeftEnd", 1.0f, 0.2f, 0.2f);
+            grab_turn_ = 2;
+            grab_timer_ = 0.6f;
+        } else if (grab_turn_ == 1 && forward) {
+            tree_.stop_custom_anim(Slot::FullBody, 0.2f);
+            grab_turn_ = 0;
+        }
+    } else {
+        grab_turn_ = 0;
+        if (grab_free_turn_ && !custom) grab_free_turn_ = false;
+        // 750 short of the look constraint, which is a quarter turn either way.
+        if (!grab_free_turn_ && std::fabs(turn) >= 85.88f) {
+            play(Slot::FullBody, right ? "HangFreeTurnRight" : "HangFreeTurnLeft", 1.0f, 0.2f, 0.2f);
+            grab_free_turn_ = true;
+        }
+    }
+    // OnCustomAnimEnd: the start's end makes it the idle, the end's end clears it.
+    if (!tree_.custom_anim_playing(Slot::FullBody)) {
+        if (grab_turn_ == 1) grab_turn_ = 3;
+        else if (grab_turn_ == 2) grab_turn_ = 0;
+    }
+    pawn_.grab_turn_type = grab_turn_;
+    pawn_.grab_turn_deg = turn;
+}
+
+// TdMove_Melee.TriggerMove, OnCustomAnimEnd, TriggerHit / TriggerMiss (and TdMove_MeleeCrouch):
+// the wind-up, then the blow that lands or misses when the wind-up ends.
+void Director::tick_melee(const PawnFrame& frame) {
+    if (melee_phase_ != 1 || tree_.custom_anim_playing(Slot::UpperBody)) return;
+    melee_phase_ = 2;
+    const bool left = melee_variant_ == 1;
+    if (melee_variant_ == 3) {
+        play(Slot::UpperBody, "MeleeCrouchHit", 1.0f, 0.1f, 0.2f);
+    } else if (melee_variant_ == 2) {
+        play(Slot::UpperBody, "MeleeHitShove", 1.0f, 0.0f, 0.1f);
+    } else if (frame.melee_hit) {
+        play(Slot::UpperBody, left ? "MeleeHitLeft" : "MeleeHitRight", 1.5f, 0.2f, 0.1f);
+    } else {
+        play(Slot::UpperBody, left ? "MeleeMissedLeft" : "MeleeMissedRight", 1.5f, 0.08f, 0.1f);
+    }
 }
 
 void Director::set_animation_state(EMovement state, float delay) {
@@ -242,6 +383,14 @@ bool Director::play_named(const std::string& name) {
     std::string playing;
     if (tree_.custom_anim_playing(a->slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(a->slot) < 0.05f) return true;
     tree_.play_custom_anim(a->slot, name, a->rate, a->blend_in, a->blend_out, a->looping, true);
+    // TdMove_Climb.ExitAtTop: over the top, and the walking tree comes in under it.
+    if (std::strstr(a->name, "exittop")) {
+        climb_exiting_ = true;
+        climb_step_time_ = -1.0f;
+        set_animation_state(EMovement::MOVE_Walking, 0.5f);
+    }
+    // TdMove_IntoGrab.ReachedPreciseLocation: the hardest catch also knocks the camera.
+    if (std::strcmp(a->name, "hanghardstart3") == 0) tree_.play_custom_anim(Slot::Camera, "gethitfront", 1.0f, 0.05f, 0.2f, false, true);
     return true;
 }
 
@@ -272,7 +421,6 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.4f);
             break;
         case EMovement::MOVE_Grabbing:
-        case EMovement::MOVE_IntoGrab:
         case EMovement::MOVE_SoftLanding:
         case EMovement::MOVE_180Turn:
             tree_.stop_custom_anim(Slot::FullBody, 0.2f);
@@ -304,9 +452,12 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBody, 0.3f);
             if (pending == EMovement::MOVE_Falling || pending == EMovement::MOVE_Jump) play(Slot::FullBody, "SwingJumpOff", 1.0f, 0.2f, 0.2f);
             break;
+        case EMovement::MOVE_MeleeSlide:
+            tree_.stop_custom_anim(Slot::FullBody, 0.15f);
+            set_animation_state(EMovement::MOVE_None);
+            break;
         case EMovement::MOVE_IntoZipLine:
         case EMovement::MOVE_AirBarge:
-        case EMovement::MOVE_MeleeSlide:
             set_animation_state(EMovement::MOVE_None);
             break;
         case EMovement::MOVE_IntoClimb:
@@ -316,12 +467,21 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::UpperBody, 0.2f);
             break;
         case EMovement::MOVE_Melee:
-            tree_.stop_custom_anim(Slot::UpperBody, 0.3f);
-            tree_.stop_custom_anim(Slot::FullBody, 0.3f);
+            // TdMove_MeleeBase.StopMove, then TdMove_Melee's (TdMove_MeleeCrouch lets its blow go quicker).
+            tree_.stop_custom_anim(Slot::Canned, 0.15f);
+            tree_.stop_custom_anim(Slot::Weapon, 0.15f);
+            tree_.stop_custom_anim(Slot::UpperBody, melee_variant_ == 3 ? 0.2f : 0.3f);
+            tree_.stop_custom_anim(Slot::FullBody, 0.15f);
+            melee_phase_ = 0;
             break;
         case EMovement::MOVE_MeleeCrouch:
+            tree_.stop_custom_anim(Slot::FullBody, 0.15f);
             tree_.stop_custom_anim(Slot::UpperBody, 0.2f);
             set_animation_state(EMovement::MOVE_None);
+            break;
+        case EMovement::MOVE_MeleeAir:
+        case EMovement::MOVE_MeleeWallrun:
+            tree_.stop_custom_anim(Slot::FullBody, 0.15f);
             break;
         default:
             break;
@@ -398,9 +558,6 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             play(Slot::FullBody, "HangTurnJump", 1.0f, 0.2f, 0.2f);
             set_animation_state(EMovement::MOVE_Grabbing);
             break;
-        case EMovement::MOVE_IntoGrab:
-            if (frame.move_anim.empty()) play(Slot::FullBody, frame.hanging_free ? "HangFreeHardStart" : "HangHardStart", 1.0f, 0.1f, 0.2f);
-            break;
         case EMovement::MOVE_GrabTransfer:
             tree_.stop_custom_anim(Slot::FullBody, 0.1f);
             set_animation_state(old);
@@ -410,7 +567,8 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             if (frame.move_anim.empty()) play(Slot::FullBody, "FallingLandHard", 1.0f, 0.05f, 0.2f);
             break;
         case EMovement::MOVE_SkillRoll:
-            play(Slot::FullBody, "fallinglandroll", 1.0f, 0.2f, 0.2f);
+            // PlayMoveAnim(CNT_FullBody, 'fallinglandroll', 1.0, 0.2, 0.2, bRootMotion).
+            tree_.play_custom_anim(Slot::FullBody, "fallinglandroll", 1.0f, 0.2f, 0.2f, false, true, true);
             set_animation_state(EMovement::MOVE_Walking, 0.2f);
             break;
         case EMovement::MOVE_SoftLanding:
@@ -418,6 +576,11 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.6f, 0.2f, true, true);
             break;
         case EMovement::MOVE_Swing:
+            // SetRootOffset(vect(0, -50, -32), AnimBlendTime, BCS_BoneSpace): up 50 and back 32, so the
+            // hands are on the bar; EnableSwingControl.
+            set_root_offset(Vec3(-32.0f, 0.0f, 50.0f), 0.15f);
+            swing_target_ = 1.0f;
+            swing_blend_ = 0.15f;
             tree_.stop_custom_anim(Slot::FullBody, 0.15f);
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.15f);
             if (frame.move_anim.empty()) play(Slot::FullBody, "SwingHardStart", 1.0f, 0.15f, 0.2f);
@@ -438,12 +601,18 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             play(Slot::FullBody, "CrouchSlide", 1.0f, 0.4f, 0.4f);
             break;
         case EMovement::MOVE_RumpSlide:
+            set_root_offset(Vec3(0.0f, 0.0f, 20.0f), 0.3f);  // TdMove_RumpSlide.RootOffset
             set_animation_state(EMovement::MOVE_None);
             play(Slot::FullBody, "crouchslideintoend45", 1.0f, 0.15f, 0.2f);
             break;
         case EMovement::MOVE_Crouch:
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.25f);
             tree_.stop_custom_anim(Slot::LowerBody, 0.25f);
+            // Out of a walk the mesh is lifted 15 for a moment while the capsule drops.
+            if (old == EMovement::MOVE_Walking) {
+                set_root_offset(Vec3(0.0f, 0.0f, 15.0f), 0.1f);
+                root_timer_ = 0.15f;
+            }
             break;
         case EMovement::MOVE_180Turn: {
             // TdMove_180Turn.StartMove: the running turn, or the standing one.
@@ -471,15 +640,65 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
         case EMovement::MOVE_LedgeWalk:
             play(Slot::FullBody, "LedgeInto", 1.0f, 0.2f, 0.3f);
             break;
-        case EMovement::MOVE_MeleeAir:
-            if (frame.move_anim.empty()) play(Slot::FullBody, "MeleeInAir", 1.0f, 0.1f, 0.2f);
+        case EMovement::MOVE_Melee:
+            // TdMove_Melee.TriggerMove: punches alternate hands, the third of a combo is a shove.
+            tree_.stop_custom_anim(Slot::Camera, 0.05f);
+            tree_.stop_custom_anim(Slot::Weapon, 0.1f);
+            set_animation_state(EMovement::MOVE_Walking);
+            melee_variant_ = frame.melee_variant;
+            melee_phase_ = 0;
+            if (melee_variant_ == 3) {
+                // The port's crouched blow: TdMove_MeleeCrouch.
+                set_animation_state(EMovement::MOVE_Crouch);
+                tree_.play_custom_anim(Slot::UpperBody, "MeleeCrouchStart", 1.0f, 0.1f, -1.0f, false, true);
+                melee_phase_ = 1;
+            } else if (melee_variant_ == 2) {
+                tree_.play_custom_anim(Slot::UpperBody, "MeleeStartShove", 1.0f, 0.1f, -1.0f, false, true);
+                melee_phase_ = 1;
+            } else if (melee_variant_ >= 0) {
+                tree_.play_custom_anim(Slot::UpperBody, melee_variant_ == 1 ? "MeleeStartLeft" : "MeleeStartRight", 1.5f, 0.1f, -1.0f, false, true);
+                melee_phase_ = 1;
+            }
             break;
+        case EMovement::MOVE_MeleeAir: {
+            // TdMove_MeleeAir: the flying kick, or the kick on the spot when she is hardly moving.
+            const float speed = std::sqrt(frame.velocity.x * frame.velocity.x + frame.velocity.y * frame.velocity.y);
+            if (frame.move_anim.empty()) play(Slot::FullBody, speed > 200.0f ? "MeleeInAir" : "MeleeInAirStill", 1.0f, 0.1f, 0.2f);
+            break;
+        }
         case EMovement::MOVE_MeleeSlide:
             if (frame.move_anim.empty()) play(Slot::FullBody, "MeleeSlide", 1.0f, 0.1f, 0.1f);
             set_animation_state(EMovement::MOVE_Slide);
             break;
+        case EMovement::MOVE_MeleeWallrun:
+            if (frame.move_anim.empty()) play(Slot::FullBody, old == EMovement::MOVE_WallRunningLeft ? "MeleeWallRunLeft" : "MeleeWallRunRight", 1.0f, 0.1f, 0.2f);
+            break;
         case EMovement::MOVE_MeleeCrouch:
             set_animation_state(EMovement::MOVE_Crouch);
+            if (frame.move_anim.empty()) {
+                tree_.play_custom_anim(Slot::UpperBody, "MeleeCrouchStart", 1.0f, 0.1f, -1.0f, false, true);
+                melee_variant_ = 3;
+                melee_phase_ = 1;
+            }
+            break;
+        case EMovement::MOVE_IntoClimb:
+            // TdMove_IntoClimb.PlayStartAnimation ends with it, whichever animation it picked.
+            set_animation_state(EMovement::MOVE_Climb, 0.15f);
+            break;
+        case EMovement::MOVE_Climb:
+            climb_left_hand_ = false;
+            climb_step_time_ = -1.0f;
+            climb_exiting_ = false;
+            break;
+        case EMovement::MOVE_Grabbing:
+            grab_turn_ = 0;
+            grab_timer_ = -1.0f;
+            grab_free_turn_ = false;
+            shimmy_ = false;
+            break;
+        case EMovement::MOVE_LayOnGround:
+            // TdMove_Landing.LandBackwards.
+            play(Slot::FullBody, "JumpTurnLanding", 1.0f, 0.1f, 0.1f);
             break;
         default:
             break;
@@ -493,6 +712,15 @@ void Director::tick(const PawnFrame& frame) {
         pawn_.old_movement = EMovement::MOVE_None;
     } else if (frame.movement != pawn_.movement) {
         const EMovement old = pawn_.movement;
+        // TdMove.StopMove: SetRootOffset(vect(0, 0, 0), 0.3); the swing lets go quicker.
+        if (old == EMovement::MOVE_Swing) {
+            set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.1f);
+            swing_target_ = 0.0f;
+            swing_blend_ = 0.25f;
+        } else {
+            set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.3f);
+        }
+        root_timer_ = -1.0f;
         stop_move(old, frame.movement, frame);
         // TdMove.StopMove: ClearAnimationMovementState.
         pawn_.animation_movement = EMovement::MOVE_None;
@@ -513,6 +741,26 @@ void Director::tick(const PawnFrame& frame) {
     }
     time_in_move_ += frame.dt;
 
+    if (root_timer_ >= 0.0f) {
+        root_timer_ -= frame.dt;
+        if (root_timer_ < 0.0f) set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.1f);
+    }
+    if (root_blend_ > frame.dt) {
+        root_offset_ += (root_target_ - root_offset_) * (frame.dt / root_blend_);
+        root_blend_ -= frame.dt;
+    } else {
+        root_offset_ = root_target_;
+        root_blend_ = 0.0f;
+    }
+    if (swing_blend_ > frame.dt) {
+        swing_strength_ += (swing_target_ - swing_strength_) * (frame.dt / swing_blend_);
+        swing_blend_ -= frame.dt;
+    } else {
+        swing_strength_ = swing_target_;
+        swing_blend_ = 0.0f;
+    }
+    if (frame.movement == EMovement::MOVE_Swing) swing_angle_ = frame.swing_angle;
+
     // TdPawn.EnterFallingHeight.
     const bool airborne = is_airborne(frame.movement);
     if (airborne) fall_top_ = airborne_ ? std::max(fall_top_, frame.position.z) : frame.position.z;
@@ -526,7 +774,9 @@ void Director::tick(const PawnFrame& frame) {
             play(Slot::FullBody, tree_.left_leg_forward() ? "SpringBoardRightLeg" : "SpringBoardLeftLeg", 1.0f, 0.15f, 0.25f);
         }
     } else if (!frame.move_anim.empty()) {
-        play_named(frame.move_anim);
+        // Hanging, the turns are TdMove_Grab's own (tick_grab), not something the move names.
+        const bool own = frame.movement == EMovement::MOVE_Grabbing && lower(frame.move_anim).compare(0, 8, "hangturn") == 0;
+        if (!own) play_named(frame.move_anim);
     }
 
     // Letting go of the stick while walking: the legs take the stopping step (native; measured).
@@ -537,6 +787,11 @@ void Director::tick(const PawnFrame& frame) {
         play(Slot::LowerBody, right ? "walktostandpassright" : "walktostandpassleft", 1.0f, 0.1f, 0.15f);
     }
     was_accelerating_ = frame.accelerating;
+
+    if (frame.movement == EMovement::MOVE_Climb) tick_climb(frame);
+    if (frame.movement == EMovement::MOVE_Grabbing) tick_grab(frame);
+    else pawn_.grab_turn_type = 0;
+    if (frame.movement == EMovement::MOVE_Melee || frame.movement == EMovement::MOVE_MeleeCrouch) tick_melee(frame);
 
     // TdMove_Falling.CloseToGround (called from native code): the jump animation lets go before the
     // feet arrive. Measured: it fires while falling faster than 400 with the ground less than 0.4 s
@@ -556,6 +811,11 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;
     pawn_.heavy_weapon = frame.heavy_weapon;
+    // The swing's angle stays where it was when she lets go (the poses fade under the jump off).
+    if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
+    pawn_.balance_lean = frame.balance_lean;
+    pawn_.hanging_free = frame.hanging_free;
+    pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
     tree_.tick(pawn_, frame.dt);
     last_velocity_ = frame.velocity;

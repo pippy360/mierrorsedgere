@@ -127,7 +127,12 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         n.use_old_state = prop_bool(props, "bUseOldState", false);
         n.child2_weight = prop_float(props, "Child2Weight", 0.0f);
         n.bone_weight = float_array(find_prop(props, "Child2PerBoneWeight"));
+        n.aim_from_legs = prop_bool(props, "bAimSourceIsLegRotation", false);
         if (const UProperty* profiles = find_prop(props, "Profiles"); profiles && !profiles->elements.empty()) {
+            if (const UProperty* range = find_prop(profiles->elements[0], "HorizontalRange")) {
+                if (range->v[0] != 0.0f) n.aim_range_neg = std::fabs(range->v[0]);
+                if (range->v[1] != 0.0f) n.aim_range_pos = std::fabs(range->v[1]);
+            }
             if (const UProperty* comps = find_prop(profiles->elements[0], "AimComponents")) {
                 static const char* const kDirs[9] = {"LU", "LC", "LD", "CU", "CC", "CD", "RU", "RC", "RD"};
                 for (const auto& comp : comps->elements) {
@@ -160,6 +165,15 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         }
     }
     root_ = node_of[root_export];
+    // The retail recorder's list leaves out what plays on the Camera and Canned slots.
+    for (Slot hidden : {Slot::Camera, Slot::Canned}) {
+        const int index = slots_[static_cast<size_t>(hidden)];
+        if (index < 0) continue;
+        const TreeNode& slot = nodes_[static_cast<size_t>(index)];
+        for (size_t c = 1; c < slot.children.size(); ++c) {
+            if (slot.children[c] >= 0) nodes_[static_cast<size_t>(slot.children[c])].unlisted = true;
+        }
+    }
     in_walk_group_.assign(nodes_.size(), 0);
     for (int i : walk_group_) in_walk_group_[static_cast<size_t>(i)] = 1;
     for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -203,6 +217,53 @@ void AnimTree::reset() {
     walk_master_ = -1;
     land_amount_ = 0.0f;
     land_time_ = -1.0f;
+    leg_yaw_set_ = false;
+    turning_ = false;
+}
+
+namespace {
+float wrap180(float a) {
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+}  // namespace
+
+// TdAnimNodeTurn: Default, Turn Left 45, Turn Left 90, Turn Right 45, Turn Right 90. Measured on
+// the recordings (76 turns; the rule makes 27 of the 30 that follow another, on the right side and
+// within three frames): standing, the legs stay where they are while the view turns, never more
+// than a quarter turn behind it; once it is more than 65 degrees off them the quarter-turn step of
+// that side plays, bringing the legs round 90 degrees over its 0.8 s whatever the view does
+// meanwhile, and blending in and out over 0.2 s. The 45 degree steps are never chosen.
+void AnimTree::tick_turn(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant) {
+    if (n.weight.size() < 5) return;
+    const float view = pawn.yaw_deg;
+    float d = wrap180(view - leg_yaw_);
+    if (std::fabs(d) > 90.0f) {
+        leg_yaw_ = view - (d > 0.0f ? 90.0f : -90.0f);
+        d = d > 0.0f ? 90.0f : -90.0f;
+    }
+    if (became_relevant && !turning_) set_active(n, 0, 0.0f);
+    if (turning_) {
+        leg_yaw_ += turn_side_ * (90.0f / 0.8f) * dt;
+        turn_time_ += dt;
+        if (turn_time_ >= 0.8f) {
+            turning_ = false;
+            set_active(n, 0, 0.2f);
+        }
+    } else if (std::fabs(d) > 65.0f) {
+        turn_side_ = d > 0.0f ? 1.0f : -1.0f;
+        const int child = d > 0.0f ? 4 : 2;
+        if (n.children[static_cast<size_t>(child)] >= 0) {
+            TreeNode& seq = nodes_[static_cast<size_t>(n.children[static_cast<size_t>(child)])];
+            seq.time = 0.0f;
+            seq.playing = true;
+        }
+        set_active(n, child, 0.2f);
+        turning_ = true;
+        turn_time_ = dt;
+        leg_yaw_ += turn_side_ * (90.0f / 0.8f) * dt;
+    }
 }
 
 void AnimTree::set_landed(float amount) {
@@ -226,7 +287,7 @@ void AnimTree::set_active(TreeNode& n, int child, float blend_time) {
 }
 
 void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping,
-                                bool override_playing) {
+                                bool override_playing, bool root_motion) {
     const int index = slot_node(slot);
     if (index < 0) return;
     TreeNode& n = nodes_[static_cast<size_t>(index)];
@@ -243,9 +304,12 @@ void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, 
     seq.rate = rate;
     seq.looping = looping;
     seq.playing = true;
-    seq.time = 0.0f;
+    // TdAnimNodeSequence.OnBecomeRelevant: one played backwards starts at its end.
+    seq.time = (rate < 0.0f && seq.seq) ? seq.seq->length : 0.0f;
+    seq.root_motion = root_motion;
     set_active(n, channel, blend_in);
-    n.pending_blend_out = looping ? -1.0f : blend_out;
+    // With no time to blend out in, it holds its last frame until something else takes the slot.
+    n.pending_blend_out = (looping || blend_out <= 0.0f) ? -1.0f : blend_out;
 }
 
 void AnimTree::stop_custom_anim(Slot slot, float blend_out) {
@@ -345,8 +409,73 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;
+    } else if (n.cls == "TdAnimNodeSwing") {
+        // Front, Middle, back. Measured on the recordings (the node is native; three swings, 2143
+        // frames, to 0.005): by the swing's angle alone, a quarter turn ahead of the bar all Front,
+        // a quarter turn behind all back, the Middle in between, with nothing smoothing it.
+        if (n.weight.size() >= 3) {
+            const float a = std::clamp(pawn.swing_angle / (PI * 0.5f), -1.0f, 1.0f);
+            n.weight[0] = std::max(a, 0.0f);
+            n.weight[1] = 1.0f - std::fabs(a);
+            n.weight[2] = std::max(-a, 0.0f);
+            n.target = n.weight;
+            n.blend_to_go = 0.0f;
+        }
+        return;
+    } else if (n.cls == "TdAnimNodeTurn") {
+        return;  // tick_turn
+    } else if (n.cls == "TdAnimNodeGrabbing") {
+        // Hang, HangFree, then the looking-back idles (left, right, and their extremes).
+        // TdMove_IntoGrab: GrabAnimNode.SetActiveMove(legs on the wall ? 0 : 1).
+        // Measured on the recordings (the node is native; every frame it has weight fits to 0.005):
+        // turned past a quarter turn with the turn started, the idle of that side shows at once,
+        // shared with its extreme by how far past ((|d| - 90) / 90); with no turn it goes back to
+        // the hang over 0.2 s; in between (the turn's end playing) it stays as it is.
+        const int hang = pawn.hanging_free ? 1 : 0;
+        const float off = std::fabs(pawn.grab_turn_deg);
+        if (became_relevant) {
+            set_active(n, hang, 0.0f);
+        } else if (pawn.grab_turn_type >= 2 && off > 90.0f && n.weight.size() >= 6) {
+            const size_t side = pawn.grab_turn_deg < 0.0f ? 0 : 1;
+            const float extreme = std::min((off - 90.0f) / 90.0f, 1.0f);
+            std::fill(n.weight.begin(), n.weight.end(), 0.0f);
+            n.weight[2 + side] = 1.0f - extreme;
+            n.weight[4 + side] = extreme;
+            n.target = n.weight;
+            n.active = static_cast<int>(2 + side);
+            n.blend_to_go = 0.0f;
+        } else if (pawn.grab_turn_type <= 1 && (n.active != hang || n.target[static_cast<size_t>(hang)] < 1.0f)) {
+            set_active(n, hang, 0.2f);
+        }
+        return;
+    } else if (n.cls == "TdAnimNodeClimb") {
+        // LadderLeft, LadderRight, LadderSlide, PipeLeft, PipeRight, PipeSlide, TurnLeftIdle, TurnRightIdle.
+        const int base = pawn.climbing_pipe ? 3 : 0;
+        want = pawn.climb_sliding ? base + 2 : base + (pawn.climb_hand ? 0 : 1);
+    } else if (n.cls == "TdAnimNodeBalanceWalk") {
+        // Danger Left, Default, Danger Right, Crouch: the lose-balance poses are not driven.
+        want = 1;
+    } else if (n.cls == "TdAnimNodeBalanceBlend") {
+        // Left, Middle, Right: by how far she leans off the beam.
+        if (n.weight.size() >= 3) {
+            const float lean = std::clamp(pawn.balance_lean, -1.0f, 1.0f);
+            n.weight[0] = std::max(0.0f, -lean);
+            n.weight[1] = 1.0f - std::fabs(lean);
+            n.weight[2] = std::max(0.0f, lean);
+            n.target = n.weight;
+            n.blend_to_go = 0.0f;
+        }
+        return;
+    } else if (n.cls == "TdAnimNodeLedgeWalk" || n.cls == "TdAnimNodeDirSwitch") {
+        // Right / Left along a ledge, Forward / Backward crouched: by the way she is going, and the
+        // last way while she is still.
+        const float yaw = pawn.yaw_deg * DEG2RAD;
+        const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+        const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
+        const float along = n.cls == "TdAnimNodeLedgeWalk" ? right : forward;
+        if (std::fabs(along) > 1.0f) want = along >= 0.0f ? 0 : 1;
     } else {
-        // Not modelled yet: the node stays on its first child.
+        // Driven by nothing here: the node stays on its first child.
         want = 0;
     }
     if (static_cast<size_t>(want) < n.blend_in.size()) blend = n.blend_in[static_cast<size_t>(want)];
@@ -420,11 +549,33 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
     // TdAnimNodeLandOffset (native): into the landing pose over LandInto, back out over LandOut.
     float land = 0.0f;
     if (land_time_ >= 0.0f) {
-        constexpr float kLandInto = 0.1f, kLandOut = 0.4f;
+        // Measured against retail's camera through landings: 0.1 s in and 0.3 s back out (the node's
+        // LandOut says 0.4; LandOverlap and OverlapSize are not accounted for).
+        constexpr float kLandInto = 0.1f, kLandOut = 0.3f;
         land_time_ += dt;
         if (land_time_ < kLandInto) land = land_amount_ * land_time_ / kLandInto;
         else if (land_time_ < kLandInto + kLandOut) land = land_amount_ * (1.0f - (land_time_ - kLandInto) / kLandOut);
         else land_time_ = -1.0f;
+    }
+    // Moving, the legs point the way she goes (the other way when she goes backward).
+    {
+        const float speed_sq = pawn.velocity.x * pawn.velocity.x + pawn.velocity.y * pawn.velocity.y;
+        if (!leg_yaw_set_) {
+            leg_yaw_ = pawn.yaw_deg;
+            leg_yaw_set_ = true;
+        }
+        if (speed_sq > 100.0f && pawn.walking_state != kWasIdle) {
+            const float yaw = pawn.yaw_deg * DEG2RAD;
+            const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+            float travel = std::atan2(pawn.velocity.y, pawn.velocity.x) / DEG2RAD;
+            if (forward < 0.0f) travel += 180.0f;
+            // They come round to it, not at once: after half a second of a slow sidestep retail's
+            // are about 40 degrees round (the rate is a rough fit).
+            const float off = wrap180(travel - leg_yaw_);
+            const float step = 2.4f * std::sqrt(speed_sq) * dt;  // 83 degrees a second at 35 uu/s
+            leg_yaw_ = wrap180(leg_yaw_ + std::clamp(off, -step, step));
+            turning_ = false;
+        }
     }
     nodes_[static_cast<size_t>(root_)].incoming = 1.0f;
     for (int index : order_) {
@@ -453,8 +604,9 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 if (n.active > 0 && n.pending_blend_out >= 0.0f) {
                     const TreeNode& seq = nodes_[static_cast<size_t>(n.children[static_cast<size_t>(n.active)])];
                     if (seq.seq && seq.seq->length > 0.0f) {
-                        const float rate = std::fabs(seq.rate * seq.seq->rate_scale);
-                        const float left = rate > 0.0f ? (seq.seq->length - seq.time) / rate : 0.0f;
+                        const float signed_rate = seq.rate * seq.seq->rate_scale;
+                        const float rate = std::fabs(signed_rate);
+                        const float left = rate > 0.0f ? (signed_rate > 0.0f ? seq.seq->length - seq.time : seq.time) / rate : 0.0f;
                         if (left <= n.pending_blend_out) {
                             set_active(n, 0, left);
                             n.pending_blend_out = -1.0f;
@@ -464,6 +616,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 break;
             }
             case TreeNode::Kind::List:
+                if (n.cls == "TdAnimNodeTurn") tick_turn(n, pawn, dt, became_relevant);
                 update_list(n, pawn, became_relevant);
                 if (n.hold >= 0.0f) {
                     n.hold -= dt;
@@ -480,6 +633,27 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
             case TreeNode::Kind::Passthrough:
                 if (!n.weight.empty()) n.weight[0] = 1.0f;
                 if (n.cls == "TdAnimNodeLandOffset") n.aim_y = land;
+                // The standing legs' twist: how far the legs are off the body, a quarter turn to the unit.
+                if (n.aim_from_legs) n.aim_x = wrap180(leg_yaw_ - pawn.yaw_deg) / 90.0f;
+                if (n.cls == "TdAnimNodeDirBone" && n.name == "1pAim") {
+                    // The hips (and the spine against them) turn the legs the way she is going, a
+                    // quarter turn at most: the profile's left and right poses are 90 degrees. Going
+                    // backward they turn off the opposite of it.
+                    float want = 0.0f;
+                    if (pawn.movement == EMovement::MOVE_Walking || pawn.movement == EMovement::MOVE_Crouch) {
+                        const float yaw = pawn.yaw_deg * DEG2RAD;
+                        const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+                        const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
+                        if (forward * forward + right * right > 100.0f) {
+                            float angle = std::atan2(right, forward) / DEG2RAD;
+                            if (angle > 90.0f) angle -= 180.0f;
+                            else if (angle < -90.0f) angle += 180.0f;
+                            want = angle / 90.0f;
+                        }
+                    }
+                    const float step = dt / 0.1f;  // DirInterpTime
+                    n.aim_x = n.aim_x < want ? std::min(n.aim_x + step, want) : std::max(n.aim_x - step, want);
+                }
                 if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;
             case TreeNode::Kind::Directional:
@@ -508,7 +682,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
 void AnimTree::leaves(std::vector<Leaf>& out, size_t limit) const {
     out.clear();
     for (const TreeNode& n : nodes_) {
-        if (n.kind != TreeNode::Kind::Sequence || n.seq_name.empty() || n.total <= 0.005f) continue;
+        if (n.kind != TreeNode::Kind::Sequence || n.seq_name.empty() || n.total <= 0.005f || n.unlisted) continue;
         // The carriers of the footstep and breathing notifies draw nothing.
         if (n.seq_name.compare(0, 13, "notifierdummy") == 0) continue;
         out.push_back(Leaf{n.seq_name, n.time, n.total});
