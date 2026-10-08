@@ -14,6 +14,8 @@ The recorder half comes from [tesseract](https://github.com/pippy360/tesseract)'
 | `record_session.py`, `tracefile.py` | Windows | Drains the ring to a JSONL trace while a human plays. |
 | `trace.py` | anywhere | Reads a trace. Cuts paused stretches and recovers keys held from before the recorder attached. Picks where the view comes from, moves each key to the recorded frame that took it, and rebuilds the frame state retail's `PlayerMove` carries (sprint energy, AccelerationTime, the walk-stop, the jump chain). Copied from tesseract's `replay.py`. |
 | `replay.py` | anywhere | Turns a trace into a `me_replay` script, runs it and scores the result. |
+| `intro_capture.py` | Windows | Boots retail at each chapter's first checkpoint and records the start-of-level intro (camera, pawn, sounds, optionally a frame a second). No key is sent to the game. |
+| `intro_check.py` | Windows to play, anywhere to compare | Plays the port's intros with `--trace` and lays them over those recordings: eye position, view direction, the hand-over, and every sound cue. `docs/LEVEL_INTROS.md` has the method and the results. |
 | `src/tools/replay_main.cpp` → `me_replay` | anywhere | Headless: loads the level from the retail packages and steps the controller once per recorded retail frame. |
 
 ## 1. Record (Windows, retail installed)
@@ -31,6 +33,18 @@ python -m tools.retail.record_session --name myrun --map escape_p
 * `python -m tools.retail.hook.build --remove` restores the original `d3d9.dll`.
 * `--no-boot` attaches to a game that is already running. Use `edge_p` or `escape_p` to record movement. The Training Area is a scripted tutorial that gates input.
 * Never press keys blindly in the game's menus. "NEW GAME" sits right under "PLAY CHAPTER", and its confirmation erases the save.
+
+### Level intros
+
+```bash
+python -m tools.retail.intro_capture --frames 1.0     # -> build/retail/intros/<map>.jsonl (+ <map>_frames/)
+python -m tools.retail.intro_check play build-win/mirrorsedge_windows.exe
+python -m tools.retail.intro_check compare
+```
+
+* `intro_capture` restarts the game once per chapter and points `[URL] Map` / `LocalMap` of your `TdEngine.ini` at it for each launch, putting them back at the end. It copies the save folder first and compares it afterwards. Do not run it while something else is driving the game.
+* A camera position in any retail trace is 10 uu ahead of the eye, along the view direction: the hook solves it out of the view-projection, whose depth column carries the near plane. `intro_check` takes it out; anything else that compares camera positions has to as well.
+* For about six seconds at the start of a chapter the trace's yaw and pitch read 0 and 90, and no sound is logged for the first second or so.
 
 ## 2. Replay
 

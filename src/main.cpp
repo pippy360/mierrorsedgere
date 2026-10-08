@@ -1183,7 +1183,7 @@ static std::string frontend_key_name(SDL_Keycode sym) {
 // -----------------------------------------------------------------------------
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
                               const std::string& custom_level, int max_frames,
-                              bool start_in_main_menu) {
+                              bool start_in_main_menu, const std::string& trace_path) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
     std::cout << "  MIRROR'S EDGE NATIVE " << platform_upper() << " - INTERACTIVE LAUNCH" << std::endl;
@@ -1263,6 +1263,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     audio.init(false);
     audio.load_stock_audio(game_root);
 
+    // --trace: one JSON line per frame (the camera, the pawn, what is playing) and one per sound asked
+    // to play, in the shape of a retail recording (tools/retail/tracefile.py), so the two can be laid
+    // over each other.
+    std::ofstream trace_file;
+    if (!trace_path.empty()) {
+        trace_file.open(trace_path, std::ios::out | std::ios::trunc);
+        if (!trace_file.is_open()) std::cerr << "[Trace] Cannot write " << trace_path << std::endl;
+        audio.set_play_log(trace_file.is_open());
+    }
+
     MovementConfig move_cfg;
     load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
 
@@ -1330,6 +1340,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
         audio.load_level_audio(game_root, map_file);
+        // The level intro's cues come from packages of their own (door hits, cutscene foley, the
+        // opening's long tracks): whatever is not loaded yet is fetched from the one it names.
+        for (const IntroSoundEvent& ev : active_scene.level_intro.sounds) {
+            if (!ev.cue.empty() && !audio.has_cue(ev.cue)) audio.load_cue_bank(game_root, ev.bank);
+        }
         pending_level_loaded_audio = true;
         was_vo_playing = false;
 
@@ -1338,8 +1353,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         if (max_frames == 0 && play_intro) {
             std::string intro_movie = custom_path.empty() ? CutscenePlayer::get_chapter_intro_movie(map_file) : "";
             if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
-                // Bink movie started; will transition into 3D rooftop intro on finish
-            } else {
+                // Bink movie started; the level's own intro follows it
+            } else if (active_scene.level_intro.valid) {
                 cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
             }
         }
@@ -1407,8 +1422,41 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     int frame_counter = 0;
     auto last_time = std::chrono::high_resolution_clock::now();
 
+    const auto trace_start = std::chrono::steady_clock::now();
+    auto write_trace = [&](const PlayerTelemetry& t, bool in_frontend) {
+        if (!trace_file.is_open()) return;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - trace_start).count();
+        const char* cutscene = cutscene_player.get_mode() == ECutsceneMode::BinkVideo ? "movie"
+                               : cutscene_player.get_mode() == ECutsceneMode::InEngineMatinee ? "intro" : "none";
+        trace_file << std::fixed << std::setprecision(6) << "{\"type\":\"sample\",\"frame\":" << frame_counter
+                   << ",\"t\":" << now << std::setprecision(3)
+                   << ",\"x\":" << t.position.x << ",\"y\":" << t.position.y << ",\"z\":" << t.position.z + t.eye_height
+                   << ",\"yaw\":" << t.yaw_deg << ",\"pitch\":" << t.pitch_deg << ",\"roll\":" << t.camera_roll_deg
+                   << ",\"fx\":" << t.position.x << ",\"fy\":" << t.position.y << ",\"fz\":" << t.position.z
+                   << ",\"move_name\":\"" << move_state_name(t.move_state) << "\""
+                   << ",\"cutscene\":\"" << cutscene << "\"";
+        if (t.intro_active) {
+            trace_file << ",\"intro\":\"" << t.intro_anim_name << "\",\"intro_t\":" << t.intro_anim_time;
+            if (cutscene_player.is_level_intro()) {
+                const Vec3 root = cutscene_player.intro_root_pos();
+                trace_file << ",\"rx\":" << root.x << ",\"ry\":" << root.y << ",\"rz\":" << root.z;
+            }
+        }
+        if (in_frontend) trace_file << ",\"frontend\":true";
+        if (renderer.is_menu_open()) trace_file << ",\"menu\":true";
+        trace_file << "}\n";
+        for (const AudioEngine::PlayEvent& e : audio.take_play_log()) {
+            trace_file << std::setprecision(6) << "{\"type\":\"sound\",\"frame\":" << frame_counter << ",\"t\":" << now
+                       << ",\"cue\":\"" << e.name << "\",\"kind\":\"" << e.kind << "\",\"start\":true"
+                       << std::setprecision(3) << ",\"dur\":" << e.duration << "}\n";
+        }
+        trace_file << std::defaultfloat << std::setprecision(6);
+    };
+
     EMovement prev_state = EMovement::MOVE_Walking;
     int prev_checkpoint = 0;
+    int intro_handover_frames = 0;  // frames since a cutscene handed the player over
+    bool level_intro_running = false;
     bool prev_falling_to_death = false;
     bool prev_fall_death_impact = false;
     float footstep_timer = 0.0f;
@@ -1603,6 +1651,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             audio.update(dt, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), 0.0f, false);
             renderer.render_frame(active_scene, controller.get_telemetry());
+            write_trace(controller.get_telemetry(), /*in_frontend=*/true);
 
             ++frame_counter;
             if (max_frames > 0 && frame_counter >= max_frames) {
@@ -1827,7 +1876,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     activate_menu_selection();
                 } else if ((key == SDLK_SPACE || key == SDLK_RETURN) && cutscene_player.is_playing()) {
                     suppress_space_until_release = true;
-                    if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo) {
+                    if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && active_scene.level_intro.valid) {
+                        // Skipping the chapter's movie leads into the level's own intro, as it ends would.
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
                         cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 3.2f);
                     } else {
@@ -1970,8 +2020,22 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             if (cutscene_player.is_playing()) {
                 cutscene_player.update(dt, active_scene, controller.get_telemetry());
+                // The doors the level intro goes through swing as its Matinee has them.
+                if (cutscene_player.is_level_intro()) {
+                    CutscenePlayer::pose_intro_doors(active_scene, cutscene_player.get_current_time());
+                }
+                // The level intro's own sounds: its animation's footsteps, clothing and foley, and the
+                // voice lines and effects behind its Matinee's event keys.
+                for (const IntroSoundEvent& ev : cutscene_player.take_intro_sounds()) {
+                    if (ev.footstep > 0) {
+                        audio.play_footstep_number(ESurfaceMaterial::Concrete, ev.footstep);
+                    } else if (!audio.play_cue(ev.cue, ev.voice)) {
+                        std::cout << "[Intro] sound not loaded: " << ev.cue << std::endl;
+                    }
+                }
                 if (!cutscene_player.is_playing()) {
                     controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                    intro_handover_frames = 30;
                 }
             } else {
                 controller.step(input, dt, active_scene);
@@ -2070,6 +2134,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         prev_falling_to_death = tel.falling_to_death;
         prev_fall_death_impact = tel.fall_death_impact;
 
+        // What the intro's Matinee stops when it ends, whether it ran out or was skipped.
+        const bool level_intro_now = cutscene_player.is_level_intro();
+        if (level_intro_running && !level_intro_now) {
+            for (const std::string& cue : active_scene.level_intro.stop_cues) audio.stop_cue(cue);
+            CutscenePlayer::pose_intro_doors(active_scene, 1.0e9f);
+        }
+        level_intro_running = level_intro_now;
+
+        if (intro_handover_frames > 0) {
+            // Standing where the intro left Faith is not reaching a checkpoint.
+            --intro_handover_frames;
+            prev_checkpoint = tel.active_checkpoint;
+        }
         if (tel.active_checkpoint != prev_checkpoint) {
             audio.play_effect(EAudioEffect::CheckpointChime);
             prev_checkpoint = tel.active_checkpoint;
@@ -2080,7 +2157,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Footstep cadence (TdPhysicalMaterialFootSteps: Sneak / Walk / Run / Sprint)
-        if (!renderer.is_menu_open() && tel.grounded && tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
+        // (not during a cutscene: a level intro's footsteps are its animation's own notifies)
+        if (!renderer.is_menu_open() && !cutscene_player.is_playing() && tel.grounded &&
+            tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
             footstep_timer += dt;
             float stride_time = std::clamp(150.0f / tel.speed_2d, 0.22f, 0.45f);
             if (footstep_timer >= stride_time) {
@@ -2095,10 +2174,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         audio.set_menu_music(renderer.is_menu_open());
         Vec3 ear = tel.position + Vec3(0, 0, tel.eye_height);
         Rotator ear_rot = Rotator::from_degrees(tel.pitch_deg, tel.yaw_deg, tel.camera_roll_deg);
-        audio.update(dt, ear, ear_rot.forward(), ear_rot.up(), tel.speed_2d, tel.reaction_active);
+        // A cutscene's motion is not the player's running: no speed-driven wind for it.
+        audio.update(dt, ear, ear_rot.forward(), ear_rot.up(), cutscene_player.is_playing() ? 0.0f : tel.speed_2d,
+                     tel.reaction_active);
 
         // Render frame
         renderer.render_frame(active_scene, tel);
+        write_trace(tel, /*in_frontend=*/false);
 
         ++frame_counter;
         if (max_frames > 0 && frame_counter >= max_frames) {
@@ -2128,6 +2210,7 @@ int main(int argc, char* argv[]) {
     std::string custom_level = "";
     int max_frames = 0;
     bool start_in_main_menu = true;
+    std::string trace_path;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -2153,6 +2236,8 @@ int main(int argc, char* argv[]) {
             start_in_main_menu = false;
         } else if (arg == "--max-frames") {
             if (i + 1 < argc) max_frames = std::atoi(argv[++i]);
+        } else if (arg == "--trace") {
+            if (i + 1 < argc) trace_path = argv[++i];
         } else if (arg == "--game-root") {
             if (i + 1 < argc) game_root = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
@@ -2167,6 +2252,7 @@ int main(int argc, char* argv[]) {
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
                       << "  --level <path>           Load custom level package\n"
                       << "  --max-frames <N>         Exit after rendering N frames\n"
+                      << "  --trace <file>           Write the camera and every sound played, one JSON line per frame\n"
                       << "  --game-root <dir>        Set retail game assets directory (default: " << me::default_game_root() << ")\n"
                       << "  --help, -h               Show this help message\n";
             return 0;
@@ -2183,5 +2269,5 @@ int main(int argc, char* argv[]) {
         return run_oracle_verification(game_root, script_json);
     }
 
-    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu);
+    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu, trace_path);
 }

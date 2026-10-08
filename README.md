@@ -153,6 +153,8 @@ Options:
   --chapter <0..9>         Start at specified campaign chapter (0: SP00, 1: SP01, etc.)
   --level <path>           Load custom level package (.me1 or .upk)
   --max-frames <N>         Exit cleanly after rendering N frames (useful for smoke tests)
+  --trace <file>           Write the camera and every sound played, one JSON line per frame, in the
+                           shape of a retail recording (docs/LEVEL_INTROS.md uses it)
   --game-root <dir>        Set retail game assets directory (default: $MEDGE_ME_INSTALL, else the Steam
                            install on Windows, else /Users/tomnom/mirrorsedge)
   --help, -h               Show help message

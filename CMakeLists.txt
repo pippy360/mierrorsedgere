@@ -40,6 +40,7 @@ set(CORE_SOURCES
     src/assets/texture_loader.cpp
     src/assets/material_system.cpp
     src/assets/ini_config.cpp
+    src/assets/level_intro.cpp
     src/physics/collision_world.cpp
     src/physics/parkour_controller.cpp
 )
