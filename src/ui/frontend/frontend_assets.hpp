@@ -9,13 +9,20 @@
 // -----------------------------------------------------------------------------
 
 #include "../../math/types.hpp"
+#include "curve.hpp"
+#include "kismet.hpp"
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+namespace me {
+class PackageManager;
+}
 
 namespace me::fe {
 
@@ -59,34 +66,6 @@ struct Rect {
     [[nodiscard]] float h() const { return b - t; }
 };
 
-// UE3 EInterpCurveMode.
-enum class CurveMode : uint8_t { Linear, CurveAuto, Constant, CurveUser, CurveBreak };
-
-struct CurveKey {
-    float t = 0.0f;
-    Vec3 v{0.0f, 0.0f, 0.0f};
-    Vec3 arrive{0.0f, 0.0f, 0.0f};
-    Vec3 leave{0.0f, 0.0f, 0.0f};
-    CurveMode mode = CurveMode::Linear;
-};
-
-// FInterpCurve<FVector>. A float curve keeps its value in x.
-struct Curve {
-    std::vector<CurveKey> keys;
-    [[nodiscard]] Vec3 eval(float t, const Vec3& fallback = Vec3{0.0f, 0.0f, 0.0f}) const;
-};
-
-// One camera Matinee: the Camera group's position and FOV, and the Target group it looks at.
-struct Matinee {
-    std::string name;
-    float length = 0.0f;
-    Curve camera;
-    Curve target;
-    Curve fov;
-    std::vector<std::pair<float, std::string>> events;
-    [[nodiscard]] bool valid() const { return length > 0.0f && !camera.keys.empty(); }
-};
-
 enum class CityMaterial : uint8_t { Buildings, Base, Water, Waves, Sky };
 
 struct CityVertex {
@@ -112,12 +91,16 @@ struct CityBatch {
     std::string mesh;
     CityMaterial material = CityMaterial::Buildings;
     int lightmap = -1;             // index into City::lightmaps, sampled with uv[1]
+    int district = -1;             // index into City::districts: which MI_SP<nn>_01 a building batch is drawn with
     std::vector<CityVertex> tris;  // three per triangle
 };
 
 struct City {
     std::vector<CityBatch> batches;
     std::vector<LightMap> lightmaps;
+    // The instances of M_CityBuildings_01 in use. Kismet sets their "Selected" parameter on the
+    // chapter-select screen: the chapter's district turns red.
+    std::vector<std::string> districts;
     Image fade;   // UI_City.T_CityFade_01_A
     Image sky;    // UI_City.T_Skydome_Menu
     Image waves;  // UI_City.T_Waves_01_A
@@ -140,6 +123,30 @@ struct City {
     [[nodiscard]] bool valid() const { return !batches.empty(); }
 };
 
+// One UIDataProvider_TdMaps of DefaultGame.ini: a chapter of the PLAY CHAPTER list.
+struct MapCheckpoint {
+    std::string name;      // CheckpointName, what the level is started at
+    std::string image;     // CheckpointImageMarkup's texture path
+    std::string friendly;  // "CHECKPOINT B"
+    std::string description;
+};
+
+struct MapProvider {
+    std::string id;           // "SP01a"
+    std::string file;         // FileName: "edge_p"
+    std::string level_event;  // the level event the chapter-select screen fires: "LoadLevel_Edge"
+    std::string game_mode;
+    std::string name;         // localized MapName: "PROLOGUE - THE EDGE"
+    std::vector<MapCheckpoint> checkpoints;
+};
+
+// One list of UIDataStore_TdStringList: its tag (DefaultGame.ini) and its strings (TdGame.int).
+struct StringListData {
+    std::string tag;
+    int default_index = 0;
+    std::vector<std::string> strings;
+};
+
 struct Assets {
     // `viewport_height` picks the font tier. Returns false and sets `error` when the retail
     // install is missing something the front end cannot do without.
@@ -147,6 +154,15 @@ struct Assets {
 
     // A string of Localization/INT/TdGameUI.int, as Latin-1 (the fonts' encoding).
     [[nodiscard]] std::string text(const std::string& section, const std::string& key) const;
+    // A string by the path a "<Strings:File.Section.Key>" markup carries ("TdGameUI.TdMainMenu.StoryCaptionText").
+    [[nodiscard]] std::string localized(const std::string& path) const;
+    // Any MultiFont of UI/UI_Fonts_Final.upk, read on first use ("Helvetica_Headline_Thick_Italic"). Null if it is not there.
+    const Font* font(const std::string& name);
+    // A Texture2D by object path ("TdUIResources.Scene.Panel512x512"), read on first use. Null if it cannot be read.
+    const Image* image(const std::string& object_path);
+    // The packages under CookedPC, for the UI scene loader.
+    [[nodiscard]] PackageManager* packages() const { return pm_.get(); }
+    [[nodiscard]] const std::string& game_root() const { return game_root_; }
     // A widget's rectangle in the scene's own 1280x720 pixels. False if the scene has no such widget.
     bool start_rect(const std::string& widget, Rect& out) const;
     bool menu_rect(const std::string& widget, Rect& out) const;
@@ -163,11 +179,11 @@ struct Assets {
     Image stick_shadow;    // UI_Menus.T_StickMaskRightShadow_01
     Image stick_timeline;  // UI_Menus.T_StickMovementTimeline_01
 
-    Matinee opening;                 // the start screen's shot
-    std::array<Matinee, 4> intro{};  // per column: the 0.35 s move in
-    std::array<Matinee, 4> loop{};   // per column: the 60 s loop
+    std::vector<MapProvider> maps;  // in DefaultGame.ini order: the Training Area, then the story
+    std::vector<StringListData> string_lists;
 
     City city;
+    KismetGraph kismet;  // the menu level's Main_Sequence and its Matinees
 
     float time_till_start_button = 4.0f;    // DefaultUI.ini [TdGame.TdUIScene_Start]
     float time_till_attract_movie = 90.0f;
@@ -175,6 +191,12 @@ struct Assets {
     std::vector<std::string> warnings;  // things that were missing but not fatal
 
 private:
+    std::shared_ptr<PackageManager> pm_;
+    std::string game_root_;
+    int viewport_height_ = 720;
+    std::unordered_map<std::string, std::unique_ptr<Font>> fonts_;
+    std::unordered_map<std::string, std::unique_ptr<Image>> images_;
+    std::unordered_map<std::string, std::string> localized_;  // "file.section.key", lower case -> text
     std::unordered_map<std::string, Rect> start_rects_;
     std::unordered_map<std::string, Rect> menu_rects_;
     std::unordered_map<std::string, std::string> strings_;  // "Section.Key" -> text

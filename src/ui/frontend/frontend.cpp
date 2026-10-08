@@ -1,5 +1,7 @@
 #include "frontend.hpp"
 
+#include "frontend_menus.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -15,8 +17,6 @@ constexpr float kMaterialStickWidth = 0.005f;
 // TdUIScene_MainMenu defaults.
 constexpr float kTimeToFadeStart = 2.0f;
 constexpr float kFadeTime = 1.0f;
-// SeqAct_TdFadeEffect.FadeTime on every fade in the level's Kismet.
-constexpr float kFadeEffectTime = 2.0f;
 // The scenes' CurrentViewportSize.
 constexpr float kSceneWidth = 1280.0f;
 constexpr float kSceneHeight = 720.0f;
@@ -91,6 +91,9 @@ void Frontend::ui_color(float r, float g, float b, float a, float out[4]) const 
     out[3] = a;
 }
 
+Frontend::Frontend() = default;
+Frontend::~Frontend() = default;
+
 bool Frontend::init(const std::string& game_root, int width, int height, std::string& error) {
     width_ = std::max(width, 16);
     height_ = std::max(height, 16);
@@ -107,11 +110,26 @@ bool Frontend::init(const std::string& game_root, int width, int height, std::st
     }
     build_panels();
 
-    // SeqEvent_SequenceActivated_2: the opening shot, looping, under a fade from white.
-    play_camera(&assets_.opening, nullptr);
-    matinee_loops_ = true;
-    white_ = 1.0f;
-    white_rate_ = -1.0f / kFadeEffectTime;
+    // The UI scenes behind the sub-buttons, the profile settings and the PC string lists.
+    ui_.init(&assets_, scale_);
+    if (!ui_.load_profile_settings(settings_)) assets_.warnings.push_back("TdGame.Default__TdProfileSettings not found: the option screens have no values");
+    for (const StringListData& list : assets_.string_lists) {
+        StringList& l = string_lists_[list.tag];
+        l.values = list.strings;
+        l.index = list.default_index;
+    }
+    // What a PC reports at run time; a host replaces these with its own.
+    string_lists_["ScreenResolution"].values = {std::to_string(width_) + "x" + std::to_string(height_)};
+    string_lists_["ScreenResolution"].index = 0;
+    string_lists_["Antialiasing"].values = {ui_.resolve_markup("<Strings:TdGameUI.TdSettingsMappings.Off>"), "2X", "4X", "8X"};
+    string_lists_["VSync"].index = 1;
+    string_lists_["TextureDetail"].index = 3;
+    string_lists_["GraphicsQuality"].index = 3;
+
+    // SeqEvent_LevelLoaded and the root's SeqEvent_SequenceActivated: the opening shot, looping,
+    // under a fade from white, and the music's sublevel.
+    kismet_.init(&assets_.kismet);
+    kismet_.begin_play();
     return true;
 }
 
@@ -149,60 +167,22 @@ void Frontend::build_panels() {
     }
 }
 
-void Frontend::play_camera(const Matinee* first, const Matinee* then) {
-    if (!first || !first->valid()) {
-        first = then;
-        then = nullptr;
-    }
-    matinee_ = (first && first->valid()) ? first : nullptr;
-    next_matinee_ = (then && then->valid()) ? then : nullptr;
-    matinee_time_ = 0.0f;
-    matinee_loops_ = matinee_ != nullptr && next_matinee_ == nullptr;
-}
-
-void Frontend::update_camera(float dt) {
-    if (white_rate_ != 0.0f) {
-        white_ = std::clamp(white_ + white_rate_ * dt, 0.0f, 1.0f);
-        if (white_ <= 0.0f || white_ >= 1.0f) {
-            // SeqAct_TdFadeEffect_4 (out) chains into SeqAct_TdFadeEffect_3 (in).
-            white_rate_ = (white_ >= 1.0f && white_rate_ > 0.0f) ? -1.0f / kFadeEffectTime : 0.0f;
-        }
-    }
-    if (!matinee_) return;
-    const float before = matinee_time_;
-    matinee_time_ += dt;
-    for (const auto& [when, name] : matinee_->events) {
-        if (name == "StartFade" && before < when && matinee_time_ >= when) white_rate_ = 1.0f / kFadeEffectTime;
-    }
-    if (matinee_time_ >= matinee_->length) {
-        if (next_matinee_) {
-            // "Completed" starts the loop Matinee from its beginning.
-            matinee_time_ -= matinee_->length;
-            matinee_ = next_matinee_;
-            next_matinee_ = nullptr;
-            matinee_loops_ = true;
-        } else if (matinee_loops_) {
-            matinee_time_ = std::fmod(matinee_time_, matinee_->length);
-        } else {
-            matinee_time_ = matinee_->length;
-        }
-    }
-}
-
 void Frontend::update(float dt) {
     dt = std::clamp(dt, 0.0f, 0.25f);
     time_ += dt;
-    if (!music_started_) {
-        // SeqEvent_LevelLoaded -> DefaultMenuMusic -> TdMainMenu_Audio0 -> PlayMenuMusic.
-        music_started_ = true;
-        sound("Music");
+    // Level events fired since the last update (a key was handled) run in this one.
+    kismet_.update(dt);
+    for (const std::string& level : kismet_.take_streamed_levels()) {
+        // SeqEvent_LevelLoaded -> DefaultMenuMusic -> TdMainMenu_Audio0, whose own Kismet fires PlayMenuMusic.
+        if (level == "TdMainMenu_Audio0") sound("Music");
     }
-    update_camera(dt);
 
     if (screen_ == Screen::Start) {
         time_in_scene_ += dt;
         return;
     }
+    if (!scenes_.empty()) scenes_.back()->tick(dt);
+    closed_.clear();
 
     // TdUIScene_MainMenu.Tick
     if (initial_tick_) {
@@ -246,8 +226,8 @@ void Frontend::set_active_panel(int index, bool silent) {
     p.animated = true;
     if (last_panel_ >= 0) panels_[static_cast<size_t>(last_panel_)].animated = true;
     if (silent) p.anim = kPanelAnimDuration - 1.0e-5f;
-    // ActivateLevelEvent('panel<N>'): the column's intro camera, then its loop.
-    play_camera(&assets_.intro[static_cast<size_t>(index)], &assets_.loop[static_cast<size_t>(index)]);
+    // The column's intro camera, then its loop.
+    level_event("panel" + std::to_string(index + 1));
     hovered_ = -1;
     fade_timer_ = 0.0f;
     if (!silent) sound("TabChangeRight");
@@ -276,6 +256,10 @@ void Frontend::open_main_menu() {
 }
 
 void Frontend::key_down(Key key) {
+    if (screen_ == Screen::MainMenu && !scenes_.empty()) {
+        scenes_.back()->key_pressed(key);
+        return;
+    }
     if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
     PanelState& p = panels_[static_cast<size_t>(current_panel_)];
     switch (key) {
@@ -295,13 +279,6 @@ void Frontend::key_down(Key key) {
             sound(key == Key::Down ? "NavigateDown" : "NavigateUp");
             break;
         }
-        case Key::Accept:
-            // HandleButtonClicked does nothing while a column is animating.
-            if (!animating_ && p.shown && !p.buttons.empty()) {
-                action_ = p.buttons[static_cast<size_t>(p.focus)].widget;
-                sound("Accept");
-            }
-            break;
         default:
             break;
     }
@@ -313,7 +290,119 @@ void Frontend::key_up(Key key) {
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
     }
-    if (key == Key::Escape) action_ = "Quit";  // OnQuitGame
+    if (!scenes_.empty()) {
+        scenes_.back()->key_released(key);
+        return;
+    }
+    if (current_panel_ < 0) return;
+    if (key == Key::Escape) {
+        quit_clicked();
+    } else if (key == Key::Accept) {
+        // A button is clicked when Enter comes up on it.
+        const PanelState& p = panels_[static_cast<size_t>(current_panel_)];
+        if (p.shown && !p.buttons.empty()) button_clicked(p.buttons[static_cast<size_t>(p.focus)].widget);
+    }
+}
+
+void Frontend::open_scene(std::unique_ptr<SubMenu> menu) {
+    if (!menu || !menu->valid()) return;
+    scenes_.push_back(std::move(menu));
+    scenes_.back()->opened();
+}
+
+// CloseScene, then the delegate, then SceneActivated on whatever is on top now, unless the
+// delegate opened a scene of its own.
+void Frontend::close_scene(SubMenu* menu, const std::function<void()>& then) {
+    auto it = std::find_if(scenes_.begin(), scenes_.end(), [&](const std::unique_ptr<SubMenu>& m) { return m.get() == menu; });
+    if (it == scenes_.end()) return;
+    closed_.push_back(std::move(*it));
+    scenes_.erase(it);
+    const size_t depth = scenes_.size();
+    if (then) then();
+    if (scenes_.size() > depth) return;
+    if (!scenes_.empty()) {
+        scenes_.back()->reactivated();
+    } else if (current_panel_ >= 0) {
+        // TdUIScene_MainMenu.SceneActivated: the column camera again.
+        level_event("panel" + std::to_string(current_panel_ + 1));
+    }
+}
+
+std::string Frontend::scene_name() const { return scenes_.empty() || !scenes_.back()->scene() ? std::string() : scenes_.back()->scene()->name; }
+const UiScene* Frontend::scene() const { return scenes_.empty() ? nullptr : scenes_.back()->scene(); }
+std::string Frontend::scene_focus() const { return scenes_.empty() ? std::string() : scenes_.back()->focused_name(); }
+
+// TdUIScene_MainMenu.HandleButtonClicked.
+void Frontend::button_clicked(const std::string& widget) {
+    if (animating_) return;
+    level_event(widget + "_Clicked");
+    sound("Accept");
+    if (widget == "LoadGameButton") {
+        action_ = "Continue";
+    } else if (widget == "NewGameButton") {
+        // OnStartGame: with a game in progress, a warning first.
+        if (profile_.can_continue) {
+            open_scene(make_message_box(*this, "<Strings:TdGameUI.TdMessageBox.NewGameWarningTitle>", "<Strings:TdGameUI.TdMessageBox.NewGameWarningMessage>",
+                                        {{"<Strings:TdGameUI.TdButtonCallouts.Cancel>", Key::Escape}, {"<Strings:TdGameUI.TdButtonCallouts.OK>", Key::Accept}},
+                                        [this](int option) {
+                                            if (option == 1) open_scene(make_sub_menu(*this, "TdDifficultySettings"));
+                                        }));
+        } else {
+            open_scene(make_sub_menu(*this, "TdDifficultySettings"));
+        }
+    } else if (widget == "LoadLevelButton") {
+        open_scene(make_sub_menu(*this, "TdLoadLevel"));
+    } else if (widget == "TimeTrialOnlineButton") {
+        online_check("TdTTSelectStretchOffline");
+    } else if (widget == "LevelRaceButton") {
+        online_check("TdLRSelectLevelOffline");
+    } else if (widget == "LeaderboardsButton") {
+        online_check("");
+    } else if (widget == "ControlsButton") {
+        open_scene(make_sub_menu(*this, "TdKeyMappings"));
+    } else if (widget == "AudioButton") {
+        open_scene(make_sub_menu(*this, "TdAudioSettings"));
+    } else if (widget == "VideoButton") {
+        open_scene(make_sub_menu(*this, "TdVideoSettingsPC"));
+    } else if (widget == "GameSettingsButton") {
+        open_scene(make_sub_menu(*this, "TdGameSettings"));
+    } else if (widget == "GamepadButton") {
+        open_scene(make_sub_menu(*this, "TdControlsSettings"));
+    } else if (widget == "UnlocksButton") {
+        open_scene(make_sub_menu(*this, "TdUnlocks"));
+    } else if (widget == "CreditsButton") {
+        open_scene(make_sub_menu(*this, "TdCredits"));
+    }
+    // A scene that could not be opened leaves the camera where the click sent it; put it back.
+    if (scenes_.empty() && action_.empty() && current_panel_ >= 0) level_event("panel" + std::to_string(current_panel_ + 1));
+}
+
+// OnQuitGame.
+void Frontend::quit_clicked() {
+    open_scene(make_message_box(*this, "<Strings:TdGameUI.TdMessageBox.QuitConfirm_Title>", "<Strings:TdGameUI.TdMessageBox.QuitConfirm_Message>",
+                                {{"<Strings:TdGameUI.TdButtonCallouts.Cancel>", Key::Escape}, {"<Strings:TdGameUI.TdButtonCallouts.OK>", Key::Accept}},
+                                [this](int option) {
+                                    if (option == 1) action_ = "Quit";
+                                }));
+}
+
+// TdOnlineLoginHandler.StartConnection with no EA servers to reach: "Connecting", then the
+// connection error, then (for the race modes) the offer to play offline.
+void Frontend::online_check(const std::string& offline_scene) {
+    open_scene(make_message_box(
+        *this, "<Strings:TdGameUI.TdModalConnectingMessageBox.TitleText>", "<Strings:TdGameUI.TdModalConnectingMessageBox.DescriptionText>",
+        {{"<Strings:TdGameUI.TdButtonCallouts.Cancel>", Key::Escape}},
+        [this, offline_scene](int option) {
+            if (option != -1) return;  // cancelled
+            open_scene(make_message_box(*this, "<Strings:TdGameUI.TpErrors.Failed_Connect_Title>", "<Strings:TdGameUI.TpErrors.Error_-203>",
+                                        {{"<Strings:TdGameUI.TdButtonCallouts.OK>", Key::Accept}}, [this, offline_scene](int) {
+                                            if (offline_scene.empty()) return;
+                                            open_scene(make_online_check(*this, [this, offline_scene] {
+                                                open_scene(make_sub_menu(*this, offline_scene));
+                                            }));
+                                        }));
+        },
+        1.5f));
 }
 
 int Frontend::button_at(float x, float y) const {
@@ -617,15 +706,22 @@ const Frame& Frontend::frame() {
     f.width = width_;
     f.height = height_;
     f.time = time_;
-    f.white = white_;
+    f.white = kismet_.fade();
+    f.district_selected.resize(assets_.city.districts.size());
+    for (size_t i = 0; i < assets_.city.districts.size(); ++i) {
+        f.district_selected[i] = kismet_.material_param(assets_.city.districts[i], "Selected", 0.0f);
+    }
     f.display_gamma = gamma();
     f.ui.clear();
-    if (matinee_) {
-        f.camera = matinee_->camera.eval(matinee_time_);
-        f.target = matinee_->target.eval(matinee_time_, f.camera + Vec3{0.0f, 1.0f, 0.0f});
-        f.fov = matinee_->fov.eval(matinee_time_, Vec3{90.0f, 0.0f, 0.0f}).x;
+    if (const KismetActor* view = kismet_.view()) {
+        const float pitch = view->euler.y * kPi / 180.0f, yaw = view->euler.z * kPi / 180.0f;
+        f.camera = view->pos;
+        f.target = view->pos + Vec3{std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)} * 100.0f;
+        f.roll = view->euler.x;
+        f.fov = view->fov;
     }
     if (screen_ == Screen::Start) draw_start(f);
+    else if (!scenes_.empty()) scenes_.back()->draw(f, scale_, origin_x_, gamma());
     else draw_menu(f);
     return f;
 }

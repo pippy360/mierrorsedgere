@@ -60,6 +60,9 @@ set(FRONTEND_SOURCES
     src/ui/frontend/frontend_assets.cpp
     src/ui/frontend/frontend_city.cpp
     src/ui/frontend/frontend.cpp
+    src/ui/frontend/kismet.cpp
+    src/ui/frontend/ui_scene.cpp
+    src/ui/frontend/frontend_menus.cpp
     src/ui/frontend/soft_city.cpp
     src/ui/frontend/soft_render.cpp
 )

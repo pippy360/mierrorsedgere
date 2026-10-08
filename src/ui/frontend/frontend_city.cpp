@@ -271,6 +271,12 @@ bool load_city(PackageManager& pm, const std::shared_ptr<UPKPackage>& menu_map, 
             }
             batch.mesh = mesh.name;
             batch.lightmap = lightmap;
+            if (batch.material == CityMaterial::Buildings) {
+                const std::string instance = material.substr(material.rfind('.') == std::string::npos ? 0 : material.rfind('.') + 1);
+                auto it = std::find(out.districts.begin(), out.districts.end(), instance);
+                if (it == out.districts.end()) it = out.districts.insert(out.districts.end(), instance);
+                batch.district = static_cast<int>(it - out.districts.begin());
+            }
             batch.tris.reserve(el.vertex_count);
             for (uint32_t v = el.first_vertex; v < el.first_vertex + el.vertex_count && v < mesh.triangles.size(); ++v) {
                 const Vertex& src = mesh.triangles[v];

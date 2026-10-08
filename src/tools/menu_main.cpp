@@ -89,10 +89,12 @@ void dump_assets(const std::string& dir, const me::fe::Assets& a) {
                   << f->pairs.size() << "\n";
         for (size_t p = 0; p < f->pages.size(); ++p) dump_image(dir, f->name + "_page" + std::to_string(p), f->pages[p]);
     }
-    for (const me::fe::Matinee* m : {&a.opening, &a.intro[0], &a.loop[0], &a.intro[1], &a.loop[1], &a.intro[2], &a.loop[2],
-                                     &a.intro[3], &a.loop[3]}) {
-        std::cout << m->name << ": " << m->length << " s, camera keys " << m->camera.keys.size() << ", target keys "
-                  << m->target.keys.size() << ", fov keys " << m->fov.keys.size() << ", events " << m->events.size() << "\n";
+    std::cout << a.kismet.nodes.size() << " Kismet objects, " << a.kismet.matinees.size() << " Matinees, " << a.kismet.actors.size()
+              << " camera and target actors\n";
+    for (const me::fe::MatineeData& m : a.kismet.matinees) {
+        std::cout << "  " << m.name << ": " << m.length << " s, groups";
+        for (const me::fe::MatineeGroup& g : m.groups) std::cout << " " << (g.name.empty() ? "(director)" : g.name);
+        std::cout << ", events " << m.events.size() << "\n";
     }
     size_t tris = 0;
     static const char* const kMaterial[] = {"buildings", "base", "water", "waves", "sky"};
@@ -221,7 +223,27 @@ int main(int argc, char** argv) {
             fe.update(dt);
         } else if (verb == "state") {
             std::cout << (fe.screen() == me::fe::Screen::Start ? "start" : "menu") << " column " << fe.panel() << " focus "
-                      << fe.focused_button() << (fe.animating() ? " (animating)" : "") << "\n";
+                      << fe.focused_button() << (fe.animating() ? " (animating)" : "");
+            if (!fe.scene_name().empty()) std::cout << " scene " << fe.scene_name() << " focus " << fe.scene_focus();
+            std::cout << "\n";
+        } else if (verb == "rects") {
+            // The open scene's widgets with their resolved rectangles (scene pixels) and text.
+            if (const me::fe::UiScene* scene = fe.scene()) {
+                for (const me::fe::UiWidget& w : scene->widgets) {
+                    if (w.cls == "TdUIButtonBarButton") continue;
+                    std::printf("%-28s %-18s %7.1f %7.1f %7.1f %7.1f%s %s\n", w.name.c_str(), w.cls.c_str(), w.rect.l, w.rect.t, w.rect.r, w.rect.b,
+                                w.hidden ? " hidden" : "", w.text.substr(0, 40).c_str());
+                }
+            }
+        } else if (verb == "event") {
+            // event <name>: fire a level event as a UI scene would ("VideoButton_Clicked", "LoadLevel_Edge")
+            std::string name;
+            cs >> name;
+            fe.level_event(name);
+            fe.update(dt);
+        } else if (verb == "kismet") {
+            // The Matinees playing now, in the order they are updated (the last one moves the camera last).
+            std::cout << "kismet: " << fe.kismet().playing() << "\n";
         } else if (verb == "bench") {
             // bench <frames>: run and render that many frames, print the average time of one
             int frames = 60;

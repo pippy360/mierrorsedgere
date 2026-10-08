@@ -19,6 +19,8 @@ constexpr float kNear = 2.0f;
 
 // M_CityBuildings_01 / M_CityBase_01: Constant3Vector diffuse.
 constexpr float kBuildingDiffuse[3] = {0.8f, 0.83f, 0.9f};
+constexpr float kSelectedDiffuse[3] = {0.5f, 0.0f, 0.0f};
+constexpr float kSelectedEmissive[3] = {0.1f, 0.0f, 0.0f};
 // M_Skydome_Menu.
 constexpr float kSkyTint[3] = {0.75f, 0.88f, 1.0f};
 
@@ -28,7 +30,7 @@ struct Camera {
 };
 
 // UE3 is left-handed with Z up: right = up x forward.
-Camera make_camera(const Vec3& pos, const Vec3& target, float fov_deg, int w, int h) {
+Camera make_camera(const Vec3& pos, const Vec3& target, float roll_deg, float fov_deg, int w, int h) {
     Camera c;
     c.pos = pos;
     c.fwd = (target - pos).normalized();
@@ -36,6 +38,13 @@ Camera make_camera(const Vec3& pos, const Vec3& target, float fov_deg, int w, in
     c.right = Vec3{0.0f, 0.0f, 1.0f}.cross(c.fwd).normalized();
     if (c.right.length_sq() < 0.5f) c.right = Vec3{0.0f, 1.0f, 0.0f};
     c.up = c.fwd.cross(c.right);
+    if (roll_deg != 0.0f) {
+        // FRotationMatrix: a positive roll turns the right axis down and the up axis to the right.
+        const float r = roll_deg * 3.14159265f / 180.0f, cr = std::cos(r), sr = std::sin(r);
+        const Vec3 right = c.right * cr - c.up * sr;
+        c.up = c.right * sr + c.up * cr;
+        c.right = right;
+    }
     // CameraActor.FOVAngle is the horizontal field of view.
     c.tan_x = std::tan(std::clamp(fov_deg, 5.0f, 170.0f) * 0.5f * 3.14159265f / 180.0f);
     c.tan_y = c.tan_x * static_cast<float>(h) / static_cast<float>(w);
@@ -75,6 +84,7 @@ struct Pass {
     Camera reflection_cam;
     float time = 0.0f;
     bool mirror = false;  // drawing the reflection: skip the water and everything below it
+    const std::vector<float>* selected = nullptr;  // Frame::district_selected
 };
 
 // One pixel of one material. `a` holds the interpolated attributes.
@@ -93,7 +103,15 @@ bool shade(const Pass& pass, const CityBatch& batch, const float a[kAttrs], floa
         case CityMaterial::Buildings: {
             float light[3] = {1.0f, 1.0f, 1.0f};
             if (batch.lightmap >= 0) sample_lightmap(city.lightmaps[static_cast<size_t>(batch.lightmap)], a[0], a[1], light);
-            for (int k = 0; k < 3; ++k) out[k] = kBuildingDiffuse[k] * light[k];
+            // Diffuse lerp((0.8, 0.83, 0.9), (0.5, 0, 0), Selected); emissive (0.1, 0, 0) * Selected.
+            float sel = 0.0f;
+            if (pass.selected && batch.district >= 0 && static_cast<size_t>(batch.district) < pass.selected->size()) {
+                sel = std::clamp((*pass.selected)[static_cast<size_t>(batch.district)], 0.0f, 1.0f);
+            }
+            for (int k = 0; k < 3; ++k) {
+                const float diffuse = kBuildingDiffuse[k] + (kSelectedDiffuse[k] - kBuildingDiffuse[k]) * sel;
+                out[k] = diffuse * light[k] + kSelectedEmissive[k] * sel;
+            }
             return true;
         }
         case CityMaterial::Base: {
@@ -596,9 +614,10 @@ void CityRenderer::render(const Frame& frame, int w, int h, std::vector<float>& 
     mirror.mirror = true;
     mirror.time = static_cast<float>(frame.time);
     mirror.target = &impl_->reflection;
+    mirror.selected = &frame.district_selected;
     const Vec3 mpos{frame.camera.x, frame.camera.y, 2.0f * city.water_z - frame.camera.z};
     const Vec3 mtarget{frame.target.x, frame.target.y, 2.0f * city.water_z - frame.target.z};
-    mirror.cam = make_camera(mpos, mtarget, frame.fov, rw, rh);
+    mirror.cam = make_camera(mpos, mtarget, -frame.roll, frame.fov, rw, rh);
     draw_pass(mirror, impl_->tris, impl_->visibility);
 
     impl_->scene.reset(w, h);
@@ -607,7 +626,8 @@ void CityRenderer::render(const Frame& frame, int w, int h, std::vector<float>& 
     main.city = &city;
     main.time = static_cast<float>(frame.time);
     main.target = &impl_->scene;
-    main.cam = make_camera(frame.camera, frame.target, frame.fov, w, h);
+    main.selected = &frame.district_selected;
+    main.cam = make_camera(frame.camera, frame.target, frame.roll, frame.fov, w, h);
     main.reflection = &impl_->reflection;
     main.reflection_cam = mirror.cam;
     draw_pass(main, impl_->tris, impl_->visibility);
