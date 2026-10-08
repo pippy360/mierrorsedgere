@@ -110,6 +110,20 @@ private:
     void update_checkpoints_and_volumes(LevelScene& scene);
     void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
     void update_barge_doors(const InputFrame& input, float dt, LevelScene& scene);
+    // TdMove_Barge (MOVE_Barge). CanDoMove: a zero-extent trace from the pawn's centre along `dir`
+    // for `dist`; returns the closed door it hits first (-1 = none) and the hit point.
+    int find_barge_door(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const;
+    // Melee pressed: CanDoMove + StartBargin (the run at the door, or the kick below
+    // BargeKickThresholdSpeed). False when no closed door is in reach.
+    bool try_initiate_barge(const LevelScene& scene);
+    // The move's tick: SetPreciseLocation run, HitWall / Bump -> TryGiveBargeDamage, the kick's
+    // BargeHitNotify, the custom animation's notifies and OnCustomAnimEnd.
+    void update_barge(const InputFrame& input, float dt, LevelScene& scene);
+    // The door's SeqEvent_TakeDamage (barged) / Use: start the open matinee and its sounds.
+    void open_barge_door(int door_index, const Vec3& push_dir, bool barged, LevelScene& scene);
+    // True when the door at `angle_rad` overlaps the pawn (InterpActor bStopOnEncroach).
+    [[nodiscard]] bool door_encroaches_pawn(const BargeDoorInstance& door, float angle_rad, bool with_blockers) const;
+    void emit_sound(const char* cue, const Vec3& location, bool at_pawn);
 
     // Collision Detection and Swept Physics. TdPawn's cylinder is Radius=30, CollisionHeight=90
     // (a half-height: the pawn is 180 tall, 122 when crouched / sliding / coiled). UE3 PHYS_Walking
@@ -261,9 +275,11 @@ private:
     void update_fall_height_volumes(const LevelScene& scene);
     void leave_ground(EMovement air_move);
     void set_stance(float eye_height);
-    // Tells the animation which of a move's animations plays (PlayerTelemetry::move_anim).
-    void set_move_anim(const char* name) {
+    // Tells the animation which of a move's animations plays (PlayerTelemetry::move_anim), and at
+    // what rate when the move works one out (TdMove_Barge's AnimPlayRate; 0: the script's own).
+    void set_move_anim(const char* name, float rate = 0.0f) {
         m_telemetry.move_anim = name;
+        m_telemetry.move_anim_rate = rate;
         ++m_telemetry.move_anim_serial;
     }
     [[nodiscard]] bool can_skill_roll() const;
@@ -320,7 +336,22 @@ private:
     bool m_snatch_fail = false;    // TdMove_Disarm.StartMiss: the grab that gets nothing
     float m_snatch_ended = 1.0f;   // since the last disarm ended
     bool m_jump_consumed = false;
-    bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
+
+    // TdMove_Barge
+    bool m_barge_kick = false;             // below BargeKickThresholdSpeed / not moving forward: the kick
+    int m_barge_door = -1;                 // BargeActorList: the door CanDoMove's trace found
+    int m_barge_anim = 0;                  // custom anim: 1 BargeInLeft, 2 BargeOutLeft, 3 MeleeKickObject
+    float m_barge_anim_pos = 0.0f;         // sequence position (s)
+    float m_barge_anim_elapsed = 0.0f;     // real seconds since PlayMoveAnim (blend-in)
+    float m_barge_anim_rate = 1.0f;
+    float m_barge_speed = 0.0f;            // BargeSpeed
+    Vec3 m_barge_dir{1.0f, 0.0f, 0.0f};    // Normal(Velocity) at StartBargin (the kick: the facing)
+    Vec3 m_barge_target{0.0f, 0.0f, 0.0f}; // SetPreciseLocation target (feet)
+    bool m_barge_precise = false;          // still running at m_barge_target
+    bool m_barge_dealt_damage = false;     // bHasDealtDamage
+    float m_ignore_move_input = 0.0f;      // TdPawn.SetIgnoreMoveInput: seconds left
+    bool m_walk_blocked = false;           // the last walk_move hit a wall (HitWall / Bump)
+    int32_t m_walk_block_actor = -1;       // ...and the actor it hit (-1 = BSP / none)
 
     // Jump / fall bookkeeping (TdMove_Jump / TdMove_Landing)
     Vec3 m_last_jump_location{0.0f, 0.0f, 0.0f};  // TdPawn.LastJumpLocation

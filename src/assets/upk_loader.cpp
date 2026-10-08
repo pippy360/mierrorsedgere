@@ -2253,21 +2253,53 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
         return parse_properties(p_start, std::min(p_end - p_start, data_.size() - p_start));
     };
 
-    // Recursive helper to traverse SoundNode graphs inside this package
-    auto walk_sound_node = [&](auto& self, int32_t obj_idx, SoundCueDef& cue, int depth) -> void {
-        if (depth > 12 || obj_idx == 0) return;
+    // RawDistributionFloat -> {min, max}: the cooked LookupTable when present (it starts with the
+    // distribution's output range), else the distribution object's Min / Max (Uniform) or Constant,
+    // over the node class's defaults (values equal to its default subobject's are not serialized).
+    auto distribution_range = [&](const UPropertyList& node_props, const char* name, float def_min,
+                                  float def_max) -> std::pair<float, float> {
+        const UProperty* p = find_prop(node_props, name);
+        if (!p) return {def_min, def_max};
+        if (const UProperty* lt = find_prop(p->fields, "LookupTable"); lt && lt->ints.size() >= 2) {
+            float lo = 0.0f;
+            float hi = 0.0f;
+            std::memcpy(&lo, &lt->ints[0], sizeof(float));
+            std::memcpy(&hi, &lt->ints[1], sizeof(float));
+            return {lo, hi};
+        }
+        const int32_t dist = prop_object(p->fields, "Distribution");
+        if (dist <= 0 || static_cast<size_t>(dist) > exports_.size()) return {def_min, def_max};
+        UPropertyList dprops;
+        parse_export_properties(*this, dist, dprops);
+        if (get_export_class(exports_[dist - 1]) == "DistributionFloatConstant") {
+            const float c = prop_float(dprops, "Constant", def_min);
+            return {c, c};
+        }
+        return {prop_float(dprops, "Min", def_min), prop_float(dprops, "Max", def_max)};
+    };
+
+    // Recursive helper to traverse SoundNode graphs inside this package. Flattens the waves into
+    // cue.wave_names and builds cue.nodes; returns the node's index there (-1 if none was added).
+    auto walk_sound_node = [&](auto& self, int32_t obj_idx, SoundCueDef& cue, int depth) -> int {
+        if (depth > 12 || obj_idx == 0) return -1;
 
         if (obj_idx < 0) {
             // Import reference (e.g. external SoundNodeWave)
             auto [imp_name, imp_cls] = resolve_object_index(obj_idx);
-            if (!imp_name.empty()) {
-                cue.wave_names.push_back(imp_name);
-                cue.wave_weights.push_back(1.0f);
+            if (imp_name.empty()) return -1;
+            cue.wave_names.push_back(imp_name);
+            cue.wave_weights.push_back(1.0f);
+            if (imp_cls.find("SoundNodeWave") != std::string::npos) {
+                cue.imported_waves.emplace_back(object_outermost_name(*this, obj_idx), imp_name);
             }
-            return;
+            SoundCueNode node;
+            node.kind = SoundCueNode::Kind::Wave;
+            node.wave = imp_name;
+            cue.nodes.push_back(std::move(node));
+            return static_cast<int>(cue.nodes.size()) - 1;
         }
 
-        if (static_cast<size_t>(obj_idx) > exports_.size()) return;
+        if (static_cast<size_t>(obj_idx) > exports_.size()) return -1;
         const auto& nexp = exports_[obj_idx - 1];
         std::string ncls = get_export_class(nexp);
 
@@ -2278,7 +2310,11 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
             }
             cue.wave_names.push_back(wname);
             cue.wave_weights.push_back(1.0f);
-            return;
+            SoundCueNode node;
+            node.kind = SoundCueNode::Kind::Wave;
+            node.wave = wname;
+            cue.nodes.push_back(std::move(node));
+            return static_cast<int>(cue.nodes.size()) - 1;
         }
 
         if (ncls.find("SoundNodeLooping") != std::string::npos) {
@@ -2304,6 +2340,48 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
             }
         }
 
+        // The node itself: USoundNodeMixer / Random / Delay / Modulator (the rest pass through).
+        const int node_index = static_cast<int>(cue.nodes.size());
+        {
+            SoundCueNode node;
+            UPropertyList uprops;
+            parse_export_properties(*this, obj_idx, uprops);
+            auto float_array = [&uprops](const char* name) {
+                std::vector<float> values;
+                if (const UProperty* a = find_prop(uprops, name)) {
+                    for (int32_t bits : a->ints) {
+                        float f = 0.0f;
+                        std::memcpy(&f, &bits, sizeof(float));
+                        values.push_back(f);
+                    }
+                }
+                return values;
+            };
+            if (ncls == "SoundNodeMixer") {
+                node.kind = SoundCueNode::Kind::Mixer;
+                node.weights = float_array("InputVolume");
+                cue.has_mixer = true;
+            } else if (ncls == "SoundNodeRandom") {
+                node.kind = SoundCueNode::Kind::Random;
+                node.weights = float_array("Weights");
+            } else if (ncls == "SoundNodeDelay") {
+                node.kind = SoundCueNode::Kind::Delay;
+                const auto [lo, hi] = distribution_range(uprops, "DelayDuration", 0.0f, 0.0f);
+                node.min_value = lo;
+                node.max_value = hi;
+            } else if (ncls == "SoundNodeModulator") {
+                // Default__SoundNodeModulator's distributions: uniform 0.9 .. 1.1.
+                node.kind = SoundCueNode::Kind::Modulator;
+                const auto [vlo, vhi] = distribution_range(uprops, "VolumeModulation", 0.9f, 1.1f);
+                const auto [plo, phi] = distribution_range(uprops, "PitchModulation", 0.9f, 1.1f);
+                node.min_value = vlo;
+                node.max_value = vhi;
+                node.min_pitch = plo;
+                node.max_pitch = phi;
+            }
+            cue.nodes.push_back(std::move(node));
+        }
+
         // Follow ChildNodes array
         if (auto it = nprops.find("ChildNodes"); it != nprops.end() && it->second.raw_bytes.size() >= 4) {
             int32_t cnt = 0;
@@ -2312,10 +2390,12 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
                 for (int32_t k = 0; k < cnt; ++k) {
                     int32_t child_idx = 0;
                     std::memcpy(&child_idx, it->second.raw_bytes.data() + 4 + static_cast<size_t>(k) * 4, 4);
-                    self(self, child_idx, cue, depth + 1);
+                    const int child = self(self, child_idx, cue, depth + 1);
+                    cue.nodes[static_cast<size_t>(node_index)].children.push_back(child);
                 }
             }
         }
+        return node_index;
     };
 
     // 1. Extract all SoundCues

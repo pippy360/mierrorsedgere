@@ -36,6 +36,8 @@ struct PawnFrame {
     // ledge grab, which heave), by name; empty when the move plays the one it always plays.
     std::string move_anim;
     // "@reached" in move_anim: the move got to the place it was steering for (TdMove.ReachedPreciseLocation).
+    // The rate the move worked out for move_anim (TdMove_Barge.StartBargin's AnimPlayRate); 0: its script's own.
+    float move_anim_rate = 0.0f;
     bool move_left = false;      // a sideways move going left (dodge jumps)
     bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
     bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)
@@ -92,7 +94,7 @@ private:
     void stop_move(EMovement move, EMovement pending, const PawnFrame& frame);
     void start_move(EMovement move, EMovement old, const PawnFrame& frame);
     void update_walking_state(const PawnFrame& frame);
-    bool play_named(const std::string& name);
+    bool play_named(const std::string& name, float rate = 0.0f);
     void land_normal(float amount);
     void tick_climb(const PawnFrame& frame);
     void tick_grab(const PawnFrame& frame);

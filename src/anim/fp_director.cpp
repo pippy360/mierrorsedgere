@@ -613,8 +613,9 @@ void Director::update_walking_state(const PawnFrame& frame) {
     pawn_.walking_state = state;
 }
 
-// An animation the move names, played the way its script plays it.
-bool Director::play_named(const std::string& name) {
+// An animation the move names, played the way its script plays it: at the rate the move worked out
+// (`rate` > 0, TdMove_Barge's AnimPlayRate), else at the script's constant one.
+bool Director::play_named(const std::string& name, float rate) {
     const MoveAnim* a = find_move_anim(name);
     if (!a) return false;
     Slot slot = a->slot;
@@ -627,7 +628,7 @@ bool Director::play_named(const std::string& name) {
     }
     std::string playing;
     if (tree_.custom_anim_playing(slot, &playing) && lower(playing) == a->name && tree_.custom_anim_time(slot) < 0.05f) return true;
-    tree_.play_custom_anim(slot, name, a->rate, a->blend_in, blend_out, a->looping, true);
+    tree_.play_custom_anim(slot, name, rate > 0.0f ? rate : a->rate, a->blend_in, blend_out, a->looping, true);
     // TdMove_Climb.ExitAtTop: over the top, and the walking tree comes in under it.
     if (std::strstr(a->name, "exittop")) {
         climb_exiting_ = true;
@@ -1094,7 +1095,7 @@ void Director::tick(const PawnFrame& frame) {
     } else if (!frame.move_anim.empty()) {
         // Hanging, the turns are TdMove_Grab's own (tick_grab), not something the move names.
         const bool own = frame.movement == EMovement::MOVE_Grabbing && lower(frame.move_anim).compare(0, 8, "hangturn") == 0;
-        if (!own) play_named(frame.move_anim);
+        if (!own) play_named(frame.move_anim, frame.move_anim_rate);
     }
 
     // Letting go of the stick while walking: the legs take the stopping step (native; measured).

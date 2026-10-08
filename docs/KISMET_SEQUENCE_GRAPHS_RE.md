@@ -124,6 +124,14 @@ Interactive buttons and turn-valves combine three classes:
    - `var TdValveSkeletalMeshActor InteractSkelMeshRef;` — binds the world valve actor directly to the `Used` event node.
    - `var bool bInteract;` — latent execution flag (`bLatentExecution=True`) that holds the Kismet pin until the valve revolutions or button press animation finishes, then fires `Used` / `Aborted` output pins into `SeqAct_Toggle` (shutting off steam `Emitter` + `TdKillZoneVolume` damage volumes + `SeqAct_TdPlaySound` hiss audio).
 
+#### Barge doors (`SPT_OnewayDoor_Seq`)
+A door Faith barges or kicks open is an `InterpActor` leaf driven by its own small sequence. `TdMove_Barge.HitObject` deals it `TakeDamage(100, .., TdDmgType_Barge)`, and:
+1. **`SeqEvent_TakeDamage`** (`ReTriggerDelay` 4.4 s, longer than the whole cycle) plays `Doors.Door_Barge` on the leaf (`SeqAct_TdPlaySound`) and starts the **open matinee** (0.6 s): the leaf turns to -103.755 degrees by 0.25 s, bounces back to -98.13 at 0.4 s and settles at -103.755 at 0.6 s. Its sound track plays `Doors.Door_Hit` at 0.
+2. **`SeqAct_Delay`** 3 s.
+3. The **close matinee** (0.6 s) swings it shut, about 13.9 degrees past closed before it settles; its sound track plays `hatch.Squek` at 0 and `Doors.Door_Hit` at 0.25 s. The leaf is `bStopOnEncroach`, so it holds still rather than swing into the player, and `SeqAct_ChangeCollision` puts back the doorway's blocker once the pawn is out of it.
+
+The port runs this in `ParkourController::open_barge_door` / `update_barge_doors` (oracle Stage 12D). It turns the leaf away from whoever opened it, whichever side the hit came from.
+
 ---
 
 ### 2.3 AI Squad Spawning & Tactical Combat Orchestration
