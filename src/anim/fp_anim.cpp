@@ -54,7 +54,9 @@ TreeNode::Kind kind_of(const std::string& cls) {
 bool AnimTree::load(const std::string& game_root, std::string& error) {
     nodes_.clear();
     order_.clear();
+    walk_group_.clear();
     root_ = -1;
+    walk_synch_ = -1;
     std::fill(std::begin(slots_), std::end(slots_), -1);
 
     UPKPackage pkg(game_root + "/TdGame/CookedPC/Characters/AT_C1P.upk");
@@ -138,6 +140,11 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         }
     }
     root_ = node_of[root_export];
+    in_walk_group_.assign(nodes_.size(), 0);
+    for (int i : walk_group_) in_walk_group_[static_cast<size_t>(i)] = 1;
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        if (nodes_[i].cls == "AnimNodeSynch" && nodes_[i].name == "MasterSync") walk_synch_ = static_cast<int>(i);
+    }
 
     // Parents before children: a node is ticked once, after everything above it.
     std::vector<int> parents_left(nodes_.size(), 0);
@@ -165,6 +172,7 @@ void AnimTree::reset() {
         n.relevant = false;
         n.blend_to_go = 0.0f;
         n.pending_blend_out = -1.0f;
+        n.hold = -1.0f;
         n.time = 0.0f;
         n.seq = nullptr;
         if (n.kind == TreeNode::Kind::List || n.kind == TreeNode::Kind::Slot) {
@@ -232,10 +240,68 @@ bool AnimTree::custom_anim_playing(Slot slot, std::string* name) const {
     return seq.playing;
 }
 
+float AnimTree::custom_anim_time(Slot slot) const {
+    const int index = slot_node(slot);
+    if (index < 0) return 0.0f;
+    const TreeNode& n = nodes_[static_cast<size_t>(index)];
+    if (n.active == 0 || n.children.size() < 3) return 0.0f;
+    return nodes_[static_cast<size_t>(n.children[static_cast<size_t>(n.active)])].time;
+}
+
+void AnimTree::activate_custom_blend(const std::string& node_name, float amount, float duration, float blend_in, float blend_out) {
+    for (TreeNode& n : nodes_) {
+        if (n.cls != "TdAnimNodeCustomBlend" || n.name != node_name || n.weight.size() < 2) continue;
+        n.target[0] = 1.0f - amount;
+        n.target[1] = amount;
+        n.blend_to_go = blend_in;
+        n.active = 1;
+        n.hold = duration;
+        n.hold_blend_out = blend_out;
+    }
+}
+
+float AnimTree::walk_cycle() const {
+    if (walk_master_ < 0) return -1.0f;
+    const TreeNode& m = nodes_[static_cast<size_t>(walk_master_)];
+    return (m.seq && m.seq->length > 0.0f) ? m.time / m.seq->length : -1.0f;
+}
+
+// AnimNodeSynch.TickAnim for the "Walk" group: the heaviest member leads at its own rate, and
+// every other member is put at the same place in its own cycle (its SynchPosOffset apart), so a
+// walk and a run of different lengths stay in step and blending between them keeps the feet.
+void AnimTree::tick_walk_group(const PawnAnimState& pawn, float dt) {
+    int master = walk_master_;
+    float best = master >= 0 ? nodes_[static_cast<size_t>(master)].total : 0.0f;
+    for (int i : walk_group_) {
+        if (nodes_[static_cast<size_t>(i)].total > best) {
+            best = nodes_[static_cast<size_t>(i)].total;
+            master = i;
+        }
+    }
+    walk_master_ = master;
+    if (master < 0) return;
+    TreeNode& m = nodes_[static_cast<size_t>(master)];
+    if (!m.seq && !m.seq_name.empty()) m.seq = find_sequence(m.seq_name);
+    if (!m.seq || m.seq->length <= 0.0f) return;
+    advance(m, pawn, dt);
+    float rel = m.time / m.seq->length - m.synch_offset;
+    rel -= std::floor(rel);
+    for (int i : walk_group_) {
+        if (i == master) continue;
+        TreeNode& slave = nodes_[static_cast<size_t>(i)];
+        if (!slave.seq && !slave.seq_name.empty()) slave.seq = find_sequence(slave.seq_name);
+        if (!slave.seq || slave.seq->length <= 0.0f) continue;
+        float at = rel + slave.synch_offset;
+        at -= std::floor(at);
+        slave.time = at * slave.seq->length;
+    }
+}
+
 // A state node's choice of child for this frame.
 void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_relevant) {
     int want = n.active;
     float blend = 0.2f;
+    if (n.cls == "TdAnimNodeCustomBlend") return;  // moved only by Activate and its timer
     if (n.cls == "TdAnimNodeMovementState") {
         // The state SetAnimationMovementState forces, else the pawn's own (its last one for bUseOldState).
         int state = static_cast<int>(n.use_old_state ? pawn.old_movement : pawn.movement);
@@ -343,7 +409,8 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                     n.time = (n.synchronize ? n.synch_offset : n.start_position) * length;
                     n.playing = true;
                 }
-                advance(n, pawn, dt);
+                // A member of the walk group is moved by the group.
+                if (!in_walk_group_[static_cast<size_t>(index)] || walk_synch_ < 0) advance(n, pawn, dt);
                 break;
             case TreeNode::Kind::Slot: {
                 // A custom animation that is not looping blends back out as it runs down.
@@ -362,6 +429,10 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
             }
             case TreeNode::Kind::List:
                 update_list(n, pawn, became_relevant);
+                if (n.hold >= 0.0f) {
+                    n.hold -= dt;
+                    if (n.hold < 0.0f) set_active(n, 0, n.hold_blend_out);
+                }
                 break;
             case TreeNode::Kind::PerBone:
                 // A bone mask: the source is always whole underneath.
@@ -372,6 +443,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 break;
             case TreeNode::Kind::Passthrough:
                 if (!n.weight.empty()) n.weight[0] = 1.0f;
+                if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;
             case TreeNode::Kind::Directional:
                 update_directional(n, pawn, dt, became_relevant);
@@ -409,14 +481,8 @@ void AnimTree::leaves(std::vector<Leaf>& out, size_t limit) const {
 }
 
 bool AnimTree::left_leg_forward() const {
-    // The group's master is its heaviest member.
-    const TreeNode* master = nullptr;
-    for (int i : walk_group_) {
-        const TreeNode& n = nodes_[static_cast<size_t>(i)];
-        if (!master || n.total > master->total) master = &n;
-    }
-    if (!master || !master->seq || master->seq->length <= 0.0f) return false;
-    return master->time > master->seq->length * 0.5f;
+    const float at = walk_cycle();
+    return at > 0.5f;
 }
 
 }  // namespace me::fp

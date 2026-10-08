@@ -5,8 +5,12 @@
 //   me_anim --game-root <install> --frames <frames.txt> --out <leaves.txt>
 //
 // A frames file has one retail frame per line:
-//   t  move  px py pz  vx vy vz  pawn_yaw  view_yaw  view_pitch
-// and a line "reset" where the recording was cut (a pause, a reload).
+//   t  move  px py pz  vx vy vz  pawn_yaw  view_yaw  view_pitch  [ground  gap  left  free  accel  anim]
+// and a line "reset" where the recording was cut (a pause, a reload). The optional columns are
+// what the moves read off the level, which a recording does not carry: the height of the feet
+// above the ground (-1 unknown), whether a long jump is over a gap, whether a sideways move goes
+// left, whether she hangs free, whether the player is pushing a direction, and the animation the
+// move picked ("-" for none, "@reached" for getting to the place the move steers for).
 
 #include "../anim/anim_system.hpp"
 #include "../anim/fp_director.hpp"
@@ -94,6 +98,17 @@ int main(int argc, char** argv) {
         me::fp::PawnFrame f;
         ls >> t >> move >> f.position.x >> f.position.y >> f.position.z >> f.velocity.x >> f.velocity.y >> f.velocity.z >> f.yaw_deg >>
             f.view_yaw_deg >> f.view_pitch_deg;
+        int gap = 0, left = 0, hang_free = 0, accel = 1;
+        std::string anim;
+        if (ls >> f.ground_distance >> gap >> left >> hang_free >> accel >> anim) {
+            f.long_jump_over_gap = gap != 0;
+            f.move_left = left != 0;
+            f.hanging_free = hang_free != 0;
+            f.accelerating = accel != 0;
+            if (anim != "-") f.move_anim = anim;
+        } else {
+            f.ground_distance = -1.0f;
+        }
         f.movement = static_cast<me::EMovement>(move);
         f.dt = last_t < 0.0 ? 0.0f : static_cast<float>(t - last_t);
         last_t = t;

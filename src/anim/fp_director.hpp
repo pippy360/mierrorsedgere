@@ -26,6 +26,15 @@ struct PawnFrame {
     bool heavy_weapon = false;
     // TdMove_Jump.StartJump: nothing to land on 1.1 x the forward speed ahead and up to 200 below.
     bool long_jump_over_gap = false;
+    // How far the feet are above what is under them; negative when not known.
+    float ground_distance = -1.0f;
+    // The animation the move's own checks of the level settled on this frame (which vault, which
+    // ledge grab, which heave), by name; empty when the move plays the one it always plays.
+    std::string move_anim;
+    // "@reached" in move_anim: the move got to the place it was steering for (TdMove.ReachedPreciseLocation).
+    bool move_left = false;      // a sideways move going left (dodge jumps)
+    bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
+    bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)
 };
 
 class Director {
@@ -43,6 +52,8 @@ private:
     void stop_move(EMovement move, EMovement pending, const PawnFrame& frame);
     void start_move(EMovement move, EMovement old, const PawnFrame& frame);
     void update_walking_state(const PawnFrame& frame);
+    bool play_named(const std::string& name);
+    void land_normal(float amount);
     // TdMove.PlayMoveAnim.
     void play(Slot slot, const char* name, float rate, float blend_in, float blend_out) {
         tree_.play_custom_anim(slot, name, rate, blend_in, blend_out, false, true);
@@ -56,6 +67,12 @@ private:
     Vec3 last_velocity_{0.0f, 0.0f, 0.0f};  // the velocity the pawn's Tick sees: last frame's physics
     EMovement pending_animation_state_ = EMovement::MOVE_None;
     float animation_state_timer_ = -1.0f;
+    std::string last_move_anim_;
+    bool close_to_ground_ = false;   // TdMove_Falling.CloseToGround has fired in this fall
+    float time_in_move_ = 0.0f;
+    bool was_accelerating_ = false;
+    float fall_top_ = 0.0f;          // TdPawn.EnterFallingHeight: the highest she has been in this fall
+    bool airborne_ = false;
 };
 
 }  // namespace me::fp

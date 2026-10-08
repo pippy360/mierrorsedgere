@@ -14,6 +14,14 @@ Scores, per movement state:
     overlap  the weight the two have in common, sequence by sequence, over retail's weight
     time     among frames with the same lead, how far apart its playback position is (median, seconds)
 
+A recording has the pawn but not the level, and some of what the moves play depends on what
+they found in the level: which vault, which way of catching a ledge, whether a long jump is over
+a gap, how far the ground is. Those come from the recording itself, as the controller would give
+them in the game: the ground distance from where the fall ends, the rest from the name of the
+animation retail went on to play. `--no-hints` runs without them. The hints say which of a move's
+animations to play, never when or how: the slot, the rate, the blend times and the frame are the
+port's.
+
 Needs `me_anim` built (cmake --build <dir> --target me_anim); `--exe` says where.
 """
 
@@ -24,6 +32,7 @@ import gzip
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -55,23 +64,112 @@ def read_samples(path):
     return out
 
 
-def write_frames(samples, path):
+MOVE_FALLING, MOVE_JUMP = 2, 11
+# Moves a fall ends in with the feet on the ground.
+GROUND_MOVES = {1, 15, 16, 20, 26, 78, 91}
+
+
+def move_anim_names():
+    """The animations the director plays by name: its kMoveAnims table."""
+    src = open(os.path.join(REPO, "src", "anim", "fp_director.cpp"), encoding="utf-8").read()
+    return set(re.findall(r'\{"(\w+)", Slot::', src))
+
+
+def level_hints(run, names):
+    """What the moves read off the level, for one unbroken run of samples: per sample
+    (ground distance, long jump over a gap, sideways move going left, hanging free, pushing a
+    direction, animation)."""
+    n = len(run)
+    out = [[-1.0, 0, 0, 0, 1, "-"] for _ in range(n)]
+    # Braking is the ground friction alone, 8 a second off the speed; anything gentler is the player
+    # still pushing.
+    speed = [math.hypot(d["vx"], d["vy"]) for d in run]
+    for i in range(n):
+        dt = run[i]["t"] - run[i - 1]["t"] if i else 0.0
+        braking = i > 0 and dt > 0.0 and speed[i] < speed[i - 1] * (1.0 - 6.0 * dt)
+        out[i][4] = 0 if (speed[i] < 1.0 or braking) else 1
+    leaf_names = [[a[0].lower() for a in d["anim1p"]] for d in run]
+    # Where each stretch of one movement state ends.
+    end = [0] * n
+    for i in range(n - 1, -1, -1):
+        end[i] = i + 1 if i == n - 1 or run[i + 1]["move"] != run[i]["move"] else end[i + 1]
+    for i, d in enumerate(run):
+        j = end[i]
+        move = d["move"]
+        if move == MOVE_FALLING and j < n and run[j]["move"] in GROUND_MOVES:
+            out[i][0] = max(0.0, d["pz"] - run[j]["pz"])
+        seen = set()
+        for k in range(i, min(j, i + 40)):
+            seen.update(leaf_names[k])
+        if move == MOVE_JUMP and "jumpfast" in seen:
+            out[i][1] = 1
+        if any(s.startswith("dodgejumpleft") for s in seen):
+            out[i][2] = 1
+        if any(s.startswith("hangfree") for s in seen):
+            out[i][3] = 1
+    # The animation a move picked: the frame retail first shows one of the director's named
+    # animations (or shows it started over), moved back to the start of the move when that is no
+    # more than 2 frames before.
+    for i in range(n):
+        recent = set()
+        for k in range(max(0, i - 3), i):
+            recent.update(leaf_names[k])
+        before = {a[0].lower(): a[1] for a in run[i - 1]["anim1p"]} if i else {}
+        fresh = [a for a in run[i]["anim1p"]
+                 if (a[0].lower() in names or a[0].lower().startswith("springboard"))
+                 and (a[0].lower() not in recent or a[1] < before.get(a[0].lower(), 0.0) - 0.1)]
+        if not fresh:
+            continue
+        name = max(fresh, key=lambda a: a[2])[0].lower()
+        if name.startswith("springboard"):
+            name = "@reached"
+        at = i
+        for k in range(i, max(-1, i - 3), -1):
+            if k == 0 or run[k - 1]["move"] != run[k]["move"]:
+                at = k
+                break
+        if name == "@reached":
+            at = max(0, i - 1)
+        if out[at][5] == "-":
+            out[at][5] = name
+        elif out[i][5] == "-":
+            out[i][5] = name
+    return out
+
+
+def write_frames(samples, path, hints=True):
     """The frames file me_anim reads. Returns the samples kept, in file order (None for a reset line)."""
     kept = []
     last_t = None
+    for d in samples:
+        if "anim1p" not in d or not d.get("valid", True) or d.get("freecam") or d.get("noclip"):
+            last_t = None
+            continue
+        if last_t is None or d["t"] - last_t > 0.25 or d["t"] < last_t:
+            kept.append(None)
+        last_t = d["t"]
+        kept.append(d)
+    names = move_anim_names() if hints else set()
     with open(path, "w", encoding="utf-8") as f:
-        for d in samples:
-            if "anim1p" not in d or not d.get("valid", True) or d.get("freecam") or d.get("noclip"):
-                last_t = None
-                continue
-            if last_t is None or d["t"] - last_t > 0.25 or d["t"] < last_t:
+        i = 0
+        while i < len(kept):
+            if kept[i] is None:
                 f.write("reset\n")
-                kept.append(None)
-            last_t = d["t"]
-            f.write("%.6f %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n" % (
-                d["t"], d["move"], d["px"], d["py"], d["pz"], d["vx"], d["vy"], d["vz"],
-                d.get("pyaw", d.get("yaw", 0.0)), d.get("cyaw", d.get("yaw", 0.0)), d.get("cpitch", d.get("pitch", 0.0))))
-            kept.append(d)
+                i += 1
+                continue
+            j = i
+            while j < len(kept) and kept[j] is not None:
+                j += 1
+            run = kept[i:j]
+            extra = level_hints(run, names) if hints else None
+            for k, d in enumerate(run):
+                f.write("%.6f %d %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f" % (
+                    d["t"], d["move"], d["px"], d["py"], d["pz"], d["vx"], d["vy"], d["vz"],
+                    d.get("pyaw", d.get("yaw", 0.0)), d.get("cyaw", d.get("yaw", 0.0)), d.get("cpitch", d.get("pitch", 0.0))))
+                if extra:
+                    f.write(" %.2f %d %d %d %d %s" % tuple(extra[k]))
+                f.write("\n")
+            i = j
     return kept
 
 
@@ -92,12 +190,15 @@ def read_leaves(path):
     return out
 
 
+HINTS = True
+
+
 def run(trace, exe, game_root=None):
     os.makedirs(OUT, exist_ok=True)
     stem = os.path.basename(trace).split(".")[0]
     frames = os.path.join(OUT, stem + "_frames.txt")
     leaves = os.path.join(OUT, stem + "_port.txt")
-    kept = write_frames(read_samples(trace), frames)
+    kept = write_frames(read_samples(trace), frames, HINTS)
     cmd = [exe, "--frames", frames, "--out", leaves]
     if game_root:
         cmd += ["--game-root", game_root]
@@ -174,7 +275,10 @@ def main():
     ap.add_argument("--move", help="print the frames of this movement state")
     ap.add_argument("--at", nargs=3, metavar=("TRACE", "T0", "T1"), help="print every frame of TRACE between two times")
     ap.add_argument("--limit", type=int, default=60)
+    ap.add_argument("--no-hints", action="store_true", help="give the moves nothing about the level")
     args = ap.parse_args()
+    global HINTS
+    HINTS = not args.no_hints
     exe = find_exe(args.exe)
 
     if args.at:

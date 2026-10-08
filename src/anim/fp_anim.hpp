@@ -88,6 +88,8 @@ struct TreeNode {
     bool relevant = false;
     float time = 0.0f;           // CurrentTime
     float pending_blend_out = -1.0f;  // a slot: blend back to the source when this much of the animation is left
+    float hold = -1.0f;               // TdAnimNodeCustomBlend.Duration: how long it stays before blending back
+    float hold_blend_out = 0.0f;      // TdAnimNodeCustomBlend.BlendOutTime
     float forward_blend = 1.0f;       // TdAnimNodeBlendDirectional.ForwardBlend: 1 going forward, 0 going backward
     float side_blend = 0.0f;          // 0 straight ahead (or back), 1 straight sideways
     const AnimSequenceAsset* seq = nullptr;
@@ -110,6 +112,15 @@ public:
     void play_custom_anim(Slot slot, const std::string& name, float rate, float blend_in, float blend_out, bool looping, bool override_playing);
     void stop_custom_anim(Slot slot, float blend_out);
     [[nodiscard]] bool custom_anim_playing(Slot slot, std::string* name = nullptr) const;
+    // How far into its animation the slot's active channel is (0 with none).
+    [[nodiscard]] float custom_anim_time(Slot slot) const;
+
+    // TdAnimNodeCustomBlend.Activate on the node of that name: its second child at `amount` for
+    // `duration`, blended in and back out.
+    void activate_custom_blend(const std::string& node_name, float amount, float duration, float blend_in, float blend_out);
+
+    // Where the walk cycle is: the "Walk" synch group's master, as CurrentTime / SequenceLength (-1 with none).
+    [[nodiscard]] float walk_cycle() const;
 
     // Every sequence player with weight, heaviest first: what the retail recorder logs as anim1p.
     struct Leaf {
@@ -129,6 +140,7 @@ private:
     void update_list(TreeNode& n, const PawnAnimState& pawn, bool became_relevant);
     void update_directional(TreeNode& n, const PawnAnimState& pawn, float dt, bool became_relevant);
     void advance(TreeNode& n, const PawnAnimState& pawn, float dt);
+    void tick_walk_group(const PawnAnimState& pawn, float dt);
     int slot_node(Slot slot) const;
     const AnimSequenceAsset* find_sequence(const std::string& name) const;
 
@@ -139,7 +151,9 @@ private:
     SequenceLookup lookup_;
     // The "Walk" synch group: its members, and the one leading it this frame.
     std::vector<int> walk_group_;
+    std::vector<char> in_walk_group_;
     int walk_master_ = -1;
+    int walk_synch_ = -1;  // the AnimNodeSynch that owns it ("MasterSync")
 };
 
 }  // namespace fp
