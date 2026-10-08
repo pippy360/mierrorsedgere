@@ -482,7 +482,9 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
     // TdAnimNodeLandOffset (native): into the landing pose over LandInto, back out over LandOut.
     float land = 0.0f;
     if (land_time_ >= 0.0f) {
-        constexpr float kLandInto = 0.1f, kLandOut = 0.4f;
+        // Measured against retail's camera through landings: 0.1 s in and 0.3 s back out (the node's
+        // LandOut says 0.4; LandOverlap and OverlapSize are not accounted for).
+        constexpr float kLandInto = 0.1f, kLandOut = 0.3f;
         land_time_ += dt;
         if (land_time_ < kLandInto) land = land_amount_ * land_time_ / kLandInto;
         else if (land_time_ < kLandInto + kLandOut) land = land_amount_ * (1.0f - (land_time_ - kLandInto) / kLandOut);
@@ -543,6 +545,25 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
             case TreeNode::Kind::Passthrough:
                 if (!n.weight.empty()) n.weight[0] = 1.0f;
                 if (n.cls == "TdAnimNodeLandOffset") n.aim_y = land;
+                if (n.cls == "TdAnimNodeDirBone" && n.name == "1pAim") {
+                    // The hips (and the spine against them) turn the legs the way she is going, a
+                    // quarter turn at most: the profile's left and right poses are 90 degrees. Going
+                    // backward they turn off the opposite of it.
+                    float want = 0.0f;
+                    if (pawn.movement == EMovement::MOVE_Walking || pawn.movement == EMovement::MOVE_Crouch) {
+                        const float yaw = pawn.yaw_deg * DEG2RAD;
+                        const float forward = std::cos(yaw) * pawn.velocity.x + std::sin(yaw) * pawn.velocity.y;
+                        const float right = -std::sin(yaw) * pawn.velocity.x + std::cos(yaw) * pawn.velocity.y;
+                        if (forward * forward + right * right > 100.0f) {
+                            float angle = std::atan2(right, forward) / DEG2RAD;
+                            if (angle > 90.0f) angle -= 180.0f;
+                            else if (angle < -90.0f) angle += 180.0f;
+                            want = angle / 90.0f;
+                        }
+                    }
+                    const float step = dt / 0.1f;  // DirInterpTime
+                    n.aim_x = n.aim_x < want ? std::min(n.aim_x + step, want) : std::max(n.aim_x - step, want);
+                }
                 if (index == walk_synch_) tick_walk_group(pawn, dt);
                 break;
             case TreeNode::Kind::Directional:
