@@ -1244,6 +1244,27 @@ struct LevelScene {
     std::vector<HeliAttackNode> heli_attack_nodes;
     std::vector<HelicopterInstance> helicopters;
     std::vector<DummyFireBarrage> dummy_fire_barrages;
+
+    struct KismetValveProp {
+        std::string object_name;
+        Vec3 position{0.0f, 0.0f, 0.0f};
+        float yaw_deg = 0.0f;
+        int32_t required_revs = 1;
+    };
+    struct KismetLookAtPoint {
+        std::string object_name;
+        Vec3 position{0.0f, 0.0f, 0.0f};
+        float duration_sec = 0.5f;
+        float interp_time_sec = 0.1f;
+    };
+    struct KismetLevelTransition {
+        std::string object_name;
+        std::string next_level_name;
+        std::string next_checkpoint_name;
+    };
+    std::vector<KismetValveProp> kismet_valves;
+    std::vector<KismetLookAtPoint> kismet_lookat_points;
+    std::vector<KismetLevelTransition> kismet_level_transitions;
     std::vector<Vec3> checkpoints;
     std::vector<LevelCheckpointInfo> checkpoint_infos;
     std::vector<LevelStreamingActionInfo> streaming_actions;

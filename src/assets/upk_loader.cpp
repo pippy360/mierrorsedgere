@@ -3967,7 +3967,10 @@ void UPKPackage::extract_reflections(std::vector<SceneCaptureReflectInfo>& out_c
 
 void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_nodes,
                                                std::vector<HelicopterInstance>& out_helicopters,
-                                               std::vector<DummyFireBarrage>& out_barrages) const {
+                                               std::vector<DummyFireBarrage>& out_barrages,
+                                               std::vector<LevelScene::KismetValveProp>* out_valves,
+                                               std::vector<LevelScene::KismetLookAtPoint>* out_lookats,
+                                               std::vector<LevelScene::KismetLevelTransition>* out_transitions) const {
     if (!valid_) return;
     std::string pkg_stem = std::filesystem::path(file_path_).stem().string();
 
@@ -4150,6 +4153,41 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                 }
                 out_barrages.push_back(std::move(bar));
             }
+        } else if (out_valves && cls == "TdValveSkeletalMeshActor") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            LevelScene::KismetValveProp valve{};
+            valve.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            if (const UProperty* loc = find_prop(props, "Location")) {
+                valve.position = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            }
+            if (const UProperty* rot = find_prop(props, "Rotation")) {
+                valve.yaw_deg = static_cast<float>(rot->vi[1]) * (360.0f / 65536.0f);
+            }
+            out_valves->push_back(std::move(valve));
+        } else if (out_lookats && (cls == "TdLookAtPoint" || cls == "TdLookAtPointSpawnable")) {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            LevelScene::KismetLookAtPoint lap{};
+            lap.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            if (const UProperty* loc = find_prop(props, "Location")) {
+                lap.position = Vec3(loc->v[0], loc->v[1], loc->v[2]);
+            }
+            lap.duration_sec = prop_float(props, "LookAtDurationTimer", 0.5f);
+            lap.interp_time_sec = prop_float(props, "LookAtInterpolationTimer", 0.1f);
+            out_lookats->push_back(std::move(lap));
+        } else if (out_transitions && cls == "SeqAct_TdLevelCompleted") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            LevelScene::KismetLevelTransition tr{};
+            tr.object_name = pkg_stem + "." + export_object_name(*this, idx);
+            if (const UProperty* nl = find_prop(props, "NextLevelName")) {
+                tr.next_level_name = nl->s;
+            }
+            if (const UProperty* nc = find_prop(props, "NextCheckpointName")) {
+                tr.next_checkpoint_name = nc->s;
+            }
+            out_transitions->push_back(std::move(tr));
         }
     }
 }
@@ -4326,7 +4364,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     for (const auto& pkg : loaded_packages) {
         pkg->extract_elevators(mesh_library, out_scene.elevators, &door_infos);
         pkg->extract_reflections(out_scene.reflection_captures, out_scene.reflection_volumes);
-        pkg->extract_helicopter_encounters(out_scene.heli_attack_nodes, out_scene.helicopters, out_scene.dummy_fire_barrages);
+        pkg->extract_helicopter_encounters(out_scene.heli_attack_nodes, out_scene.helicopters, out_scene.dummy_fire_barrages,
+                                           &out_scene.kismet_valves, &out_scene.kismet_lookat_points, &out_scene.kismet_level_transitions);
     }
     // Bind each elevator to its real moving InterpActors (cab, attached cab doors, landing doors).
     assign_elevator_parts(out_scene, door_infos, mesh_library);
