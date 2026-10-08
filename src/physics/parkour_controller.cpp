@@ -324,6 +324,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_climb_top = Vec3(0.0f, 0.0f, 0.0f);
     m_climb_normal = Vec3(0.0f, 0.0f, 0.0f);
     m_climb_cooldown = 0.0f;
+    m_climb_can_exit_top = true;
     m_balance_start = Vec3(0.0f, 0.0f, 0.0f);
     m_balance_end = Vec3(0.0f, 0.0f, 0.0f);
     m_balance_lean = 0.0f;
@@ -3670,10 +3671,14 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         const float h_dist = horiz(m_telemetry.position - base).length();
         if (!(h_dist <= max_horiz)) continue;
 
-        // Native UE3 TdLadderVolume: actor Rotation faces into the wall/ladder when non-zero;
-        // unrotated brush volumes (Rotation == 0,0,0) detect the mounting wall normal directly from scene collision.
+        // Native UE3 TdLadderVolume: serialized WallNormal points outward toward the climber;
+        // fallback to actor Rotation (faces into the wall/ladder) or scene wall probes.
         Vec3 wall_out(0.0f, 0.0f, 0.0f);
-        if (std::abs(act.rotation.yaw) > 1.0f || std::abs(act.rotation.pitch) > 1.0f) {
+        if (act.wall_normal.length_sq() > 0.25f) {
+            wall_out = horiz(act.wall_normal).normalized();
+        }
+        if (wall_out.length_sq() < 0.25f &&
+            (std::abs(act.rotation.yaw) > 1.0f || std::abs(act.rotation.pitch) > 1.0f)) {
             wall_out = horiz(-act.rotation.forward()).normalized();
         }
         if (wall_out.length_sq() < 0.25f) {
@@ -3709,6 +3714,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         m_climb_base = base;
         m_climb_top = top;
         m_climb_normal = wall_out;
+        m_climb_can_exit_top = act.can_exit_at_top;
         m_telemetry.wall_normal = wall_out;
         m_state_timer = 0.0f;
         m_coil_timer = 0.0f;
@@ -3764,22 +3770,31 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
         m_telemetry.velocity = Vec3(0.0f, 0.0f, kClimbUpSpeed);
         m_telemetry.position.z += kClimbUpSpeed * dt;
 
-        // Reaching top of pipe/ladder (TdLadderVolume.ExitAtTop):
-        // Check whether a walkable roof/ledge exists behind the pipe top; if so, mantle onto it.
-        // If no walkable roof exists (dead-end pipe below upper wall), hold at the top step.
-        if (m_telemetry.position.z >= m_climb_top.z - 25.0f) {
-            for (float dist_in : {45.0f, 80.0f, 120.0f}) {
+        // Reaching top of pipe/ladder (TdMove_Climb.ExitAtTop):
+        // In UE3 TdLadderVolume, GetLastStep().Z = End.Z - 96.0 (side rails extend ~96 UU above the platform),
+        // so the top catwalk/roof surface can lie down to m_climb_top.z - 160.0f.
+        const float exit_check_z = m_climb_can_exit_top ? (m_climb_top.z - 65.0f) : (m_climb_top.z - 25.0f);
+        if (m_telemetry.position.z >= exit_check_z) {
+            for (float dist_in : {36.0f, 52.0f, 68.0f, 84.0f, 104.0f, 128.0f, 152.0f}) {
                 const Vec3 probe_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + into * dist_in;
-                const TraceHit roof = trace_ray(
-                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z + 150.0f),
-                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z - 80.0f),
+                TraceHit roof = trace_ray(
+                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z + 32.0f),
+                    Vec3(probe_xy.x, probe_xy.y, m_climb_top.z - 160.0f),
                     scene
                 );
+                if (!roof.hit || roof.normal.z < kWalkableFloorZ) {
+                    roof = trace_ray(
+                        Vec3(probe_xy.x, probe_xy.y, m_climb_top.z + 150.0f),
+                        Vec3(probe_xy.x, probe_xy.y, m_climb_top.z - 160.0f),
+                        scene
+                    );
+                }
                 if (roof.hit && roof.normal.z >= kWalkableFloorZ) {
                     const Vec3 stand_pos(probe_xy.x, probe_xy.y, roof.point.z + 2.0f);
-                    if (has_room_at(stand_pos, kPawnHeight, scene)) {
+                    if (has_room_at(stand_pos, kPawnHeight, scene) ||
+                        has_room_at(stand_pos + Vec3(0.0f, 0.0f, 12.0f), kEyeHeightCrouch, scene)) {
                         m_telemetry.position = stand_pos;
-                        m_telemetry.velocity = into * 220.0f;
+                        m_telemetry.velocity = into * 300.0f;
                         m_telemetry.move_state = EMovement::MOVE_Walking;
                         m_telemetry.grounded = true;
                         m_climb_cooldown = 0.45f;
@@ -3788,8 +3803,20 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
                     }
                 }
             }
-            m_telemetry.position.z = m_climb_top.z - 25.0f;
-            m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+            if (m_telemetry.position.z >= m_climb_top.z - 25.0f) {
+                if (m_climb_can_exit_top) {
+                    const Vec3 exit_pos = Vec3(m_climb_base.x, m_climb_base.y, m_climb_top.z - 64.0f) + into * 64.0f;
+                    m_telemetry.position = exit_pos;
+                    m_telemetry.velocity = into * 300.0f;
+                    m_telemetry.move_state = EMovement::MOVE_Walking;
+                    m_telemetry.grounded = true;
+                    m_climb_cooldown = 0.45f;
+                    m_fall_peak_z = exit_pos.z;
+                    return;
+                }
+                m_telemetry.position.z = m_climb_top.z - 25.0f;
+                m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+            }
         }
     } else if (input.forward < -0.2f) {
         constexpr float kClimbDownSpeed = 240.0f;

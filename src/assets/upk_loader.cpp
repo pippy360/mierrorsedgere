@@ -1430,6 +1430,9 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                                   (pe->vec_val - ps->vec_val).length_sq() >= 100.0f;
 
             if (a.is_ladder) {
+                if (const auto* pcet = get_prop("bCanExitAtTop")) {
+                    a.can_exit_at_top = pcet->bool_val;
+                }
                 const float dz = valid_se ? std::abs(pe->vec_val.z - ps->vec_val.z) : 0.0f;
                 const float dxy = valid_se ? (pe->vec_val - ps->vec_val).length_xy() : 1e9f;
                 if (valid_se && dz >= 60.0f && dz <= 5000.0f && dxy < 500.0f) {
