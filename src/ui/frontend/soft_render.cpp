@@ -53,10 +53,16 @@ void draw_quads(const Target& t, const DrawOp& op, float gamma) {
     for (const Quad& q : op.quads) {
         const float qw = q.x1 - q.x0, qh = q.y1 - q.y0;
         if (qw <= 0.0f || qh <= 0.0f) continue;
-        const int x0 = std::max(0, static_cast<int>(std::ceil(q.x0 - 0.5f)));
-        const int y0 = std::max(0, static_cast<int>(std::ceil(q.y0 - 0.5f)));
-        const int x1 = std::min(t.w, static_cast<int>(std::ceil(q.x1 - 0.5f)));
-        const int y1 = std::min(t.h, static_cast<int>(std::ceil(q.y1 - 0.5f)));
+        int x0 = std::max(0, static_cast<int>(std::ceil(q.x0 - 0.5f)));
+        int y0 = std::max(0, static_cast<int>(std::ceil(q.y0 - 0.5f)));
+        int x1 = std::min(t.w, static_cast<int>(std::ceil(q.x1 - 0.5f)));
+        int y1 = std::min(t.h, static_cast<int>(std::ceil(q.y1 - 0.5f)));
+        if (op.clipped) {
+            x0 = std::max(x0, static_cast<int>(std::ceil(op.clip.l - 0.5f)));
+            y0 = std::max(y0, static_cast<int>(std::ceil(op.clip.t - 0.5f)));
+            x1 = std::min(x1, static_cast<int>(std::ceil(op.clip.r - 0.5f)));
+            y1 = std::min(y1, static_cast<int>(std::ceil(op.clip.b - 0.5f)));
+        }
         for (int y = y0; y < y1; ++y) {
             const float v = q.v0 + (static_cast<float>(y) + 0.5f - q.y0) / qh * (q.v1 - q.v0);
             for (int x = x0; x < x1; ++x) {

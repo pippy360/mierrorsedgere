@@ -238,7 +238,9 @@ Loop Matinees (60 s, `bLooping`):
 
 The port reads the full keys, tangents and modes out of the level at load (`load_matinee` in `frontend_assets.cpp`); `python tools/ue3_tree.py <TdMainMenu.me1> --dump InterpData_18` and its groups' tracks print them.
 
-Clicking a sub-button sets `Sub_Menu` and plays a 0.5 s "sub menu camera" Matinee; those belong to the sub-menu screens and are not covered here.
+Clicking a sub-button sets `Sub_Menu` and plays a 0.5 s "sub menu camera" Matinee; those, and the chapter-select cameras, are in [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), section 4.
+
+The port no longer imitates this section: it loads `Main_Sequence` and runs it (`src/ui/frontend/kismet.*`), so the tables above are what the graph does, read by hand.
 
 ---
 
@@ -323,7 +325,9 @@ With gamma 2.2 the port's start screen then differs from a retail frame of the s
 | File | What |
 |---|---|
 | `frontend_assets.*`, `frontend_city.cpp` | reads the fonts, textures, widget rectangles, strings, Matinees, city meshes, light maps and post-process settings out of the retail packages |
-| `frontend.*` | the state machine: `TdUIScene_Start`, `TdUIScene_MainMenu`, `TdMenuPostProcesWrapper` and the camera Kismet. Input and time in, a `Frame` out: a camera and a list of 2D draw operations |
+| `frontend.*` | the state machine: `TdUIScene_Start`, `TdUIScene_MainMenu`, `TdMenuPostProcesWrapper`, and the stack of scenes the sub-buttons open. Input and time in, a `Frame` out: a camera and a list of 2D draw operations |
+| `kismet.*` | the menu level's Kismet and Matinees, run as the engine runs them: the camera, the fades, the chapter-select highlight |
+| `ui_scene.*`, `frontend_menus.*` | the screens behind the sub-buttons ([`SUB_MENUS_RE.md`](SUB_MENUS_RE.md)) |
 | `soft_render.*`, `soft_city.cpp` | the reference renderer for a `Frame`, on the CPU: the stick material per pixel, canvas text and tiles, and the city with its reflection, bloom and tone curve |
 | `src/tools/menu_main.cpp` | `me_menu`: runs the front end headless from a script and writes PNGs |
 
@@ -345,19 +349,22 @@ Retail on the left, the port on the right, same camera pose:
 ![OPTIONS](../screenshots/menu/main_menu_options.png)
 ![EXTRAS](../screenshots/menu/main_menu_extras.png)
 
-### In the macOS app
+### In the game
 
-`mirrorsedge_macos` boots into the front end (`run_interactive_app` in `src/main.mm`). While it is up it owns the frame: keyboard (arrows, Enter or Space, Escape), mouse and D-pad go to `Frontend`; its cue names become the skin's sounds from `Audio/A_HUD.upk` (`Tab_Change`, `D-Pad`, `A_Pos`) and the menu music; `SoftRenderer` draws the frame at 1280x720 and `MetalRenderer::set_frontend_frame` shows it full screen, aspect-fitted, the way a Bink frame is shown.
+`mirrorsedge_macos` and `mirrorsedge_windows` boot into the front end (`run_interactive_app` in `src/main.cpp`, which both share). While it is up it owns the frame: keyboard (arrows, Enter or Space, Escape), mouse and D-pad go to `Frontend`; its cue names become the skin's sounds from `Audio/A_HUD.upk` (`Tab_Change`, `D-Pad`, `A_Pos`, `B_Neg`) and the menu music; `SoftRenderer` draws the frame at 1280x720 and the renderer's `set_frontend_frame` shows it full screen, aspect-fitted, the way a Bink frame is shown.
 
 | Chosen | Does |
 |---|---|
 | CONTINUE GAME | starts the chapter loaded at start-up |
-| NEW GAME | loads the Prologue with its opening |
-| PLAY CHAPTER, and every RACE / OPTIONS / EXTRAS item | opens the older chapter-select overlay on the matching tab (those screens are not reverse engineered yet) |
-| QUIT GAME (Escape) | quits |
+| NEW GAME, then SELECT | loads the Prologue with its opening |
+| PLAY CHAPTER, a chapter, a checkpoint | loads that chapter; for a checkpoint other than the first, streams its sublevels in and stands the player there |
+| VIDEO, AUDIO, GAME SETTINGS | the screens work and keep their values for the session; the app does not apply them to the game yet |
+| QUIT GAME (Escape), then OK | quits |
+
+The sub-menu screens are in [`SUB_MENUS_RE.md`](SUB_MENUS_RE.md), which also lists the ones not built yet; choosing one of those does nothing.
 
 `--chapter` and `--level` start in the level and skip the front end, as they skipped the old menu.
 
-This part was written on the Windows machine that has retail installed. It compiles and links on a macOS 15 Apple Silicon runner; it has not been run on a Mac, so the first launch there is its first test. The pictures above are the same `Frontend` and `SoftRenderer` the app uses, so what can differ on a Mac is the hand-off (input, sound, the texture upload), not the menu.
+This part was written on the Windows machine that has retail installed. It has been run there in `mirrorsedge_windows`: start screen, main menu, PLAY CHAPTER, a checkpoint, and into the level at that checkpoint. On macOS it compiles and links on a macOS 15 Apple Silicon runner and has not been run, so the first launch there is its first test. The pictures above are the same `Frontend` and `SoftRenderer` the game uses, so what can differ on a Mac is the hand-off (input, sound, the texture upload), not the menu.
 
-Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the screens the sub-buttons open, the save-system spinner between the start screen and the menu, and the attract movie. The front end is drawn at 720 lines whatever the window's size; on a Retina display that is upscaled.
+Not in the port yet: the building materials' specular term (retail's sunlit roofs are a little warmer), the save-system spinner between the start screen and the menu, and the attract movie. The front end is drawn at 720 lines whatever the window's size; on a Retina display that is upscaled.

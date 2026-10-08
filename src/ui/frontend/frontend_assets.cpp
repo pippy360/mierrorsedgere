@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 
 namespace me::fe {
 
@@ -239,77 +241,6 @@ void load_scene_rects(const UPKPackage& pkg, const std::string& scene_name, cons
     }
 }
 
-// --- Matinee ------------------------------------------------------------------------------
-
-CurveMode curve_mode(const std::string& s) {
-    if (s == "CIM_CurveAuto" || s == "CIM_CurveAutoClamped") return CurveMode::CurveAuto;
-    if (s == "CIM_Constant") return CurveMode::Constant;
-    if (s == "CIM_CurveUser") return CurveMode::CurveUser;
-    if (s == "CIM_CurveBreak") return CurveMode::CurveBreak;
-    return CurveMode::Linear;
-}
-
-Vec3 curve_value(const UProperty& p) {
-    if (p.type == "FloatProperty") return Vec3{p.f, 0.0f, 0.0f};
-    return Vec3{p.v[0], p.v[1], p.v[2]};
-}
-
-void read_curve(const UPropertyList& track, const std::string& name, Curve& out) {
-    const UProperty* curve = find_prop(track, name);
-    if (!curve) return;
-    const UProperty* points = find_prop(curve->fields, "Points");
-    if (!points) return;
-    for (const auto& el : points->elements) {
-        CurveKey k;
-        for (const UProperty& f : el) {
-            if (f.name == "InVal") k.t = f.f;
-            else if (f.name == "OutVal") k.v = curve_value(f);
-            else if (f.name == "ArriveTangent") k.arrive = curve_value(f);
-            else if (f.name == "LeaveTangent") k.leave = curve_value(f);
-            else if (f.name == "InterpMode") k.mode = curve_mode(f.s);
-        }
-        out.keys.push_back(k);
-    }
-}
-
-bool load_matinee(const UPKPackage& pkg, const std::string& interp_data, Matinee& out) {
-    const int32_t index = find_export(pkg, interp_data, "InterpData");
-    if (index <= 0) return false;
-    UPropertyList props;
-    parse_export_properties(pkg, index, props);
-    out = Matinee{};
-    out.name = interp_data;
-    out.length = prop_float(props, "InterpLength", 0.0f);
-    const UProperty* groups = find_prop(props, "InterpGroups");
-    if (!groups) return false;
-    for (int32_t g : groups->ints) {
-        if (g <= 0) continue;
-        UPropertyList gp;
-        parse_export_properties(pkg, g, gp);
-        const std::string group_name = prop_name(gp, "GroupName");
-        const UProperty* tracks = find_prop(gp, "InterpTracks");
-        if (!tracks) continue;
-        for (int32_t t : tracks->ints) {
-            if (t <= 0) continue;
-            const std::string cls = object_class_name(pkg, t);
-            UPropertyList tp;
-            parse_export_properties(pkg, t, tp);
-            if (cls == "InterpTrackMove") {
-                read_curve(tp, "PosTrack", group_name == "Camera" ? out.camera : out.target);
-            } else if (cls == "InterpTrackFloatProp" && group_name == "Camera" && prop_name(tp, "PropertyName") == "FOVAngle") {
-                read_curve(tp, "FloatTrack", out.fov);
-            } else if (cls == "InterpTrackEvent") {
-                if (const UProperty* ev = find_prop(tp, "EventTrack")) {
-                    for (const auto& el : ev->elements) {
-                        out.events.emplace_back(prop_float(el, "Time", 0.0f), prop_name(el, "EventName"));
-                    }
-                }
-            }
-        }
-    }
-    return out.valid();
-}
-
 // IniConfig hands back the file's bytes as UTF-8; the fonts are indexed by Latin-1 code.
 std::string to_latin1(const std::string& s) {
     std::string out;
@@ -326,6 +257,27 @@ std::string to_latin1(const std::string& s) {
     size_t start = 0;
     while (start < out.size() && (out[start] == ' ' || out[start] == '"')) ++start;
     return out.substr(start);
+}
+
+// The value of `key` in an ini struct literal: (Key="value",Other="...").
+std::string struct_field(const std::string& text, const std::string& key) {
+    const size_t at = text.find(key + "=");
+    if (at == std::string::npos) return {};
+    size_t start = at + key.size() + 1;
+    if (start < text.size() && text[start] == '"') {
+        const size_t end = text.find('"', start + 1);
+        return end == std::string::npos ? text.substr(start + 1) : text.substr(start + 1, end - start - 1);
+    }
+    const size_t end = text.find_first_of(",)", start);
+    return text.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+// "<Images:TdUIResources_CheckpointImages.Level1a_CP1>" -> "TdUIResources_CheckpointImages.Level1a_CP1".
+std::string image_markup_path(const std::string& markup) {
+    const size_t colon = markup.find(':');
+    const size_t close = markup.rfind('>');
+    if (colon == std::string::npos || close == std::string::npos || close < colon) return {};
+    return markup.substr(colon + 1, close - colon - 1);
 }
 
 }  // namespace
@@ -386,7 +338,9 @@ bool decode_texture_mip(const TextureMip& mip, TexFormat fmt, Image& out) {
 }
 
 float Font::advance(unsigned char c, unsigned char next) const {
-    float a = static_cast<float>(glyphs[c].w + spacing);
+    // Font.Kerning is added after every glyph but a space: the gap between two words of a
+    // Small font is 8 px on a retail frame, the space glyph plus one.
+    float a = static_cast<float>(glyphs[c].w + (c == ' ' ? 0 : spacing));
     if (next != 0) {
         auto it = pairs.find((static_cast<uint32_t>(c) << 16) | next);
         if (it != pairs.end()) a += it->second;
@@ -431,6 +385,43 @@ std::string Assets::text(const std::string& section, const std::string& key) con
     return it == strings_.end() ? std::string() : it->second;
 }
 
+std::string Assets::localized(const std::string& path) const {
+    auto it = localized_.find(to_lower(path));
+    return it == localized_.end() ? std::string() : it->second;
+}
+
+const Font* Assets::font(const std::string& name) {
+    auto it = fonts_.find(name);
+    if (it != fonts_.end()) return it->second.get();
+    std::unique_ptr<Font> f;
+    if (pm_) {
+        if (auto pkg = pm_->load("UI_Fonts_Final")) {
+            auto loaded = std::make_unique<Font>();
+            if (load_font(*pm_, *pkg, name, viewport_height_, *loaded)) f = std::move(loaded);
+        }
+    }
+    if (!f) warnings.push_back("font " + name + " not found in UI_Fonts_Final.upk");
+    return fonts_.emplace(name, std::move(f)).first->second.get();
+}
+
+const Image* Assets::image(const std::string& object_path) {
+    const std::string key = to_lower(object_path);
+    auto it = images_.find(key);
+    if (it != images_.end()) return it->second.get();
+    std::unique_ptr<Image> img;
+    const size_t dot = key.find('.');
+    if (pm_ && dot != std::string::npos) {
+        if (auto pkg = pm_->load(object_path.substr(0, dot))) {
+            int32_t index = pm_->find_export(*pkg, key);
+            if (index <= 0) index = pm_->find_export(*pkg, key.substr(dot + 1));
+            auto loaded = std::make_unique<Image>();
+            if (index > 0 && load_image_export(*pm_, *pkg, index, *loaded)) img = std::move(loaded);
+        }
+    }
+    if (!img) warnings.push_back("texture " + object_path + " could not be read");
+    return images_.emplace(key, std::move(img)).first->second.get();
+}
+
 bool Assets::start_rect(const std::string& widget, Rect& out) const {
     auto it = start_rects_.find(widget);
     if (it == start_rects_.end()) return false;
@@ -452,7 +443,10 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
         error = "no TdGame/CookedPC under " + game_root;
         return false;
     }
-    PackageManager pm(cooked.string());
+    pm_ = std::make_shared<PackageManager>(cooked.string());
+    PackageManager& pm = *pm_;
+    game_root_ = game_root;
+    viewport_height_ = viewport_height;
 
     auto open = [&](const fs::path& rel) -> std::shared_ptr<UPKPackage> {
         const fs::path p = cooked / rel;
@@ -473,6 +467,77 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
         }
     } else {
         warnings.push_back("Localization/INT/TdGameUI.int not found");
+    }
+    // Every string a "<Strings:File.Section.Key>" markup can name.
+    for (const char* file : {"TdGameUI", "TdGame", "TdGameCredits"}) {
+        IniConfig ini;
+        if (!ini.load_file(get_localization_path(game_root, std::string(file) + ".int", "INT"))) continue;
+        for (const std::string& section : ini.get_section_names()) {
+            for (const auto& [key, values] : ini.get_section_keys(section)) {
+                if (!values.empty()) localized_[to_lower(std::string(file) + "." + section + "." + key)] = to_latin1(values.front());
+            }
+        }
+    }
+    // The chapters: every "[<Id> UIDataProvider_TdMaps]" section of DefaultGame.ini, in file order.
+    {
+        std::ifstream game_ini(get_config_path(game_root, "DefaultGame.ini"));
+        std::string line;
+        MapProvider* current = nullptr;
+        const std::string suffix = " UIDataProvider_TdMaps]";
+        while (std::getline(game_ini, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty() && line.front() == '[') {
+                current = nullptr;
+                if (line.size() > suffix.size() && line.compare(line.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                    maps.emplace_back();
+                    current = &maps.back();
+                    current->id = line.substr(1, line.size() - suffix.size() - 1);
+                    const std::string section = "TdGame." + current->id + " UIDataProvider_TdMaps.";
+                    current->name = localized(section + "MapName");
+                }
+                continue;
+            }
+            const size_t eq = line.find('=');
+            if (!current || eq == std::string::npos) continue;
+            std::string key = line.substr(0, eq);
+            if (!key.empty() && key.front() == '+') key.erase(0, 1);
+            const std::string value = line.substr(eq + 1);
+            if (key == "FileName") current->file = value;
+            else if (key == "LevelEvent") current->level_event = value;
+            else if (key == "GameMode") current->game_mode = value;
+            else if (key == "Checkpoints") {
+                MapCheckpoint cp;
+                cp.name = struct_field(value, "CheckpointName");
+                cp.image = image_markup_path(struct_field(value, "CheckpointImageMarkup"));
+                const std::string text = localized("TdGame." + current->id + " UIDataProvider_TdMaps.Checkpoints[" +
+                                                   std::to_string(current->checkpoints.size()) + "]");
+                cp.friendly = struct_field(text, "CheckpointFriendlyName");
+                cp.description = struct_field(text, "CheckpointDescription");
+                current->checkpoints.push_back(std::move(cp));
+            }
+        }
+    }
+    // The string lists: tags in DefaultGame.ini, strings at the same index in TdGame.int.
+    {
+        IniConfig game_ini;
+        if (game_ini.load_file(get_config_path(game_root, "DefaultGame.ini"))) {
+            const std::vector<std::string> entries = game_ini.get_array("TdGame.UIDataStore_TdStringList", "StringData");
+            for (size_t k = 0; k < entries.size(); ++k) {
+                StringListData list;
+                list.tag = struct_field(entries[k], "Tag");
+                list.default_index = std::atoi(struct_field(entries[k], "DefaultValueIndex").c_str());
+                const std::string text = localized("TdGame.UIDataStore_TdStringList.StringData[" + std::to_string(k) + "]");
+                size_t at = text.find("Strings=(");
+                while (at != std::string::npos) {
+                    const size_t open = text.find('"', at);
+                    const size_t close = open == std::string::npos ? std::string::npos : text.find('"', open + 1);
+                    if (close == std::string::npos) break;
+                    list.strings.push_back(text.substr(open + 1, close - open - 1));
+                    at = close + 1;
+                }
+                string_lists.push_back(std::move(list));
+            }
+        }
     }
     IniConfig ui_ini;
     if (ui_ini.load_file(get_config_path(game_root, "DefaultUI.ini"))) {
@@ -545,14 +610,7 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
         warnings.push_back("Maps/Menu/TdMainMenu.me1 not found: no background");
         return true;
     }
-    // Which InterpData each Kismet branch plays (docs/MAIN_MENU_SYSTEM_RE.md, section 6).
-    static const char* const kIntro[4] = {"InterpData_21", "InterpData_36", "InterpData_32", "InterpData_33"};
-    static const char* const kLoop[4] = {"InterpData_18", "InterpData_23", "InterpData_27", "InterpData_57"};
-    if (!load_matinee(*menu_map, "InterpData_17", opening)) warnings.push_back("opening Matinee InterpData_17 not found");
-    for (int i = 0; i < 4; ++i) {
-        if (!load_matinee(*menu_map, kIntro[i], intro[static_cast<size_t>(i)])) warnings.push_back(std::string(kIntro[i]) + " not found");
-        if (!load_matinee(*menu_map, kLoop[i], loop[static_cast<size_t>(i)])) warnings.push_back(std::string(kLoop[i]) + " not found");
-    }
+    kismet.load(*menu_map, warnings);
     load_city(pm, menu_map, city, warnings);
     return true;
 }

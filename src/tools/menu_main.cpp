@@ -89,10 +89,12 @@ void dump_assets(const std::string& dir, const me::fe::Assets& a) {
                   << f->pairs.size() << "\n";
         for (size_t p = 0; p < f->pages.size(); ++p) dump_image(dir, f->name + "_page" + std::to_string(p), f->pages[p]);
     }
-    for (const me::fe::Matinee* m : {&a.opening, &a.intro[0], &a.loop[0], &a.intro[1], &a.loop[1], &a.intro[2], &a.loop[2],
-                                     &a.intro[3], &a.loop[3]}) {
-        std::cout << m->name << ": " << m->length << " s, camera keys " << m->camera.keys.size() << ", target keys "
-                  << m->target.keys.size() << ", fov keys " << m->fov.keys.size() << ", events " << m->events.size() << "\n";
+    std::cout << a.kismet.nodes.size() << " Kismet objects, " << a.kismet.matinees.size() << " Matinees, " << a.kismet.actors.size()
+              << " camera and target actors\n";
+    for (const me::fe::MatineeData& m : a.kismet.matinees) {
+        std::cout << "  " << m.name << ": " << m.length << " s, groups";
+        for (const me::fe::MatineeGroup& g : m.groups) std::cout << " " << (g.name.empty() ? "(director)" : g.name);
+        std::cout << ", events " << m.events.size() << "\n";
     }
     size_t tris = 0;
     static const char* const kMaterial[] = {"buildings", "base", "water", "waves", "sky"};
@@ -152,6 +154,14 @@ int main(int argc, char** argv) {
             profile.all_levels_unlocked = true;
         } else if (a == "--controller") {
             profile.controller = true;
+        } else if (a == "--chapters") {
+            // --chapters <n>: the first n entries of the PLAY CHAPTER list are unlocked (1 = the Training Area only)
+            const int n = std::atoi(next().c_str());
+            profile.unlocked_levels = n >= 32 ? 0xFFFFFFFFu : ((1u << (n < 0 ? 0 : n)) - 1u);
+        } else if (a == "--hard") {
+            profile.hard_unlocked = true;
+        } else if (a == "--player") {
+            profile.player_name = next();
         } else if (a == "--size") {
             const std::string s = next();
             const size_t x = s.find('x');
@@ -161,7 +171,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--help" || a == "-h") {
             std::cout << "me_menu --game-root <install> --out <dir> [--size 1280x720] [--no-background] [--no-ui]\n"
-                         "        [--no-save] [--all-levels] [--controller]   what the save file would unlock\n"
+                         "        [--no-save] [--all-levels] [--controller] [--chapters <n>] [--hard] [--player <name>]\n"
+                         "                                              what the profile and the save file would unlock\n"
                          "        [--dump-assets <dir>] [--script-file <file>] --script \"wait 5; shot start.png; key any; wait 4; shot menu.png\"\n";
             return 0;
         } else {
@@ -221,7 +232,62 @@ int main(int argc, char** argv) {
             fe.update(dt);
         } else if (verb == "state") {
             std::cout << (fe.screen() == me::fe::Screen::Start ? "start" : "menu") << " column " << fe.panel() << " focus "
-                      << fe.focused_button() << (fe.animating() ? " (animating)" : "") << "\n";
+                      << fe.focused_button() << (fe.animating() ? " (animating)" : "");
+            if (!fe.scene_name().empty()) std::cout << " scene " << fe.scene_name() << " focus " << fe.scene_focus();
+            std::cout << "\n";
+        } else if (verb == "set") {
+            // set <setting> <value>: a profile setting, before its screen is opened ("set Brightness 10")
+            std::string name;
+            int value = 0;
+            cs >> name >> value;
+            if (me::fe::ProfileSetting* s = fe.settings().find(name)) s->value = value;
+            else std::cout << "set: no profile setting " << name << "\n";
+        } else if (verb == "list") {
+            // list <tag> <a,b,c> <index>: a PC string list, as the host would report it ("list Antialiasing OFF,2X,4X 1")
+            std::string tag, values;
+            int index = 0;
+            cs >> tag >> values >> index;
+            me::fe::StringList& list = fe.string_list(tag);
+            list.values.clear();
+            std::stringstream vs(values);
+            std::string v;
+            while (std::getline(vs, v, ',')) list.values.push_back(v);
+            list.index = index;
+        } else if (verb == "texture") {
+            // texture <object path> <name>: a Texture2D of the retail packages as <name>.png and its alpha as <name>_a.png
+            std::string path, name;
+            cs >> path >> name;
+            const me::fe::Image* img = fe.image(path);
+            if (!img || !img->valid()) {
+                std::cout << "texture " << path << ": not found\n";
+            } else {
+                std::vector<uint8_t> alpha(img->px.size());
+                for (size_t i = 0; i < img->px.size(); i += 4) {
+                    alpha[i] = alpha[i + 1] = alpha[i + 2] = img->px[i + 3];
+                    alpha[i + 3] = 255;
+                }
+                me::fe::write_png(out_dir + "/" + name + ".png", img->w, img->h, img->px.data());
+                me::fe::write_png(out_dir + "/" + name + "_a.png", img->w, img->h, alpha.data());
+                std::cout << "texture " << path << ": " << img->w << "x" << img->h << "\n";
+            }
+        } else if (verb == "rects") {
+            // The open scene's widgets with their resolved rectangles (scene pixels) and text.
+            if (const me::fe::UiScene* scene = fe.scene()) {
+                for (const me::fe::UiWidget& w : scene->widgets) {
+                    if (w.cls == "TdUIButtonBarButton") continue;
+                    std::printf("%-28s %-18s %7.1f %7.1f %7.1f %7.1f%s %s\n", w.name.c_str(), w.cls.c_str(), w.rect.l, w.rect.t, w.rect.r, w.rect.b,
+                                w.hidden ? " hidden" : "", w.text.substr(0, 40).c_str());
+                }
+            }
+        } else if (verb == "event") {
+            // event <name>: fire a level event as a UI scene would ("VideoButton_Clicked", "LoadLevel_Edge")
+            std::string name;
+            cs >> name;
+            fe.level_event(name);
+            fe.update(dt);
+        } else if (verb == "kismet") {
+            // The Matinees playing now, in the order they are updated (the last one moves the camera last).
+            std::cout << "kismet: " << fe.kismet().playing() << "\n";
         } else if (verb == "bench") {
             // bench <frames>: run and render that many frames, print the average time of one
             int frames = 60;

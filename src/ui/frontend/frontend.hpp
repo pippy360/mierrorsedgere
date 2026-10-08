@@ -10,34 +10,23 @@
 // docs/MAIN_MENU_SYSTEM_RE.md is the description of what retail does.
 // -----------------------------------------------------------------------------
 
+#include "frame.hpp"
 #include "frontend_assets.hpp"
+#include "kismet.hpp"
+#include "ui_scene.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace me::fe {
 
-// The display gamma the game encodes the frame with, measured on retail frames. The start screen
-// is drawn with the DisplayGamma of TdEngine.ini, 2.2. Taking a key there loads the profile, and
-// TdPlayerController.SetVideoProfileSettings then calls SetGamma(Brightness / 10): from the main
-// menu on, a default profile gives 2.73.
-constexpr float kStartGamma = 2.2f;
-constexpr float kProfileGamma = 2.73f;
-
-// What the canvas does to a linear colour on its way to the back buffer: pow(c, 1 / gamma), with
-// a floor under it. "Black" canvas pixels are (2, 2, 2) on the start screen and (9, 9, 9) on the
-// main menu; the floor is taken between those two measurements. Materials drawn in the UI (the
-// columns) do not go through this.
-inline float canvas_encode(float linear, float gamma) {
-    const float c = linear < 0.0f ? 0.0f : (linear > 1.0f ? 1.0f : linear);
-    const float t = (gamma - kStartGamma) / (kProfileGamma - kStartGamma);
-    const float floor_out = (2.0f + (9.0f - 2.0f) * (t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t))) / 255.0f;
-    const float out = std::pow(c, 1.0f / gamma);
-    return out < floor_out ? floor_out : out;
-}
+class SubMenu;
 
 enum class Screen : uint8_t { Start, MainMenu };
 enum class Key : uint8_t { Other, Left, Right, Up, Down, Accept, Escape };
@@ -45,60 +34,27 @@ enum class Key : uint8_t { Other, Left, Right, Up, Down, Accept, Escape };
 // The four columns, ETdMainMenuPanel.
 enum Panel : int { kStory = 0, kTimeTrial = 1, kOptions = 2, kExtras = 3, kPanelCount = 4 };
 
-// The scalar parameters TdMenuPostProcesWrapper sets on one M_MainMenuStick_01 instance.
-struct StickParams {
-    float width = 0.02f;         // StickWidth
-    float select_top = 0.0f;     // SelectTop, fraction of the screen height
-    float select_bottom = 0.0f;  // SelectBottom
-    float select_opacity = 0.0f; // SelectOpacity
-    float move_offset = 0.0f;    // MovementOffset
-    float move_amount = 1.0f;    // MovementAmount
-    float left_offset = 0.0f;    // LeftSideOffset
-    float right_offset = 0.0f;   // RightSideOffset
-};
-
-struct Quad {
-    float x0, y0, x1, y1;  // viewport pixels
-    float u0, v0, u1, v1;  // 0..1 across the image
-};
-
-struct DrawOp {
-    enum class Kind : uint8_t {
-        Image,   // quads of `image` through the canvas (sRGB texel -> linear -> canvas_encode), times `color`
-        Glyphs,  // quads of a font page: `color` with the page's alpha as coverage
-        Stick,   // M_MainMenuStick_01 over `rect` with `stick`
-    };
-    Kind kind = Kind::Image;
-    const Image* image = nullptr;
-    float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // display space, straight alpha
-    std::vector<Quad> quads;
-    Rect rect;
-    StickParams stick;
-};
-
-// Everything a renderer needs for one frame.
-struct Frame {
-    int width = 1280;
-    int height = 720;
-    double time = 0.0;  // seconds the front end has run: the stick material's Time
-    Vec3 camera{0.0f, 0.0f, 0.0f};
-    Vec3 target{0.0f, 1.0f, 0.0f};
-    float fov = 90.0f;   // horizontal, degrees (CameraActor.FOVAngle)
-    float white = 0.0f;  // SeqAct_TdFadeEffect: 0 = clear, 1 = white
-    float display_gamma = kStartGamma;  // what the scene and the canvas are encoded with this frame
-    std::vector<DrawOp> ui;
-};
-
 // What the save file would tell TdUIScene_MainMenu.InitializeWidgetsData.
 struct Profile {
     bool can_continue = true;         // CONTINUE GAME
     bool chapters_unlocked = true;    // PLAY CHAPTER
     bool all_levels_unlocked = false; // SPEED RUN
     bool controller = false;          // GAMEPAD SETUP, and "Accept" in the button bar
+    uint32_t unlocked_levels = 0x7FF; // PLAY CHAPTER's list: bit i is Assets::maps[i]
+    bool hard_unlocked = false;       // the story was finished: HARD is offered
+    std::string player_name = "Player";
+};
+
+// One list of UIDataStore_TdStringList: what "<TdStringList:VSync>" binds an option button to.
+struct StringList {
+    std::vector<std::string> values;
+    int index = 0;
 };
 
 class Frontend {
 public:
+    Frontend();
+    ~Frontend();
     bool init(const std::string& game_root, int width, int height, std::string& error);
 
     void set_profile(const Profile& p) { profile_ = p; }
@@ -111,6 +67,9 @@ public:
     void mouse_move(float x, float y);
     void mouse_click(float x, float y);
 
+    // TdUIScene.ActivateLevelEvent: the level's Kismet does the rest (the camera, the fades).
+    void level_event(const std::string& name) { kismet_.fire_event(name); }
+
     // Jumps straight to the main menu, as if a key had been released on the start screen.
     void open_main_menu();
 
@@ -121,15 +80,41 @@ public:
     // The focused sub-button's widget name ("LoadGameButton"), or "" while a column is opening.
     [[nodiscard]] std::string focused_button() const;
     [[nodiscard]] bool animating() const { return animating_; }
+    // The scene open on top of the main menu ("TdGameSettings", "TdMessageBox"), or "" if none, and its focused widget.
+    [[nodiscard]] std::string scene_name() const;
+    [[nodiscard]] std::string scene_focus() const;
+    [[nodiscard]] const UiScene* scene() const;
+    // The profile's settings (TdProfileSettings) and the PC string lists (resolution, texture detail, ...).
+    [[nodiscard]] ProfileSettings& settings() { return settings_; }
+    [[nodiscard]] StringList& string_list(const std::string& tag) { return string_lists_[tag]; }
     [[nodiscard]] const Assets& assets() const { return assets_; }
+    // Where a map of the chapter list is, relative to CookedPC ("edge_p" -> "Maps/SP01/Edge_p.me1"); "" if it is not installed.
+    [[nodiscard]] std::string map_path(const std::string& file) const;
+    // A Texture2D of the retail packages by object path, read on first use (Assets::image).
+    const Image* image(const std::string& object_path) { return assets_.image(object_path); }
+    [[nodiscard]] const KismetRunner& kismet() const { return kismet_; }
 
     // UI sound cue names played since the last call ("TabChangeRight", "NavigateDown", "Accept"),
     // and "Music" once when the menu music should start.
     std::vector<std::string> take_sounds();
-    // The sub-button chosen since the last call ("NewGameButton", ...), "Quit" or "Friends"; "" if none.
+    // What the host should do, since the last call; "" if nothing:
+    //   "Continue"                      CONTINUE GAME
+    //   "NewGame"                       a new game at the difficulty now in settings()
+    //   "StartLevel <map> [checkpoint]" PLAY CHAPTER ("StartLevel edge_p After_Intro")
+    //   "TimeTrial <stretch>"           START RACE
+    //   "ApplySettings"                 an options screen was saved
+    //   "Quit"
     std::string take_action();
 
 private:
+    friend class SubMenu;
+    // Scenes on top of the main menu. The last one is drawn and takes the input.
+    void open_scene(std::unique_ptr<SubMenu> menu);
+    void close_scene(SubMenu* menu, const std::function<void()>& then);
+    void button_clicked(const std::string& widget);  // TdUIScene_MainMenu.HandleButtonClicked
+    void quit_clicked();                             // OnQuitGame
+    void online_check(const std::string& offline_scene);  // TdUIScene_MainMenu's LoginHandler
+
     struct Button {
         std::string widget;       // "LoadGameButton"
         std::string caption;
@@ -153,8 +138,6 @@ private:
     void build_panels();
     void set_active_panel(int index, bool silent);
     void panel_anim_finished(int index);
-    void play_camera(const Matinee* first, const Matinee* then);
-    void update_camera(float dt);
     void sound(const char* cue) { sounds_.emplace_back(cue); }
     int button_at(float x, float y) const;
 
@@ -169,6 +152,11 @@ private:
     [[nodiscard]] Rect to_view(const Rect& scene) const;
 
     Assets assets_;
+    UiSystem ui_;
+    ProfileSettings settings_;
+    std::unordered_map<std::string, StringList> string_lists_;
+    std::vector<std::unique_ptr<SubMenu>> scenes_;
+    std::vector<std::unique_ptr<SubMenu>> closed_;  // closed during this update; destroyed at its end
     Profile profile_;
     Frame frame_;
     int width_ = 1280;
@@ -179,15 +167,8 @@ private:
     Screen screen_ = Screen::Start;
     double time_ = 0.0;
     float time_in_scene_ = 0.0f;  // TdUIScene_Start.TimeElapsedInScene
-    bool music_started_ = false;
 
-    // Camera: the Matinee playing now and the one that follows it (a column's intro, then its loop).
-    const Matinee* matinee_ = nullptr;
-    const Matinee* next_matinee_ = nullptr;
-    float matinee_time_ = 0.0f;
-    bool matinee_loops_ = false;
-    float white_ = 1.0f;       // current SeqAct_TdFadeEffect level
-    float white_rate_ = 0.0f;  // per second; negative fades in
+    KismetRunner kismet_;  // the menu level's Kismet: the camera, the fades
 
     std::array<PanelState, kPanelCount> panels_{};
     int current_panel_ = -1;
