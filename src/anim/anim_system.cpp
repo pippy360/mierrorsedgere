@@ -1480,6 +1480,11 @@ struct AnimSystem::FirstPerson {
     EMovement last_move = EMovement::MOVE_None;
     fp::PawnFrame last_frame;
     uint32_t move_anim_serial = 0;
+    // Mesh1p.AnimSets with the weapon in hand: [2] the weapon's own set, [1] the common armed set
+    // of its kind, [0] the unarmed set; searched in that order.
+    std::string weapon_name;
+    const AnimSetAsset* weapon_set = nullptr;
+    const AnimSetAsset* common_set = nullptr;
 };
 
 // Runs the first-person tree up to this frame and says what of it to use.
@@ -1491,12 +1496,50 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
     if (!fp.tried) {
         fp.tried = true;
         std::string error;
-        const AnimSetAsset* set = &faith_unarmed_set_;
-        fp.ok = fp.director.init(game_root_, [set](const std::string& name) { return set->find_sequence(name); }, error);
+        const AnimSetAsset* unarmed = &faith_unarmed_set_;
+        FirstPerson* state = &fp;
+        // TdPawn.UpdateAnimSets: a sequence is looked for in the weapon's set, then the common armed
+        // set, then the unarmed one.
+        auto lookup = [unarmed, state](const std::string& name, const AnimSetAsset** set) -> const AnimSequenceAsset* {
+            for (const AnimSetAsset* s : {state->weapon_set, state->common_set, unarmed}) {
+                if (!s) continue;
+                if (const AnimSequenceAsset* seq = s->find_sequence(name)) {
+                    if (set) *set = s;
+                    return seq;
+                }
+            }
+            return nullptr;
+        };
+        fp.ok = fp.director.init(game_root_, lookup, error);
         if (fp.ok) fp.poser.init(faith_upper_, faith_unarmed_set_, fp.director.tree());
         else std::cerr << "[anim] first-person tree: " << error << "\n";
     }
     if (!fp.ok) return use;
+
+    // The weapon in hand changes the AnimSets and the grip (TdPawn.SetArmed / SetUnarmed).
+    const bool armed_now = telemetry.weapon.equipped;
+    const std::string weapon_now = armed_now ? telemetry.weapon.name : std::string();
+    if (weapon_now != fp.weapon_name) {
+        fp.weapon_name = weapon_now;
+        fp.weapon_set = fp.common_set = nullptr;
+        std::vector<int> grip;
+        if (armed_now) {
+            const bool heavy = telemetry.weapon.is_heavy || is_heavy_weapon_name(weapon_now);
+            auto own = faith_weapon_sets_.find(weapon_now);
+            if (own != faith_weapon_sets_.end()) fp.weapon_set = &own->second;
+            fp.common_set = (heavy && !faith_2h_common_set_.sequences.empty()) ? &faith_2h_common_set_ : &faith_common_set_;
+            // Its pose profile: "OneHanded-<weapon>" or "TwoHanded-<weapon>".
+            std::string want = to_lower_str(weapon_now);
+            for (const auto& profile : fp.director.tree().weapon_pose_profiles()) {
+                std::string name = to_lower_str(profile.first);
+                const size_t dash = name.find('-');
+                if (dash != std::string::npos) name = name.substr(dash + 1);
+                if (!name.empty() && want.compare(0, name.size(), name) == 0) grip = profile.second;
+            }
+        }
+        fp.director.tree().invalidate_sequences();
+        fp.poser.set_weapon_pose(fp.weapon_set, fp.common_set, grip);
+    }
 
     float dt = telemetry.sim_time - fp.last_time;
     const bool restart = fp.last_time < 0.0f || dt < 0.0f || dt > 0.5f;
@@ -1514,6 +1557,9 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.view_yaw_deg = telemetry.yaw_deg;
         frame.view_pitch_deg = telemetry.pitch_deg;
         frame.accelerating = telemetry.move_input;
+        frame.armed = armed_now;
+        frame.heavy_weapon = armed_now && (telemetry.weapon.is_heavy || is_heavy_weapon_name(telemetry.weapon.name));
+        frame.fired = armed_now && telemetry.weapon.fired_this_tick;
         frame.ground_distance = telemetry.ground_distance;
         frame.long_jump_over_gap = telemetry.jump_over_gap;
         frame.move_left = telemetry.move_left;
@@ -1542,7 +1588,12 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         }
         fp.director.tick(frame);
         fp.last_frame = frame;
-        fp.poser.evaluate(fp.director.tree(), fp.pose);
+        // At the ready the weapon arm follows the view (TdSkelControlAim1p), both arms with a two-handed weapon.
+        fp::PoseEvaluator::Aim aim;
+        aim.pitch_deg = telemetry.pitch_deg;
+        aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready();
+        aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready();
+        fp.poser.evaluate(fp.director.tree(), fp.pose, aim);
         fp.poser.component_space(fp.pose, fp.comp_pos, fp.comp_rot);
         float look = telemetry.yaw_deg - telemetry.body_yaw_deg;
         while (look > 180.0f) look -= 360.0f;
@@ -1556,11 +1607,11 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
     // A level intro and the death fall carry their own camera and body.
     if (fp.pose.pos.empty() || telemetry.intro_active || telemetry.falling_to_death) return use;
     use.camera = true;
-    // With a weapon in hand, or snatching one, the arms are still posed by hand (evaluate_faith_1p);
-    // the legs and the eye are the tree's.
-    const bool armed = telemetry.weapon.equipped || telemetry.move_state == EMovement::MOVE_Snatch;
-    use.body = !armed;
-    use.legs = armed;
+    // Snatching a weapon the arms are still posed by hand (evaluate_faith_1p); the legs and the eye
+    // are the tree's.
+    const bool by_hand = telemetry.move_state == EMovement::MOVE_Snatch;
+    use.body = !by_hand;
+    use.legs = by_hand;
     return use;
 }
 

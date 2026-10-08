@@ -199,6 +199,7 @@ void Director::reset() {
     was_accelerating_ = false;
     airborne_ = false;
     fall_top_ = 0.0f;
+    was_armed_ = false;
     climb_left_hand_ = false;
     climb_step_time_ = -1.0f;
     grab_turn_ = 0;
@@ -211,6 +212,43 @@ void Director::reset() {
     root_timer_ = -1.0f;
     swing_strength_ = swing_target_ = 0.0f;
     swing_blend_ = 0.0f;
+}
+
+// The weapon in hand: TdPawn.SetArmed / PlayWeaponDeploy, PlayFireAnimation, UpdateWeaponAnimState.
+// Taken up or fired it is at the ready (the weapon arm on the ready stances); a light one is let
+// down again (relaxed: the arm goes with the run, in the armed sets' versions of it) once 5 s have
+// passed and she has moved 1000 uu.
+void Director::tick_weapon(const PawnFrame& frame) {
+    if (!frame.armed) {
+        was_armed_ = false;
+        pawn_.weapon_state = 0;
+        pawn_.armed_right = pawn_.armed_left = 0.0f;
+        return;
+    }
+    const bool light = !frame.heavy_weapon;
+    auto make_ready = [&]() {
+        pawn_.weapon_state = 2;
+        ready_for_ = 0.0f;
+        amount_til_unarmed_ = light ? 1000.0f : 0.0f;
+    };
+    if (!was_armed_) {
+        was_armed_ = true;
+        tree_.play_custom_anim(Slot::CannedUpperBody, "unholster", 1.0f, 0.0f, 0.2f, false, true);
+        make_ready();
+    }
+    if (frame.fired) {
+        // PlayCustomAnim(CNT_Weapon, 'standfire', 1.0, 0.1, 0.0). (The script gives no blend out and
+        // marks the node as a firing animation for native code to clear; here it goes back to the
+        // ready stance over 0.2 s as it ends.)
+        tree_.stop_custom_anim(Slot::Weapon, 0.0f);
+        tree_.play_custom_anim(Slot::Weapon, "standfire", 1.0f, 0.1f, 0.2f, false, true);
+        make_ready();
+    }
+    ready_for_ += frame.dt;
+    amount_til_unarmed_ -= frame.velocity.length() * frame.dt;
+    if (pawn_.weapon_state == 2 && amount_til_unarmed_ <= 0.0f && ready_for_ > (light ? 5.0f : 1.0f) && light) pawn_.weapon_state = 1;
+    pawn_.armed_right = 1.0f;
+    pawn_.armed_left = light ? 0.0f : 1.0f;
 }
 
 void Director::set_root_offset(const Vec3& offset, float blend_time) {
@@ -817,6 +855,7 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.hanging_free = frame.hanging_free;
     pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
+    tick_weapon(frame);
     tree_.tick(pawn_, frame.dt);
     last_velocity_ = frame.velocity;
 }

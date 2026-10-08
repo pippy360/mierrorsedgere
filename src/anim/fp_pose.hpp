@@ -12,6 +12,7 @@
 #include "anim_system.hpp"
 #include "fp_anim.hpp"
 
+#include <unordered_map>
 #include <vector>
 
 namespace me::fp {
@@ -39,8 +40,21 @@ public:
     void init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set, const AnimTree& tree);
     [[nodiscard]] bool ready() const { return mesh_ != nullptr; }
 
+    // The weapon in hand (TdPawn.UpdateWeaponPoseProfile): the bones of its pose profile take what
+    // its own `weaponpose` differs by from the common set's, so one set of armed animations grips
+    // every weapon. Null sets clear it.
+    void set_weapon_pose(const AnimSetAsset* weapon_set, const AnimSetAsset* common_set, const std::vector<int>& bones);
+
+    // TdSkelControlAim1p on SpineXRight / SpineXLeft: how far each arm is turned with the view's pitch.
+    struct Aim {
+        float pitch_deg = 0.0f;
+        float right = 0.0f;
+        float left = 0.0f;
+    };
+
     // The tree's pose this frame.
-    void evaluate(const AnimTree& tree, Pose& out) const;
+    void evaluate(const AnimTree& tree, Pose& out, const Aim& aim) const;
+    void evaluate(const AnimTree& tree, Pose& out) const { evaluate(tree, out, Aim{}); }
     // Every bone in the mesh component's space.
     void component_space(const Pose& pose, std::vector<Vec3>& pos, std::vector<Quat4>& rot) const;
 
@@ -58,8 +72,17 @@ private:
     void reference(Pose& out) const;
     void apply_aim(const TreeNode& n, size_t node_index, Pose& out) const;
 
+    const std::vector<int>& tracks(const AnimSetAsset* set) const;
+    void turn_arm(int bone, float degrees, Pose& out) const;
+
     const SkeletalMeshAsset* mesh_ = nullptr;
-    std::vector<int> track_of_;               // the AnimSet track of each bone, -1 for none
+    const AnimSetAsset* base_set_ = nullptr;
+    // The AnimSet track of each bone (-1 for none), per set: the armed sets order their tracks differently.
+    mutable std::unordered_map<const AnimSetAsset*, std::vector<int>> tracks_;
+    std::vector<int> pose_bones_;             // the weapon pose profile's bones, with what each is turned and moved by
+    std::vector<Quat4> pose_rot_;
+    std::vector<Vec3> pose_pos_;
+    int spine_right_ = -1, spine_left_ = -1;
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;
     int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn

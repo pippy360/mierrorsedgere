@@ -83,7 +83,11 @@ int main(int argc, char** argv) {
     }
     me::fp::Director director;
     std::string error;
-    if (!director.init(game_root, [&](const std::string& name) { return unarmed.find_sequence(name); }, error)) {
+    auto lookup = [&](const std::string& name, const me::AnimSetAsset** set) {
+        if (set) *set = &unarmed;
+        return unarmed.find_sequence(name);
+    };
+    if (!director.init(game_root, lookup, error)) {
         std::cerr << "me_anim: " << error << "\n";
         return 1;
     }

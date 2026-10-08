@@ -54,15 +54,29 @@ void aim_offset(const TreeNode::AimBone& a, float x, float y, Quat4& rot, Vec3& 
 
 }  // namespace
 
+const std::vector<int>& PoseEvaluator::tracks(const AnimSetAsset* set) const {
+    auto it = tracks_.find(set);
+    if (it != tracks_.end()) return it->second;
+    std::vector<int>& out = tracks_[set];
+    out.assign(mesh_->bones.size(), -1);
+    for (size_t b = 0; b < mesh_->bones.size(); ++b) {
+        const std::string key = mesh_->bones[b].name_lower.empty() ? lower(mesh_->bones[b].name) : mesh_->bones[b].name_lower;
+        auto track = set->bone_to_track.find(key);
+        if (track != set->bone_to_track.end()) out[b] = track->second;
+    }
+    return out;
+}
+
 void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set, const AnimTree& tree) {
     mesh_ = &mesh;
+    base_set_ = &set;
+    tracks_.clear();
     const size_t bones = mesh.bones.size();
-    track_of_.assign(bones, -1);
     for (size_t b = 0; b < bones; ++b) {
-        const std::string key = mesh.bones[b].name_lower.empty() ? lower(mesh.bones[b].name) : mesh.bones[b].name_lower;
-        auto it = set.bone_to_track.find(key);
-        if (it != set.bone_to_track.end()) track_of_[b] = it->second;
+        const std::string key = lower(mesh.bones[b].name);
         if (key == "eyejoint") eye_ = camera_ = static_cast<int>(b);
+        if (key == "spinexright") spine_right_ = static_cast<int>(b);
+        if (key == "spinexleft") spine_left_ = static_cast<int>(b);
     }
     for (size_t b = 0; b < bones; ++b) {
         if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
@@ -89,6 +103,49 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
     right_ = ref.rotate(Vec3(-1.0f, 0.0f, 0.0f));
 }
 
+void PoseEvaluator::set_weapon_pose(const AnimSetAsset* weapon_set, const AnimSetAsset* common_set, const std::vector<int>& bones) {
+    pose_bones_.clear();
+    pose_rot_.clear();
+    pose_pos_.clear();
+    if (!mesh_ || !weapon_set || !common_set) return;
+    const AnimSequenceAsset* own = weapon_set->find_sequence("weaponpose");
+    const AnimSequenceAsset* common = common_set->find_sequence("weaponpose");
+    if (!own || !common) return;
+    const std::vector<int>& own_tracks = tracks(weapon_set);
+    const std::vector<int>& common_tracks = tracks(common_set);
+    for (int bone : bones) {
+        if (bone < 0 || static_cast<size_t>(bone) >= mesh_->bones.size()) continue;
+        const int to = own_tracks[static_cast<size_t>(bone)], tc = common_tracks[static_cast<size_t>(bone)];
+        if (to < 0 || tc < 0 || static_cast<size_t>(to) >= own->tracks.size() || static_cast<size_t>(tc) >= common->tracks.size()) continue;
+        const AnimTrack& a = own->tracks[static_cast<size_t>(to)];
+        const AnimTrack& c = common->tracks[static_cast<size_t>(tc)];
+        if (a.rotations.empty() || c.rotations.empty() || a.positions.empty() || c.positions.empty()) continue;
+        // own = offset o common, in the parent bone's space.
+        const Quat4 rot = Quat4::multiply(a.rotations[0], c.rotations[0].conjugate()).normalized();
+        pose_bones_.push_back(bone);
+        pose_rot_.push_back(rot);
+        pose_pos_.push_back(a.positions[0] - rot.rotate(c.positions[0]));
+    }
+}
+
+// The arm from `bone` out is turned about that bone by `degrees` of pitch, in the mesh's space.
+void PoseEvaluator::turn_arm(int bone, float degrees, Pose& out) const {
+    if (bone < 0 || degrees == 0.0f) return;
+    Quat4 parent;  // the parent's rotation in the mesh's space
+    std::vector<int> chain;
+    for (int b = mesh_->bones[static_cast<size_t>(bone)].parent_index; b >= 0; b = (b == 0 ? -1 : mesh_->bones[static_cast<size_t>(b)].parent_index)) {
+        chain.push_back(b);
+        if (b == 0) break;
+    }
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) parent = Quat4::multiply(parent, out.rot[static_cast<size_t>(*it)]).normalized();
+    // About the pawn's side axis, forward towards up.
+    const Vec3 axis = fwd_.cross(up_).normalized();
+    const float half = degrees * DEG2RAD * 0.5f;
+    const Quat4 turn(axis.x * std::sin(half), axis.y * std::sin(half), axis.z * std::sin(half), std::cos(half));
+    const size_t i = static_cast<size_t>(bone);
+    out.rot[i] = Quat4::multiply(parent.conjugate(), Quat4::multiply(turn, Quat4::multiply(parent, out.rot[i]))).normalized();
+}
+
 void PoseEvaluator::reference(Pose& out) const {
     const size_t bones = mesh_->bones.size();
     out.pos.resize(bones);
@@ -104,8 +161,9 @@ void PoseEvaluator::sample(const TreeNode& n, Pose& out) const {
     const AnimSequenceAsset* seq = n.seq;
     if (!seq || seq->length <= 0.0f) return;
     const float u = std::clamp(n.time / seq->length, 0.0f, 1.0f);
+    const std::vector<int>& track_of = tracks(n.seq_set ? n.seq_set : base_set_);
     for (size_t b = 0; b < out.pos.size(); ++b) {
-        const int track = track_of_[b];
+        const int track = track_of[b];
         if (track < 0 || static_cast<size_t>(track) >= seq->tracks.size()) continue;
         const AnimTrack& tr = seq->tracks[static_cast<size_t>(track)];
         if (!tr.positions.empty()) {
@@ -211,15 +269,26 @@ void PoseEvaluator::atoms(const AnimTree& tree, int index, Pose& out, size_t dep
         for (Quat4& q : out.rot) q = q.normalized();
     }
     apply_aim(n, static_cast<size_t>(index), out);
+    // TdAnimNodeWeaponPoseOffset: the grip of the weapon in hand.
+    if (!pose_bones_.empty() && n.cls == "TdAnimNodeWeaponPoseOffset") {
+        for (size_t k = 0; k < pose_bones_.size(); ++k) {
+            const size_t b = static_cast<size_t>(pose_bones_[k]);
+            out.rot[b] = Quat4::multiply(pose_rot_[k], out.rot[b]).normalized();
+            out.pos[b] = pose_rot_[k].rotate(out.pos[b]) + pose_pos_[k];
+        }
+    }
 }
 
-void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out) const {
+void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) const {
     if (!mesh_) return;
     int root = -1;
     for (size_t i = 0; i < tree.nodes().size(); ++i) {
         if (tree.nodes()[i].cls == "AnimTree") root = static_cast<int>(i);
     }
     atoms(tree, root, out, 0);
+    // The aim controls: the weapon arm (both, with a two-handed weapon) follows the view's pitch.
+    turn_arm(spine_right_, aim.pitch_deg * aim.right, out);
+    turn_arm(spine_left_, aim.pitch_deg * aim.left, out);
 }
 
 void PoseEvaluator::component_space(const Pose& pose, std::vector<Vec3>& pos, std::vector<Quat4>& rot) const {

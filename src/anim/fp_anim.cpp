@@ -55,6 +55,7 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
     nodes_.clear();
     order_.clear();
     walk_group_.clear();
+    weapon_pose_profiles_.clear();
     root_ = -1;
     walk_synch_ = -1;
     std::fill(std::begin(slots_), std::end(slots_), -1);
@@ -128,6 +129,15 @@ bool AnimTree::load(const std::string& game_root, std::string& error) {
         n.child2_weight = prop_float(props, "Child2Weight", 0.0f);
         n.bone_weight = float_array(find_prop(props, "Child2PerBoneWeight"));
         n.aim_from_legs = prop_bool(props, "bAimSourceIsLegRotation", false);
+        if (n.cls == "TdAnimNodeWeaponPoseOffset") {
+            if (const UProperty* profiles = find_prop(props, "Profiles")) {
+                for (const auto& profile : profiles->elements) {
+                    std::vector<int> bones;
+                    if (const UProperty* indices = find_prop(profile, "BoneIndices")) bones.assign(indices->ints.begin(), indices->ints.end());
+                    weapon_pose_profiles_.emplace_back(prop_name(profile, "Name"), std::move(bones));
+                }
+            }
+        }
         if (const UProperty* profiles = find_prop(props, "Profiles"); profiles && !profiles->elements.empty()) {
             if (const UProperty* range = find_prop(profiles->elements[0], "HorizontalRange")) {
                 if (range->v[0] != 0.0f) n.aim_range_neg = std::fabs(range->v[0]);
@@ -271,8 +281,16 @@ void AnimTree::set_landed(float amount) {
     land_time_ = 0.0f;
 }
 
-const AnimSequenceAsset* AnimTree::find_sequence(const std::string& name) const {
-    return (lookup_ && !name.empty()) ? lookup_(name) : nullptr;
+void AnimTree::resolve(TreeNode& n) const {
+    n.seq_set = nullptr;
+    n.seq = (lookup_ && !n.seq_name.empty()) ? lookup_(n.seq_name, &n.seq_set) : nullptr;
+}
+
+void AnimTree::invalidate_sequences() {
+    for (TreeNode& n : nodes_) {
+        n.seq = nullptr;
+        n.seq_set = nullptr;
+    }
 }
 
 int AnimTree::slot_node(Slot slot) const { return slots_[static_cast<size_t>(slot)]; }
@@ -300,7 +318,7 @@ void AnimTree::play_custom_anim(Slot slot, const std::string& name, float rate, 
     const int channel = n.active == 1 ? 2 : 1;
     TreeNode& seq = nodes_[static_cast<size_t>(n.children[static_cast<size_t>(channel)])];
     seq.seq_name = name;
-    seq.seq = find_sequence(name);
+    resolve(seq);
     seq.rate = rate;
     seq.looping = looping;
     seq.playing = true;
@@ -372,7 +390,7 @@ void AnimTree::tick_walk_group(const PawnAnimState& pawn, float dt) {
     walk_master_ = master;
     if (master < 0) return;
     TreeNode& m = nodes_[static_cast<size_t>(master)];
-    if (!m.seq && !m.seq_name.empty()) m.seq = find_sequence(m.seq_name);
+    if (!m.seq && !m.seq_name.empty()) resolve(m);
     if (!m.seq || m.seq->length <= 0.0f) return;
     advance(m, pawn, dt);
     float rel = m.time / m.seq->length - m.synch_offset;
@@ -380,7 +398,7 @@ void AnimTree::tick_walk_group(const PawnAnimState& pawn, float dt) {
     for (int i : walk_group_) {
         if (i == master) continue;
         TreeNode& slave = nodes_[static_cast<size_t>(i)];
-        if (!slave.seq && !slave.seq_name.empty()) slave.seq = find_sequence(slave.seq_name);
+        if (!slave.seq && !slave.seq_name.empty()) resolve(slave);
         if (!slave.seq || slave.seq->length <= 0.0f) continue;
         float at = rel + slave.synch_offset;
         at -= std::floor(at);
@@ -405,6 +423,13 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         want = 0;
         for (size_t k = 0; k < n.state_mapping.size(); ++k) {
             if (n.state_mapping[k] == static_cast<int>(pawn.walking_state)) want = static_cast<int>(k) + 1;
+        }
+    } else if (n.cls == "TdAnimNodeWeaponState") {
+        // Default (ready, reloading, throwing: the weapon up), then Relaxed, Unarmed, HeavyArmed by
+        // TdPawn.WeaponAnimState.
+        want = 0;
+        for (size_t k = 0; k < n.state_mapping.size(); ++k) {
+            if (n.state_mapping[k] == pawn.weapon_state) want = static_cast<int>(k) + 1;
         }
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
@@ -522,7 +547,7 @@ void AnimTree::update_directional(TreeNode& n, const PawnAnimState& pawn, float 
 }
 
 void AnimTree::advance(TreeNode& n, const PawnAnimState& pawn, float dt) {
-    if (!n.seq && !n.seq_name.empty()) n.seq = find_sequence(n.seq_name);
+    if (!n.seq && !n.seq_name.empty()) resolve(n);
     if (!n.seq || !n.playing) return;
     const float length = n.seq->length;
     if (length <= 0.0f) return;
@@ -591,7 +616,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
             case TreeNode::Kind::Sequence:
                 if (became_relevant && n.reset_on_relevant && !n.seq_name.empty()) {
                     // TdAnimNodeSequence.OnBecomeRelevant.
-                    if (!n.seq) n.seq = find_sequence(n.seq_name);
+                    if (!n.seq) resolve(n);
                     const float length = n.seq ? n.seq->length : 0.0f;
                     n.time = (n.synchronize ? n.synch_offset : n.start_position) * length;
                     n.playing = true;
@@ -673,6 +698,7 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
                 n.blend_to_go = 0.0f;
             }
         }
+        if (n.cls == "TdAnimNodeWeaponState" && !n.weight.empty()) weapon_ready_ = pawn.weapon_state == 0 ? 0.0f : n.weight[0];
         for (size_t c = 0; c < n.children.size(); ++c) {
             if (n.children[c] >= 0) nodes_[static_cast<size_t>(n.children[c])].incoming += n.total * n.weight[c];
         }
