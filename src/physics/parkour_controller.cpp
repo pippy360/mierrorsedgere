@@ -3995,6 +3995,9 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
 
     const Vec3 into = -m_climb_normal;
     const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 64.0f;
+    // How far the ladder goes on, for the animation: a pipe's last rung is climbed differently.
+    m_telemetry.climb_top = std::max(0.0f, (m_climb_can_exit_top ? m_climb_top.z - 65.0f : m_climb_top.z - 25.0f) - m_telemetry.position.z);
+    m_telemetry.climb_bottom = std::max(0.0f, m_telemetry.position.z - m_climb_base.z);
     m_telemetry.position.x = climb_xy.x;
     m_telemetry.position.y = climb_xy.y;
 

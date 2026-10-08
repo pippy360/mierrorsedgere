@@ -363,18 +363,25 @@ void Director::tick_climb(const PawnFrame& frame) {
     const bool moving = vz > 20.0f || step_down;
     const bool was_moving = climb_last_vz_ > 20.0f || (climb_last_vz_ <= -50.0f && climb_last_vz_ >= -150.0f);
     climb_last_vz_ = vz;
-    const float rungs = frame.climbing_pipe ? 64.0f : 32.0f;
-    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > rungs + 2.0f;
+    const bool past_step = std::fabs(frame.position.z - climb_step_z_) > climb_step_size_ + 2.0f;
     if (!climb_exiting_ && moving && (!was_moving || past_step)) {
         // Where this step started: a frame's travel back from here.
-        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? rungs : -rungs) : frame.position.z - vz * frame.dt;
+        climb_step_z_ = was_moving ? climb_step_z_ + (vz > 0.0f ? climb_step_size_ : -climb_step_size_) : frame.position.z - vz * frame.dt;
+        // HandleClimbAction: a pipe is climbed two rungs to the animation, the fast one, while more
+        // than one rung is left above her (going down, while she is past the second), and the last
+        // with the plain one.
+        const float left = step_down ? frame.climb_bottom : frame.climb_top;
+        const bool fast = frame.climbing_pipe && (left < 0.0f || left > (step_down ? 2.5f : 1.5f) * 32.0f);
+        climb_step_size_ = fast ? 64.0f : 32.0f;
         // Up: ClimbAnims[bClimbLeftHand ? right : left]; down, the other one at -1.
         const bool right_hand = step_down ? !climb_left_hand_ : climb_left_hand_;
-        const char* name = frame.climbing_pipe ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
-                                               : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
-        // At the speed the move climbs at (96 uu/s a ladder, 128 a pipe) the animation lasts as long
-        // as its step; a controller that climbs faster gets it played faster.
-        const float pace = std::clamp(std::fabs(vz) / (frame.climbing_pipe ? 128.0f : 96.0f), 1.0f, 2.0f);
+        const char* name = fast ? (right_hand ? "PipeClimbUpFastRightHand" : "PipeClimbUpFastLeftHand")
+                           : frame.climbing_pipe ? (right_hand ? "PipeClimbUpRightHand" : "PipeClimbUpLeftHand")
+                                                 : (right_hand ? "LadderClimbUpRightHand" : "LadderClimbUpLeftHand");
+        // At the speed the move climbs at (96 uu/s a ladder, 64 a pipe, so 128 two rungs at a time)
+        // the animation lasts as long as its step; a controller that climbs faster gets it played
+        // faster.
+        const float pace = std::clamp(std::fabs(vz) / (fast ? 128.0f : frame.climbing_pipe ? 64.0f : 96.0f), 1.0f, 2.0f);
         play(Slot::FullBody, name, (step_down ? -1.0f : 1.0f) * pace, 0.1f, 0.075f);
         climb_step_time_ = 0.0f;
         climb_step_length_ = frame.climbing_pipe ? 0.5f : 1.0f / 3.0f;

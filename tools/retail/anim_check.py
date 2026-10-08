@@ -158,8 +158,12 @@ def level_hints(run, names):
         while j < n and run[j]["move"] in (21, 22):
             j += 1
         pipe = any(name.startswith("pipe") for k in range(i, j) for name in leaf_names[k])
+        # How far up the last step is: where she is as she goes over the top, if she does.
+        over = next((k for k in range(i, j) if any("exittop" in name for name in leaf_names[k])), None)
         for k in range(i, j):
             out[k].append(("pipe", 1 if pipe else 0))
+            if over is not None:
+                out[k].append(("top", "%.1f" % max(0.0, run[over]["pz"] - run[k]["pz"])))
         i = j
     # The animation a move picked: the frame retail first shows one of the director's named
     # animations (or shows it started over). A move that picks its animation as it starts gets it

@@ -1140,6 +1140,8 @@ struct PlayerTelemetry {
     float swing_angle = 0.0f;       // radians from hanging straight down, positive ahead of the bar
     float body_yaw_deg = 0.0f;      // TdPawn.Rotation.Yaw: where the body faces while the view looks round
     bool climbing_pipe = false;     // the ladder volume being climbed is a pipe
+    float climb_top = -1.0f;        // uu up to the ladder's last step (-1 off a ladder)
+    float climb_bottom = -1.0f;     // uu down to its first
     float balance_lean = 0.0f;      // -1 .. 1 off the beam
     EMovement move_state = EMovement::MOVE_Walking;
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};

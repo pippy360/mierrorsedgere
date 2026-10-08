@@ -41,6 +41,8 @@ struct PawnFrame {
     float swing_angle = 0.0f;    // radians from hanging straight down, positive ahead of the bar
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     bool climbing_pipe = false;  // on a pipe, not a ladder
+    float climb_top = -1.0f;     // uu up to the ladder's last step, down to its first (-1 not known)
+    float climb_bottom = -1.0f;
     // TdMove_Melee: which blow (0 right, 1 left, 2 the shove that ends a combo, 3 crouched) and
     // whether it lands. -1: the move names its animations itself (move_anim).
     int melee_variant = -1;
@@ -107,6 +109,7 @@ private:
     bool climb_exiting_ = false;     // TdMove_Climb.ExitAtTop is playing
     float climb_last_vz_ = 0.0f;
     float climb_step_z_ = 0.0f;      // where the step being climbed started
+    float climb_step_size_ = 32.0f;  // and how far it goes: one rung, or two on a pipe
     // TdMove_Grab: CurrentGrabTurnType (0 none, 1 start, 2 end, 3 idle) with its timer, the free
     // hang's turn, and the shimmy step.
     int grab_turn_ = 0;

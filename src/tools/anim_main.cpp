@@ -153,6 +153,7 @@ int main(int argc, char** argv) {
             else if (key == "swing") f.swing_angle = std::stof(value);
             else if (key == "lean") f.balance_lean = std::stof(value);
             else if (key == "pipe") f.climbing_pipe = value != "0";
+            else if (key == "top") f.climb_top = std::stof(value);
         }
         f.movement = static_cast<me::EMovement>(move);
         f.dt = last_t < 0.0 ? 0.0f : static_cast<float>(t - last_t);
