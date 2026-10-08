@@ -133,6 +133,8 @@ public:
     void invalidate_sequences();
     // TdAnimNodeWeaponPoseOffset.Profiles: the bones each weapon's pose profile holds, by profile name.
     [[nodiscard]] const std::vector<std::pair<std::string, std::vector<int>>>& weapon_pose_profiles() const { return weapon_pose_profiles_; }
+    // TdPawn.LegRotation: where the legs point (degrees).
+    [[nodiscard]] float leg_yaw() const { return leg_yaw_; }
     // How much of the ready stance the weapon state node shows (its Default child's weight).
     [[nodiscard]] float weapon_ready() const { return weapon_ready_; }
     [[nodiscard]] bool loaded() const { return root_ >= 0; }

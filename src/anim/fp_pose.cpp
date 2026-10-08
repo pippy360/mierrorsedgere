@@ -78,6 +78,7 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
         if (key == "spinexright") spine_right_ = static_cast<int>(b);
         if (key == "spinexleft") spine_left_ = static_cast<int>(b);
         if (key == "rightshoulder") shoulder_right_ = static_cast<int>(b);
+        if (key == "hips") hips_ = static_cast<int>(b);
     }
     for (size_t b = 0; b < bones; ++b) {
         if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
@@ -292,6 +293,11 @@ void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) co
         const size_t b = static_cast<size_t>(shoulder_right_);
         out.pos[b] += out.rot[b].rotate(aim.shoulder) * aim.right;
     }
+    if (hips_ >= 0 && (aim.hips.x != 0.0f || aim.hips.y != 0.0f || aim.hips.z != 0.0f)) {
+        // The hips hang off the root, which no animation turns.
+        const size_t b = static_cast<size_t>(hips_);
+        out.pos[b] += out.rot[0].conjugate().rotate(fwd_ * aim.hips.x + right_ * aim.hips.y + up_ * aim.hips.z);
+    }
     turn_arm(spine_right_, aim.pitch_deg * aim.right, out);
     turn_arm(spine_left_, aim.pitch_deg * aim.left, out);
 }
@@ -313,22 +319,15 @@ void PoseEvaluator::component_space(const Pose& pose, std::vector<Vec3>& pos, st
 }
 
 ViewFrame PoseEvaluator::view(const std::vector<Vec3>& comp_pos, const std::vector<Quat4>& comp_rot, float view_pitch_deg,
-                              float yaw_offset_deg) const {
+                              float yaw_offset_deg, float swan_forward, float swan_down) const {
     ViewFrame v;
     const size_t eye = static_cast<size_t>(eye_);
     v.eye = comp_pos[eye];
-    // SwanNeck1p.GetSwanNeckPos (native): looking down past TdMove.SwanNeckEnableAtPitch (15 degrees)
-    // the camera cranes forward and down off the eye, along the way the view faces, so that looking
-    // at her feet she sees them and not her own chest. Measured on retail standing still at five
-    // pitches (docs/FIRST_PERSON_ANIMATION_RE.md): with a = 90 degrees x (pitch - 15) / 75,
-    // forward 20.1 sin a + 4.1 (1 - cos a) and down 18.6 (1 - cos a), which is 24.2 and 18.6
-    // looking straight down.
-    if (view_pitch_deg < -15.0f) {
-        const float a = std::min((-view_pitch_deg - 15.0f) / 75.0f, 1.0f) * (PI * 0.5f);
-        const float forward = 20.1f * std::sin(a) + 4.1f * (1.0f - std::cos(a));
-        const float down = 18.6f * (1.0f - std::cos(a));
+    // CalcCamera: out_Location += SwanNeck1p.GetSwanNeckPos(the view's yaw): forward along the
+    // way the view faces and straight down.
+    {
         const float yaw = yaw_offset_deg * DEG2RAD;
-        v.eye += (fwd_ * std::cos(yaw) + right_ * std::sin(yaw)) * forward - up_ * down;
+        v.eye += (fwd_ * std::cos(yaw) + right_ * std::sin(yaw)) * swan_forward - up_ * swan_down;
     }
     v.eye_pawn = Vec3(v.eye.dot(fwd_), v.eye.dot(right_), v.eye.dot(up_));
 

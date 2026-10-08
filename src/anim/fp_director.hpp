@@ -63,6 +63,10 @@ public:
     // Moves the eye and turns the camera of `view` accordingly; the body's place against its own
     // eye is not changed by either.
     void apply_mesh_transform(ViewFrame& view) const;
+    // The swan neck's reach this frame (TdSwanNeck.UpdateSwanNeck), and the hips' offset (SetHipsOffset).
+    [[nodiscard]] float swan_forward() const { return swan_forward_; }
+    [[nodiscard]] float swan_down() const { return swan_down_; }
+    [[nodiscard]] Vec3 hips_offset() const { return hips_offset_; }
 
 private:
     void stop_move(EMovement move, EMovement pending, const PawnFrame& frame);
@@ -75,6 +79,7 @@ private:
     void tick_melee(const PawnFrame& frame);
     void set_root_offset(const Vec3& offset, float blend_time);
     void tick_weapon(const PawnFrame& frame);
+    void tick_swan_neck(const PawnFrame& frame);
     // TdMove.PlayMoveAnim.
     void play(Slot slot, const char* name, float rate, float blend_in, float blend_out) {
         tree_.play_custom_anim(slot, name, rate, blend_in, blend_out, false, true);
@@ -116,6 +121,9 @@ private:
     float swing_target_ = 0.0f;
     float swing_blend_ = 0.0f;
     float swing_angle_ = 0.0f;
+    float swan_forward_ = 0.0f, swan_down_ = 0.0f;
+    Vec3 hips_offset_{0.0f, 0.0f, 0.0f};
+    float slide_ended_ = 1.0f;       // seconds since a slide ended (the crouch's hips wait 0.3 s)
     // TdPawn.WeaponAnimState's bookkeeping (UpdateWeaponAnimState): BecameReadyTime, AmountTilUnarmed.
     bool was_armed_ = false;
     float ready_for_ = 0.0f;

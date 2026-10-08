@@ -212,6 +212,9 @@ void Director::reset() {
     root_timer_ = -1.0f;
     swing_strength_ = swing_target_ = 0.0f;
     swing_blend_ = 0.0f;
+    swan_forward_ = swan_down_ = 0.0f;
+    hips_offset_ = Vec3(0.0f, 0.0f, 0.0f);
+    slide_ended_ = 1.0f;
 }
 
 // The weapon in hand: TdPawn.SetArmed / PlayWeaponDeploy, PlayFireAnimation, UpdateWeaponAnimState.
@@ -249,6 +252,63 @@ void Director::tick_weapon(const PawnFrame& frame) {
     if (pawn_.weapon_state == 2 && amount_til_unarmed_ <= 0.0f && ready_for_ > (light ? 5.0f : 1.0f) && light) pawn_.weapon_state = 1;
     pawn_.armed_right = 1.0f;
     pawn_.armed_left = light ? 0.0f : 1.0f;
+}
+
+// TdSwanNeck (script): looking down past the move's SwanNeckEnableAtPitch the camera cranes forward
+// and down off the eye, so she sees her feet and not her chest. With P the pitch below level in
+// Unreal units, thr = int(Start * 182.044) and t = (P - thr) / (17385 - thr):
+//     forward = SwanNeckForward * t * cos(t * pi / 4),  down = SwanNeckDown * t * sin(t * pi / 4)
+// and the neck follows that, a fraction dt / 0.07 of the way each tick. TdMove.StartMove sets the
+// move's constants (15, 35, 30 unless it has its own), StopMove puts the defaults back.
+// TdPlayerPawn.SetHipsOffset moves the hips and legs (not the eye): running, back by four times
+// the neck's reach up to 20 (TdMove_Walking.UpdateViewRotation); crouched, with the turn of the
+// view off the legs (TdMove_Crouch.UpdateViewRotation).
+void Director::tick_swan_neck(const PawnFrame& frame) {
+    float start = 15.0f, forward = 35.0f, down = 30.0f;
+    switch (frame.movement) {
+        case EMovement::MOVE_Grabbing:
+            start = 0.0f;
+            forward = 70.0f;
+            break;
+        case EMovement::MOVE_Climb:
+            forward = 40.0f;
+            break;
+        case EMovement::MOVE_LayOnGround:
+        case EMovement::MOVE_180TurnInAir:
+            start = forward = down = 0.0f;
+            break;
+        case EMovement::MOVE_SkillRoll:
+            if (time_in_move_ >= 0.2f) start = forward = down = 0.0f;  // the DisableSwanneck timer
+            break;
+        default:
+            break;
+    }
+    const float pitch_units = -frame.view_pitch_deg * (65536.0f / 360.0f);
+    const float threshold = std::floor(start * 182.044f);
+    float want_forward = 0.0f, want_down = 0.0f;
+    if (pitch_units > threshold && (forward != 0.0f || down != 0.0f)) {
+        const float t = (pitch_units - threshold) / (17385.0f - threshold);
+        want_forward = forward * t * std::cos(t * PI * 0.25f);
+        want_down = down * t * std::sin(t * PI * 0.25f);
+    }
+    const float step = std::min(1.0f, frame.dt / 0.07f);
+    swan_forward_ += (want_forward - swan_forward_) * step;
+    swan_down_ += (want_down - swan_down_) * step;
+
+    slide_ended_ += frame.dt;
+    Vec3 hips(0.0f, 0.0f, 0.0f);
+    if (frame.movement == EMovement::MOVE_Walking && pawn_.walking_state > kWasWalk) {
+        hips.x = -std::min(swan_forward_, 5.0f) * 4.0f;
+    } else if (frame.movement == EMovement::MOVE_Crouch && slide_ended_ > 0.3f) {
+        float turn = frame.view_yaw_deg - tree_.leg_yaw();
+        while (turn > 180.0f) turn -= 360.0f;
+        while (turn < -180.0f) turn += 360.0f;
+        hips.x = 25.0f * std::fabs(turn) / 90.0f;
+        hips.y = 30.0f * turn / 90.0f;
+    }
+    // SetHipsOffset(Offset, 0.3).
+    const float blend = std::min(1.0f, frame.dt / 0.1f);
+    hips_offset_ += (hips - hips_offset_) * blend;
 }
 
 void Director::set_root_offset(const Vec3& offset, float blend_time) {
@@ -729,6 +789,9 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             climb_exiting_ = false;
             break;
         case EMovement::MOVE_Grabbing:
+            // TdMove_Grab.StartMove: RootOffset.X += RelativeExtent + 1 with the legs on the wall (the
+            // recordings have the eye 1 forward in 794 of 872 hanging frames), over 0.3 s.
+            if (!frame.hanging_free) set_root_offset(Vec3(1.0f, 0.0f, 0.0f), 0.3f);
             grab_turn_ = 0;
             grab_timer_ = -1.0f;
             grab_free_turn_ = false;
@@ -759,6 +822,7 @@ void Director::tick(const PawnFrame& frame) {
             set_root_offset(Vec3(0.0f, 0.0f, 0.0f), 0.3f);
         }
         root_timer_ = -1.0f;
+        if (old == EMovement::MOVE_Slide) slide_ended_ = 0.0f;
         stop_move(old, frame.movement, frame);
         // TdMove.StopMove: ClearAnimationMovementState.
         pawn_.animation_movement = EMovement::MOVE_None;
@@ -856,6 +920,7 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.climbing_pipe = frame.climbing_pipe;
     update_walking_state(frame);
     tick_weapon(frame);
+    tick_swan_neck(frame);
     tree_.tick(pawn_, frame.dt);
     last_velocity_ = frame.velocity;
 }

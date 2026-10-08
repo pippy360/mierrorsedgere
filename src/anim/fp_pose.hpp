@@ -53,6 +53,9 @@ public:
         // OneHandedRightShoulderOffset: the weapon's own nudge of the right shoulder, in the bone's
         // space, at the ready (TdWeapon.OneHandedRightShoulderTranslationOffset).
         Vec3 shoulder{0.0f, 0.0f, 0.0f};
+        // HipsControl (TdPlayerPawn.SetHipsOffset): the hips and legs moved against the pawn
+        // (forward, right, up), out from under the camera when she looks down running.
+        Vec3 hips{0.0f, 0.0f, 0.0f};
     };
 
     // The tree's pose this frame.
@@ -63,9 +66,10 @@ public:
 
     // TdPlayerPawn.CalcCamera: the camera sits at the EyeJoint and looks where the controller
     // looks, turned further by what the animation does to the eye. `view_pitch_deg` is the
-    // controller's pitch, `yaw_offset_deg` how far its yaw is from the pawn's.
+    // controller's pitch, `yaw_offset_deg` how far its yaw is from the pawn's; `swan_forward` and
+    // `swan_down` are the swan neck's reach (TdSwanNeck, which the director follows).
     [[nodiscard]] ViewFrame view(const std::vector<Vec3>& comp_pos, const std::vector<Quat4>& comp_rot, float view_pitch_deg,
-                                 float yaw_offset_deg) const;
+                                 float yaw_offset_deg, float swan_forward, float swan_down) const;
 
     [[nodiscard]] int eye_bone() const { return eye_; }
 
@@ -85,7 +89,7 @@ private:
     std::vector<int> pose_bones_;             // the weapon pose profile's bones, with what each is turned and moved by
     std::vector<Quat4> pose_rot_;
     std::vector<Vec3> pose_pos_;
-    int spine_right_ = -1, spine_left_ = -1, shoulder_right_ = -1;
+    int spine_right_ = -1, spine_left_ = -1, shoulder_right_ = -1, hips_ = -1;
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;
     int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn
