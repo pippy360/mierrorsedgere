@@ -811,7 +811,8 @@ void Director::tick(const PawnFrame& frame) {
     pawn_.view_yaw_deg = frame.view_yaw_deg;
     pawn_.view_pitch_deg = frame.view_pitch_deg;
     pawn_.heavy_weapon = frame.heavy_weapon;
-    pawn_.swing_angle = frame.swing_angle;
+    // The swing's angle stays where it was when she lets go (the poses fade under the jump off).
+    if (frame.movement == EMovement::MOVE_Swing) pawn_.swing_angle = frame.swing_angle;
     pawn_.balance_lean = frame.balance_lean;
     pawn_.hanging_free = frame.hanging_free;
     pawn_.climbing_pipe = frame.climbing_pipe;

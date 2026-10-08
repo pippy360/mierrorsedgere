@@ -208,8 +208,10 @@ public:
     // moves return weight 0.
     [[nodiscard]] CameraAnimation camera_animation(const PlayerTelemetry& telemetry) const;
 
-    // The first-person camera for `telemetry`: the eyes eye_height above the feet looking along the
-    // view rotation, moved onto the animated EyeJoint and turned by camera_animation() while it plays.
+    // The first-person camera for `telemetry`. In play it is the first-person tree's: at its EyeJoint
+    // (bobbing with the run, dipping on a landing, craning forward looking down), looking along the
+    // view rotation turned by what the animation does to the camera bone. In a level intro, the death
+    // fall, or without the tree: the eyes eye_height above the feet, with camera_animation().
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
 
     // Evaluate KrugerSec / CPF Officer / Celeste 3D skeletal mesh + equipped weapon + 3P muzzle flash
