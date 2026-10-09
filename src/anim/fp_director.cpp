@@ -250,10 +250,11 @@ void Director::tick_weapon(const PawnFrame& frame) {
     };
     if (frame.movement == EMovement::MOVE_Snatch) {
         // TdMove_Disarm.TakeDisarmedPawnsWeapon: the weapon's sets are in but the state is unarmed
-        // (SetWeaponAnimState(0)) while the canned animation takes it off the enemy; it is hers at
-        // the ready as the move ends, with nothing drawn from a holster.
-        was_armed_ = true;
-        make_ready();
+        // (SetWeaponAnimState(0)) while the canned animation takes it off the enemy. As the move
+        // ends it becomes her weapon like any other (StopMove: SetCurrentWeapon), so `unholster`
+        // plays and the ready stance is there under it: in retail both at full weight in the first
+        // dump after the move.
+        was_armed_ = false;
         pawn_.weapon_state = 0;
         pawn_.armed_right = pawn_.armed_left = 0.0f;
         return;
@@ -641,11 +642,11 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             set_animation_state(EMovement::MOVE_None);
             break;
         case EMovement::MOVE_Snatch:
-            // The disarm's animation is played with no blend out, so it holds its last frame, the
-            // weapon in her hands, and the move ends with it (OnCustomAnimEnd). Nothing in the
-            // script lets the slot go; here it gives way to the weapon's stance over 0.2 s, the time
-            // AbortDisarm takes it off in.
-            tree_.stop_custom_anim(Slot::Canned, 0.2f);
+            // The disarm's animation is played with no blend out and the move ends with it
+            // (OnCustomAnimEnd). Retail, a pistol taken from behind, the tree dumped every 0.02 s:
+            // whole to its last frame, and gone in the next dump, with `unholster` at full weight
+            // in its place (tick_weapon).
+            tree_.stop_custom_anim(Slot::Canned, 0.0f);
             break;
         case EMovement::MOVE_MeleeAir:
         case EMovement::MOVE_MeleeWallrun:

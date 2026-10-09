@@ -2421,7 +2421,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     };
 
     // Through a disarm the weapon is not in her hand until the move attaches it.
-    const SkeletalMeshAsset* equipped_wmesh = (state == EMovement::MOVE_Snatch ? telemetry.snatch_weapon_attached : telemetry.weapon.equipped)
+    const SkeletalMeshAsset* equipped_wmesh = (telemetry.weapon.equipped && telemetry.snatch_weapon_attached)
                                                   ? get_weapon_mesh(telemetry.weapon.name)
                                                   : nullptr;
     size_t w_idx_cnt = equipped_wmesh ? equipped_wmesh->indices.size() : 0;

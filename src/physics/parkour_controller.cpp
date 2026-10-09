@@ -726,9 +726,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                     const float dist = to.length();
                     const float step = m_snatch_speed * step_dt;
                     if (dist <= step) {
-                        if (dist > 1e-3f) move_swept(to, kPawnHeight, 0.0f, scene);
+                        if (dist > 1e-3f) move_swept(to, kPawnHeight, kMaxStepHeight, scene);
                         m_snatch_align = false;
-                    } else if (move_swept(to * (step / dist), kPawnHeight, 0.0f, scene).hit) {
+                    } else if (move_swept(to * (step / dist), kPawnHeight, kMaxStepHeight, scene).hit) {
                         m_snatch_align = false;  // something in the way (retail moves the enemy instead)
                     }
                 }
@@ -890,24 +890,38 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
     m_telemetry.body_yaw_deg = m_pawn_yaw;
     update_against_wall(effective_dt, scene);
     {
-        // The first-person mesh, and the eye in it, do not take a fast change of the floor's height
-        // at once (TdPawn.SmoothOffset / TargetMeshTranslationZ, native). Retail running a flight
-        // of stairs, a ramp to the pawn: the eye 20 uu low going up at 283 uu/s of rise, 19 high
-        // coming down at 300 to 470, level again within 0.15 s at either end, and no different
-        // from level ground walking it at 79. So: a rise or drop faster than 150 uu/s is held back
-        // and let out with a time constant of 0.065 s.
+        // The first-person mesh, and the eye in it, do not take a change of the floor's height at
+        // once (TdPawn.SmoothOffset / TargetMeshTranslationZ, native). Retail over a 32 uu step,
+        // either way, walking or running: the eye is left 20 uu behind, no more, and closes on the
+        // pawn by 0.835 a sixtieth of a second until 6.7 uu is left, then at 60 uu/s. On a flight
+        // of stairs, a ramp to the pawn: 1.6 low climbing at 96 uu/s of rise, 14 at 249, 21 at 283
+        // and 293; 15 to 16 high coming down at 280 to 446; nothing at 79. So: what the floor
+        // moves faster than 85 uu/s is held back, up to 20 uu, and let out as over the step.
         const bool walking = m_telemetry.grounded && m_base_actor < 0 &&
                              (m_telemetry.move_state == EMovement::MOVE_Walking || m_telemetry.move_state == EMovement::MOVE_Crouch);
         if (walking && m_smooth_was_walking && effective_dt > 0.0f) {
             const float dz = m_telemetry.position.z - m_smooth_last_z;
-            if (std::abs(dz) >= 150.0f * effective_dt) m_mesh_smooth_z -= dz;
+            const float held = std::max(0.0f, std::abs(dz) - 85.0f * effective_dt);
+            m_mesh_smooth_z = std::clamp(m_mesh_smooth_z - (dz < 0.0f ? -held : held), -20.0f, 20.0f);
         }
-        m_mesh_smooth_z = std::clamp(m_mesh_smooth_z * std::exp(-effective_dt / 0.065f), -40.0f, 40.0f);
+        if (std::abs(m_mesh_smooth_z) > 6.7f) {
+            m_mesh_smooth_z *= std::pow(0.835f, effective_dt * 60.0f);
+        } else {
+            const float step = 60.0f * effective_dt;
+            m_mesh_smooth_z = std::abs(m_mesh_smooth_z) <= step ? 0.0f : m_mesh_smooth_z - (m_mesh_smooth_z < 0.0f ? -step : step);
+        }
         m_smooth_was_walking = walking;
         m_smooth_last_z = m_telemetry.position.z;
         m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z;
     }
-    if (m_telemetry.move_state != EMovement::MOVE_Snatch) m_telemetry.snatch_weapon_attached = true;
+    // Retail's frames have the pistol in her hand between 0.08 and 0.16 s after the move ends, not
+    // on its last frame.
+    if (m_telemetry.move_state == EMovement::MOVE_Snatch) {
+        m_snatch_ended = 0.0f;
+    } else {
+        m_snatch_ended += effective_dt;
+        if (m_snatch_ended >= 0.1f) m_telemetry.snatch_weapon_attached = true;
+    }
     for (auto& bot : scene.enemies) {
         if (bot.disarm_weapon.empty()) continue;
         bot.disarm_weapon_time -= effective_dt;
@@ -1083,12 +1097,17 @@ void ParkourController::camera_reset_look(float seconds) {
 
 // TdPlayerPawn.UpdateAgainstWall / CheckAgainstWall are native. From a retail recording made for
 // it, walking into a flat wall and away again, standing and crouched, with and without a pistol:
-//  - at the wall both hands go up on it (state 1); with the body turned 45 degrees off it, which
-//    is as far as the view goes there, only the hand of the near shoulder (2 the left, 3 the right);
-//  - running at it (435 uu/s) the hands start up 70 to 100 uu before she gets there, creeping
-//    up to it crouched only as she arrives: the reach grows with her speed at the wall;
-//  - walking away it ends about 0.15 s after she starts (StopAgainstWall checks again on a 0.15 s
-//    timer), 30 to 40 uu out.
+//  - at the wall both hands go up on it (state 1) with the body up to 28.6 degrees off square to
+//    it; from 29.6 to 59.9 only the hand of the near shoulder (2 the left, 3 the right); from 63.9
+//    neither. Walked in at 10 and 20 degrees: both; at 30 and 60: the near one;
+//  - standing, it is on up to 11 uu short of touching the wall and off from 12;
+//  - running at it (430 uu/s) it comes on 65 uu out square on, 61 at 20 degrees, 49 at 30, 25 at
+//    60, and creeping up to it crouched only as she arrives: the reach grows with her speed;
+//  - walking away the arms start down about 0.15 s after she starts (StopAgainstWall checks again
+//    on a 0.15 s timer);
+//  - things that stop below her shoulders (a pipe stub, a vent) do not count.
+// Fitted: a trace from each shoulder (15 uu either side) along her facing, 43.3 uu from her centre
+// line and 0.121 s of her speed further, that has to meet a wall no more than 62 degrees off square.
 // Only in the moves with bEnableAgainstWall (Walking, Crouch, LedgeWalk).
 void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
     const EMovement m = m_telemetry.move_state;
@@ -1098,7 +1117,7 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         const Vec3 fwd = body.forward();
         const Vec3 right = body.right();
         const float toward = std::max(0.0f, horiz(m_telemetry.velocity).dot(fwd));
-        const float reach = kPawnRadius + 8.0f + 0.14f * toward;
+        const float reach = 43.3f + 0.121f * toward;
         const float shoulder = 0.78f * (m == EMovement::MOVE_Crouch ? kCrouchHeight : kPawnHeight);
         bool hand[2] = {false, false};
         float ahead[2] = {-1.0f, -1.0f};
@@ -1106,7 +1125,7 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         for (int k = 0; k < 2; ++k) {
             const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, shoulder) + right * (k == 0 ? -15.0f : 15.0f);
             const TraceHit hit = trace_ray(start, start + fwd * reach, scene);
-            if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f) {
+            if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f && horiz(hit.normal).normalized().dot(fwd) <= -0.47f) {
                 hand[k] = true;
                 ahead[k] = hit.fraction * reach;
                 normal = normal + horiz(hit.normal);
@@ -1188,14 +1207,17 @@ void ParkourController::update_camera_collision(const Vec3& eye, float dt, const
     }
     if (base) want = facing * -miss(facing, 11.0f, 0.0f, nullptr);
 
-    // OffsetMeshXY is native. Taken here as: back at once, and let out again at kCameraMeshReturn.
-    constexpr float kCameraMeshReturn = 60.0f;  // uu/s
-    if (want.length_xy() >= m_cam_mesh_offset.length_xy()) {
-        m_cam_mesh_offset = want;
-    } else {
+    // OffsetMeshXY is native. Retail jumping into a wall looking 75 degrees down, the swan neck
+    // carrying the eye to within a unit of it: the eye is 12.6 uu off the wall 0.1 s after she
+    // meets it (11.7 uu back, where the sweep's 11 and the box's 2 put it) and stays there through
+    // the jump with the view not pushed at all; once she is falling, a move without the check, it
+    // goes forward again at 97 uu/s. So: back at 170 uu/s, forward at 100.
+    constexpr float kCameraMeshBack = 170.0f, kCameraMeshReturn = 100.0f;  // uu/s
+    {
         const Vec3 d = want - m_cam_mesh_offset;
-        const float step = kCameraMeshReturn * dt;
-        m_cam_mesh_offset = d.length_xy() <= step ? want : m_cam_mesh_offset + d * (step / d.length_xy());
+        const float far = d.length_xy();
+        const float step = (want.length_xy() >= m_cam_mesh_offset.length_xy() ? kCameraMeshBack : kCameraMeshReturn) * dt;
+        m_cam_mesh_offset = far <= step ? want : m_cam_mesh_offset + d * (step / far);
     }
     m_telemetry.camera_mesh_offset.x = m_cam_mesh_offset.x;
     m_telemetry.camera_mesh_offset.y = m_cam_mesh_offset.y;
@@ -1442,13 +1464,15 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
     MoveCamera mc = move_camera(m);
     const bool at_wall = m_against_wall != 0 && (m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch);
     if (at_wall) {
-        // Against a wall retail's view stops 27.2 degrees down, standing or crouched, and 44.8
-        // degrees to either side of the way into the wall (5000 and 8192 in Unreal units, by the
-        // look of it; how far up it goes was not tried). Away from the wall the same view went to
-        // 80 down.
+        // Against a wall retail's view stops 26 to 27.5 degrees down, standing or crouched, with
+        // one hand on it or two (5000 in Unreal units, by the look of it; how far up it goes was
+        // not tried), and is brought up to that with a time constant of 0.2 s. It turns freely.
+        // Away from the wall the same view went to 80 down.
         mc.constrain = true;
         mc.pitch_min = -5000.0f;
         mc.pitch_max = 32768.0f;
+        mc.yaw_min = -65536.0f;
+        mc.yaw_max = 65536.0f;
     } else if (m == EMovement::MOVE_Walking && m_cam_constrain_look) {
         // TdMove_Walking.CheckForCameraCollision: with something right in front of the camera she
         // cannot look further down (bConstrainLook; nothing limits the yaw or looking up).
@@ -1464,9 +1488,6 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
         if (m == EMovement::MOVE_WallRunningRight || m == EMovement::MOVE_WallRunningLeft) {
             lo = wrap_deg(m_wallrun_yaw_min - m_pawn_yaw) * kUUPerDeg;
             hi = wrap_deg(m_wallrun_yaw_max - m_pawn_yaw) * kUUPerDeg;
-        } else if (at_wall) {
-            lo = wrap_deg(m_against_wall_yaw - 45.0f - m_pawn_yaw) * kUUPerDeg;
-            hi = wrap_deg(m_against_wall_yaw + 45.0f - m_pawn_yaw) * kUUPerDeg;
         }
         const float rel_yaw = wrap_deg(m_telemetry.yaw_deg - m_pawn_yaw) * kUUPerDeg;
         yaw_d = constrain_axis(rel_yaw, lo, hi, speed, yaw_d * kUUPerDeg) / kUUPerDeg;
@@ -4883,7 +4904,10 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                 m_pawn_yaw = m_telemetry.yaw_deg;
                 m_snatch_target = bot.position - to_bot * 125.899f;
                 m_snatch_speed = std::max(400.0f, m_telemetry.velocity.length_xy());
-                m_snatch_align = std::abs(bot.position.z - m_telemetry.position.z) <= 3.0f;
+                // (Standing more than 3 uu apart in height retail flies her up to him or slides him
+                // to her instead, HandleHeightDifference; here she is brought in along the floor
+                // either way, unless a step's height or more is between them.)
+                m_snatch_align = std::abs(bot.position.z - m_telemetry.position.z) <= 35.0f;
             }
 
             std::string snatched_wep = bot.weapon_name;

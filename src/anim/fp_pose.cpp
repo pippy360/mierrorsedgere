@@ -423,23 +423,29 @@ ViewFrame PoseEvaluator::view(const std::vector<Vec3>& comp_pos, const std::vect
     }
     v.eye_pawn = Vec3(v.eye.dot(fwd_), v.eye.dot(right_), v.eye.dot(up_));
 
-    // TdPawn.GetCameraAnimation (native): the camera bone's rotation in the mesh's space, as
-    // FMatrix::Rotator reads it. The mesh's axes are +X left, -Y up, +Z forward, so the rotator's
-    // roll is the view's pitch, its pitch the view's yaw and its yaw the view's roll, which is the
-    // swizzle CalcCamera does: Pitch += -Roll, Yaw += Pitch, Roll += -Yaw. Read this way the pitch
-    // keeps going past straight down, which is how a roll turns the view right over.
+    // TdPawn.GetCameraAnimation (native) and CalcCamera's Pitch += -Roll, Yaw += Pitch, Roll += -Yaw:
+    // the camera bone's orientation as a view's. At rest the bone's axes are the mesh's (+X left,
+    // -Y up, +Z forward), so the camera looks along the bone's Z with the bone's -X to its right
+    // and -Y up; that frame, in the pawn's axes, read as a rotator (FMatrix::Rotator) is the pitch,
+    // yaw and roll the animation adds. Through a disarm, where the camera pitches, turns and
+    // rolls at once (36, 21 and 13 degrees), this is retail's camera to a degree; reading the
+    // mesh-space rotator and swapping its angles, which is the same thing for a turn about one
+    // axis, was 5 to 8 degrees out there. (Past straight down the pitch comes back and the yaw and
+    // roll go half a turn: the same orientation a somersault's pitch would run on to.)
     {
         const Quat4& q = comp_rot[static_cast<size_t>(camera_)];
         const Vec3 x_axis = q.rotate(Vec3(1.0f, 0.0f, 0.0f));
         const Vec3 y_axis = q.rotate(Vec3(0.0f, 1.0f, 0.0f));
         const Vec3 z_axis = q.rotate(Vec3(0.0f, 0.0f, 1.0f));
-        const float pitch = std::atan2(x_axis.z, std::sqrt(x_axis.x * x_axis.x + x_axis.y * x_axis.y));
-        const float yaw = std::atan2(x_axis.y, x_axis.x);
+        auto in_pawn = [&](const Vec3& m) { return Vec3(m.dot(fwd_), m.dot(right_), m.dot(up_)); };
+        const Vec3 f = in_pawn(z_axis), r = in_pawn(x_axis) * -1.0f, u = in_pawn(y_axis) * -1.0f;
+        const float pitch = std::atan2(f.z, std::sqrt(f.x * f.x + f.y * f.y));
+        const float yaw = std::atan2(f.y, f.x);
         const Vec3 flat_y(-std::sin(yaw), std::cos(yaw), 0.0f);
-        const float roll = std::atan2(z_axis.dot(flat_y), y_axis.dot(flat_y));
-        v.anim_pitch = -roll * RAD2DEG;
-        v.anim_yaw = pitch * RAD2DEG;
-        v.anim_roll = -yaw * RAD2DEG;
+        const float roll = std::atan2(u.dot(flat_y), r.dot(flat_y));
+        v.anim_pitch = pitch * RAD2DEG;
+        v.anim_yaw = yaw * RAD2DEG;
+        v.anim_roll = roll * RAD2DEG;
     }
 
     // CalcCamera adds the animation's turn to the view rotation, angle by angle.

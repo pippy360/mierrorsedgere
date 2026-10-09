@@ -315,6 +315,7 @@ private:
     int m_disarm_count = 0;
     float m_snatch_attach = 0.0f;  // when in the move the weapon becomes hers to hold
     bool m_snatch_fail = false;    // TdMove_Disarm.StartMiss: the grab that gets nothing
+    float m_snatch_ended = 1.0f;   // since the last disarm ended
     bool m_jump_consumed = false;
     bool m_barge_kick = false;  // TdMove_Barge below BargeKickThresholdSpeed: a standing kick
 
