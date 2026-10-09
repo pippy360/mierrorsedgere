@@ -91,8 +91,8 @@ if(MINGW)
 endif()
 
 # The game itself: everything but the renderer backend is shared between the platforms.
+# main.cpp is compiled per target (renderer/renderer.hpp picks the backend from its defines).
 set(GAME_SOURCES
-    src/main.cpp
     ${CORE_SOURCES}
     src/audio/audio_engine.cpp
     src/cutscene/cutscene_player.cpp
@@ -100,20 +100,38 @@ set(GAME_SOURCES
     src/ui/main_menu.cpp
     ${FRONTEND_SOURCES}
 )
+add_library(me_game_objs OBJECT ${GAME_SOURCES})
+
+# The OpenGL 4.1 backend (src/renderer/opengl_renderer.cpp): the Linux renderer. It can be built
+# on macOS as well, as `mirrorsedge_opengl`, to check it against the Metal backend there.
+set(OPENGL_RENDERER_SOURCES
+    src/renderer/opengl_renderer.cpp
+    src/renderer/msl_to_glsl.cpp
+)
+if(APPLE)
+    option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS" ON)
+endif()
+
+# me_glsl: translates every built-in and material shader to GLSL and compiles it on the GPU
+# (docs/LINUX_PORT.md). Builds wherever SDL2 is available.
+if(UNIX)
+    add_executable(me_glsl src/tools/glsl_main.cpp src/renderer/msl_to_glsl.cpp ${CORE_SOURCES})
+    target_link_libraries(me_glsl PRIVATE ZLIB::ZLIB Threads::Threads)
+    if(APPLE)
+        target_link_libraries(me_glsl PRIVATE SDL2)
+    else()
+        find_package(SDL2 REQUIRED)
+        target_link_libraries(me_glsl PRIVATE SDL2::SDL2 ${CMAKE_DL_LIBS})
+    endif()
+endif()
 
 if(APPLE)
 
-# Source files
-set(SOURCES
-    ${GAME_SOURCES}
-    src/renderer/metal_renderer.mm
-)
-
 # Executable target
-add_executable(mirrorsedge_macos ${SOURCES})
+add_executable(mirrorsedge_macos src/main.cpp $<TARGET_OBJECTS:me_game_objs> src/renderer/metal_renderer.mm)
 
 # Target libraries & frameworks
-target_link_libraries(mirrorsedge_macos PRIVATE
+set(ME_MACOS_LIBS
     SDL2
     avformat
     avcodec
@@ -124,14 +142,24 @@ target_link_libraries(mirrorsedge_macos PRIVATE
     vorbis
     ogg
     z
-    "-framework Metal"
-    "-framework QuartzCore"
     "-framework Foundation"
     "-framework AppKit"
     "-framework CoreGraphics"
     "-framework ImageIO"
     "-framework OpenAL"
 )
+target_link_libraries(mirrorsedge_macos PRIVATE
+    ${ME_MACOS_LIBS}
+    "-framework Metal"
+    "-framework QuartzCore"
+)
+
+if(ME_OPENGL)
+    add_executable(mirrorsedge_opengl src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+    target_compile_definitions(mirrorsedge_opengl PRIVATE ME_RENDERER_OPENGL=1 GL_SILENCE_DEPRECATION=1)
+    # OpenGL itself is loaded through SDL_GL_GetProcAddress; no framework to link.
+    target_link_libraries(mirrorsedge_opengl PRIVATE ${ME_MACOS_LIBS})
+endif()
 
 elseif(WIN32)
 
@@ -145,7 +173,8 @@ pkg_check_modules(VORBISFILE REQUIRED IMPORTED_TARGET vorbisfile)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libswresample libavutil)
 
 add_executable(mirrorsedge_windows
-    ${GAME_SOURCES}
+    src/main.cpp
+    $<TARGET_OBJECTS:me_game_objs>
     src/renderer/d3d11_renderer.cpp
     src/renderer/msl_to_hlsl.cpp
 )
@@ -176,5 +205,30 @@ if(ME_BUNDLE_RUNTIME_DLLS)
         VERBATIM
     )
 endif()
+
+else()
+
+# mirrorsedge_linux: the same game on OpenGL 4.1 core (docs/LINUX_PORT.md). Against the
+# distribution's packages, e.g. on Debian / Ubuntu:
+#   apt install g++ cmake ninja-build pkg-config libsdl2-dev libopenal-dev libvorbis-dev \
+#               libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavutil-dev zlib1g-dev
+find_package(SDL2 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(OPENAL REQUIRED IMPORTED_TARGET openal)
+pkg_check_modules(VORBISFILE REQUIRED IMPORTED_TARGET vorbisfile)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswscale libswresample libavutil)
+
+add_executable(mirrorsedge_linux src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+target_compile_definitions(mirrorsedge_linux PRIVATE ME_RENDERER_OPENGL=1)
+# OpenGL itself is loaded through SDL_GL_GetProcAddress; libGL is not linked.
+target_link_libraries(mirrorsedge_linux PRIVATE
+    SDL2::SDL2
+    PkgConfig::OPENAL
+    PkgConfig::VORBISFILE
+    PkgConfig::FFMPEG
+    ZLIB::ZLIB
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
 
 endif()

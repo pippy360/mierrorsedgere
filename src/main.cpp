@@ -3,6 +3,11 @@
 #include <SDL2/SDL.h>
 #if defined(__APPLE__)
 #include <SDL2/SDL_metal.h>
+#define ME_PLATFORM_TITLE "macOS"
+#elif defined(_WIN32)
+#define ME_PLATFORM_TITLE "Windows"
+#else
+#define ME_PLATFORM_TITLE "Linux"
 #endif
 
 #include "math/types.hpp"
@@ -1365,7 +1370,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     int win_w = 1280;
     int win_h = 720;
-#if defined(__APPLE__)
+#if defined(ME_RENDERER_OPENGL)
+    // The OpenGL backend (Linux, or macOS when built to check it): the window carries the
+    // GL context the renderer creates in init_with_window().
+    const char* window_title = "Mirror's Edge (Native " ME_PLATFORM_TITLE " OpenGL)";
+    const Uint32 window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    Renderer::prepare_window_attributes();
+#elif defined(__APPLE__)
     const char* window_title = "Mirror's Edge (Native macOS Apple Silicon)";
     const Uint32 window_flags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #else
@@ -1385,8 +1396,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return 1;
     }
 
-    // What the renderer draws into: a CAMetalLayer on macOS, the window itself (HWND) on Windows.
-#if defined(__APPLE__)
+    // What the renderer draws into: a CAMetalLayer on macOS, the window itself (HWND) on Windows,
+    // the SDL window's GL context on Linux.
+#if defined(ME_RENDERER_OPENGL)
+    auto get_drawable_size = [&](int* w, int* h) { SDL_GL_GetDrawableSize(window, w, h); };
+    auto destroy_surface = []() {};
+#elif defined(__APPLE__)
     SDL_MetalView metal_view = SDL_Metal_CreateView(window);
     if (!metal_view) {
         std::cerr << "[SDL ERROR] Failed to create Metal view: " << SDL_GetError() << std::endl;
@@ -1407,7 +1422,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     Renderer renderer;
     renderer.set_game_root(game_root);
-#if defined(__APPLE__)
+#if defined(ME_RENDERER_OPENGL)
+    const bool renderer_ok = renderer.init_with_window(window, drawable_w, drawable_h);
+#elif defined(__APPLE__)
     const bool renderer_ok = renderer.init_with_metal_layer(SDL_Metal_GetLayer(metal_view), drawable_w, drawable_h);
 #else
     SDL_SysWMinfo wm_info;

@@ -49,16 +49,33 @@ std::string registry_string(HKEY root, const char* key, const char* value) {
     return s;
 }
 
-// Every Steam library: the Steam install itself plus the "path" entries of its libraryfolders.vdf.
+}  // namespace
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+namespace {
+
+// Every Steam library: the Steam installs themselves plus the "path" entries of their
+// libraryfolders.vdf.
 std::vector<std::string> steam_libraries() {
     std::vector<std::string> roots;
     auto add = [&roots](const std::string& p) {
         if (!p.empty() && std::find(roots.begin(), roots.end(), p) == roots.end()) roots.push_back(p);
     };
+#if defined(_WIN32)
     add(registry_string(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath"));
     add(registry_string(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam", "InstallPath"));
     add("C:/Program Files (x86)/Steam");
     add("C:/Program Files/Steam");
+#else
+    if (const char* home = std::getenv("HOME")) {
+        const std::string h = home;
+        add(h + "/.steam/steam");                                            // the usual symlink
+        add(h + "/.local/share/Steam");                                      // the native client
+        add(h + "/.var/app/com.valvesoftware.Steam/.local/share/Steam");     // the Flatpak client
+        add(h + "/snap/steam/common/.local/share/Steam");                    // the Snap client
+    }
+#endif
     for (const std::string& root : std::vector<std::string>(roots)) {
         std::ifstream vdf(root + "/steamapps/libraryfolders.vdf");
         std::string line;
@@ -98,6 +115,20 @@ std::string default_game_root() {
         if (is_game_root(c)) return c;
     }
     return "C:/Program Files (x86)/Steam/steamapps/common/mirrors edge";
+#elif defined(__linux__)
+    // The Windows game installed through Steam (Proton) lands in the same place as on Windows,
+    // relative to the library. Otherwise a copy of the install directory under $HOME.
+    std::vector<std::string> candidates;
+    for (const std::string& lib : steam_libraries()) candidates.push_back(lib + "/steamapps/common/mirrors edge");
+    if (const char* home = std::getenv("HOME")) {
+        candidates.push_back(std::string(home) + "/mirrorsedge");
+        candidates.push_back(std::string(home) + "/Games/mirrorsedge");
+        candidates.push_back(std::string(home) + "/Games/Mirror's Edge");
+    }
+    for (const std::string& c : candidates) {
+        if (is_game_root(c)) return c;
+    }
+    return candidates.empty() ? std::string("/opt/mirrorsedge") : candidates.front();
 #else
     return "/Users/tomnom/mirrorsedge";
 #endif
