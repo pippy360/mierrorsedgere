@@ -20,6 +20,9 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 - The correct animation isn't played when Faith has a soft landing (e.g. landing cushion).
 - The sound effect played on death is wrong.
 - When loading the Jacknife level (`Stormdrain_p`), the player immediately gets gunned down by a helicopter (doesn't happen in retail).
+- Respawning often respawns the player to a position where they fall and die or inside geometry.
+- The falling effect is wrong (it's just a transparent black border now).
+- A weird sound plays when the binary is first started.
 
 ---
 
