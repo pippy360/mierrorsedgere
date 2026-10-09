@@ -10,6 +10,11 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 ## User-Added Issues
 
 <!-- Add new bug reports or feature requests right below this comment: -->
+- The camera isn't high enough when the character is pulling herself up from a ledge.
+- The cutscene in Flight (`Escape_p`) when Faith exits the elevator doesn't show Kate.
+- The camera isn't high enough in the cutscene.
+- Player can hear Faith getting injured (taking damage) while a cutscene is playing.
+- Faith doesn't make her breathing sound effects while running.
 
 ---
 
