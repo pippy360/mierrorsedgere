@@ -616,6 +616,11 @@ void Director::update_walking_state(const PawnFrame& frame) {
 // An animation the move names, played the way its script plays it: at the rate the move worked out
 // (`rate` > 0, TdMove_Barge's AnimPlayRate), else at the script's constant one.
 bool Director::play_named(const std::string& name, float rate) {
+    if (lower(name) == "fallinglandsoftlanding") {
+        tree_.play_custom_anim(Slot::FullBody, "FallingLandSoftLanding", 1.0f, 0.08f, 0.2f, false, true, true);
+        set_animation_state(EMovement::MOVE_Walking, 0.2f);
+        return true;
+    }
     const MoveAnim* a = find_move_anim(name);
     if (!a) return false;
     Slot slot = a->slot;
@@ -729,6 +734,7 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             break;
         case EMovement::MOVE_Barge:
             tree_.stop_custom_anim(Slot::UpperBody, 0.2f);
+            tree_.stop_custom_anim(Slot::FullBody, 0.1f);
             break;
         case EMovement::MOVE_Melee:
             // TdMove_MeleeBase.StopMove, then TdMove_Melee's (TdMove_MeleeCrouch lets its blow go quicker).
@@ -870,8 +876,13 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             set_animation_state(EMovement::MOVE_Walking, 0.2f);
             break;
         case EMovement::MOVE_SoftLanding:
-            set_animation_state(EMovement::MOVE_180TurnInAir);
-            tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.6f, 0.2f, true, true);
+            if (lower(frame.move_anim) == "fallinglandsoftlanding") {
+                tree_.play_custom_anim(Slot::FullBody, "FallingLandSoftLanding", 1.0f, 0.08f, 0.2f, false, true, true);
+                set_animation_state(EMovement::MOVE_Walking, 0.2f);
+            } else {
+                set_animation_state(EMovement::MOVE_180TurnInAir);
+                tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.25f, 0.1f, true, true, true);
+            }
             break;
         case EMovement::MOVE_Swing:
             // SetRootOffset(vect(0, -50, -32), AnimBlendTime, BCS_BoneSpace): up 50 and back 32, so the

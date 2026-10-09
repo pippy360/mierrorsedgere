@@ -220,13 +220,18 @@ public:
     void set_world_trace(WorldTrace trace) { world_trace_ = std::move(trace); }
 
     enum EnemyArchetypeId : uint32_t {
-        EnemyArch_SWAT    = 0,
-        EnemyArch_Patrol  = 1,
-        EnemyArch_Support = 2,
-        EnemyArch_Riot    = 3,
-        EnemyArch_Pursuit = 4,
-        EnemyArch_Celeste = 5,
-        EnemyArch_Count   = 6
+        EnemyArch_SWAT     = 0,
+        EnemyArch_Patrol   = 1,
+        EnemyArch_Support  = 2,
+        EnemyArch_Riot     = 3,
+        EnemyArch_Pursuit  = 4,
+        EnemyArch_Celeste  = 5,
+        EnemyArch_Kate     = 6,
+        EnemyArch_Jacknife = 7,
+        EnemyArch_Ropeburn = 8,
+        EnemyArch_Miller   = 9,
+        EnemyArch_Kreeg    = 10,
+        EnemyArch_Count    = 11
     };
 
     struct EnemyCharacterModel {
@@ -364,6 +369,7 @@ private:
     AnimSetAsset faith_2h_common_set_;
     AnimSetAsset faith_colt_set_;
     std::unordered_map<std::string, AnimSetAsset> faith_weapon_sets_;
+    mutable std::mutex level_intro_mutex_;
     mutable std::unordered_map<std::string, AnimSetAsset> level_intro_sets_;
     AnimSetAsset swat_set_;
     AnimSetAsset swat_2h_set_;

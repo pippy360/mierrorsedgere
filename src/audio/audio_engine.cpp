@@ -625,29 +625,42 @@ void AudioEngine::update(float dt,
             target_breath_gain = 0.10f;
             break;
         case ESoundGroupEffectMode::FallingToDeath:
-            // Mode 6: Wind & Faith scream at full gain, music attenuated
-            target_sfx_gain = 1.15f;
-            target_music_gain = 0.12f;
-            target_breath_gain = 1.25f;
+            // Mode 6 (DefaultEngine.ini): freefall wind active at 1.0 pitch, vocals muted
+            target_sfx_gain = 1.00f;
+            target_music_gain = 0.85f;
+            target_breath_gain = 0.0f;
             target_slomo_pitch = 1.0f;
             break;
         case ESoundGroupEffectMode::DeathByFall:
+            // Mode 8 (DefaultEngine.ini): Music=0, SFX=0, InGameSFX=0, Dead=1.0 at normal pitch
+            target_sfx_gain = 0.0f;
+            target_music_gain = 0.0f;
+            target_breath_gain = 0.0f;
+            target_slomo_pitch = 1.0f;
+            break;
         case ESoundGroupEffectMode::DeathGeneric:
-            // Mode 8/9: Music & ambient ducked out while death impact resonates
-            target_sfx_gain = 0.90f;
+            // Mode 9 (DefaultEngine.ini): low-passed fade to near silence at normal pitch
+            target_sfx_gain = 0.05f;
             target_music_gain = 0.02f;
             target_breath_gain = 0.0f;
-            target_slomo_pitch = 0.88f;
+            target_slomo_pitch = 1.0f;
             break;
         default:
             break;
     }
 
     float lerp_factor = std::clamp(dt * 4.0f, 0.0f, 1.0f);
-    sfx_bus_gain_ += (target_sfx_gain - sfx_bus_gain_) * lerp_factor;
-    music_bus_gain_ += (target_music_gain - music_bus_gain_) * lerp_factor;
-    breath_bus_gain_ += (target_breath_gain - breath_bus_gain_) * lerp_factor;
-    slomo_pitch_scale_ += (target_slomo_pitch - slomo_pitch_scale_) * lerp_factor;
+    if (sound_mode_ == ESoundGroupEffectMode::DeathByFall) {
+        sfx_bus_gain_ = 0.0f;
+        music_bus_gain_ = 0.0f;
+        breath_bus_gain_ = 0.0f;
+        slomo_pitch_scale_ = 1.0f;
+    } else {
+        sfx_bus_gain_ += (target_sfx_gain - sfx_bus_gain_) * lerp_factor;
+        music_bus_gain_ += (target_music_gain - music_bus_gain_) * lerp_factor;
+        breath_bus_gain_ += (target_breath_gain - breath_bus_gain_) * lerp_factor;
+        slomo_pitch_scale_ += (target_slomo_pitch - slomo_pitch_scale_) * lerp_factor;
+    }
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
@@ -725,23 +738,36 @@ void AudioEngine::update(float dt,
         alSourcef(run_wind_source_, AL_PITCH, wind_pitch);
     }
 
-    // 4. Stamina-coupled Faith breathing cadence (A_Character_Female_01.upk)
-    if (player_speed > 320.0f || reaction_active) {
+    // 4. Retail Faith breathing cadence (A_Character_Female_01.upk + AS_C1P_Unarmed.upk notifies):
+    // Walk (notifierdummywalk): Breath_Soft.Breath_Soft_Short_{In,Out}
+    // Jog/Run (notifierdummyrun): Breath_Medium.Breath_Medium_Long_{In,Out}
+    // Sprint (notifierdummysprint, >= 550 UU/s): Breath_Medium.Breath_Medium_Short_{In,Out}
+    // (Note: Breath_Hard.* exports in A_Character_Female_01.upk are empty 48-byte stubs with no waves.)
+    if ((player_speed > 180.0f || reaction_active) && breath_bus_gain_ > 0.02f) {
         breath_timer_ += dt;
-        float breath_interval = reaction_active ? 0.85f : std::clamp(650.0f / std::max(player_speed, 320.0f), 0.55f, 1.4f);
+        float breath_interval = reaction_active
+            ? 0.78f
+            : (player_speed >= 550.0f ? 0.68f : (player_speed >= 320.0f ? 1.05f : 1.15f));
         if (breath_timer_ >= breath_interval) {
             breath_timer_ = 0.0f;
             const char* cue_name = nullptr;
-            if (player_speed > 620.0f || reaction_active) {
-                cue_name = breath_inhale_next_ ? "Breath_Hard.Breath_Hard_Short_In" : "Breath_Hard.Breath_Hard_Short_Out";
+            if (player_speed >= 550.0f || reaction_active) {
+                cue_name = breath_inhale_next_ ? "Breath_Medium.Breath_Medium_Short_In"
+                                               : "Breath_Medium.Breath_Medium_Short_Out";
+            } else if (player_speed >= 320.0f) {
+                cue_name = breath_inhale_next_ ? "Breath_Medium.Breath_Medium_Long_In"
+                                               : "Breath_Medium.Breath_Medium_Long_Out";
             } else {
-                cue_name = breath_inhale_next_ ? "Breath_Medium.Breath_Medium_Long_In" : "Breath_Medium.Breath_Medium_Long_Out";
+                cue_name = breath_inhale_next_ ? "Breath_Soft.Breath_Soft_Short_In"
+                                               : "Breath_Soft.Breath_Soft_Short_Out";
             }
             breath_inhale_next_ = !breath_inhale_next_;
-            play_sound(cue_name, 0.28f * breath_bus_gain_, 1.0f);
+            float spd_scale = std::clamp((player_speed - 180.0f) / 520.0f, 0.35f, 1.0f);
+            float breath_gain = (reaction_active ? 0.90f : (0.55f + 0.40f * spd_scale)) * breath_bus_gain_;
+            play_sound(cue_name, breath_gain, 1.0f);
         }
     } else {
-        breath_timer_ = 0.0f;
+        breath_timer_ = 0.25f;
     }
 
     // 5. Spatialize nearest 4 3D AmbientSound emitters from *_Aud.me1 sublevels (using MONO 3D buffers!)
@@ -1666,28 +1692,45 @@ void AudioEngine::play_effect(EAudioEffect effect, float volume, float pitch) {
             break;
         }
         case EAudioEffect::FallDeathScream: {
+            // Retail TdPlayerPawn.UncontrolledFall.BeginState: SetSoundMode(6) + Death_Fall
+            // (Freefall_Loop + LOD stereo wind rush; retail plays NO vocal scream or impact on entry)
             set_sound_group_mode(ESoundGroupEffectMode::FallingToDeath);
             float v = volume, p = pitch;
-            if (resolve_cue_or_clip("Death_Fall", v, p)) {
-                play_sound("Death_Fall", volume * 1.15f, pitch);
-                if (resolve_cue_or_clip("Oral_Death", v, p)) play_sound("Oral_Death", volume * 0.95f, pitch);
+            if (resolve_cue_or_clip("Freefall_Loop", v, p)) {
+                play_sound("Freefall_Loop", volume * 1.10f, 1.0f);
+                if (resolve_cue_or_clip("LOD", v, p)) play_sound("LOD", volume * 0.55f, 1.0f);
                 return;
             }
-            if (resolve_cue_or_clip("Oral_Death", v, p)) { play_sound("Oral_Death", volume * 1.1f, pitch); return; }
-            if (resolve_cue_or_clip("Death", v, p)) { play_sound("Death", volume * 1.1f, pitch); return; }
+            if (resolve_cue_or_clip("Death_Fall", v, p)) {
+                play_sound("Death_Fall", volume * 1.10f, 1.0f);
+                return;
+            }
             break;
         }
         case EAudioEffect::FallDeathImpact: {
+            // Retail TdPlayerPawn.UncontrolledFall.Landed: fade out FallingSound immediately,
+            // cut all Music/SFX/VO via SetSoundMode(8), and play ONLY Faith.Death_Impact (Bodyfall01..05)
+            // at 1.0x pitch in complete silence (NEVER Misc.ArmCrack!).
+            stop_cue("Death_Fall");
+            stop_cue("Freefall_Loop");
+            stop_cue("LOD");
             set_sound_group_mode(ESoundGroupEffectMode::DeathByFall);
-            float v = volume, p = pitch;
+            float v = volume, p = 1.0f;
             if (resolve_cue_or_clip("Death_Impact", v, p)) {
-                play_sound("Death_Impact", volume * 1.25f, pitch);
-                if (resolve_cue_or_clip("ArmCrack", v, p)) play_sound("ArmCrack", volume * 0.85f, pitch);
+                // Temporarily ensure Dead bus sound plays cleanly even while sfx_bus_gain_ = 0
+                float saved_sfx = sfx_bus_gain_;
+                sfx_bus_gain_ = 1.0f;
+                play_sound("Death_Impact", volume * 1.15f, 1.0f);
+                sfx_bus_gain_ = saved_sfx;
                 return;
             }
-            if (resolve_cue_or_clip("BodyFall", v, p)) { play_sound("BodyFall", volume * 1.2f, pitch); return; }
-            if (resolve_cue_or_clip("Body_Fall", v, p)) { play_sound("Body_Fall", volume * 1.2f, pitch); return; }
-            if (resolve_cue_or_clip("Impact_Hard", v, p)) { play_sound("Impact_Hard", volume * 1.2f, pitch); return; }
+            if (resolve_cue_or_clip("BodyFall", v, p)) {
+                float saved_sfx = sfx_bus_gain_;
+                sfx_bus_gain_ = 1.0f;
+                play_sound("BodyFall", volume * 1.15f, 1.0f);
+                sfx_bus_gain_ = saved_sfx;
+                return;
+            }
             break;
         }
         default:

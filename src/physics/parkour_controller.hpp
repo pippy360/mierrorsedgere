@@ -313,6 +313,7 @@ private:
 
     // Movement Timers & Accumulators
     float m_state_timer = 0.0f;
+    Vec3 m_pullup_start{0.0f, 0.0f, 0.0f};
     float m_wallrun_cooldown = 0.0f;
     float m_wallrun_begin_speed = 0.0f;
     float m_slide_timer = 0.0f;

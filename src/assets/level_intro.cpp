@@ -680,13 +680,12 @@ bool bake_pawn_matinee(const std::string& game_root, const Packages& packages, c
         actor_yaw = Rotator(rp->vi[0], rp->vi[1], rp->vi[2]).to_degrees().y;
     }
 
-    // Where the animation's root sits against the placed actor. Retail, from its pawn and
-    // camera through all ten intros: the root is at the actor, so the pawn's Location rides
-    // kPawnAboveRoot over it, floor under the actor or not (Jacknife's is in mid-air). Boat is
-    // the exception, and the one intro whose pawn group has a movement track: there the
-    // pawn's Location itself is at the actor, which the level places that far above the deck,
-    // and the root is kPawnAboveRoot below.
-    const bool pawn_at_actor = !move.keys.empty();
+    // Where the animation's root sits against the placed actor:
+    // SkeletalMeshActorMAT (CINE_Female1p) always has its pivot on the floor (root height), even
+    // when UnrealEd inserted a default constant (0,0,0) InterpTrackMove track. Only 3P
+    // SkeletalMeshActor (SK_TKY_Crim_Fixer, e.g. Boat sp07_intro / sp07_truck) is placed at
+    // pawn capsule center (+94 uu above the floor).
+    const bool pawn_at_actor = class_of(pkg, m.actor) == "SkeletalMeshActor";
     Vec3 anim_origin = actor_loc;
     if (pawn_at_actor) anim_origin.z -= kPawnAboveRoot;
 
