@@ -15,6 +15,9 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 - The camera isn't high enough in the cutscene.
 - Player can hear Faith getting injured (taking damage) while a cutscene is playing.
 - Faith doesn't make her breathing sound effects while running.
+- The door barge animation is still wrong.
+- Jumping + trying to vault something mid-air doesn't work like it does in the retail game.
+- The correct animation isn't played when Faith has a soft landing (e.g. landing cushion).
 
 ---
 
