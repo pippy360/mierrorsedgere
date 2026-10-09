@@ -224,6 +224,90 @@ void Director::reset() {
     swan_forward_ = swan_down_ = 0.0f;
     hips_offset_ = Vec3(0.0f, 0.0f, 0.0f);
     slide_ended_ = 1.0f;
+    controls_.reset();
+    hand_ik_[0] = hand_ik_[1] = false;
+    hand_ik_blend_[0] = hand_ik_blend_[1] = 0.0f;
+    vault_ik_on_ = vault_ik_off_ = -1.0f;
+    foot_placement_ = false;
+    foot_blend_ = 0.2f;
+    foot_timer_ = -1.0f;
+}
+
+void Director::set_hand_ik(int side, const Vec3& target, float blend) {
+    hand_ik_[side] = true;
+    hand_ik_target_[side] = target;
+    hand_ik_blend_[side] = blend;
+}
+
+void Director::clear_hand_ik(float blend) {
+    for (int side = 0; side < 2; ++side) {
+        hand_ik_[side] = false;
+        hand_ik_blend_[side] = blend;
+    }
+}
+
+// TdMove_SpeedVault.EnableVaultIK: the left hand (both, vaulting onto something high) on the
+// ledge, 7 back from its edge; the left 26 to her left of where the ledge was found, the right 10
+// to her right.
+void Director::vault_ik(const PawnFrame& frame) {
+    if (!frame.ledge_known) return;
+    const Vec3 right = frame.ledge_wall_normal.cross(frame.ledge_top_normal);
+    Vec3 dir(-frame.ledge_wall_normal.x, -frame.ledge_wall_normal.y, 0.0f);
+    dir = dir.length_sq() > 1e-6f ? dir.normalized() : dir;
+    set_hand_ik(0, frame.ledge_point - right * 20.0f + dir * -7.0f - right * 6.0f, 0.1f);
+    if (vault_ik_both_) set_hand_ik(1, frame.ledge_point + dir * -7.0f + right * 10.0f, 0.1f);
+}
+
+// The tree's skeletal controls read the pawn after the tree has: what the lazy springs follow,
+// which arms aim, where the hands and feet are to go.
+void Director::tick_controls(const PawnFrame& frame) {
+    if (vault_ik_on_ >= 0.0f) {
+        vault_ik_on_ -= frame.dt;
+        if (vault_ik_on_ < 0.0f) vault_ik(vault_frame_);
+    }
+    if (vault_ik_off_ >= 0.0f) {
+        vault_ik_off_ -= frame.dt;
+        if (vault_ik_off_ < 0.0f) clear_hand_ik(0.1f);
+    }
+    if (foot_timer_ >= 0.0f) {
+        foot_timer_ -= frame.dt;
+        if (foot_timer_ < 0.0f) {
+            // TdPlayerPawn.DisableFootPlacement.
+            foot_placement_ = false;
+            foot_blend_ = 0.2f;
+        }
+    }
+    SkelControls::Input in;
+    in.dt = frame.dt;
+    in.movement = frame.movement;
+    in.walking_state = pawn_.walking_state;
+    in.weapon_state = pawn_.weapon_state;
+    in.armed = frame.armed;
+    in.heavy_weapon = frame.heavy_weapon;
+    in.view_pitch_deg = frame.view_pitch_deg;
+    in.view_yaw_deg = frame.view_yaw_deg;
+    in.pawn_yaw_deg = frame.yaw_deg;
+    in.velocity = frame.velocity;
+    // bSetStrengthFromAnimNode: the weight of the nodes a control names.
+    for (const TreeNode& n : tree_.nodes()) {
+        if (!n.relevant || n.name.empty()) continue;
+        if (n.name == "WalkingState") in.walking_node_weight += n.total;
+        else if (n.name == "AgainstWallLeft") in.wall_weight[0] += n.total;
+        else if (n.name == "AgainstWallRight") in.wall_weight[1] += n.total;
+    }
+    in.against_wall = frame.against_wall;
+    for (int side = 0; side < 2; ++side) {
+        in.wall_hand[side] = frame.wall_hand[side];
+        in.hand_ik[side] = hand_ik_[side];
+        in.hand_ik_target[side] = hand_ik_target_[side];
+        in.hand_ik_blend[side] = hand_ik_blend_[side];
+    }
+    in.foot_placement = foot_placement_;
+    in.foot_blend = foot_blend_;
+    in.floor_sloped = frame.floor_sloped;
+    in.smooth_offset = frame.smooth_offset;
+    in.fired = frame.fired;
+    controls_.tick(in);
 }
 
 // The weapon in hand: TdPawn.SetArmed / PlayWeaponDeploy, PlayFireAnimation, UpdateWeaponAnimState.
@@ -563,6 +647,12 @@ void Director::land_normal(float amount) {
 
 void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& frame) {
     (void)frame;
+    // TdMove_GrabPullUp.StopMove and TdMove_SpeedVault.StopMove take the hands' world IK off.
+    if (move == EMovement::MOVE_GrabPullUp) clear_hand_ik(0.0f);
+    if (move == EMovement::MOVE_VaultOver || move == EMovement::MOVE_SpeedVaulting) {
+        clear_hand_ik(0.1f);
+        vault_ik_on_ = vault_ik_off_ = -1.0f;
+    }
     switch (move) {
         case EMovement::MOVE_Jump:
             // TdMove_Jump.StopMove: the jump animation carries on into a fall or a vault.
@@ -582,6 +672,11 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.4f);
             break;
         case EMovement::MOVE_Grabbing:
+            // TdMove_Grab.StopMove: the hands come off the ledge, unless she is pulling herself up
+            // (RequestDropDown lets them go over 0.3 s).
+            if (pending != EMovement::MOVE_GrabPullUp) clear_hand_ik(pending == EMovement::MOVE_Falling ? 0.3f : 0.0f);
+            tree_.stop_custom_anim(Slot::FullBody, 0.2f);
+            break;
         case EMovement::MOVE_SoftLanding:
         case EMovement::MOVE_180Turn:
             tree_.stop_custom_anim(Slot::FullBody, 0.2f);
@@ -603,6 +698,12 @@ void Director::stop_move(EMovement move, EMovement pending, const PawnFrame& fra
             play(Slot::FullBody, "CrouchSlideToCrouch", 1.0f, 0.1f, 0.2f);
             break;
         case EMovement::MOVE_Crouch:
+            // TdMove_Crouch.StopMove: standing up into a walk, the feet are placed for 0.2 s.
+            if (pending == EMovement::MOVE_Walking) {
+                foot_placement_ = true;
+                foot_blend_ = 0.0f;
+                foot_timer_ = 0.2f;
+            }
             play(Slot::Camera, "CrouchIntoStand", 1.0f, 0.2f, 0.2f);
             break;
         case EMovement::MOVE_Coil:
@@ -691,6 +792,23 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             // TdMove_SpeedVault.StartMove: the vault type's animation.
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.2f);
             if (frame.move_anim.empty()) play(Slot::FullBody, "VaultOver", 1.0f, 0.15f, 0.2f);
+            // UpdateVaultMovement: the vault types with bLeftHandIK (VaultOnto, VaultOver) or both
+            // hands' (VaultOntoHigh) have the hands on the ledge from the hand plant (after
+            // VaultTimeUp: at once, or 0.27 s) for VaultTimeOver (0.35 s, 0.3 s).
+            {
+                const std::string anim = lower(frame.move_anim);
+                vault_ik_on_ = vault_ik_off_ = -1.0f;
+                if (anim == "vaultonto" || anim == "vaultover") {
+                    vault_ik_both_ = false;
+                    vault_ik(frame);
+                    vault_ik_off_ = 0.35f;
+                } else if (anim == "vaultontohigh") {
+                    vault_ik_both_ = true;
+                    vault_frame_ = frame;
+                    vault_ik_on_ = 0.27f;
+                    vault_ik_off_ = 0.27f + 0.3f;
+                }
+            }
             break;
         case EMovement::MOVE_AutoStepUp:
             play(Slot::FullBody, "autostepuprightleg", 0.8f, 0.15f, 0.25f);
@@ -787,10 +905,14 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
         case EMovement::MOVE_Crouch:
             tree_.stop_custom_anim(Slot::FullBodyDir, 0.25f);
             tree_.stop_custom_anim(Slot::LowerBody, 0.25f);
-            // Out of a walk the mesh is lifted 15 for a moment while the capsule drops.
+            // Out of a walk the mesh is lifted 15 for a moment while the capsule drops, and the
+            // feet are placed for 0.2 s (EnableFootPlacement(0.1), the pawn's timer to disable it).
             if (old == EMovement::MOVE_Walking) {
                 set_root_offset(Vec3(0.0f, 0.0f, 15.0f), 0.1f);
                 root_timer_ = 0.15f;
+                foot_placement_ = true;
+                foot_blend_ = 0.1f;
+                foot_timer_ = 0.2f;
             }
             break;
         case EMovement::MOVE_180Turn: {
@@ -877,6 +999,14 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             // Hanging free from a sloped ledge it is 3 up instead.
             if (!frame.hanging_free) set_root_offset(Vec3(1.0f, 0.0f, 0.0f), 0.3f);
             else if (frame.ledge_sloped) set_root_offset(Vec3(0.0f, 0.0f, 3.0f), 0.3f);
+            // TdMove_Grab.EnableGrabIK, on a sloped ledge: the hands 20 to either side of where the
+            // ledge was found, along it, 11 below it and 3 out from the wall, over 0.1 s.
+            if (frame.ledge_sloped && frame.ledge_known) {
+                const Vec3 right = frame.ledge_wall_normal.cross(frame.ledge_top_normal);
+                const Vec3 shift = Vec3(0.0f, 0.0f, -11.0f) + frame.ledge_wall_normal * 3.0f;
+                set_hand_ik(0, frame.ledge_point - right * 20.0f + shift, 0.1f);
+                set_hand_ik(1, frame.ledge_point + right * 20.0f + shift, 0.1f);
+            }
             grab_turn_ = 0;
             grab_timer_ = -1.0f;
             grab_free_turn_ = false;
@@ -1019,6 +1149,7 @@ void Director::tick(const PawnFrame& frame) {
     tick_weapon(frame);
     tick_swan_neck(frame);
     tree_.tick(pawn_, frame.dt);
+    tick_controls(frame);
     last_velocity_ = frame.velocity;
 }
 

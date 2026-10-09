@@ -1467,6 +1467,9 @@ bool is_heavy_weapon_name(const std::string& wname) {
 // -----------------------------------------------------------------------------
 // Evaluate Faith's 1P Skeletal Viewmodel (AT_C1P Blend Tree + Linear Blend Skinning)
 // -----------------------------------------------------------------------------
+// TdPlayerPawn.Mesh1p sits 94 below the capsule's centre: 4 below the feet (measured, standing and crouched).
+constexpr float kMeshOriginBelowFeet = 4.0f;
+
 struct AnimSystem::FirstPerson {
     fp::Director director;
     fp::PoseEvaluator poser;
@@ -1511,8 +1514,12 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
             return nullptr;
         };
         fp.ok = fp.director.init(game_root_, lookup, error);
-        if (fp.ok) fp.poser.init(faith_upper_, faith_unarmed_set_, fp.director.tree());
-        else std::cerr << "[anim] first-person tree: " << error << "\n";
+        if (fp.ok) {
+            fp.poser.init(faith_upper_, faith_unarmed_set_, fp.director.tree());
+            fp.director.controls().init(faith_upper_, fp.poser.forward_axis(), fp.poser.right_axis(), fp.poser.up_axis());
+        } else {
+            std::cerr << "[anim] first-person tree: " << error << "\n";
+        }
     }
     if (!fp.ok) return use;
 
@@ -1570,9 +1577,14 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.balance_lean = telemetry.balance_lean;
         frame.balance_danger = telemetry.balance_danger;
         frame.against_wall = telemetry.against_wall;
-        frame.against_wall_left = telemetry.against_wall_left;
-        frame.against_wall_right = telemetry.against_wall_right;
-        frame.against_wall_height = telemetry.against_wall_height;
+        frame.wall_hand[0] = telemetry.against_wall_hand[0];
+        frame.wall_hand[1] = telemetry.against_wall_hand[1];
+        frame.ledge_known = telemetry.ledge_known;
+        frame.ledge_point = telemetry.ledge_point;
+        frame.ledge_wall_normal = telemetry.ledge_wall_normal;
+        frame.ledge_top_normal = telemetry.ledge_top_normal;
+        frame.floor_sloped = telemetry.floor_sloped;
+        frame.smooth_offset = telemetry.camera_mesh_offset.z;
         frame.climbing_pipe = telemetry.climbing_pipe;
         frame.climb_top = telemetry.climb_top;
         frame.climb_bottom = telemetry.climb_bottom;
@@ -1597,31 +1609,34 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         }
         fp.director.tick(frame);
         fp.last_frame = frame;
-        // At the ready the weapon arm follows the view (TdSkelControlAim1p), both arms with a two-handed weapon.
         fp::PoseEvaluator::Aim aim;
         fp.poser.set_grip_enabled(telemetry.move_state != EMovement::MOVE_Snatch);
-        aim.pitch_deg = telemetry.pitch_deg;
-        // (An arm that is on the wall is not the weapon's to aim.)
-        aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_right());
-        aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_left());
-        // (With a two-handed weapon both hands stay on it: its own `againstwall` has them there.)
-        const bool both_on_weapon = fp.director.pawn().heavy_weapon && fp.director.pawn().weapon_state != 0;
-        aim.wall_left = both_on_weapon ? 0.0f : fp.director.tree().wall_left();
-        aim.wall_right = both_on_weapon ? 0.0f : fp.director.tree().wall_right();
-        aim.wall_ahead_left = fp.last_frame.against_wall_left;
-        aim.wall_ahead_right = fp.last_frame.against_wall_right;
-        aim.wall_height = fp.last_frame.against_wall_height;
-        aim.hips = fp.director.hips_offset();
-        aim.swan_forward = fp.director.swan_forward();
-        aim.swan_down = fp.director.swan_down();
-        // The two light weapons whose class sets a shoulder offset (TdSharedContent.u).
-        if (fp.weapon_name == "BerettaM93R") aim.shoulder = Vec3(0.0f, 0.8f, -1.43f);
-        else if (fp.weapon_name == "SteyrTMP") aim.shoulder = Vec3(0.0f, 4.0f, -1.0f);
-        fp.poser.evaluate(fp.director.tree(), fp.pose, aim);
-        fp.poser.component_space(fp.pose, fp.comp_pos, fp.comp_rot);
         float look = telemetry.yaw_deg - telemetry.body_yaw_deg;
         while (look > 180.0f) look -= 360.0f;
         while (look < -180.0f) look += 360.0f;
+        aim.hips = fp.director.hips_offset();
+        aim.swan_forward = fp.director.swan_forward();
+        aim.swan_down = fp.director.swan_down();
+        aim.look_yaw_deg = look;
+        // The two light weapons whose class sets a shoulder offset (TdSharedContent.u).
+        if (fp.weapon_name == "BerettaM93R") aim.shoulder = Vec3(0.0f, 0.8f, -1.43f);
+        else if (fp.weapon_name == "SteyrTMP") aim.shoulder = Vec3(0.0f, 4.0f, -1.0f);
+        // The mesh in the world, for the controls that put hands and feet on the level: its
+        // origin is 4 below the feet, and it is moved with the eye (the root offset, OffsetMeshXY
+        // and SmoothOffset).
+        fp::MeshPlace place;
+        {
+            const Rotator body = Rotator::from_degrees(0.0f, telemetry.body_yaw_deg, 0.0f);
+            place.forward = body.forward();
+            place.right = body.right();
+            fp::ViewFrame shift;
+            fp.director.apply_mesh_transform(shift);  // the root offset alone
+            place.origin = telemetry.position + Vec3(0.0f, 0.0f, shift.eye_pawn.z - kMeshOriginBelowFeet) + place.forward * shift.eye_pawn.x +
+                           place.right * shift.eye_pawn.y + telemetry.camera_mesh_offset;
+            place.trace = world_trace_;
+        }
+        fp.poser.evaluate(fp.director.tree(), fp.pose, aim, &fp.director.controls(), &place);
+        fp.poser.component_space(fp.pose, fp.comp_pos, fp.comp_rot);
         fp.view = fp.poser.view(fp.comp_pos, fp.comp_rot, telemetry.pitch_deg, look, fp.director.swan_forward(), fp.director.swan_down());
         fp.director.apply_mesh_transform(fp.view);
         fp.last_time = telemetry.sim_time;
@@ -2644,9 +2659,6 @@ CameraAnimation AnimSystem::camera_animation(const PlayerTelemetry& telemetry) c
     out.roll_deg = -y;
     return out;
 }
-
-// TdPlayerPawn.Mesh1p sits 94 below the capsule's centre: 4 below the feet (measured, standing and crouched).
-constexpr float kMeshOriginBelowFeet = 4.0f;
 
 void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
     const Vec3 still_eye(0.0f, 0.0f, telemetry.eye_height);

@@ -1384,6 +1384,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     renderer.set_selected_chapter(current_chapter_idx);
 
     ParkourController controller(move_cfg);
+    // The first-person mesh's foot placement asks the level where the floor is under each foot.
+    renderer.set_world_trace([&controller, &active_scene](const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal) {
+        return controller.leg_line_check(from, to, active_scene, hit, normal);
+    });
 
     CutscenePlayer cutscene_player;
     cutscene_player.init(game_root, /*headless=*/(max_frames > 0));

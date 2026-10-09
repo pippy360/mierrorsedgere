@@ -37,6 +37,7 @@ set(CORE_SOURCES
     src/anim/fp_anim.cpp
     src/anim/fp_director.cpp
     src/anim/fp_pose.cpp
+    src/anim/fp_controls.cpp
     src/assets/upk_loader.cpp
     src/assets/ue3_props.cpp
     src/assets/package_manager.cpp

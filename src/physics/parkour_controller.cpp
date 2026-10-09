@@ -819,6 +819,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         const bool has_floor = !attached &&
                                check_ground(scene, probe_depth, low_profile ? kCrouchHeight : kPawnHeight, floor);
 
+        m_telemetry.floor_sloped = has_floor && floor.normal.z < 0.9999f;
         if (has_floor && m_telemetry.velocity.z <= 50.0f) {
             if (!m_telemetry.grounded) {
                 land(floor, scene);
@@ -1109,34 +1110,48 @@ void ParkourController::camera_reset_look(float seconds) {
 // Fitted: a trace from each shoulder (15 uu either side) along her facing, 43.3 uu from her centre
 // line and 0.121 s of her speed further, that has to meet a wall no more than 62 degrees off square.
 // Only in the moves with bEnableAgainstWall (Walking, Crouch, LedgeWalk).
+bool ParkourController::leg_line_check(const Vec3& from, const Vec3& to, const LevelScene& scene, Vec3& hit, Vec3& normal) const {
+    const TraceHit t = trace_ray(from, to, scene, COLL_BlockZeroExtent);
+    if (!t.hit) return false;
+    hit = t.point;
+    normal = t.normal;
+    return true;
+}
+
 void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
     const EMovement m = m_telemetry.move_state;
     int state = 0;
     if ((m == EMovement::MOVE_Walking || m == EMovement::MOVE_Crouch || m == EMovement::MOVE_LedgeWalk) && m_telemetry.grounded) {
+        // TdPawn's native check, as the executable has it: a box of 2 x 2 x 5 (half extents) swept
+        // from 14 uu to either side of her centre, 68 above it (26 crouched), the way she faces,
+        // by 40 uu or 0.28 of her speed that way if that is more. A hand has a wall where the
+        // box meets one that faces her within 60 degrees. The hand's place is where the box stopped,
+        // moved out to its side by up to 15 uu as she looks down.
         const Rotator body = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f);
         const Vec3 fwd = body.forward();
         const Vec3 right = body.right();
-        const float toward = std::max(0.0f, horiz(m_telemetry.velocity).dot(fwd));
-        const float reach = 43.3f + 0.121f * toward;
-        const float shoulder = 0.78f * (m == EMovement::MOVE_Crouch ? kCrouchHeight : kPawnHeight);
+        const bool crouched = m == EMovement::MOVE_Crouch;
+        const Vec3 centre = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * (crouched ? kCrouchHeight : kPawnHeight));
+        const float reach = std::max(40.0f, m_telemetry.velocity.dot(fwd) * 0.7f * 0.4f);
+        const float look_down = std::min(0.0f, std::sin(m_telemetry.pitch_deg * DEG2RAD));
+        const Vec3 extent(2.0f, 2.0f, 5.0f);
         bool hand[2] = {false, false};
-        float ahead[2] = {-1.0f, -1.0f};
         Vec3 normal(0.0f, 0.0f, 0.0f);
-        for (int k = 0; k < 2; ++k) {
-            const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, shoulder) + right * (k == 0 ? -15.0f : 15.0f);
-            const TraceHit hit = trace_ray(start, start + fwd * reach, scene);
-            if (hit.hit && !hit.start_penetrating && std::abs(hit.normal.z) < 0.3f && horiz(hit.normal).normalized().dot(fwd) <= -0.47f) {
+        for (int k = 1; k >= 0; --k) {  // the right hand's first
+            const float side = k == 0 ? -1.0f : 1.0f;
+            const Vec3 start = centre + right * (14.0f * side) + Vec3(0.0f, 0.0f, crouched ? 26.0f : 68.0f);
+            const TraceHit hit = sweep_box(start, extent, fwd * reach, scene);
+            if (hit.hit && hit.normal.dot(fwd) < -0.5f) {
                 hand[k] = true;
-                ahead[k] = hit.fraction * reach;
+                m_telemetry.against_wall_hand[k] = hit.point - right * (side * look_down * 15.0f);
                 normal = normal + horiz(hit.normal);
             }
         }
-        if (hand[0]) m_telemetry.against_wall_left = ahead[0];
-        if (hand[1]) m_telemetry.against_wall_right = ahead[1];
-        m_telemetry.against_wall_height = shoulder;
-        state = hand[0] && hand[1] ? 1 : hand[0] ? 2 : hand[1] ? 3 : 0;
+        const bool heavy = m_telemetry.weapon.equipped && m_telemetry.weapon.is_heavy;
+        state = hand[0] && hand[1] ? 1 : hand[0] ? (heavy ? 1 : 2) : hand[1] ? (heavy ? 1 : 3) : 0;
         if (state != 0 && normal.length_sq() > 1e-4f) m_against_wall_yaw = yaw_of(-normal);
     }
+    // UpdateAgainstWall: the state holds for 0.15 s after the check last found a wall.
     if (state != 0) {
         m_against_wall = state;
         m_against_wall_off = 0.0f;
@@ -1144,7 +1159,6 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         m_against_wall_off += dt;
         if (m_against_wall_off >= 0.15f) m_against_wall = 0;
     }
-    if (m_against_wall == 0) m_telemetry.against_wall_left = m_telemetry.against_wall_right = -1.0f;
     m_telemetry.against_wall = m_against_wall;
 }
 
@@ -3370,6 +3384,11 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     // The test box is inscribed in the pawn's circle, so it clears a wall face at any angle.
     const float target_z = ledge.top_z - c.grab_hang_depth;
     const float gap = ledge.wall_distance - kPawnRadius - 1.0f;
+    // TdPawn.MoveLedgeLocation: the lip in front of her.
+    m_telemetry.ledge_known = true;
+    m_telemetry.ledge_point = Vec3(m_telemetry.position.x, m_telemetry.position.y, ledge.top_z) + into * ledge.wall_distance;
+    m_telemetry.ledge_wall_normal = ledge.normal;
+    m_telemetry.ledge_top_normal = ledge.top_normal;
     {
         const float r = kPawnRadius * 0.7f;
         const Vec3 hang = m_telemetry.position + into * std::max(gap, 0.0f);
@@ -3712,6 +3731,10 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     const float probe_extra = std::max(0.0f, (ledge.top_point - m_telemetry.position).dot(into) - ledge.wall_distance);
     Vec3 face = ledge.top_point - into * probe_extra;  // back on the front face line
     face.z = top_z;
+    m_telemetry.ledge_known = true;
+    m_telemetry.ledge_point = face;
+    m_telemetry.ledge_wall_normal = ledge.normal;
+    m_telemetry.ledge_top_normal = ledge.top_normal;
 
     // TdMove_SpeedVault.FindValidOntoEndLocation: the body (a 1.4 x radius box, full height) has to
     // pass VaultClearObjectHeight above the ledge for at least 32 (low ledge) / 64 units along the

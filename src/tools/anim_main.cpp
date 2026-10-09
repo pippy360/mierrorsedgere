@@ -14,7 +14,9 @@
 // what the moves read off the level, which a recording does not carry: g (the height of the feet
 // above the ground), gap (a long jump over a gap), left (a sideways move going left), free (hanging
 // free), acc (the player pushing a direction), anim (the animation the move picked, "@reached" for
-// getting to the place the move steers for), swing (the swing's angle), lean, pipe.
+// getting to the place the move steers for), swing (the swing's angle), lean, pipe, wall and
+// wallat (the against-wall state and how far ahead the wall is), ledge (the ledge of a hang or
+// vault), heavy, fired, floor (a floor that is not level).
 
 #include "../anim/anim_system.hpp"
 #include "../anim/fp_director.hpp"
@@ -125,6 +127,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         poser.init(anim.faith_upper_mesh(), unarmed, director.tree());
+        director.controls().init(anim.faith_upper_mesh(), poser.forward_axis(), poser.right_axis(), poser.up_axis());
         eye_file.open(eye_path);
     }
     me::fp::Pose pose;
@@ -158,6 +161,7 @@ int main(int argc, char** argv) {
         // acc (pushing a direction), anim (the animation the move picked, or @reached), swing
         // (radians), lean, pipe.
         f.ground_distance = -1.0f;
+        float wall_ahead = -1.0f;
         for (std::string token; ls >> token;) {
             const size_t eq = token.find('=');
             if (eq == std::string::npos) continue;
@@ -177,9 +181,20 @@ int main(int argc, char** argv) {
             else if (key == "armed") f.armed = value != "0";
             else if (key == "danger") f.balance_danger = std::stoi(value);
             else if (key == "wall") f.against_wall = std::stoi(value);
-            else if (key == "wallat") {
-                f.against_wall_left = f.against_wall_right = std::stof(value);
-                f.against_wall_height = 0.78f * 180.0f;
+            else if (key == "wallat") wall_ahead = std::stof(value);  // how far ahead of her centre the wall is
+            else if (key == "heavy") f.heavy_weapon = value != "0";
+            else if (key == "fired") f.fired = value != "0";
+            else if (key == "floor") f.floor_sloped = value != "0";
+            else if (key == "ledge") {
+                // ledge=x,y,z,nx,ny[,tx,ty,tz]: where the ledge is, the wall's normal, the top's normal.
+                float v[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+                std::stringstream parts(value);
+                int n = 0;
+                for (std::string part; n < 8 && std::getline(parts, part, ',');) v[n++] = std::stof(part);
+                f.ledge_known = true;
+                f.ledge_point = me::Vec3(v[0], v[1], v[2]);
+                f.ledge_wall_normal = me::Vec3(v[3], v[4], 0.0f);
+                f.ledge_top_normal = me::Vec3(v[5], v[6], v[7]);
             }
             else if (key == "pipe") f.climbing_pipe = value != "0";
             else if (key == "top") f.climb_top = std::stof(value);
@@ -187,16 +202,29 @@ int main(int argc, char** argv) {
         f.movement = static_cast<me::EMovement>(move);
         f.dt = last_t < 0.0 ? 0.0f : static_cast<float>(t - last_t);
         last_t = t;
+        // The recordings' pawn location is the capsule's centre, 94 above the mesh's origin.
+        me::fp::MeshPlace place;
+        {
+            const me::Rotator body = me::Rotator::from_degrees(0.0f, f.yaw_deg, 0.0f);
+            place.origin = f.position - me::Vec3(0.0f, 0.0f, 94.0f);
+            place.forward = body.forward();
+            place.right = body.right();
+            // TdPawn.CheckAgainstWall's traces: 14 to either side, 68 up, a 2 uu box that stops on the wall.
+            if (wall_ahead >= 0.0f) {
+                for (int side = 0; side < 2; ++side) {
+                    f.wall_hand[side] = f.position + place.forward * (wall_ahead - 2.0f) + place.right * (side == 0 ? -14.0f : 14.0f) +
+                                        me::Vec3(0.0f, 0.0f, 68.0f);
+                }
+            }
+        }
         director.tick(f);
         if (eye_file.is_open()) {
             me::fp::PoseEvaluator::Aim aim;
             aim.hips = director.hips_offset();
-            aim.wall_left = director.tree().wall_left();
-            aim.wall_right = director.tree().wall_right();
-            aim.wall_ahead_left = f.against_wall_left;
-            aim.wall_ahead_right = f.against_wall_right;
-            aim.wall_height = f.against_wall_height;
-            poser.evaluate(director.tree(), pose, aim);
+            aim.swan_forward = director.swan_forward();
+            aim.swan_down = director.swan_down();
+            aim.look_yaw_deg = f.view_yaw_deg - f.yaw_deg;
+            poser.evaluate(director.tree(), pose, aim, &director.controls(), &place);
             poser.component_space(pose, comp_pos, comp_rot);
             me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg, director.swan_forward(),
                                              director.swan_down());
@@ -208,17 +236,35 @@ int main(int argc, char** argv) {
             // Where the hands are in that view: to the left, ahead, up.
             if (watch.size() == 1 && watch[0] == "?") {
                 // --bones ? lists the skeleton.
-                for (const auto& bone : upper_mesh.bones) std::cout << bone.name << std::endl;
+                // --bones ? lists the skeleton: each bone, its parent, and where it is in the mesh's
+                // space in the reference pose.
+                for (const auto& bone : upper_mesh.bones) {
+                    const int up = bone.parent_index;
+                    std::cout << bone.name << " (" << (up >= 0 && &bone != &upper_mesh.bones[0] ? upper_mesh.bones[static_cast<size_t>(up)].name : std::string("-"))
+                              << ") " << bone.comp_ref_pos.x << " " << bone.comp_ref_pos.y << " " << bone.comp_ref_pos.z << std::endl;
+                }
                 return 0;
             }
             for (const std::string& want : watch) {
+                // "w:<bone>" writes the bone's place in the world instead (the mesh's origin 94
+                // under the recorded pawn location).
+                const bool world = want.compare(0, 2, "w:") == 0;
+                const std::string bone_name = world ? want.substr(2) : want;
                 me::Vec3 d(0.0f, 0.0f, 0.0f);
                 for (size_t b = 0; b < upper_mesh.bones.size(); ++b) {
                     std::string name = upper_mesh.bones[b].name;
                     for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    if (name == want) d = comp_pos[b] - v.eye;
+                    if (name != bone_name) continue;
+                    if (world) {
+                        const me::Vec3& c = comp_pos[b];
+                        d = place.origin + place.forward * c.dot(poser.forward_axis()) + place.right * c.dot(poser.right_axis()) +
+                            me::Vec3(0.0f, 0.0f, c.dot(poser.up_axis()));
+                    } else {
+                        d = comp_pos[b] - v.eye;
+                    }
                 }
-                std::snprintf(line, sizeof line, " %.2f %.2f %.2f", d.dot(v.left), d.dot(v.forward), d.dot(v.up));
+                if (world) std::snprintf(line, sizeof line, " %.2f %.2f %.2f", d.x, d.y, d.z);
+                else std::snprintf(line, sizeof line, " %.2f %.2f %.2f", d.dot(v.left), d.dot(v.forward), d.dot(v.up));
                 eye_file << line;
             }
             eye_file << "\n";

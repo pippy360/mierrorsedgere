@@ -58,6 +58,9 @@ public:
     // TdPlayerPawn.CalcCamera's last step, once a frame after the step: the move's
     // CheckForCameraCollision with the eye of the first-person mesh as it is without any offset.
     void update_camera_collision(const Vec3& eye, float dt, const LevelScene& scene);
+    // USkeletalMeshComponent::LegLineCheck: a line through the level's geometry with no extent,
+    // for the first-person mesh's foot placement. True with where it meets something.
+    bool leg_line_check(const Vec3& from, const Vec3& to, const LevelScene& scene, Vec3& hit, Vec3& normal) const;
     [[nodiscard]] PlayerTelemetry& get_telemetry() { return m_telemetry; }
 
     [[nodiscard]] const MovementConfig& get_config() const { return m_config; }
