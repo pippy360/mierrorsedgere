@@ -2,7 +2,7 @@
 
 A high-performance, clean-room native macOS port and engine reimplementation of *Mirror's Edge* (PC Unreal Engine 3 CookedPC) designed from first principles for Apple Silicon (arm64, M-series) and macOS Metal 3.0.
 
-The same game also builds and runs on Windows, drawn with Direct3D 11: see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md).
+The same game also builds and runs on Windows, drawn with Direct3D 11 (see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)), and on Linux, drawn with OpenGL 4.1 (see [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md)).
 
 Built under the `universal-modder` methodology (Pattern 4: *Reimplement, then Fuse*), `mierrorsedgere` directly loads and runs retail PC assets (UPK/ME1 packages, Ogg Vorbis audio banks, INI physics configs, and INT localization files) from the user's local game installation without redistributing or modifying proprietary game binaries.
 
@@ -40,6 +40,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
      - `2D Vector HUD & Bitmap Font`: Minimalist built-in ASCII typography overlay, dynamic center reticle, momentum speedometer, health/reaction gauges, subtitle prompts, and interactive Chapter Select modal.
    - Dual-Mode: Seamless switching between interactive windowed mode (SDL2 + `CAMetalLayer` with Retina high-DPI support) and zero-copy shared memory headless mode for automated verification.
    - On Windows, `src/renderer/d3d11_renderer.*` draws the same passes with Direct3D 11. It has no shaders of its own: the MSL above and the generated material shaders are translated to HLSL at start-up (`src/renderer/msl_to_hlsl.*`).
+   - On Linux, `src/renderer/opengl_renderer.*` draws them with OpenGL 4.1 core, the same MSL translated to GLSL (`src/renderer/msl_to_glsl.*`). It also builds on macOS as `mirrorsedge_opengl`, which is how it is checked against the Metal renderer.
 
 4. **Dynamic Audio Engine (`src/audio/audio_engine.*`)**:
    - Native OpenAL spatial audio subsystem with Xiph.Org libVorbis streaming.
@@ -87,6 +88,13 @@ Then run the launcher from `cmd` or PowerShell:
 play_windows.bat
 ```
 It builds `build-win/mirrorsedge_windows.exe` and starts it; arguments are passed on (`play_windows.bat --chapter 1`). The retail install is found through Steam, or set `MEDGE_ME_INSTALL` or pass `--game-root`. Details, what was verified and the known gaps are in [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md).
+
+### Linux
+Install the distribution's toolchain and libraries (Debian / Ubuntu: `g++ cmake ninja-build pkg-config libsdl2-dev libopenal-dev libvorbis-dev libavformat-dev libavcodec-dev libswscale-dev libswresample-dev libavutil-dev zlib1g-dev`) and run the launcher:
+```bash
+./play_linux.sh
+```
+It builds `build/mirrorsedge_linux` (OpenGL 4.1 core) and starts it; arguments are passed on (`./play_linux.sh --chapter 1`). The retail install is found in the Steam libraries (native, Flatpak and Snap clients, Proton installs included), or set `MEDGE_ME_INSTALL` or pass `--game-root`. The same backend builds on macOS as `build/mirrorsedge_opengl`. Details, what was verified and the known gaps are in [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md).
 
 ---
 
