@@ -18,6 +18,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 - The door barge animation is still wrong.
 - Jumping + trying to vault something mid-air doesn't work like it does in the retail game.
 - The correct animation isn't played when Faith has a soft landing (e.g. landing cushion).
+- The sound effect played on death is wrong.
 
 ---
 
