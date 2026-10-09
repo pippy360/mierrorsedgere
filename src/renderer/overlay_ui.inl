@@ -204,7 +204,6 @@
 
         const UIColor runner_red   = ui_color(0.890f, 0.078f, 0.078f, 0.96f); // #E31414
         const UIColor dark_ink     = ui_color(0.110f, 0.135f, 0.175f, 0.96f);
-        const UIColor muted_ink    = ui_color(0.240f, 0.285f, 0.350f, 0.92f);
         const UIColor pure_white   = ui_color(1.000f, 1.000f, 1.000f, 1.00f);
         const UIColor row_strip    = ui_color(0.960f, 0.975f, 0.992f, 0.62f);
         const UIColor col_veil     = ui_color(0.955f, 0.970f, 0.988f, 0.42f);

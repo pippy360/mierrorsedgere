@@ -33,8 +33,11 @@ cmake --build /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name>/build -j
 /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name>/build/mirrorsedge_macos --verify-all
 ```
 
-### Step 3: Commit Your Changes in the Worktree
+### Step 3: Update `TODO.md`, Document in `MODLOG.md`, and Commit in Your Worktree
 Once your changes compile cleanly and pass verification:
+- Check `TODO.md` at the root of your worktree. **Remove any issues from `TODO.md` that your change fixed and verified** (keep only open issues in `TODO.md`—do not leave checked-off `[x]` history). If you uncovered new out-of-scope bugs or retail parity gaps, add concise bullets for them in `TODO.md`.
+- Record technical details and verification results in `MODLOG.md`.
+- Commit your changes in the worktree:
 
 ```bash
 git -C /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name> add -A
@@ -60,8 +63,17 @@ git -C /Users/tomnom/git/mierrorsedgere branch -d agent/<task-name>
 
 ---
 
-## 3. Conflict & Safety Rules
+## 3. Issue Tracker (`TODO.md`) Rules
+
+- **`TODO.md` is the shared backlog of open bugs and retail parity gaps** (checked into Git at the repository root).
+- **Check `TODO.md` when starting a task** — especially `## User-Added Issues` at the top of the file.
+- **Delete resolved items from `TODO.md` once fixed and verified**, and log the implementation & oracle proof in `MODLOG.md`. Never delete unverified items from `TODO.md`.
+
+---
+
+## 4. Conflict & Safety Rules
 
 1. **No Proprietary Game Assets in Git**: Never commit `.me1`, `.upk`, `.u`, `.bik`, `.exe`, or `.dll` files from `/Users/tomnom/mirrorsedge`.
 2. **Resolve Merge Conflicts Before Pushing**: If `main` has advanced while you were working in your worktree, rebase your `agent/<task-name>` branch onto `main` inside your worktree, re-run `./build/mirrorsedge_macos --verify-all` to confirm nothing broke, and then merge into `main` and push.
 3. **Always Leave `main` Buildable**: Every merge to `main` must compile cleanly on macOS `arm64` (`clang++ -std=c++20 -fobjc-arc`) and pass `--verify-all`.
+
