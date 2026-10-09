@@ -90,12 +90,14 @@ emitted GLSL and the renderer do about it:
 |---|---|
 | Clip space z: Metal [0, 1], OpenGL [-1, 1] | Every vertex entry point ends with `gl_Position.z = 2.0 * gl_Position.z - gl_Position.w`. Depth tests, clears and the shadow maps' stored depths are then the same numbers as on Metal. |
 | Framebuffer rows: Metal top-down, OpenGL bottom-up | The vertex entry point also flips `gl_Position.y`. Row 0 of an OpenGL render target then holds what row 0 (the top) of the Metal one holds, so render targets sampled by later passes, uploaded textures (row 0 = top), `gl_FragCoord.y`, `dFdy` and screenshot readback all match Metal with no further flips. The flip mirrors triangle winding, so the renderer declares front faces the opposite way round from the Metal backend, and the finished frame is blitted to the window with the y axis inverted. |
-| Separate textures and samplers | GLSL 4.1 only has combined samplers. Each (texture, sampler) pair a shader samples becomes one `sampler*` uniform named `<texture>__<sampler>`; the renderer binds the texture and a sampler object (`glBindSampler`) to one unit and points the uniform at it. |
-| Vertex and fragment buffer slots are separate spaces in MSL | Uniform blocks are named by stage and slot (`VSB1`, `FSB0`); the renderer gives the two stages separate binding point ranges. |
-| `constant T& u [[buffer(n)]]` | `layout(std140) uniform <stage>B<n> { T u; };`. std140 lays out the renderer's uniform structs (float4x4, packed_float3 + float pairs, float4 arrays) as MSL does, so the CPU-side structs are shared with the other backends unchanged. |
-| Vertices from `vertices[vertex_id]` | Attributes: member i of the vertex struct is `layout(location = i) in`, and the renderer's vertex array object matches, as the Direct3D input layouts do. |
-| `fmod` | GLSL's `mod` floors where Metal's `fmod` truncates; a prelude helper keeps Metal's meaning. |
-| Names | `float4` -> `vec4`, `float4x4` -> `mat4`, `half` -> `float`, `dfdx` -> `dFdx`, `rsqrt` -> `inversesqrt`, `discard_fragment()` -> `discard`, `constant` -> `const`, `T&` -> `inout`, `{...}` array initialisers -> `T[](...)`, identifiers that are GLSL keywords get `_` appended. Matrix products need no rewriting: GLSL's `*` is Metal's. |
+| Separate textures and samplers | GLSL 4.1 only has combined samplers. Each (texture, sampler) pair a shader samples becomes one `sampler*` uniform named `<texture>__<sampler>` (`t0__s0`); a texture sampled through a `constexpr sampler` is `<texture>__<static sampler>` where the static sampler is `me_ss_<function>_<name>` (`shadow_map__me_ss_sun_shadow_pcf_cmp`), one only measured with `get_width()` is `<texture>__default` (`sampler_slot` -1). The translator follows the texture through helper functions: a helper's `sampler` parameters are dropped and its texture parameters become combined samplers, so `mat_lm_bicubic(lm_a, lm_smp, uv)` is called as `mat_lm_bicubic(lm_a__scene_smp, uv)`. `sample_compare` makes the uniform a `*Shadow` sampler and the lookup `texture(s, vec4(uv, slice, ref))`; `depth2d` lookups are `textureLod(s, uv, 0.0).r`. The renderer binds the texture and a sampler object (`glBindSampler`) to one unit and points the uniform at it. |
+| Vertex and fragment buffer slots are separate spaces in MSL | Uniform blocks are named by stage and slot (`VSB1`, `FSB0`); the renderer gives the two stages separate binding point ranges. A block whose members the shader never reads may be optimised away by the driver, so the renderer must accept `GL_INVALID_INDEX` for a reported block. |
+| `constant T& u [[buffer(n)]]` | `layout(std140) uniform <stage>B<n> { T u; };`. std140 lays out the renderer's uniform structs (float4x4, packed_float3 + float pairs, float4 arrays) as MSL does, so the CPU-side structs are shared with the other backends unchanged. `constant float4* U [[buffer(n)]]` becomes `vec4 U[<pointer_array_size>]` in the block. |
+| Vertices from `vertices[vertex_id]` | Attributes: member i of the vertex struct is `layout(location = i) in <type> in_<member>` (`uint` members stay `uint`, for `glVertexAttribIPointer`), and the renderer's vertex array object matches, as the Direct3D input layouts do. `[[stage_in]]` structs with `[[attribute(n)]]` use location n. |
+| Varyings | The vertex stage's return struct members are `out <type> v_<member>` (`[[flat]]` and integer members `flat`), its `[[position]]` member `gl_Position`; the fragment stage's `[[stage_in]]` struct reads them back, `[[position]]` from `gl_FragCoord`. A `float4` fragment result is `layout(location = 0) out vec4 frag_out0`. |
+| Integer literals | C++ converts `uint_value & 0xFF`'s literal; GLSL's bitwise operators want one signedness and Apple's compiler enforces it. A literal next to an operand whose declared type is unsigned (parameters, locals, struct members) gets a `u` suffix. |
+| `fmod`, `saturate`, `select` | GLSL's `mod` floors where Metal's `fmod` truncates; a prelude at the top of every shader defines `me_fmod`, `saturate` and `select` with Metal's meaning. |
+| Names | `float4` -> `vec4`, `float4x4` -> `mat4`, `half` -> `float`, `int2` -> `ivec2`, `dfdx` -> `dFdx`, `rsqrt` -> `inversesqrt`, `atan2` -> `atan`, `as_type<uint>` -> `floatBitsToUint`, `discard_fragment()` -> `discard`, `constant` -> `const`, `const T&` -> by value, `T&` -> `inout`, `template <typename T>` -> one overload per float..float4, `{...}` array initialisers -> `T[N](...)`, `metal::`, `inline`, `static` and `#include` dropped, identifiers that are GLSL keywords or built-in functions (`in`, `out`, `sample`, `filter`, `input`, `texture`, ...) get `_` appended. Matrix products need no rewriting: GLSL's `*` is Metal's. Only the helper functions an entry point can reach are emitted, so a vertex shader never sees fragment-only built-ins. |
 
 Anything else passes through unchanged. If MSL written later uses a construct outside this list,
 the GLSL compiler rejects it and the renderer prints the error and the shader's name at start-up
@@ -107,9 +109,12 @@ material shader of every chapter and compiles them on the GPU, printing what fai
 
 ```bash
 cmake --build build --target me_glsl
-build/me_glsl                       # the built-in shaders and every chapter's materials
-build/me_glsl --chapter 3 --dump    # one chapter, writing the GLSL next to the errors
+build/me_glsl                                 # the built-in shaders and every chapter's materials
+build/me_glsl --chapter 3 --dump /tmp/glsl    # one chapter, writing the failed shaders' GLSL to a directory
+build/me_glsl --builtin-only --dump-all /tmp/glsl   # just the built-ins, all of them written out
 ```
+
+It exits with 1 when anything failed, so it can gate a merge.
 
 ## Where the OpenGL backend differs from the Metal one
 
@@ -138,7 +143,10 @@ build/me_glsl --chapter 3 --dump    # one chapter, writing the GLSL next to the 
 
 ## What was run
 
-_To be filled in when the backend is complete._
+- `me_glsl` on macOS (OpenGL 4.1 Metal - 90.5, Apple M5 Pro): built-in shaders 14/14 programs;
+  material shaders Tutorial_p 213/213, Edge_p 289/289, Stormdrain_p 397/397, Cranes_p 372/372,
+  Subway_p 451/451, Mall_p 465/465, Factory_p 440/440, Boat_p 330/330, Convoy_p 362/362,
+  Scraper_p 425/425, Escape_p 537/537 — every shader the game generates compiles and links.
 
 ## Known gaps
 
