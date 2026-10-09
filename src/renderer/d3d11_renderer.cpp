@@ -2,6 +2,7 @@
 #include "builtin_shaders_msl.hpp"
 #include "hud_font.hpp"
 #include "msl_to_hlsl.hpp"
+#include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
 #include "../anim/anim_system.hpp"
@@ -248,7 +249,34 @@ struct D3D11Renderer::Impl {
     Program sky_program;
     Program world_program;
     Program viewmodel_program;
-    Program post_program;
+    // The post-process chain (builtin_shaders_msl.hpp, section 4)
+    Program fog_program;
+    Program haze_program;
+    Program bloom_gather_program;
+    Program filter_program;
+    Program meter_scene_program;
+    Program meter_program;
+    Program exposure_program;
+    Program tonemap_program;
+    struct ColorTarget {
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11RenderTargetView> rtv;
+        ComPtr<ID3D11ShaderResourceView> srv;
+        int w = 0;
+        int h = 0;
+    };
+    ColorTarget scene_hazed;    // the scene with the haze added: what bloom and the tone mapper read
+    ColorTarget filter_a;       // quarter size: the bloom gather, then the blurred result
+    ColorTarget filter_b;       // quarter size: the blur's first axis
+    ColorTarget meter[kMeterSteps];  // the exposure's metering: 512 .. 1 across, 16-bit fixed point
+    ColorTarget exposure[2];    // 1 x 1: exposure squared over 64, this frame's and the last's
+    PostSettingsBlend post_settings;  // the post-process settings in force at the view
+    int exposure_current = 0;
+    float exposure_sim_time = -1.0f;  // telemetry.sim_time the exposure was last moved at
+    std::string exposure_map;         // the level it adapted in
+    Vec3 exposure_view_pos{0.0f, 0.0f, 0.0f};  // where the view was when it last moved
+    ComPtr<ID3D11Buffer> cb_post;     // PostUniforms: pixel b1 during the chain
+    ComPtr<ID3D11BlendState> blend_fog;  // One, SrcAlpha: scene * scattering + fog
     Program hud_program;
     Program ui_tex_program;
 
@@ -451,6 +479,7 @@ struct D3D11Renderer::Impl {
     // -------------------------------------------------------------------------
     std::shared_ptr<const SceneMaterialLibrary> mat_lib;  // library currently resident on the GPU
     std::vector<UITexture> mat_textures;                  // per SceneTexture (null = missing -> default)
+    std::vector<UITexture> lm_textures;                   // SceneMaterialLibrary::lightmap_textures (null = unreadable)
     std::vector<ComPtr<ID3D11PixelShader>> mat_pixel_shaders;  // per MaterialShader (null = failed -> legacy)
     ComPtr<ID3D11VertexShader> mat_vertex_shader;
     ComPtr<ID3D11InputLayout> mat_input_layout;
@@ -775,7 +804,14 @@ struct D3D11Renderer::Impl {
         if (!make_program("sky_vertex", "sky_fragment", VertexKind::None, sky_program)) return false;
         if (!make_program("world_vertex", "world_fragment", VertexKind::Scene, world_program)) return false;
         if (!make_program("viewmodel_vertex", "viewmodel_fragment", VertexKind::Scene, viewmodel_program)) return false;
-        if (!make_program("post_vertex", "post_fragment", VertexKind::None, post_program)) return false;
+        if (!make_program("post_vertex", "fog_fragment", VertexKind::None, fog_program)) return false;
+        if (!make_program("post_vertex", "haze_fragment", VertexKind::None, haze_program)) return false;
+        if (!make_program("post_vertex", "bloom_gather_fragment", VertexKind::None, bloom_gather_program)) return false;
+        if (!make_program("post_vertex", "filter_fragment", VertexKind::None, filter_program)) return false;
+        if (!make_program("post_vertex", "meter_scene_fragment", VertexKind::None, meter_scene_program)) return false;
+        if (!make_program("post_vertex", "meter_fragment", VertexKind::None, meter_program)) return false;
+        if (!make_program("post_vertex", "exposure_fragment", VertexKind::None, exposure_program)) return false;
+        if (!make_program("post_vertex", "tonemap_fragment", VertexKind::None, tonemap_program)) return false;
         if (!make_program("hud_vertex", "hud_fragment", VertexKind::Hud, hud_program)) return false;
         if (!make_program("ui_tex_vertex", "ui_tex_fragment", VertexKind::UiTex, ui_tex_program)) return false;
 
@@ -829,6 +865,7 @@ struct D3D11Renderer::Impl {
         blend_translucent = make_blend(true, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ZERO, D3D11_BLEND_ONE);
         blend_additive = make_blend(true, D3D11_BLEND_ONE, D3D11_BLEND_ONE, D3D11_BLEND_ZERO, D3D11_BLEND_ONE);
         blend_modulate = make_blend(true, D3D11_BLEND_DEST_COLOR, D3D11_BLEND_ZERO, D3D11_BLEND_ZERO, D3D11_BLEND_ONE);
+        blend_fog = make_blend(true, D3D11_BLEND_ONE, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_ZERO, D3D11_BLEND_ONE);
         // Alpha blending for UI overlay
         blend_ui = make_blend(true, D3D11_BLEND_SRC_ALPHA, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_SRC_ALPHA,
                               D3D11_BLEND_INV_SRC_ALPHA);
@@ -849,6 +886,7 @@ struct D3D11Renderer::Impl {
             return b;
         };
         cb_frame = make_constants(sizeof(FrameUniformsGPU));
+        cb_post = make_constants(sizeof(PostUniformsGPU));
         cb_screen = make_constants(16);
         cb_material = make_constants(static_cast<size_t>(kMaxMaterialUniforms) * 16);
         return cb_frame && cb_screen && cb_material && linear_sampler && blend_ui && raster_no_cull && depth_write_state;
@@ -994,8 +1032,9 @@ struct D3D11Renderer::Impl {
         }
         mat_cube_sampler = make_sampler(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP,
                                         D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_FLOAT32_MAX);
-        scene_copy_sampler = make_sampler(D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP,
-                                          D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f);
+        // The scene copies have one mip; the light maps bound beside them have a full chain.
+        scene_copy_sampler = make_sampler(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP,
+                                          D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_FLOAT32_MAX);
     }
 
     // Uploads one decoded UE3 texture (2D or cube, full mip chain). Thread-safe.
@@ -1111,6 +1150,7 @@ struct D3D11Renderer::Impl {
         if (lib == mat_lib) return;
         mat_lib = lib;
         mat_textures.clear();
+        lm_textures.clear();
         mat_pixel_shaders.clear();
         if (!lib) return;
 
@@ -1121,6 +1161,10 @@ struct D3D11Renderer::Impl {
         parallel_for(n_tex, [&](size_t i) {
             mat_textures[i] = upload_scene_texture(lib->textures[i]);
             if (mat_textures[i]) uploaded.fetch_add(1, std::memory_order_relaxed);
+        });
+        lm_textures.assign(lib->lightmap_textures.size(), nullptr);
+        parallel_for(lm_textures.size(), [&](size_t i) {
+            if (lib->lightmap_textures[i].valid()) lm_textures[i] = upload_scene_texture(lib->lightmap_textures[i]);
         });
         compile_material_shaders(*lib);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1148,6 +1192,23 @@ struct D3D11Renderer::Impl {
         const size_t n = static_cast<size_t>(std::min(count, kMaxMaterialUniforms));
         for (size_t i = 0; i < n; ++i) padded[i] = (i < values.size()) ? values[i] : std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f};
         update_constants(cb_material, padded.data(), n * 16);
+    }
+
+    // Binds a section's three light-map coefficient textures (texture(24..26), sampler(15)). A
+    // section without a set gets white: its vertices carry their own samples, or none. A texture
+    // that could not be read is black, so what it would have lit stays unlit.
+    void bind_lightmap(int32_t set) {
+        ID3D11ShaderResourceView* srvs[3];
+        for (int k = 0; k < 3; ++k) {
+            const GpuTexture* t = tex_default_white.get();
+            if (set >= 0) {
+                const size_t i = static_cast<size_t>(set) * 3 + static_cast<size_t>(k);
+                t = (i < lm_textures.size() && lm_textures[i]) ? lm_textures[i].get() : tex_default_black.get();
+            }
+            srvs[k] = t ? t->srv.Get() : nullptr;
+        }
+        ctx->PSSetShaderResources(matbind::kLightMapTexture, 3, srvs);
+        ctx->PSSetSamplers(matbind::kSceneSampler, 1, scene_copy_sampler.GetAddressOf());
     }
 
     // Binds a material instance's textures, samplers and parameter uniforms.
@@ -1196,6 +1257,24 @@ struct D3D11Renderer::Impl {
     // -------------------------------------------------------------------------
     // Render targets
     // -------------------------------------------------------------------------
+    bool make_color_target(ColorTarget& t, int w, int h, DXGI_FORMAT format) {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = static_cast<UINT>(std::max(1, w));
+        d.Height = static_cast<UINT>(std::max(1, h));
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = format;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        t = ColorTarget{};
+        t.w = static_cast<int>(d.Width);
+        t.h = static_cast<int>(d.Height);
+        return SUCCEEDED(device->CreateTexture2D(&d, nullptr, &t.tex)) &&
+               SUCCEEDED(device->CreateRenderTargetView(t.tex.Get(), nullptr, &t.rtv)) &&
+               SUCCEEDED(device->CreateShaderResourceView(t.tex.Get(), nullptr, &t.srv));
+    }
+
     bool allocate_render_targets() {
         // The views of the old targets may still be bound.
         ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1233,6 +1312,16 @@ struct D3D11Renderer::Impl {
         ok = ok && make_target(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, offscreen_color_tex);
         ok = ok && SUCCEEDED(device->CreateRenderTargetView(offscreen_color_tex.Get(), nullptr, offscreen_color_rtv.ReleaseAndGetAddressOf()));
         readback_tex.Reset();
+
+        // The post-process chain's own targets.
+        ok = ok && make_color_target(scene_hazed, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        ok = ok && make_color_target(filter_a, width / kFilterDownsample, height / kFilterDownsample, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        ok = ok && make_color_target(filter_b, width / kFilterDownsample, height / kFilterDownsample, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        for (int i = 0; i < kMeterSteps; ++i) {
+            ok = ok && make_color_target(meter[i], kMeterSizes[i], kMeterSizes[i], DXGI_FORMAT_R16G16B16A16_UNORM);
+        }
+        for (auto& e : exposure) ok = ok && make_color_target(e, 1, 1, DXGI_FORMAT_R32_FLOAT);
+        exposure_sim_time = -1.0f;
 
         // Copies of the opaque scene (UE3 "resolved" SceneColor / SceneDepth) sampled by
         // translucent materials (SceneTexture, DestColor, DepthBiasedAlpha/Blend).
@@ -1530,7 +1619,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     player_camera(telemetry, cam_pos, rot);
     float fov_deg = telemetry.fov_deg;
     float near_plane = 5.0f;
-    float far_plane = 65000.0f;
+    float far_plane = kFarPlane;
 
     if (in_main_menu) {
         const MenuChapterEntry& cam_ch = impl->main_menu.get_chapter(impl->selected_chapter);
@@ -1540,6 +1629,9 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         near_plane = 10.0f;
         far_plane = 400000.0f;
     }
+
+    // The post-process settings in force where the view is (the world's, or a volume's).
+    const PostProcessSettings& view_post = impl->post_settings.update(active_scene, cam_pos, telemetry.sim_time);
 
     Vec3 fwd = rot.forward();
     Vec3 right = rot.right();
@@ -2035,6 +2127,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     if (ps && mat_blend_is_translucent(sh->blend)) continue;
                     if (ps) {
                         use_material_pipeline(ps, *sh, *m, impl->mat_cull_enabled && !sh->two_sided && !in_main_menu);
+                        impl->bind_lightmap(s.lightmap);
                         if (in_main_menu && sh->num_uniforms > 0 && !active_mi_tag.empty()) {
                             std::string mname = m->name;
                             for (char& c : mname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -2104,6 +2197,33 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         prof(Impl::kProfScene);
 
+        // Height fog over the opaque scene, before anything translucent is drawn on it
+        // (HeightFogPixelShader.usf): scene * scattering + fog, read off the depth buffer.
+        if (!active_scene.height_fog.empty()) {
+            PostUniformsGPU fog_constants{};
+            fill_post_uniforms(active_scene, view_post, cam_pos, 0.0f, false, fog_constants);
+            auto push_post = [&]() { impl->update_constants(impl->cb_post, &fog_constants, sizeof(fog_constants)); };
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_post.GetAddressOf());
+            ctx->OMSetRenderTargets(1, &scene_rtv, nullptr);  // the depth buffer is read, not tested
+            impl->unbind_shader_resources();
+            ctx->PSSetShaderResources(1, 1, impl->depth_srv.GetAddressOf());
+            impl->bind_static_samplers(impl->builtin_shaders);
+            ctx->OMSetDepthStencilState(impl->depth_disabled_state.Get(), 0);
+            ctx->RSSetState(impl->raster_no_cull.Get());
+            set_blend(impl->blend_fog);
+            set_viewport(fw, fh, 0.0f, 1.0f);
+            use_program(impl->fog_program);
+            push_uniforms();
+            push_post();
+            impl->draw(3, 0);
+            impl->unbind_shader_resources();
+            set_blend(impl->blend_opaque);
+            ctx->OMSetRenderTargets(1, &scene_rtv, impl->depth_dsv.Get());
+            set_viewport(fw, fh, 0.05f, 1.0f);
+            bind_shadow_map();
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_material.GetAddressOf());
+        }
+
         // B3. Translucent / additive / modulated materials (UE3 translucency pass): drawn after
         // all opaque geometry, depth-tested without depth writes. Materials that read the scene
         // (SceneTexture, DestColor, DepthBiasedAlpha) sample copies of the opaque scene.
@@ -2131,6 +2251,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         mesh_bound = true;
                     }
                     use_material_pipeline(ps, *sh, *m, impl->mat_cull_enabled && !sh->two_sided);
+                    impl->bind_lightmap(s.lightmap);
                     impl->draw(s.vertex_count, s.first_vertex);
                 }
             }
@@ -2198,17 +2319,90 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
     ctx->ClearRenderTargetView(final_rtv, black);
     impl->unbind_shader_resources();
     set_viewport(fw, fh, 0.0f, 1.0f);
-    use_program(impl->post_program);
     ctx->OMSetDepthStencilState(impl->depth_disabled_state.Get(), 0);
     ctx->RSSetState(impl->raster_no_cull.Get());
     set_blend(impl->blend_opaque);
     if (!scene_hidden) {
-        ID3D11ShaderResourceView* post_inputs[2] = {impl->scene_hdr_srv.Get(), impl->depth_srv.Get()};
-        ctx->PSSetShaderResources(0, 2, post_inputs);
+        // The chain, in the game's order: haze, bloom (gather, blur across, blur down), exposure,
+        // then the blend of the bloom with the scene and the tone mapping, in one pass.
+        PostUniformsGPU post{};
+        // When the game asks (a level opening), the exposure buffers go back to the game's starting
+        // value and adapt from there. Otherwise the exposure follows the view in time, and settles at
+        // once for a still: the same moment again, a first picture of a level nobody asked to open, a
+        // gap no eye followed, or a view that is suddenly somewhere else (the oracle renders now and
+        // then, from wherever its stage put the player).
+        const bool opening = telemetry.exposure_reset;
+        if (opening) {
+            const float start[4] = {kExposureStart, kExposureStart, kExposureStart, kExposureStart};
+            for (auto& e : impl->exposure) ctx->ClearRenderTargetView(e.rtv.Get(), start);
+        }
+        const bool new_level = impl->exposure_map != active_scene.map_name;
+        const bool fresh = impl->exposure_sim_time < 0.0f;  // the buffers were just made (a resize)
+        const float post_dt = (opening || new_level || fresh) ? 0.0f : telemetry.sim_time - impl->exposure_sim_time;
+        const bool view_jumped = (cam_pos - impl->exposure_view_pos).length_sq() > 300.0f * 300.0f;
+        const bool still = !opening && (new_level || fresh || post_dt == 0.0f || post_dt >= 0.5f || view_jumped);
+        impl->exposure_view_pos = cam_pos;
+        fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
+        post.fade[0] = telemetry.fade_color.x;
+        post.fade[1] = telemetry.fade_color.y;
+        post.fade[2] = telemetry.fade_color.z;
+        post.fade[3] = telemetry.fade_amount;
+        impl->exposure_sim_time = telemetry.sim_time;
+        impl->exposure_map = active_scene.map_name;
+        auto push_post = [&]() { impl->update_constants(impl->cb_post, &post, sizeof(post)); };
+        auto post_pass = [&](const Impl::Program& program, const Impl::ColorTarget& target, std::initializer_list<ID3D11ShaderResourceView*> inputs) {
+            ID3D11RenderTargetView* rtv = target.rtv.Get();
+            ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            set_viewport(static_cast<float>(target.w), static_cast<float>(target.h), 0.0f, 1.0f);
+            impl->unbind_shader_resources();
+            UINT slot = 0;
+            for (ID3D11ShaderResourceView* srv : inputs) ctx->PSSetShaderResources(slot++, 1, &srv);
+            use_program(program);
+            push_post();
+            impl->draw(3, 0);
+        };
+        ctx->PSSetConstantBuffers(1, 1, impl->cb_post.GetAddressOf());
         ctx->PSSetSamplers(0, 1, impl->linear_sampler.GetAddressOf());
         impl->bind_static_samplers(impl->builtin_shaders);
         push_uniforms();
+
+        post.texel[0] = 1.0f / fw;
+        post.texel[1] = 1.0f / fh;
+        post_pass(impl->haze_program, impl->scene_hazed, {impl->scene_hdr_srv.Get(), impl->depth_srv.Get()});
+        post_pass(impl->bloom_gather_program, impl->filter_a, {impl->scene_hazed.srv.Get(), impl->depth_srv.Get()});
+        fill_filter_taps(impl->width, impl->filter_a.w, impl->filter_a.h, /*horizontal=*/true, post);
+        post_pass(impl->filter_program, impl->filter_b, {impl->filter_a.srv.Get()});
+        fill_filter_taps(impl->width, impl->filter_a.w, impl->filter_a.h, /*horizontal=*/false, post);
+        post_pass(impl->filter_program, impl->filter_a, {impl->filter_b.srv.Get()});
+
+        // The metering: the scene with its bloom into 512 x 512, then down to one texel.
+        post.texel[0] = 1.0f / fw;
+        post.texel[1] = 1.0f / fh;
+        post.texel[2] = static_cast<float>(meter_taps(impl->width, kMeterSizes[0]));
+        post_pass(impl->meter_scene_program, impl->meter[0],
+                  {impl->scene_hazed.srv.Get(), impl->depth_srv.Get(), impl->filter_a.srv.Get()});
+        for (int i = 1; i < kMeterSteps; ++i) {
+            post.texel[0] = post.texel[1] = 1.0f / static_cast<float>(kMeterSizes[i - 1]);
+            post.texel[2] = static_cast<float>(meter_taps(kMeterSizes[i - 1], kMeterSizes[i]));
+            post_pass(impl->meter_program, impl->meter[i], {impl->meter[i - 1].srv.Get()});
+        }
+        post.texel[0] = 1.0f / fw;
+        post.texel[1] = 1.0f / fh;
+        const int previous = impl->exposure_current;
+        impl->exposure_current = 1 - previous;
+        post_pass(impl->exposure_program, impl->exposure[impl->exposure_current],
+                  {impl->meter[kMeterSteps - 1].srv.Get(), impl->exposure[previous].srv.Get()});
+
+        ctx->OMSetRenderTargets(1, &final_rtv, nullptr);
+        set_viewport(fw, fh, 0.0f, 1.0f);
+        impl->unbind_shader_resources();
+        ID3D11ShaderResourceView* tonemap_inputs[4] = {impl->scene_hazed.srv.Get(), impl->depth_srv.Get(), impl->filter_a.srv.Get(),
+                                                       impl->exposure[impl->exposure_current].srv.Get()};
+        ctx->PSSetShaderResources(0, 4, tonemap_inputs);
+        use_program(impl->tonemap_program);
+        push_post();
         impl->draw(3, 0);
+        ctx->PSSetConstantBuffers(1, 1, impl->cb_material.GetAddressOf());
     }
 
     // ---------------------------------------------------------------------

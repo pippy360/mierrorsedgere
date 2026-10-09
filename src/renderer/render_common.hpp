@@ -16,6 +16,11 @@
 
 namespace me {
 
+// The far plane. The game's projection has none; what needs the distance is the sky dome, a mesh
+// several hundred thousand units across, and the sun's flare beyond it. The shaders that turn a
+// depth-buffer value back into a distance carry the same number (post_linear_depth, mat_linear_depth).
+constexpr float kFarPlane = 10000000.0f;
+
 inline bool tex_format_is_bc(TexFormat f) {
     return f == TexFormat::DXT1 || f == TexFormat::DXT3 || f == TexFormat::DXT5;
 }

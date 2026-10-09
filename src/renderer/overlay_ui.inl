@@ -457,6 +457,9 @@
 
     void draw_hud(std::vector<HUDVertex>& verts, const LevelScene& scene, const PlayerTelemetry& telemetry) {
         verts.clear();
+        // ME_NO_HUD: the picture alone, for holding against a retail frame (tools/retail/render_check.py).
+        static const bool hidden = std::getenv("ME_NO_HUD") != nullptr;
+        if (hidden) return;
         float w = float(width);
         float h = float(height);
         float sim_time = telemetry.sim_time;

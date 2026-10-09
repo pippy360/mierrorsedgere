@@ -288,10 +288,15 @@ in the toolchain, so a compile error only shows up at runtime, as
 
 The model follows `BasePassPixelShader.usf`, using its HL2 light-map basis and its
 diffuse and specular transfer functions. Mirror's Edge lighting is baked by Beast into
-`LightMapTexture2D`s, which are not decoded yet. Instead, a **virtual light-map** spreads an
-unshadowed sun over the three HL2 basis directions. A flat normal with DiffusePower 1 receives
-exactly Lambert N·L. On top of that come a sky/ground hemisphere term and a small ambient
-term. Distance haze is added in the output helpers.
+`LightMapTexture2D`s and per-vertex samples, and since 2026-10-09 the level's geometry (static
+meshes and BSP) is lit by those and by nothing else: see
+[`RENDERING_RE.md`](RENDERING_RE.md), section 3. Materials write linear scene colour; fog, haze,
+exposure and the tone curve are passes over the whole picture (the same page, sections 5 and 6).
+
+What follows in this section is the stand-in that is left for geometry that is not the level's
+(movers, characters, the first-person body): a **virtual light-map** spreads an unshadowed sun
+over the three HL2 basis directions. A flat normal with DiffusePower 1 receives exactly Lambert
+N·L. On top of that come a sky/ground hemisphere term and a small ambient term.
 
 **The level sun** is read from the data (see `scan_level_suns` in
 [`upk_loader.cpp`](../src/assets/upk_loader.cpp)):
@@ -423,14 +428,12 @@ levels; the counts on a Mac have not been re-recorded.
 
 ## 11. Known limitations and next steps
 
-1. **Beast light-maps.** Decode `LightMapTexture2D` and the `FLightMap2D`/`FLightMap1D` data in
-   `StaticMeshComponent.LODData`. That needs light-map UVs and per-component scale vectors,
-   and would replace the virtual light-map with the real baked GI and shadows. Tutorial_p alone
-   has 76 light-map textures (35 MB). With real light-map magnitudes, the TwoSidedLightingMask
-   clamp (§7) can be dropped.
+1. **Beast light-maps.** Done for level geometry on 2026-10-09
+   ([`RENDERING_RE.md`](RENDERING_RE.md)); the TwoSidedLightingMask clamp (§7) is dropped where
+   the light is baked. Left: light for dynamic objects (light environments).
 2. **Decals.** Implement `DecalComponent` static receivers, the pre-baked decal geometry
    (550 components in Tutorial_p).
-3. **BSP.** Render the `ModelComponent`s (Tutorial_p has 151 Models).
+3. **BSP.** Rendered, with its light maps.
 4. **Skeletal meshes** placed in levels.
 5. **More than two UV sets in one material.** A vertex carries two (§2.4). A material that reads
    three gets a warning and its third index shares a slot.

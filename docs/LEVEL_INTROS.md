@@ -34,7 +34,9 @@ The group's tracks:
 - **`InterpTrackAnimControl`**, slot `Custom_Canned`: one full-body first-person `AnimSequence`. The camera is
   the `CameraJoint` of the first-person skeleton (`CH_TKY_Crim_Fixer_1P.SK_UpperBody`), animated like any bone.
 - **`InterpTrackEvent`** keys, each firing the Kismet output of the same name: the teleport onto the stand-in,
-  voice lines (`SeqAct_TdPlaySound`), door hits, the fade.
+  voice lines (`SeqAct_TdPlaySound`), door hits, the fade. The fades (`SeqAct_TdFadeEffect`: the picture coming in from
+  white at the start, the white flash that covers the hand-over) are in
+  [`RENDERING_RE.md`](RENDERING_RE.md), section 7.
 - **`InterpTrackMove`**, in Boat only: slides the pawn 104 uu sideways over the first seven seconds.
 
 The animation's own `Notifies` carry the foley: `AnimNotify_Footstep` (`FootDown` is the footstep cue's number,

@@ -75,6 +75,8 @@ public:
     [[nodiscard]] bool is_level_intro() const { return mode_ == ECutsceneMode::InEngineMatinee && level_intro_; }
     // The sounds the level intro reached during the last update(), in order, for the game to play.
     [[nodiscard]] std::vector<IntroSoundEvent> take_intro_sounds() { return std::exchange(intro_sounds_, {}); }
+    // The screen fades it reached, likewise, for the game's ScreenFade.
+    [[nodiscard]] std::vector<IntroFadeEvent> take_intro_fades() { return std::exchange(intro_fades_, {}); }
     // Turns the doors the level's intro swings (LevelIntroSequence::door_swings) to where its
     // Matinee has them `elapsed_sec` in. Past the last key they rest where it leaves them, which is
     // also where a skipped intro puts them.
@@ -135,6 +137,8 @@ private:
     bool level_intro_ = false;
     size_t intro_next_sound_ = 0;
     std::vector<IntroSoundEvent> intro_sounds_;
+    size_t intro_next_fade_ = 0;
+    std::vector<IntroFadeEvent> intro_fades_;
     Vec3 intro_root_pos_{0.0f, 0.0f, 0.0f};
 
     // In-engine 3D Matinee camera keyframes

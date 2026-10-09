@@ -32,11 +32,11 @@ The engine fuses five specialized native subsystems into a single executable (`m
 3. **Apple Metal 3.0 Graphics Engine (`src/renderer/metal_renderer.*`)**:
    - Native Apple Metal shader pipelines written in Metal Shading Language (MSL):
      - `Generated UE3 materials`: one pipeline per translated material shader, drawn per mesh section with back-face culling (two-sided materials excepted). Opaque/Masked sections go in the base pass. Translucent/Additive/Modulate sections go in a second pass that reads copies of scene colour and depth.
-     - `TdDirHaze`: Directional atmospheric sun haze, sky dome gradient, sharp corona, and horizon glare.
-     - `BasePass + Beast Radiosity`: High-key white architectural aesthetic, dual-hemisphere ambient bounce (cyan sky / warm ground), and contact ambient occlusion.
+     - `Baked lighting`: the level's own Beast light maps (static meshes and BSP, directional coefficients in the Half-Life 2 basis, bicubic filtering), read from the cooked components. Level geometry is lit by them and by nothing else, as in retail.
+     - `The post-process chain`: retail's, pass for pass, from its shipped shader sources and its executable: height fog, `TdDirHaze` sun haze, bloom, exposure metered and adapted the way the game does it, `TdToneMapping` with each level's and each `PostProcessVolume`'s curves, and the screen fade. What retail does and how closely the port matches it, measured against retail pictures from the same cameras: [`docs/RENDERING_RE.md`](docs/RENDERING_RE.md).
      - `Runner Vision (LOI)`: Dynamic breathing scarlet red (`#E61414`) pulse on parkour targets, springboard ramps, and conduit pipes.
      - `CH_Faith_1P`: the real skinned first-person mesh (`USkeletalMesh` + `TdAnimSet`, `src/anim/anim_system.*`), and the real skinned KrugerSec / CPF enemies and weapons.
-     - `TdToneMapping & TdMotionBlur`: DICE photographic S-curve contrast scaling, radial speed blur, and low-health vignette.
+     - `Stand-ins still in place`: a sun with shadow cascades and a sky hemisphere for what is not level geometry (movers, characters, the first-person body), and approximations of the reaction-time and low-health effects.
      - `2D Vector HUD & Bitmap Font`: Minimalist built-in ASCII typography overlay, dynamic center reticle, momentum speedometer, health/reaction gauges, subtitle prompts, and interactive Chapter Select modal.
    - Dual-Mode: Seamless switching between interactive windowed mode (SDL2 + `CAMetalLayer` with Retina high-DPI support) and zero-copy shared memory headless mode for automated verification.
    - On Windows, `src/renderer/d3d11_renderer.*` draws the same passes with Direct3D 11. It has no shaders of its own: the MSL above and the generated material shaders are translated to HLSL at start-up (`src/renderer/msl_to_hlsl.*`).
@@ -148,6 +148,11 @@ Usage:
 
 Options:
   --verify-all             Run deterministic headless oracle verification suite
+  --intro-shots <map> <t,t,..> <dir>
+                           Play the level's intro headless and save the picture at those Matinee
+                           times (docs/RENDERING_RE.md compares them with retail's)
+  --dump-shaders <dir>     Write the Metal shader sources as the renderer compiles them, to check
+                           them with a compiler on a machine with no game data
   --headless-oracle <file> Run script-based headless oracle
   --test-replay <trace>    Replay physics trace headless
   --chapter <0..9>         Start at specified campaign chapter (0: SP00, 1: SP01, etc.)

@@ -1,6 +1,7 @@
 #include "metal_renderer.hpp"
 #include "builtin_shaders_msl.hpp"
 #include "hud_font.hpp"
+#include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
 #include "../anim/anim_system.hpp"
@@ -130,7 +131,15 @@ struct MetalRenderer::Impl {
     id<MTLRenderPipelineState> sky_pipeline = nil;
     id<MTLRenderPipelineState> world_pipeline = nil;
     id<MTLRenderPipelineState> viewmodel_pipeline = nil;
-    id<MTLRenderPipelineState> post_pipeline = nil;
+    // The post-process chain (builtin_shaders_msl.hpp, section 4)
+    id<MTLRenderPipelineState> fog_pipeline = nil;
+    id<MTLRenderPipelineState> haze_pipeline = nil;
+    id<MTLRenderPipelineState> bloom_gather_pipeline = nil;
+    id<MTLRenderPipelineState> filter_pipeline = nil;
+    id<MTLRenderPipelineState> meter_scene_pipeline = nil;
+    id<MTLRenderPipelineState> meter_pipeline = nil;
+    id<MTLRenderPipelineState> exposure_pipeline = nil;
+    id<MTLRenderPipelineState> tonemap_pipeline = nil;
     id<MTLRenderPipelineState> hud_pipeline = nil;
     id<MTLRenderPipelineState> ui_tex_pipeline = nil;
 
@@ -147,6 +156,16 @@ struct MetalRenderer::Impl {
     id<MTLTexture> offscreen_color_tex = nil;
     id<MTLTexture> offscreen_depth_tex = nil;
     id<MTLTexture> scene_hdr_tex = nil; // Intermediate HDR buffer for tone mapping
+    id<MTLTexture> scene_hazed_tex = nil;          // the scene with the haze on it
+    id<MTLTexture> filter_a_tex = nil;             // quarter size: what blooms, and its blur
+    id<MTLTexture> filter_b_tex = nil;
+    id<MTLTexture> meter_tex[kMeterSteps] = {};    // the exposure's metering: 512 .. 1 across, 16-bit fixed point
+    id<MTLTexture> exposure_tex[2] = {};           // 1 x 1: exposure squared over 64, this frame's and the last's
+    PostSettingsBlend post_settings;               // the post-process settings in force at the view
+    int exposure_current = 0;
+    float exposure_sim_time = -1.0f;               // telemetry.sim_time the exposure was last moved at
+    std::string exposure_map;                      // the level it adapted in
+    Vec3 exposure_view_pos{0.0f, 0.0f, 0.0f};      // where the view was when it last moved
     id<MTLTexture> shadow_depth_tex = nil; // sun shadow cascades: 2-slice 4096x4096 depth array (renderer/sun_shadow.hpp)
     // The far cascade slice only holds static level geometry and is redrawn only when its (coarsely
     // snapped) matrix changes or the scene's vertex buffers are rebuilt.
@@ -268,6 +287,7 @@ struct MetalRenderer::Impl {
     // -------------------------------------------------------------------------
     std::shared_ptr<const SceneMaterialLibrary> mat_lib;     // library currently resident on the GPU
     std::vector<id<MTLTexture>> mat_textures;                // per SceneTexture (nil = missing -> default)
+    std::vector<id<MTLTexture>> lm_textures;                 // SceneMaterialLibrary::lightmap_textures (nil = unreadable)
     std::vector<id<MTLRenderPipelineState>> mat_pipelines;   // per MaterialShader (nil = failed -> legacy)
     id<MTLTexture> tex_default_white = nil;
     id<MTLTexture> tex_default_flat_normal = nil;
@@ -418,8 +438,10 @@ struct MetalRenderer::Impl {
         mat_cube_sampler = [device newSamplerStateWithDescriptor:cs];
 
         MTLSamplerDescriptor* ss = [[MTLSamplerDescriptor alloc] init];
+        // The scene copies have one mip; the light maps bound beside them have a full chain.
         ss.minFilter = MTLSamplerMinMagFilterLinear;
         ss.magFilter = MTLSamplerMinMagFilterLinear;
+        ss.mipFilter = MTLSamplerMipFilterLinear;
         ss.sAddressMode = MTLSamplerAddressModeClampToEdge;
         ss.tAddressMode = MTLSamplerAddressModeClampToEdge;
         scene_copy_sampler = [device newSamplerStateWithDescriptor:ss];
@@ -625,6 +647,7 @@ struct MetalRenderer::Impl {
         if (lib == mat_lib) return;
         mat_lib = lib;
         mat_textures.clear();
+        lm_textures.clear();
         mat_pipelines.clear();
         if (!lib) return;
 
@@ -652,6 +675,12 @@ struct MetalRenderer::Impl {
             for (unsigned t = 0; t < tex_threads; ++t) tex_pool.emplace_back(tex_worker);
             for (auto& th : tex_pool) th.join();
         }
+        lm_textures.assign(lib->lightmap_textures.size(), nil);
+        for (size_t i = 0; i < lm_textures.size(); ++i) {
+            @autoreleasepool {
+                if (lib->lightmap_textures[i].valid()) lm_textures[i] = upload_scene_texture(lib->lightmap_textures[i]);
+            }
+        }
         compile_material_shaders(*lib);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::cout << "[MetalRenderer] Material library resident: " << lib->materials.size() << " materials, "
@@ -669,6 +698,21 @@ struct MetalRenderer::Impl {
         if (out_shader) *out_shader = &mat_lib->shaders[static_cast<size_t>(m.shader)];
         if (out_material) *out_material = &m;
         return ps;
+    }
+
+    // Binds a section's three light-map coefficient textures (texture(24..26), sampler(15)). A
+    // section without a set gets white: its vertices carry their own samples, or none. A texture
+    // that could not be read is black, so what it would have lit stays unlit.
+    void bind_lightmap(id<MTLRenderCommandEncoder> enc, int32_t set) {
+        for (int k = 0; k < 3; ++k) {
+            id<MTLTexture> t = tex_default_white;
+            if (set >= 0) {
+                const size_t i = static_cast<size_t>(set) * 3 + static_cast<size_t>(k);
+                t = (i < lm_textures.size() && lm_textures[i]) ? lm_textures[i] : tex_default_black;
+            }
+            [enc setFragmentTexture:t atIndex:static_cast<NSUInteger>(matbind::kLightMapTexture + k)];
+        }
+        [enc setFragmentSamplerState:scene_copy_sampler atIndex:matbind::kSceneSampler];
     }
 
     // Binds a material instance's textures, samplers and parameter uniforms.
@@ -780,15 +824,43 @@ struct MetalRenderer::Impl {
         viewmodel_pipeline = [device newRenderPipelineStateWithDescriptor:vmDesc error:&error];
         if (!viewmodel_pipeline) return false;
 
-        // 4. Post-Processing Pipeline
+        // 4. The post-process chain: a full-screen triangle per pass, each into its own target.
         id<MTLFunction> postVert = [shader_library newFunctionWithName:@"post_vertex"];
-        id<MTLFunction> postFrag = [shader_library newFunctionWithName:@"post_fragment"];
-        MTLRenderPipelineDescriptor* postDesc = [[MTLRenderPipelineDescriptor alloc] init];
-        postDesc.vertexFunction = postVert;
-        postDesc.fragmentFunction = postFrag;
-        postDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-        post_pipeline = [device newRenderPipelineStateWithDescriptor:postDesc error:&error];
-        if (!post_pipeline) return false;
+        auto post_pipeline_for = [&](NSString* fragment, MTLPixelFormat format, bool fog_blend) -> id<MTLRenderPipelineState> {
+            MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+            desc.vertexFunction = postVert;
+            desc.fragmentFunction = [shader_library newFunctionWithName:fragment];
+            desc.colorAttachments[0].pixelFormat = format;
+            if (fog_blend) {
+                // One, SrcAlpha: scene * scattering + fog. The scene's alpha is left as it is.
+                desc.colorAttachments[0].blendingEnabled = YES;
+                desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+                desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+                desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorSourceAlpha;
+                desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+                desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+            }
+            NSError* post_error = nil;
+            id<MTLRenderPipelineState> state = [device newRenderPipelineStateWithDescriptor:desc error:&post_error];
+            if (!state) {
+                std::cerr << "[Metal ERROR] post-process pipeline " << [fragment UTF8String] << ": "
+                          << (post_error ? [[post_error localizedDescription] UTF8String] : "unknown") << std::endl;
+            }
+            return state;
+        };
+        fog_pipeline = post_pipeline_for(@"fog_fragment", MTLPixelFormatRGBA16Float, true);
+        haze_pipeline = post_pipeline_for(@"haze_fragment", MTLPixelFormatRGBA16Float, false);
+        bloom_gather_pipeline = post_pipeline_for(@"bloom_gather_fragment", MTLPixelFormatRGBA16Float, false);
+        filter_pipeline = post_pipeline_for(@"filter_fragment", MTLPixelFormatRGBA16Float, false);
+        meter_scene_pipeline = post_pipeline_for(@"meter_scene_fragment", MTLPixelFormatRGBA16Unorm, false);
+        meter_pipeline = post_pipeline_for(@"meter_fragment", MTLPixelFormatRGBA16Unorm, false);
+        exposure_pipeline = post_pipeline_for(@"exposure_fragment", MTLPixelFormatR32Float, false);
+        tonemap_pipeline = post_pipeline_for(@"tonemap_fragment", MTLPixelFormatRGBA8Unorm, false);
+        if (!fog_pipeline || !haze_pipeline || !bloom_gather_pipeline || !filter_pipeline || !meter_scene_pipeline ||
+            !meter_pipeline || !exposure_pipeline || !tonemap_pipeline) {
+            return false;
+        }
 
         // 5. 2D HUD Pipeline
         id<MTLFunction> hudVert = [shader_library newFunctionWithName:@"hud_vertex"];
@@ -890,6 +962,23 @@ struct MetalRenderer::Impl {
         hdrDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         hdrDesc.storageMode = MTLStorageModePrivate;
         scene_hdr_tex = [device newTextureWithDescriptor:hdrDesc];
+
+        // The post-process chain's own targets.
+        auto post_target = [&](MTLPixelFormat format, int w, int h) -> id<MTLTexture> {
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+                                                                                            width:(NSUInteger)std::max(1, w)
+                                                                                           height:(NSUInteger)std::max(1, h)
+                                                                                        mipmapped:NO];
+            desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            desc.storageMode = MTLStorageModePrivate;
+            return [device newTextureWithDescriptor:desc];
+        };
+        scene_hazed_tex = post_target(MTLPixelFormatRGBA16Float, width, height);
+        filter_a_tex = post_target(MTLPixelFormatRGBA16Float, width / kFilterDownsample, height / kFilterDownsample);
+        filter_b_tex = post_target(MTLPixelFormatRGBA16Float, width / kFilterDownsample, height / kFilterDownsample);
+        for (int i = 0; i < kMeterSteps; ++i) meter_tex[i] = post_target(MTLPixelFormatRGBA16Unorm, kMeterSizes[i], kMeterSizes[i]);
+        for (auto& e : exposure_tex) e = post_target(MTLPixelFormatR32Float, 1, 1);
+        exposure_sim_time = -1.0f;
 
         MTLTextureDescriptor* depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                                             width:width
@@ -1176,7 +1265,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         player_camera(telemetry, cam_pos, rot);
         float fov_deg = telemetry.fov_deg;
         float near_plane = 5.0f;
-        float far_plane = 65000.0f;
+        float far_plane = kFarPlane;
 
         if (in_main_menu) {
             const MenuChapterEntry& cam_ch = impl_->main_menu.get_chapter(impl_->selected_chapter);
@@ -1186,6 +1275,9 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             near_plane = 10.0f;
             far_plane = 400000.0f;
         }
+
+        // The post-process settings in force where the view is (the world's, or a volume's).
+        const PostProcessSettings& view_post = impl_->post_settings.update(active_scene, cam_pos, telemetry.sim_time);
 
         Vec3 fwd = rot.forward();
         Vec3 right = rot.right();
@@ -1633,6 +1725,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         [enc setRenderPipelineState:ps];
                         [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided && !in_main_menu) ? MTLCullModeBack : MTLCullModeNone];
                         impl_->bind_material(enc, *m, *sh);
+                        impl_->bind_lightmap(enc, s.lightmap);
                         if (in_main_menu && sh->num_uniforms > 0 && !active_mi_tag.empty()) {
                             std::string mname = m->name;
                             for (char& c : mname) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -1713,28 +1806,52 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
         }
 
+        // Height fog over the opaque scene, before anything translucent is drawn on it
+        // (HeightFogPixelShader.usf): scene * scattering + fog, read off the depth buffer, which
+        // for that cannot be the pass's own. The scene pass is taken up again afterwards.
+        const bool fog_pass = !active_scene.height_fog.empty();
+        if (fog_pass) {
+            [enc endEncoding];
+            PostUniformsGPU fog_constants{};
+            fill_post_uniforms(active_scene, view_post, cam_pos, 0.0f, false, fog_constants);
+            MTLRenderPassDescriptor* fogPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            fogPass.colorAttachments[0].texture = impl_->scene_hdr_tex;
+            fogPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            fogPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> fogEnc = [cmd_buffer renderCommandEncoderWithDescriptor:fogPass];
+            [fogEnc setRenderPipelineState:impl_->fog_pipeline];
+            [fogEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
+            [fogEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+            [fogEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [fogEnc setFragmentBytes:&fog_constants length:sizeof(fog_constants) atIndex:1];
+            [fogEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [fogEnc endEncoding];
+        }
+
         // B3. Translucent / additive / modulated materials (UE3 translucency pass): drawn after
         // all opaque geometry, depth-tested without depth writes. Materials that read the scene
         // (SceneTexture, DestColor, DepthBiasedAlpha) sample copies of the opaque scene.
-        if (has_translucent) {
-            if (needs_scene_copies) {
-                [enc endEncoding];
+        const bool copy_scene = has_translucent && needs_scene_copies;
+        if (fog_pass || copy_scene) {
+            if (!fog_pass) [enc endEncoding];
+            if (copy_scene) {
                 id<MTLBlitCommandEncoder> blit = [cmd_buffer blitCommandEncoder];
                 [blit copyFromTexture:impl_->scene_hdr_tex toTexture:impl_->scene_color_copy];
                 [blit copyFromTexture:impl_->offscreen_depth_tex toTexture:impl_->scene_depth_copy];
                 [blit endEncoding];
-
-                MTLRenderPassDescriptor* transPass = [MTLRenderPassDescriptor renderPassDescriptor];
-                transPass.colorAttachments[0].texture = impl_->scene_hdr_tex;
-                transPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-                transPass.colorAttachments[0].storeAction = MTLStoreActionStore;
-                transPass.depthAttachment.texture = impl_->offscreen_depth_tex;
-                transPass.depthAttachment.loadAction = MTLLoadActionLoad;
-                transPass.depthAttachment.storeAction = MTLStoreActionStore;
-                enc = [cmd_buffer renderCommandEncoderWithDescriptor:transPass];
-                [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
-                [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
             }
+            MTLRenderPassDescriptor* resumePass = [MTLRenderPassDescriptor renderPassDescriptor];
+            resumePass.colorAttachments[0].texture = impl_->scene_hdr_tex;
+            resumePass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            resumePass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            resumePass.depthAttachment.texture = impl_->offscreen_depth_tex;
+            resumePass.depthAttachment.loadAction = MTLLoadActionLoad;
+            resumePass.depthAttachment.storeAction = MTLStoreActionStore;
+            enc = [cmd_buffer renderCommandEncoderWithDescriptor:resumePass];
+            [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
+            [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+        }
+        if (has_translucent) {
             [enc setDepthStencilState:impl_->depth_test_only_state];
             [enc setFrontFacingWinding:impl_->mat_front_winding];
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
@@ -1754,6 +1871,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     [enc setRenderPipelineState:ps];
                     [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided) ? MTLCullModeBack : MTLCullModeNone];
                     impl_->bind_material(enc, *m, *sh);
+                    impl_->bind_lightmap(enc, s.lightmap);
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
                 }
             }
@@ -1817,8 +1935,87 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         [enc endEncoding];
 
         // ---------------------------------------------------------------------
-        // Pass 2: Post-Processing, SSAO & Tone Mapping (HDR -> Final Output)
+        // Pass 2: the post-process chain, in the game's order: haze, bloom (gather, blur across,
+        // blur down), the exposure's metering and step, then the blend of the bloom with the
+        // scene and the tone mapping, in one pass (HDR -> final output).
         // ---------------------------------------------------------------------
+        PostUniformsGPU post{};
+        {
+            // When the game asks (a level opening), the exposure buffers go back to the game's starting
+            // value and adapt from there. Otherwise the exposure follows the view in time, and settles at
+            // once for a still: the same moment again, a first picture of a level nobody asked to open, a
+            // gap no eye followed, or a view that is suddenly somewhere else (the oracle renders now and
+            // then, from wherever its stage put the player).
+            const bool opening = telemetry.exposure_reset;
+            if (opening) {
+                for (id<MTLTexture> e : impl_->exposure_tex) {
+                    MTLRenderPassDescriptor* startPass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    startPass.colorAttachments[0].texture = e;
+                    startPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+                    startPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    startPass.colorAttachments[0].clearColor = MTLClearColorMake(kExposureStart, kExposureStart, kExposureStart, kExposureStart);
+                    [[cmd_buffer renderCommandEncoderWithDescriptor:startPass] endEncoding];
+                }
+            }
+            const bool new_level = impl_->exposure_map != active_scene.map_name;
+            const bool fresh = impl_->exposure_sim_time < 0.0f;  // the buffers were just made (a resize)
+            const float post_dt = (opening || new_level || fresh) ? 0.0f : telemetry.sim_time - impl_->exposure_sim_time;
+            const bool view_jumped = (cam_pos - impl_->exposure_view_pos).length_sq() > 300.0f * 300.0f;
+            const bool still = !opening && (new_level || fresh || post_dt == 0.0f || post_dt >= 0.5f || view_jumped);
+            impl_->exposure_view_pos = cam_pos;
+            fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
+            post.fade[0] = telemetry.fade_color.x;
+            post.fade[1] = telemetry.fade_color.y;
+            post.fade[2] = telemetry.fade_color.z;
+            post.fade[3] = telemetry.fade_amount;
+            impl_->exposure_sim_time = telemetry.sim_time;
+            impl_->exposure_map = active_scene.map_name;
+        }
+        const float post_fw = static_cast<float>(impl_->width);
+        const float post_fh = static_cast<float>(impl_->height);
+        auto post_pass = [&](id<MTLRenderPipelineState> pipeline, id<MTLTexture> target, id<MTLTexture> t0, id<MTLTexture> t1,
+                             id<MTLTexture> t2) {
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cmd_buffer renderCommandEncoderWithDescriptor:pass];
+            [e setRenderPipelineState:pipeline];
+            if (t0) [e setFragmentTexture:t0 atIndex:0];
+            if (t1) [e setFragmentTexture:t1 atIndex:1];
+            if (t2) [e setFragmentTexture:t2 atIndex:2];
+            [e setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+            [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [e setFragmentBytes:&post length:sizeof(post) atIndex:1];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [e endEncoding];
+        };
+
+        post.texel[0] = 1.0f / post_fw;
+        post.texel[1] = 1.0f / post_fh;
+        post_pass(impl_->haze_pipeline, impl_->scene_hazed_tex, impl_->scene_hdr_tex, impl_->offscreen_depth_tex, nil);
+        post_pass(impl_->bloom_gather_pipeline, impl_->filter_a_tex, impl_->scene_hazed_tex, impl_->offscreen_depth_tex, nil);
+        fill_filter_taps(impl_->width, (int)impl_->filter_a_tex.width, (int)impl_->filter_a_tex.height, /*horizontal=*/true, post);
+        post_pass(impl_->filter_pipeline, impl_->filter_b_tex, impl_->filter_a_tex, nil, nil);
+        fill_filter_taps(impl_->width, (int)impl_->filter_a_tex.width, (int)impl_->filter_a_tex.height, /*horizontal=*/false, post);
+        post_pass(impl_->filter_pipeline, impl_->filter_a_tex, impl_->filter_b_tex, nil, nil);
+
+        // The metering: the scene with its bloom into 512 x 512, then down to one texel.
+        post.texel[2] = static_cast<float>(meter_taps(impl_->width, kMeterSizes[0]));
+        post_pass(impl_->meter_scene_pipeline, impl_->meter_tex[0], impl_->scene_hazed_tex, impl_->offscreen_depth_tex,
+                  impl_->filter_a_tex);
+        for (int i = 1; i < kMeterSteps; ++i) {
+            post.texel[0] = post.texel[1] = 1.0f / static_cast<float>(kMeterSizes[i - 1]);
+            post.texel[2] = static_cast<float>(meter_taps(kMeterSizes[i - 1], kMeterSizes[i]));
+            post_pass(impl_->meter_pipeline, impl_->meter_tex[i], impl_->meter_tex[i - 1], nil, nil);
+        }
+        post.texel[0] = 1.0f / post_fw;
+        post.texel[1] = 1.0f / post_fh;
+        const int exposure_previous = impl_->exposure_current;
+        impl_->exposure_current = 1 - exposure_previous;
+        post_pass(impl_->exposure_pipeline, impl_->exposure_tex[impl_->exposure_current], impl_->meter_tex[kMeterSteps - 1],
+                  impl_->exposure_tex[exposure_previous], nil);
+
         MTLRenderPassDescriptor* postPass = [MTLRenderPassDescriptor renderPassDescriptor];
         postPass.colorAttachments[0].texture = final_target;
         postPass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1826,11 +2023,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         postPass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
         id<MTLRenderCommandEncoder> postEnc = [cmd_buffer renderCommandEncoderWithDescriptor:postPass];
-        [postEnc setRenderPipelineState:impl_->post_pipeline];
-        [postEnc setFragmentTexture:impl_->scene_hdr_tex atIndex:0];
+        [postEnc setRenderPipelineState:impl_->tonemap_pipeline];
+        [postEnc setFragmentTexture:impl_->scene_hazed_tex atIndex:0];
         [postEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
+        [postEnc setFragmentTexture:impl_->filter_a_tex atIndex:2];
+        [postEnc setFragmentTexture:impl_->exposure_tex[impl_->exposure_current] atIndex:3];
         [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
         [postEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [postEnc setFragmentBytes:&post length:sizeof(post) atIndex:1];
         [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
         // ---------------------------------------------------------------------

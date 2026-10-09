@@ -84,6 +84,11 @@ struct StaticMeshAsset {
     std::vector<float> uv_extra;
     std::vector<StaticMeshElement> elements;
     int num_uv_channels = 0;  // LOD0 NumTexCoords
+    // Baked lighting: the UV set light maps are laid out in (UStaticMesh.LightMapCoordinateIndex),
+    // and for each entry of `triangles` the LOD0 vertex it came from (vertex light maps hold one
+    // sample per such vertex).
+    int lightmap_uv_index = 0;
+    std::vector<uint32_t> source_vertex;
 
     // UV set `index` of triangle vertex `vertex`, with the last set standing in for a missing one.
     void uv(size_t vertex, int index, float& out_u, float& out_v) const {
@@ -119,6 +124,10 @@ struct UProperty;
 class UPKPackage;
 void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out);
 
+// The convex pieces of a volume actor's brush (its BrushComponent's BrushAggGeom.ConvexElems) in
+// world space, each as triangles, 3 vertices apiece.
+void read_actor_brush_hulls(const UPKPackage& pkg, int32_t actor_export_1based, std::vector<std::vector<Vec3>>& out);
+
 // A sliding door InterpActor driven by a door Matinee group (e.g. "lowerdoors").
 struct InterpDoorInfo {
     std::string package;     // source package stem
@@ -126,6 +135,13 @@ struct InterpDoorInfo {
     std::string group;       // InterpGroup.GroupName
     Vec3 open_offset{0.0f, 0.0f, 0.0f};  // world displacement at the end of the matinee (open)
     float open_time = 0.7f;              // PosTrack length
+};
+
+// The level BSP's triangles of one material under one set of light-map textures (-1: none).
+struct BspRenderBin {
+    std::string material;
+    int32_t lightmap_set = -1;
+    std::vector<Vertex> vertices;
 };
 
 class UPKPackage {
@@ -168,9 +184,10 @@ public:
     // space (3 vertices per triangle). Non-CSG nodes and PF_NotSolid surfaces are skipped.
     void extract_bsp_collision(std::vector<Vec3>& out_triangles) const;
     // Level BSP render geometry (from PersistentLevel UModel Nodes + Surfs + FModelVertexBuffer),
-    // binned by canonical material path and oriented to counter-clockwise front-facing winding.
-    void extract_bsp_render_geometry(std::vector<std::pair<std::string, std::vector<Vertex>>>& out_bins,
-                                     AABB& inout_bounds) const;
+    // binned by canonical material path and light-map set, and oriented to counter-clockwise
+    // front-facing winding. With `lightmaps` the vertices carry their elements' baked lighting.
+    void extract_bsp_render_geometry(std::vector<BspRenderBin>& out_bins, AABB& inout_bounds,
+                                     class LightMapSets* lightmaps = nullptr) const;
     void extract_elevators(const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                            std::vector<ElevatorInstance>& out_elevators,
                            std::vector<InterpDoorInfo>* out_doors = nullptr) const;
@@ -225,9 +242,10 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           CollisionWorld& out_collision,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                           std::vector<std::string>* out_material_paths = nullptr,
-                          const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins = nullptr,
+                          const std::vector<BspRenderBin>* bsp_render_bins = nullptr,
                           const AABB* bsp_bounds = nullptr,
-                          class MaterialUVResolver* material_uvs = nullptr);
+                          class MaterialUVResolver* material_uvs = nullptr,
+                          class LightMapSets* lightmaps = nullptr);
 
 // Appends one actor's UE3 collision triangles (world space) to `out` with the per-triangle
 // channels implied by the actor flags and the mesh's UseSimple*Collision settings.

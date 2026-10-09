@@ -1202,8 +1202,11 @@ void GraphCompiler::run() {
     }
     if (out_.uses_scene_color) src << ", texture2d<float> scene_color [[texture(" << matbind::kSceneColorTexture << ")]]";
     if (out_.uses_scene_depth) src << ", depth2d<float> scene_depth [[texture(" << matbind::kSceneDepthTexture << ")]]";
-    if (out_.uses_scene_color || out_.uses_scene_depth) src << ", sampler scene_smp [[sampler(" << matbind::kSceneSampler << ")]]";
+    src << ", sampler scene_smp [[sampler(" << matbind::kSceneSampler << ")]]";
     src << ", depth2d_array<float> shadow_map [[texture(" << matbind::kShadowMapTexture << ")]]";
+    src << ", texture2d<float> lm_a [[texture(" << matbind::kLightMapTexture << ")]]";
+    src << ", texture2d<float> lm_b [[texture(" << matbind::kLightMapTexture + 1 << ")]]";
+    src << ", texture2d<float> lm_c [[texture(" << matbind::kLightMapTexture + 2 << ")]]";
     src << ") {\n";
     src << "    MatParams P = mat_setup(in, F);\n";
     for (const auto& s : normal_stmts) src << s << "\n";
@@ -1217,15 +1220,16 @@ void GraphCompiler::run() {
             break;
         case MatLightingModel::Phong:
         case MatLightingModel::NonDirectional:
-            src << "    float3 m_color = m_emissive + mat_lighting(P, F, shadow_map, " << diffuse.code << ", " << diffuse_power.code
+            src << "    MatLightMap m_lmap = mat_scene_lightmap(P, F, shadow_map, lm_a, lm_b, lm_c, scene_smp);\n";
+            src << "    float3 m_color = m_emissive + mat_lighting(P, F, m_lmap, " << diffuse.code << ", " << diffuse_power.code
                 << ", " << specular.code << ", " << specular_power.code << ", " << tslm.code << ", "
                 << (lighting == MatLightingModel::NonDirectional ? 1 : 0) << ");\n";
             break;
         case MatLightingModel::Custom:
             src << "    float3 m_custom = float3(0.0);\n";
-            src << "    float m_sh = mat_shadow(P, F, shadow_map);\n";
+            src << "    MatLightMap m_lmap = mat_scene_lightmap(P, F, shadow_map, lm_a, lm_b, lm_c, scene_smp);\n";
             src << "    {\n";
-            src << "        MatLightMap m_lm = mat_virtual_lightmap(P, F, m_sh);\n";
+            src << "        MatLightMap m_lm = m_lmap;\n";
             src << "        for (int m_j = 0; m_j < 3; ++m_j) {\n";
             src << "            P.tlight = mat_lmb(m_j);\n";
             for (const auto& s : custom_stmts) src << s << "\n";
@@ -1234,7 +1238,7 @@ void GraphCompiler::run() {
             src << "        P.tlight = float3(0.0, 0.0, 1.0);\n";
             src << "    }\n";
             src << "    float3 m_color = m_emissive + mat_lighting_custom(P, F, " << diffuse.code << ", " << tslm.code
-                << ", m_custom, m_sh);\n";
+                << ", m_custom, m_lmap);\n";
             break;
     }
     switch (blend) {
@@ -1682,7 +1686,7 @@ const char* material_common_msl() {
 #include <metal_stdlib>
 using namespace metal;
 
-// Must match me::Vertex (60 bytes).
+// Must match me::Vertex (80 bytes).
 struct MatVertexIn {
     packed_float3 position;
     packed_float3 normal;
@@ -1691,6 +1695,10 @@ struct MatVertexIn {
     float u2, v2;
     uint color;
     float tangent_sign;
+    float lm_u, lm_v;  // baked lighting: see me::Vertex
+    uint lm0;
+    uint lm1;
+    uint lm2;
 };
 
 // Must match FrameUniformsGPU in metal_renderer.mm.
@@ -1730,7 +1738,18 @@ struct MatVSOut {
     float4 uv01;
     float4 color;
     float4 screen_pos;
+    // Baked lighting. lm_uv.x >= 0: the place in the section's light-map textures, lm0..2 the three
+    // coefficients' scales. lm_uv.x == -1: lm0..2 are the vertex's own three coefficients. -2: none.
+    float2 lm_uv;
+    float3 lm0;
+    float3 lm1;
+    float3 lm2;
 };
+
+// A linear colour packed as RGB9E5 (pack_rgb9e5 in assets/level_lightmaps.cpp).
+inline float3 mat_rgb9e5(uint c) {
+    return float3(float(c & 511u), float((c >> 9) & 511u), float((c >> 18) & 511u)) * exp2(float(c >> 27) - 24.0);
+}
 
 // LocalVertexFactory equivalent: binormal = cross(TangentZ, TangentX) * TangentZ.w
 vertex MatVSOut mat_vertex(const device MatVertexIn* vertices [[buffer(0)]],
@@ -1750,6 +1769,10 @@ vertex MatVSOut mat_vertex(const device MatVertexIn* vertices [[buffer(0)]],
     o.uv01 = float4(v.u, v.v, v.u2, v.v2);
     o.color = float4(float(v.color & 0xFFu), float((v.color >> 8) & 0xFFu),
                      float((v.color >> 16) & 0xFFu), float((v.color >> 24) & 0xFFu)) * (1.0 / 255.0);
+    o.lm_uv = float2(v.lm_u, v.lm_v);
+    o.lm0 = mat_rgb9e5(v.lm0);
+    o.lm1 = mat_rgb9e5(v.lm1);
+    o.lm2 = mat_rgb9e5(v.lm2);
     return o;
 }
 
@@ -1770,6 +1793,10 @@ struct MatParams {
     float3 B;
     float3 N;
     float time;
+    float2 lm_uv;
+    float3 lm0;
+    float3 lm1;
+    float3 lm2;
 };
 
 inline float3 mat_perp(float3 n) {
@@ -1806,6 +1833,10 @@ inline MatParams mat_setup(MatVSOut in, constant FrameUniforms& F) {
     P.screen_uv = ndc * float2(0.5, -0.5) + 0.5;
     P.wpos = in.world_pos;
     P.time = F.sim_time;
+    P.lm_uv = in.lm_uv;
+    P.lm0 = in.lm0;
+    P.lm1 = in.lm1;
+    P.lm2 = in.lm2;
     return P;
 }
 
@@ -1845,7 +1876,6 @@ constant float kSunIntensity = 0.88;
 constant float kSkyUpper = 0.48;
 constant float kSkyLower = 0.34;
 constant float kAmbient = 0.025;
-constant float3 kHazeColor = float3(0.76, 0.86, 0.96);
 
 inline float3 mat_lmb(int j) { return j == 0 ? kLMB0 : (j == 1 ? kLMB1 : kLMB2); }
 
@@ -1853,6 +1883,8 @@ struct MatLightMap {
     float3 c0;
     float3 c1;
     float3 c2;
+    float baked;   // 1: the level's own light map; 0: the stand-in for geometry nothing was baked for
+    float shadow;  // the stand-in's sun visibility
 };
 inline float3 mat_lm(MatLightMap m, int j) { return j == 0 ? m.c0 : (j == 1 ? m.c1 : m.c2); }
 
@@ -1882,6 +1914,50 @@ inline MatLightMap mat_virtual_lightmap(MatParams P, constant FrameUniforms& F, 
     m.c0 = sun * w.x;
     m.c1 = sun * w.y;
     m.c2 = sun * w.z;
+    m.baked = 0.0;
+    m.shadow = shadow;
+    return m;
+}
+
+// One light-map coefficient texture, filtered as the game does with TdBicubicFiltering on:
+// tex2DBicubic of BasePassPixelShader.usf, a cubic B-spline over 4 x 4 texels taken as four
+// bilinear taps. The weights it reads from BSplineTexture are computed here.
+inline float3 mat_lm_bicubic(texture2d<float> t, sampler s, float2 uv) {
+    float2 size = float2(float(t.get_width()), float(t.get_height()));
+    float2 x = uv * size - 0.5;
+    float2 p = floor(x);
+    float2 f = x - p;
+    float2 f2 = f * f;
+    float2 f3 = f2 * f;
+    float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) * (1.0 / 6.0);
+    float2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) * (1.0 / 6.0);
+    float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) * (1.0 / 6.0);
+    float2 w3 = f3 * (1.0 / 6.0);
+    float2 g0 = w0 + w1;
+    float2 g1 = w2 + w3;
+    float2 h0 = (p - 0.5 + w1 / g0) / size;
+    float2 h1 = (p + 1.5 + w3 / g1) / size;
+    return g0.y * (g0.x * t.sample(s, float2(h0.x, h0.y)).rgb + g1.x * t.sample(s, float2(h1.x, h0.y)).rgb) +
+           g1.y * (g0.x * t.sample(s, float2(h0.x, h1.y)).rgb + g1.x * t.sample(s, float2(h1.x, h1.y)).rgb);
+}
+
+// The three directional coefficients at this pixel: the section's light-map textures times their
+// scales, or the vertex's own samples (BasePassPixelShader.usf, TEXTURE_LIGHTMAP / VERTEX_LIGHTMAP).
+// Geometry nothing was baked for (movers, anything spawned) gets the sun stand-in.
+inline MatLightMap mat_scene_lightmap(MatParams P, constant FrameUniforms& F, depth2d_array<float> shadow_map,
+                                      texture2d<float> lm_a, texture2d<float> lm_b, texture2d<float> lm_c, sampler lm_smp) {
+    if (P.lm_uv.x < -1.5) return mat_virtual_lightmap(P, F, mat_shadow(P, F, shadow_map));
+    MatLightMap m;
+    m.c0 = P.lm0;
+    m.c1 = P.lm1;
+    m.c2 = P.lm2;
+    if (P.lm_uv.x >= 0.0) {
+        m.c0 *= mat_lm_bicubic(lm_a, lm_smp, P.lm_uv);
+        m.c1 *= mat_lm_bicubic(lm_b, lm_smp, P.lm_uv);
+        m.c2 *= mat_lm_bicubic(lm_c, lm_smp, P.lm_uv);
+    }
+    m.baked = 1.0;
+    m.shadow = 1.0;
     return m;
 }
 
@@ -1922,12 +1998,12 @@ inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diff
     return mix(up_l, tsl, tslm) * upper_c + mix(lo_l, tsl, tslm) * lower_c;
 }
 
-inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, depth2d_array<float> shadow_map,
+inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, MatLightMap lm,
                            float3 diffuse, float diffuse_power,
                            float3 specular, float specular_power, float3 tslm, int model) {
-    float shadow = mat_shadow(P, F, shadow_map);
-    MatLightMap lm = mat_virtual_lightmap(P, F, shadow);
-    float3 m = (model == 1) ? float3(1.0) : saturate(tslm);
+    // Against the level's own light map the mask is what the graph says, unclamped, as in the game;
+    // the stand-in's magnitudes cannot take values above one (docs/MATERIAL_SYSTEM.md, section 7).
+    float3 m = (model == 1) ? float3(1.0) : (lm.baked > 0.5 ? tslm : saturate(tslm));
     float3 lmn = saturate(float3(dot(P.tnormal, kLMB0), dot(P.tnormal, kLMB1), dot(P.tnormal, kLMB2)));
     float3 lmr = saturate(float3(dot(P.trefl, kLMB0), dot(P.trefl, kLMB1), dot(P.trefl, kLMB2)));
     float3 dt = pow(max(lmn * lmn, float3(1e-8)), float3(diffuse_power)) * (1.0 - m) + m;
@@ -1936,56 +2012,49 @@ inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, depth2d_array
     float3 c = lm.c0 * (dt.x * dn + st.x * specular)
              + lm.c1 * (dt.y * dn + st.y * specular)
              + lm.c2 * (dt.z * dn + st.z * specular);
-    c += mat_hemisphere(P, F, diffuse, tslm, model, shadow);
-    c += diffuse * kAmbient;
+    // What a baked surface receives is in its light map: the sky and the bounces were baked with the
+    // sun. The hemisphere and ambient terms belong to the stand-in.
+    if (lm.baked < 0.5) {
+        c += mat_hemisphere(P, F, diffuse, tslm, model, lm.shadow);
+        c += diffuse * kAmbient;
+    }
     return c;
 }
 
 inline float3 mat_lighting_custom(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm,
-                                  float3 custom_sum, float shadow) {
-    return custom_sum + mat_hemisphere(P, F, diffuse, tslm, 2, shadow) + diffuse * kAmbient;
+                                  float3 custom_sum, MatLightMap lm) {
+    if (lm.baked > 0.5) return custom_sum;
+    return custom_sum + mat_hemisphere(P, F, diffuse, tslm, 2, lm.shadow) + diffuse * kAmbient;
 }
 
-// ---- Output (scene color is display-referred in this renderer) -------------
-inline float mat_haze(MatParams P, constant FrameUniforms& F) {
-    float dist = length(float3(F.camera_pos) - P.wpos);
-    return saturate((dist - 2500.0) / 38000.0) * 0.65;
-}
-// Filmic HDR highlight compression before gamma encoding prevents sunlit white concrete (c ~ 1.8)
-// from clipping to flat #FFFFFF, preserving warm sun vs cool azure shadow contrast.
-inline float3 mat_encode(float3 c) {
-    float3 x = max(c, float3(0.0));
-    float3 mapped = float3(1.0) - exp(-x * 0.76);
-    return pow(mapped, float3(1.0 / 2.2));
-}
-
+// ---- Output: scene colour is linear and unbounded, as the game's is (BasePassPixelShader.usf).
+// Fog, haze, exposure and the tone curve come after, on the whole picture.
 inline float4 mat_out_opaque(MatParams P, constant FrameUniforms& F, float3 c) {
-    return float4(mix(mat_encode(c), kHazeColor, mat_haze(P, F)), 1.0);
+    return float4(max(c, float3(0.0)), 1.0);
 }
 inline float4 mat_out_translucent(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
-    return float4(mix(mat_encode(c), kHazeColor, mat_haze(P, F)), saturate(opacity));
+    return float4(max(c, float3(0.0)), saturate(opacity));
 }
 inline float4 mat_out_additive(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
-    return float4(max(c, float3(0.0)) * ((1.0 - mat_haze(P, F)) * max(opacity, 0.0)), 0.0);
+    return float4(max(c, float3(0.0)) * max(opacity, 0.0), 0.0);
 }
 inline float4 mat_out_modulate(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
-    return float4(mix(mat_encode(c), float3(1.0), mat_haze(P, F)), opacity);
+    return float4(max(c, float3(0.0)), opacity);
 }
 
-// ---- Scene depth (matches the renderer's projection: near 5, far 65000, depth range [0.05, 1]) ----
+// ---- Scene depth (matches the renderer's projection: near 5, far 10000000, depth range [0.05, 1]) ----
 inline float mat_linear_depth(float d) {
     float ndc = saturate((d - 0.05) / 0.95);
-    return (5.0 * 65000.0) / (65000.0 - ndc * (65000.0 - 5.0));
+    return (5.0 * 10000000.0) / (10000000.0 - ndc * (10000000.0 - 5.0));
 }
 inline float mat_depth_biased_alpha(MatParams P, float scene_depth, float alpha, float bias, float bias_scale) {
     float depth_bias = (1.0 - bias) * bias_scale;
     float blend = saturate((scene_depth - P.screen_pos.w) / max(depth_bias, 0.001));
     return alpha * blend;
 }
-// The opaque scene color copy is display-referred: decode to linear for the material graph.
+// The opaque scene colour copy, linear like the scene itself.
 inline float4 mat_scene_color(texture2d<float> t, sampler s, float2 uv) {
-    float4 c = t.sample(s, uv);
-    return float4(pow(max(c.rgb, float3(0.0)), float3(2.2)), c.a);
+    return t.sample(s, uv);
 }
 )msl";
     return source.c_str();
@@ -2009,6 +2078,38 @@ MaterialUVSlots MaterialUVResolver::slots(const std::string& material_path) {
     const MaterialUVSlots s = impl_->builder.build(material_path).uv_slots;
     impl_->cache.emplace(key, s);
     return s;
+}
+
+std::string material_check_msl() {
+    static const char* kArguments = R"msl((MatVSOut in [[stage_in]], constant FrameUniforms& F [[buffer(0)]],
+        texture2d<float> t0 [[texture(0)]], sampler s0 [[sampler(0)]], sampler scene_smp [[sampler(15)]],
+        depth2d_array<float> shadow_map [[texture(27)]], texture2d<float> lm_a [[texture(24)]],
+        texture2d<float> lm_b [[texture(25)]], texture2d<float> lm_c [[texture(26)]]) {
+    MatParams P = mat_setup(in, F);
+    mat_finish_normal(P, float3(0.0, 0.0, 1.0));
+    float4 base = t0.sample(s0, P.uv0);
+    MatLightMap m_lmap = mat_scene_lightmap(P, F, shadow_map, lm_a, lm_b, lm_c, scene_smp);
+)msl";
+    std::string source = material_common_msl();
+    source += "\nfragment float4 mat_check_lit";
+    source += kArguments;
+    source += R"msl(    float3 m_color = mat_lighting(P, F, m_lmap, base.xyz, 1.0, base.xyz, 15.0, float3(0.0), 0);
+    return mat_out_opaque(P, F, m_color);
+}
+)msl";
+    source += "\nfragment float4 mat_check_custom";
+    source += kArguments;
+    source += R"msl(    float3 m_color = mat_lighting_custom(P, F, base.xyz, float3(0.0), base.xyz, m_lmap);
+    return mat_out_translucent(P, F, m_color, base.w);
+}
+)msl";
+    source += "\nfragment float4 mat_check_unlit";
+    source += kArguments;
+    source += R"msl(    float4 seen = mat_scene_color(t0, scene_smp, P.uv0);
+    return mat_out_additive(P, F, base.xyz + seen.xyz, base.w) + mat_out_modulate(P, F, base.xyz, base.w);
+}
+)msl";
+    return source;
 }
 
 std::shared_ptr<SceneMaterialLibrary> build_scene_materials(PackageManager& pm,
