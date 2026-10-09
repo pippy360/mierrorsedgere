@@ -107,7 +107,10 @@ add_library(me_game_objs OBJECT ${GAME_SOURCES})
 set(OPENGL_RENDERER_SOURCES
     src/renderer/opengl_renderer.cpp
     src/renderer/msl_to_glsl.cpp
+    src/renderer/gl/gl_api.cpp
 )
+# glcorearb.h includes <KHR/khrplatform.h>; both are vendored under src/renderer/gl.
+set(OPENGL_RENDERER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/gl)
 if(APPLE)
     option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS" ON)
 endif()
@@ -157,6 +160,7 @@ target_link_libraries(mirrorsedge_macos PRIVATE
 if(ME_OPENGL)
     add_executable(mirrorsedge_opengl src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
     target_compile_definitions(mirrorsedge_opengl PRIVATE ME_RENDERER_OPENGL=1 GL_SILENCE_DEPRECATION=1)
+    target_include_directories(mirrorsedge_opengl PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR})
     # OpenGL itself is loaded through SDL_GL_GetProcAddress; no framework to link.
     target_link_libraries(mirrorsedge_opengl PRIVATE ${ME_MACOS_LIBS})
 endif()
@@ -220,6 +224,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libswsc
 
 add_executable(mirrorsedge_linux src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
 target_compile_definitions(mirrorsedge_linux PRIVATE ME_RENDERER_OPENGL=1)
+target_include_directories(mirrorsedge_linux PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR})
 # OpenGL itself is loaded through SDL_GL_GetProcAddress; libGL is not linked.
 target_link_libraries(mirrorsedge_linux PRIVATE
     SDL2::SDL2
