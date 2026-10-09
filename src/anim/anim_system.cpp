@@ -1570,6 +1570,9 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.balance_lean = telemetry.balance_lean;
         frame.balance_danger = telemetry.balance_danger;
         frame.against_wall = telemetry.against_wall;
+        frame.against_wall_left = telemetry.against_wall_left;
+        frame.against_wall_right = telemetry.against_wall_right;
+        frame.against_wall_height = telemetry.against_wall_height;
         frame.climbing_pipe = telemetry.climbing_pipe;
         frame.climb_top = telemetry.climb_top;
         frame.climb_bottom = telemetry.climb_bottom;
@@ -1598,8 +1601,16 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         fp::PoseEvaluator::Aim aim;
         fp.poser.set_grip_enabled(telemetry.move_state != EMovement::MOVE_Snatch);
         aim.pitch_deg = telemetry.pitch_deg;
-        aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready();
-        aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready();
+        // (An arm that is on the wall is not the weapon's to aim.)
+        aim.right = fp.director.pawn().armed_right * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_right());
+        aim.left = fp.director.pawn().armed_left * fp.director.tree().weapon_ready() * (1.0f - fp.director.tree().wall_left());
+        // (With a two-handed weapon both hands stay on it: its own `againstwall` has them there.)
+        const bool both_on_weapon = fp.director.pawn().heavy_weapon && fp.director.pawn().weapon_state != 0;
+        aim.wall_left = both_on_weapon ? 0.0f : fp.director.tree().wall_left();
+        aim.wall_right = both_on_weapon ? 0.0f : fp.director.tree().wall_right();
+        aim.wall_ahead_left = fp.last_frame.against_wall_left;
+        aim.wall_ahead_right = fp.last_frame.against_wall_right;
+        aim.wall_height = fp.last_frame.against_wall_height;
         aim.hips = fp.director.hips_offset();
         aim.swan_forward = fp.director.swan_forward();
         aim.swan_down = fp.director.swan_down();
@@ -2410,7 +2421,7 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     };
 
     // Through a disarm the weapon is not in her hand until the move attaches it.
-    const SkeletalMeshAsset* equipped_wmesh = (state == EMovement::MOVE_Snatch ? telemetry.snatch_weapon_attached : telemetry.weapon.equipped)
+    const SkeletalMeshAsset* equipped_wmesh = (telemetry.weapon.equipped && telemetry.snatch_weapon_attached)
                                                   ? get_weapon_mesh(telemetry.weapon.name)
                                                   : nullptr;
     size_t w_idx_cnt = equipped_wmesh ? equipped_wmesh->indices.size() : 0;

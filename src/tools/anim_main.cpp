@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     std::string game_root = default_game_root();
     std::string frames_path, out_path, eye_path;
     std::vector<std::string> watch{"lefthand", "righthand"};
+    bool armed_sets = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
@@ -53,6 +54,7 @@ int main(int argc, char** argv) {
         else if (a == "--frames") frames_path = next();
         else if (a == "--out") out_path = next();
         else if (a == "--eye") eye_path = next();
+        else if (a == "--armed") armed_sets = true;
         else if (a == "--bones") {
             // Bones whose place in the view --eye also writes (to the left, ahead, up), comma separated.
             watch.clear();
@@ -81,9 +83,25 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // --armed: the one-handed weapons' common set in front of the unarmed one, as with a pistol in
+    // hand (TdPawn.UpdateAnimSets), for the armed stances and the disarm.
+    me::AnimSetAsset common;
+    if (armed_sets) {
+        me::UPKPackage pkg(game_root + "/TdGame/CookedPC/Animations/AS_C1P_OneHanded_Common.upk");
+        if (!pkg.is_valid() || !me::AnimSystem::parse_anim_set_package(pkg, common)) {
+            std::cerr << "me_anim: cannot read Animations/AS_C1P_OneHanded_Common.upk under " << game_root << "\n";
+            return 1;
+        }
+    }
     me::fp::Director director;
     std::string error;
     auto lookup = [&](const std::string& name, const me::AnimSetAsset** set) {
+        if (armed_sets) {
+            if (const me::AnimSequenceAsset* seq = common.find_sequence(name)) {
+                if (set) *set = &common;
+                return seq;
+            }
+        }
         if (set) *set = &unarmed;
         return unarmed.find_sequence(name);
     };
@@ -156,8 +174,13 @@ int main(int argc, char** argv) {
             else if (key == "anim") f.move_anim = value;
             else if (key == "swing") f.swing_angle = std::stof(value);
             else if (key == "lean") f.balance_lean = std::stof(value);
+            else if (key == "armed") f.armed = value != "0";
             else if (key == "danger") f.balance_danger = std::stoi(value);
             else if (key == "wall") f.against_wall = std::stoi(value);
+            else if (key == "wallat") {
+                f.against_wall_left = f.against_wall_right = std::stof(value);
+                f.against_wall_height = 0.78f * 180.0f;
+            }
             else if (key == "pipe") f.climbing_pipe = value != "0";
             else if (key == "top") f.climb_top = std::stof(value);
         }
@@ -168,6 +191,11 @@ int main(int argc, char** argv) {
         if (eye_file.is_open()) {
             me::fp::PoseEvaluator::Aim aim;
             aim.hips = director.hips_offset();
+            aim.wall_left = director.tree().wall_left();
+            aim.wall_right = director.tree().wall_right();
+            aim.wall_ahead_left = f.against_wall_left;
+            aim.wall_ahead_right = f.against_wall_right;
+            aim.wall_height = f.against_wall_height;
             poser.evaluate(director.tree(), pose, aim);
             poser.component_space(pose, comp_pos, comp_rot);
             me::fp::ViewFrame v = poser.view(comp_pos, comp_rot, f.view_pitch_deg, f.view_yaw_deg - f.yaw_deg, director.swan_forward(),
@@ -178,6 +206,11 @@ int main(int argc, char** argv) {
                           v.anim_yaw, v.anim_roll);
             eye_file << line;
             // Where the hands are in that view: to the left, ahead, up.
+            if (watch.size() == 1 && watch[0] == "?") {
+                // --bones ? lists the skeleton.
+                for (const auto& bone : upper_mesh.bones) std::cout << bone.name << std::endl;
+                return 0;
+            }
             for (const std::string& want : watch) {
                 me::Vec3 d(0.0f, 0.0f, 0.0f);
                 for (size_t b = 0; b < upper_mesh.bones.size(); ++b) {

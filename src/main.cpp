@@ -469,7 +469,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         Vec3 cam_pos;
         Rotator cam_rot;
         renderer.player_camera(controller.get_telemetry(), cam_pos, cam_rot);
-        const float raw = cam_rot.to_degrees().x;
+        // How far the view has gone round, head over heels: the angle of its forward in the plane
+        // of the roll (a rotator's own pitch comes back past straight down).
+        const Vec3 look = cam_rot.forward();
+        const float raw = std::atan2(look.z, look.dot(roll_fwd)) * RAD2DEG;
         cam_pitch = first ? raw : cam_pitch + wrap_180(raw - cam_pitch_raw_prev);
         cam_pitch_raw_prev = raw;
         cam_pitch_min = first ? cam_pitch : std::min(cam_pitch_min, cam_pitch);
@@ -528,6 +531,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     for (int i = 0; i < 20; ++i) {
         controller.step(in7_walk, kDt, sim_scene);
     }
+    // A frame before the disarm, as the game has every step: the first-person tree is running
+    // when the move starts, and takes the animation the move names.
+    renderer.render_frame(sim_scene, controller.get_telemetry());
     InputFrame in7{};
     in7.reaction_time = true;
     in7.disarm = true;
@@ -538,7 +544,18 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool s7_disarm = (controller.get_move_state() == EMovement::MOVE_Snatch && controller.get_telemetry().weapon.equipped);
     bool s7_reaction = controller.get_telemetry().reaction_active;
 
-    renderer.render_frame(sim_scene, controller.get_telemetry());
+    // The picture is taken part way through the disarm's animation, not on its first frame.
+    for (int f = 0; f < 45 && controller.get_move_state() == EMovement::MOVE_Snatch; ++f) {
+        controller.step(InputFrame{}, kDt, sim_scene);
+        renderer.render_frame(sim_scene, controller.get_telemetry());
+    }
+    {
+        const Vec3 at = controller.get_position();
+        std::cout << "  [Stage 7] disarm picture: player (" << at.x << ", " << at.y << ", " << at.z << ") yaw " << controller.get_telemetry().yaw_deg
+                  << " t " << controller.get_telemetry().combat_anim_time << " / " << controller.get_telemetry().combat_anim_duration;
+        for (const auto& bot : sim_scene.enemies) std::cout << " | bot " << bot.archetype << " at " << at.distance(bot.position) << (bot.disarm_weapon.empty() ? "" : " (being disarmed)");
+        std::cout << std::endl;
+    }
     save_and_publish_png("oracle_5_combat_disarm_reaction.png");
 
     // Verify all 11 retail firearms equip, fire with 3D tracers, and render 1P/3P animations

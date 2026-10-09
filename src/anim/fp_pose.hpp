@@ -55,6 +55,11 @@ public:
         // Where the swan neck has the camera off the eye (forward, down): the armed arm goes with it.
         float swan_forward = 0.0f;
         float swan_down = 0.0f;
+        // Against a wall: how far each arm is on it (0 .. 1) and how far ahead of her centre the
+        // wall is there, for the hand to be set on it (-1 not known).
+        float wall_left = 0.0f, wall_right = 0.0f;
+        float wall_ahead_left = -1.0f, wall_ahead_right = -1.0f;
+        float wall_height = 0.0f;  // those points' height above her feet
         // OneHandedRightShoulderOffset: the weapon's own nudge of the right shoulder, in the bone's
         // space, at the ready (TdWeapon.OneHandedRightShoulderTranslationOffset).
         Vec3 shoulder{0.0f, 0.0f, 0.0f};
@@ -96,6 +101,8 @@ private:
     std::vector<Vec3> pose_pos_;
     bool grip_ = true;
     int spine_right_ = -1, spine_left_ = -1, shoulder_right_ = -1, hips_ = -1;
+    int arm_[2] = {-1, -1}, forearm_[2] = {-1, -1}, hand_[2] = {-1, -1};  // left, right
+    void reach_hand(int side, const Vec3& shift, Pose& out) const;
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;
     int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn

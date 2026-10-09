@@ -812,6 +812,10 @@ void AnimTree::tick(const PawnAnimState& pawn, float dt) {
             }
         }
         if (n.cls == "TdAnimNodeWeaponState" && !n.weight.empty()) weapon_ready_ = pawn.weapon_state == 0 ? 0.0f : n.weight[0];
+        if (n.cls == "TdAnimNodeAgainstWallState" && n.state_mapping.size() == 2 && !n.weight.empty()) {
+            if (n.state_mapping[1] == 2) wall_left_ = 1.0f - n.weight[0];
+            else if (n.state_mapping[1] == 3) wall_right_ = 1.0f - n.weight[0];
+        }
         for (size_t c = 0; c < n.children.size(); ++c) {
             if (n.children[c] >= 0) nodes_[static_cast<size_t>(n.children[c])].incoming += n.total * n.weight[c];
         }

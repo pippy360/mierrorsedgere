@@ -79,6 +79,12 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
         if (key == "spinexleft") spine_left_ = static_cast<int>(b);
         if (key == "rightshoulder") shoulder_right_ = static_cast<int>(b);
         if (key == "hips") hips_ = static_cast<int>(b);
+        if (key == "leftarm") arm_[0] = static_cast<int>(b);
+        if (key == "leftforearm") forearm_[0] = static_cast<int>(b);
+        if (key == "lefthand") hand_[0] = static_cast<int>(b);
+        if (key == "rightarm") arm_[1] = static_cast<int>(b);
+        if (key == "rightforearm") forearm_[1] = static_cast<int>(b);
+        if (key == "righthand") hand_[1] = static_cast<int>(b);
     }
     for (size_t b = 0; b < bones; ++b) {
         if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
@@ -164,6 +170,45 @@ void PoseEvaluator::turn_arm(int bone, float degrees, const Vec3& shift, Pose& o
     const Vec3 moved = eye_pos + turn.rotate(at - eye_pos) + shift;
     out.pos[i] = parent.conjugate().rotate(moved - parent_pos);
     out.rot[i] = Quat4::multiply(parent.conjugate(), Quat4::multiply(turn, Quat4::multiply(parent, out.rot[i]))).normalized();
+}
+
+// A hand moved by `shift` (in the mesh's space) with the arm following: the upper arm and the
+// forearm keep their lengths, the elbow stays in the plane it is in, and the hand keeps its turn.
+void PoseEvaluator::reach_hand(int side, const Vec3& shift, Pose& out) const {
+    const int upper = arm_[side], lower = forearm_[side], hand = hand_[side];
+    if (upper < 0 || lower < 0 || hand < 0 || shift.length_sq() < 1e-6f) return;
+    if (mesh_->bones[static_cast<size_t>(lower)].parent_index != upper || mesh_->bones[static_cast<size_t>(hand)].parent_index != lower) return;
+    std::vector<Vec3> pos;
+    std::vector<Quat4> rot;
+    component_space(out, pos, rot);
+    const size_t u = static_cast<size_t>(upper), l = static_cast<size_t>(lower), h = static_cast<size_t>(hand);
+    const Vec3 a = pos[u], b = pos[l], c = pos[h];
+    const float l1 = (b - a).length(), l2 = (c - b).length();
+    if (l1 < 1e-3f || l2 < 1e-3f) return;
+    const Vec3 to = c + shift - a;
+    const float d = std::clamp(to.length(), std::fabs(l1 - l2) + 0.1f, l1 + l2 - 0.1f);
+    const Vec3 dir = to.normalized();
+    Vec3 pole = (b - a) - dir * (b - a).dot(dir);
+    if (pole.length_sq() < 1e-6f) pole = up_ * -1.0f;
+    pole = pole.normalized();
+    const float along = (l1 * l1 - l2 * l2 + d * d) / (2.0f * d);
+    const float out_of_line = std::sqrt(std::max(0.0f, l1 * l1 - along * along));
+    const Vec3 elbow = a + dir * along + pole * out_of_line;
+    const Vec3 target = a + dir * d;
+    auto between = [](const Vec3& from, const Vec3& onto) {
+        const Vec3 f = from.normalized(), t = onto.normalized();
+        const Vec3 axis = f.cross(t);
+        return Quat4(axis.x, axis.y, axis.z, 1.0f + f.dot(t)).normalized();
+    };
+    const Quat4 q1 = between(b - a, elbow - a);
+    const Quat4 upper_rot = Quat4::multiply(q1, rot[u]).normalized();
+    const Quat4 q2 = between(q1.rotate(c - b), target - elbow);
+    const Quat4 lower_rot = Quat4::multiply(q2, Quat4::multiply(q1, rot[l])).normalized();
+    const int up_parent = mesh_->bones[u].parent_index;
+    const Quat4 parent = up_parent >= 0 ? rot[static_cast<size_t>(up_parent)] : Quat4();
+    out.rot[u] = Quat4::multiply(parent.conjugate(), upper_rot).normalized();
+    out.rot[l] = Quat4::multiply(upper_rot.conjugate(), lower_rot).normalized();
+    out.rot[h] = Quat4::multiply(lower_rot.conjugate(), rot[h]).normalized();
 }
 
 void PoseEvaluator::reference(Pose& out) const {
@@ -319,6 +364,34 @@ void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) co
     const Vec3 swan = fwd_ * aim.swan_forward - up_ * aim.swan_down;
     turn_arm(spine_right_, aim.pitch_deg * aim.right, swan * aim.right, out);
     turn_arm(spine_left_, aim.pitch_deg * aim.left, swan * aim.left, out);
+    // Against a wall the hands are set on it (TdPawn.AgainstWallLeftHand / RightHand and the limb
+    // controls, native; the skeleton has an IK bone for the left hand only, LeftHand_GameIK). In
+    // retail's frames at a flat wall the left fingers are where they would be with the wrist 15 uu
+    // out from her middle and 17 under the eye, on the wall: 4 further in and 6 lower than the
+    // animation alone has it, which also has both hands 3 uu inside the wall. The right hand is
+    // where the animation has it. At a fence she stood further from, the left hand reaches out to
+    // it. So: the left wrist goes to the point of the wall in front of its shoulder (where the
+    // controller found it), a hand's thickness short of it; the right is only brought out to the
+    // wall's surface; the arms bend or reach to suit and the hands keep their turn.
+    if ((aim.wall_left > 0.0f && aim.wall_ahead_left >= 0.0f) || (aim.wall_right > 0.0f && aim.wall_ahead_right >= 0.0f)) {
+        constexpr float kShoulderOut = 15.0f, kPalm = 2.0f, kWristBelowTrace = 2.2f, kMeshOriginBelowFeet = 4.0f;
+        std::vector<Vec3> pos;
+        std::vector<Quat4> rot;
+        component_space(out, pos, rot);
+        const Vec3 wrist[2] = {hand_[0] >= 0 ? pos[static_cast<size_t>(hand_[0])] : Vec3(0.0f, 0.0f, 0.0f),
+                               hand_[1] >= 0 ? pos[static_cast<size_t>(hand_[1])] : Vec3(0.0f, 0.0f, 0.0f)};
+        for (int side = 0; side < 2; ++side) {
+            const float weight = side == 0 ? aim.wall_left : aim.wall_right;
+            const float ahead = side == 0 ? aim.wall_ahead_left : aim.wall_ahead_right;
+            if (weight <= 0.0f || ahead < 0.0f || hand_[side] < 0) continue;
+            const Vec3 point = fwd_ * (ahead - kPalm) + right_ * -kShoulderOut + up_ * (aim.wall_height - kWristBelowTrace + kMeshOriginBelowFeet);
+            const Vec3 target = side == 0 ? point : wrist[side] + fwd_ * ((ahead - kPalm) - wrist[side].dot(fwd_));
+            Vec3 shift = (target - wrist[side]) * weight;
+            const float far = shift.length();
+            if (far > 20.0f) shift = shift * (20.0f / far);
+            reach_hand(side, shift, out);
+        }
+    }
 }
 
 void PoseEvaluator::component_space(const Pose& pose, std::vector<Vec3>& pos, std::vector<Quat4>& rot) const {
@@ -350,23 +423,29 @@ ViewFrame PoseEvaluator::view(const std::vector<Vec3>& comp_pos, const std::vect
     }
     v.eye_pawn = Vec3(v.eye.dot(fwd_), v.eye.dot(right_), v.eye.dot(up_));
 
-    // TdPawn.GetCameraAnimation (native): the camera bone's rotation in the mesh's space, as
-    // FMatrix::Rotator reads it. The mesh's axes are +X left, -Y up, +Z forward, so the rotator's
-    // roll is the view's pitch, its pitch the view's yaw and its yaw the view's roll, which is the
-    // swizzle CalcCamera does: Pitch += -Roll, Yaw += Pitch, Roll += -Yaw. Read this way the pitch
-    // keeps going past straight down, which is how a roll turns the view right over.
+    // TdPawn.GetCameraAnimation (native) and CalcCamera's Pitch += -Roll, Yaw += Pitch, Roll += -Yaw:
+    // the camera bone's orientation as a view's. At rest the bone's axes are the mesh's (+X left,
+    // -Y up, +Z forward), so the camera looks along the bone's Z with the bone's -X to its right
+    // and -Y up; that frame, in the pawn's axes, read as a rotator (FMatrix::Rotator) is the pitch,
+    // yaw and roll the animation adds. Through a disarm, where the camera pitches, turns and
+    // rolls at once (36, 21 and 13 degrees), this is retail's camera to a degree; reading the
+    // mesh-space rotator and swapping its angles, which is the same thing for a turn about one
+    // axis, was 5 to 8 degrees out there. (Past straight down the pitch comes back and the yaw and
+    // roll go half a turn: the same orientation a somersault's pitch would run on to.)
     {
         const Quat4& q = comp_rot[static_cast<size_t>(camera_)];
         const Vec3 x_axis = q.rotate(Vec3(1.0f, 0.0f, 0.0f));
         const Vec3 y_axis = q.rotate(Vec3(0.0f, 1.0f, 0.0f));
         const Vec3 z_axis = q.rotate(Vec3(0.0f, 0.0f, 1.0f));
-        const float pitch = std::atan2(x_axis.z, std::sqrt(x_axis.x * x_axis.x + x_axis.y * x_axis.y));
-        const float yaw = std::atan2(x_axis.y, x_axis.x);
+        auto in_pawn = [&](const Vec3& m) { return Vec3(m.dot(fwd_), m.dot(right_), m.dot(up_)); };
+        const Vec3 f = in_pawn(z_axis), r = in_pawn(x_axis) * -1.0f, u = in_pawn(y_axis) * -1.0f;
+        const float pitch = std::atan2(f.z, std::sqrt(f.x * f.x + f.y * f.y));
+        const float yaw = std::atan2(f.y, f.x);
         const Vec3 flat_y(-std::sin(yaw), std::cos(yaw), 0.0f);
-        const float roll = std::atan2(z_axis.dot(flat_y), y_axis.dot(flat_y));
-        v.anim_pitch = -roll * RAD2DEG;
-        v.anim_yaw = pitch * RAD2DEG;
-        v.anim_roll = -yaw * RAD2DEG;
+        const float roll = std::atan2(u.dot(flat_y), r.dot(flat_y));
+        v.anim_pitch = pitch * RAD2DEG;
+        v.anim_yaw = yaw * RAD2DEG;
+        v.anim_roll = roll * RAD2DEG;
     }
 
     // CalcCamera adds the animation's turn to the view rotation, angle by angle.
