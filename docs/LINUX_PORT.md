@@ -134,6 +134,17 @@ It exits with 1 when anything failed, so it can gate a merge.
   samplers become sampler objects fixed to their units at link time, so nothing is bound for them per
   pass. Uniform blocks go to binding points by stage: vertex `buffer(n)` -> n, fragment `buffer(n)` ->
   16 + n.
+- **The opaque pass is sorted by material.** A level is a handful of vertex buffers holding hundreds
+  of sections, nearly all with a different material, and a GL driver pays for every program change
+  (Apple's builds a Metal pipeline descriptor each time). Each buffer's opaque sections are drawn
+  ordered by material shader, material and light map, so a program is switched to once per buffer;
+  sections that then follow each other in the buffer with the same material and light map become one
+  draw. Opaque geometry depth-tests the same in any order except at exact depth ties, and UE3 sorts
+  its own base pass the same way; `ME_GL_SORT=0` restores the buffer order the other backends use.
+  The translucent pass keeps its order. The shadow pass, which binds no material, draws each buffer's
+  casting sections as merged ranges. Fixed-function state, uniform bindings and the per-mesh frame
+  uniforms are only sent when they change, and every material's uniforms are uploaded once with its
+  library and bound as a range (`glBindBufferRange`) rather than uploaded per section.
 - **The level is not drawn under the front end.** While a front end frame covers the window the
   shadow, scene and post passes are skipped; the level's materials are still made resident.
 - **Texture formats.** L8 and V8U8 use texture swizzles as Metal does (`GL_TEXTURE_SWIZZLE_*`): L8 is
@@ -158,7 +169,9 @@ It exits with 1 when anything failed, so it can gate a merge.
 | Variable | Effect |
 |---|---|
 | `MEDGE_ME_INSTALL` | The retail install (as for the tools in `tools/retail`). |
-| `ME_RENDER_PROF=1` | Every 120 frames, print where a frame's time went, by phase, and the draw count. |
+| `ME_RENDER_PROF=1` | Every 120 frames, print where a frame's CPU time went, by phase, the GPU's time for the frame (`GL_TIME_ELAPSED`), the wall-clock frame time and rate, and the draw count. |
+| `ME_VSYNC=0` | Do not wait for the display (to measure the frame rate). |
+| `ME_GL_SORT=0` | Draw each buffer's opaque sections in the buffer's order instead of sorted by material. |
 | `ME_GL_DEBUG=1` | Create a debug context and print the driver's messages (`GL_KHR_debug`, where the driver has it; Apple's does not, and there `glGetError` is polled after every pass instead). |
 | `ME_CULL=off\|cw\|ccw` | Material back-face culling, as on macOS. |
 | `SDL_VIDEODRIVER=offscreen` | Render without a display (Mesa). |
@@ -196,11 +209,15 @@ GCC in mind, no more.
   Nothing is flipped or has its channels swapped (the same measure against the vertically flipped
   or BGR picture is 45 to 120). What differs is at triangle edges and in texture filtering: the two
   drivers rasterise and sample a little differently. No pass is missing in any picture.
-- **The interactive window** (`--chapter 0 --max-frames 600`, 1280x720 at Retina scale): the level
-  loads, plays and exits cleanly. `ME_RENDER_PROF=1` reports 3.5 to 4.5 ms of CPU time for the scene
-  pass and about 1 ms for the translucent one per frame, 1,434 draws; the first frame of a level
-  spends 4 s making the tutorial's 213 material programs and 486 textures resident (10.5 s for
-  `Escape_p`'s 537 and 1,174).
+- **The interactive window** (`--chapter 0 --max-frames 600`, 1280x720 at Retina scale, so
+  2560x1440 pixels): the level loads, plays and exits cleanly. With the display wait off
+  (`ME_VSYNC=0`) `ME_RENDER_PROF=1` reports 9.5 to 9.8 ms a frame, 102 to 106 fps, the GPU busy
+  6.4 to 7.0 ms of it; on the CPU the scene pass takes 4.4 ms, the shadow pass 0.4, the
+  translucent pass with the viewmodel 1.2 and the post chain with the HUD 1.1, for 777 draws.
+  Before the material sort and the merged shadow ranges it was 1,434 draws, the scene pass 5.8 to
+  6.5 ms and 96 to 100 fps; the frame is now bound by the GPU and the driver's per-draw work rather
+  than by the renderer's own calls. The first frame of a level spends 4 s making the tutorial's 213
+  material programs and 486 textures resident (10.5 s for `Escape_p`'s 537 and 1,174).
 - **`mirrorsedge_macos --verify-all`** still passes from the same tree (it shares `main.cpp` and the
   CMake files with this backend).
 
@@ -216,6 +233,12 @@ same `glReadPixels` of the off-screen framebuffer that produced the oracle pictu
   vendor drivers differ from it in what they optimise away, how strictly they validate, and their
   GLSL front ends; the first Linux run may turn up compile errors or binding mistakes that Apple's
   driver let pass. `me_glsl` is the first thing to run there.
+- **The frame rate at Retina resolution is set by the GPU and the driver.** At 2560x1440 the GPU
+  needs about 7 ms for the frame (the 4096x4096 near shadow cascade, the scene, the full-resolution
+  haze and tone-mapping passes), and Apple's OpenGL spends 4 to 6 µs of CPU on every draw whatever
+  the renderer does (resource tracking and pipeline lookup per draw). Fewer draws would need light
+  map atlases; a smaller shadow map or post chain would change the picture. Mesa's per-draw cost is
+  a fraction of Apple's, so Linux should come out better on the CPU side.
 - **Material residency is slow.** Textures are uploaded and programs linked one after another on the
   main thread, with the GLSL compiler of the driver doing the work (4 to 11 s per level here). The
   other backends do this on worker threads. Nothing is cached between runs beyond what the driver

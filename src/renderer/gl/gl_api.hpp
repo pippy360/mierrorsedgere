@@ -76,6 +76,7 @@ namespace gl {
     X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange)                             \
     X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer)                                   \
     X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase)                             \
+    X(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange)                           \
     /* vertex arrays */                                                      \
     X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays)                           \
     X(PFNGLDELETEVERTEXARRAYSPROC, glDeleteVertexArrays)                     \
@@ -112,7 +113,14 @@ namespace gl {
     X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer)                           \
     /* drawing */                                                            \
     X(PFNGLDRAWARRAYSPROC, glDrawArrays)                                     \
-    X(PFNGLDRAWELEMENTSPROC, glDrawElements)
+    X(PFNGLDRAWELEMENTSPROC, glDrawElements)                                 \
+    /* timer queries (ME_RENDER_PROF: GPU time per frame) */                 \
+    X(PFNGLGENQUERIESPROC, glGenQueries)                                     \
+    X(PFNGLDELETEQUERIESPROC, glDeleteQueries)                               \
+    X(PFNGLBEGINQUERYPROC, glBeginQuery)                                     \
+    X(PFNGLENDQUERYPROC, glEndQuery)                                         \
+    X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv)                       \
+    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)
 
 // Entry points of extensions the renderer can do without: null when the driver lacks them.
 //   glDebugMessageCallback / glDebugMessageControl : GL_KHR_debug (ME_GL_DEBUG=1; Apple has neither)
