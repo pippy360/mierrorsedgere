@@ -119,15 +119,37 @@ It exits with 1 when anything failed, so it can gate a merge.
 ## Where the OpenGL backend differs from the Metal one
 
 - **Off-screen first.** Every frame is rendered to an RGBA8 framebuffer that is then blitted to the
-  window. `P` / `F12` screenshots therefore work in a window.
+  window (`glBlitFramebuffer`, y inverted). `P` / `F12` screenshots therefore work in a window, and
+  `glReadPixels` on that framebuffer already returns the rows top-down.
 - **Vertices come from vertex arrays**, not from a buffer indexed by `vertex_id`, so a mesh section is
-  drawn with `glDrawArrays(first, count)`.
-- **Enemies are drawn indexed**, posed into mapped vertex buffers, as on Direct3D; enemies that cannot
-  be seen are not posed.
+  drawn with `glDrawArrays(first, count)`. OpenGL 4.1 ties attribute pointers to a buffer, so every
+  vertex buffer carries its own vertex array object, set up the first time it is drawn with a layout.
+- **Enemies are drawn indexed**, posed into mapped vertex buffers (`glMapBufferRange` on the context's
+  thread, the posing on worker threads), as on Direct3D; enemies that cannot be seen are not posed.
+- **Textures and samplers are bound per program.** The passes put textures and sampler objects into
+  the MSL slots the shaders name, as the other backends do. Which GL texture unit a program reads a
+  slot through is settled when it is linked (one unit per combined sampler, MSL `texture(n)` on unit
+  n, a texture read through two samplers gets a spare unit from 32 up), and the renderer applies the
+  current program's table before each draw, skipping what is already bound. The MSL's `constexpr`
+  samplers become sampler objects fixed to their units at link time, so nothing is bound for them per
+  pass. Uniform blocks go to binding points by stage: vertex `buffer(n)` -> n, fragment `buffer(n)` ->
+  16 + n.
 - **The level is not drawn under the front end.** While a front end frame covers the window the
   shadow, scene and post passes are skipped; the level's materials are still made resident.
-- **Texture formats.** L8 and V8U8 use texture swizzles as Metal does (`GL_TEXTURE_SWIZZLE_*`); BC1/2/3
-  need `GL_EXT_texture_compression_s3tc`, which Mesa and every vendor driver expose.
+- **Texture formats.** L8 and V8U8 use texture swizzles as Metal does (`GL_TEXTURE_SWIZZLE_*`): L8 is
+  `GL_R8`, or `GL_SRGB8` filled through the red channel when sRGB (core OpenGL has no sRGB R8), V8U8
+  `GL_RG8_SNORM`. BC1/2/3 need `GL_EXT_texture_compression_s3tc`, which Mesa and every vendor driver
+  expose; without it the level's textures fall back to the material defaults. BC textures whose top
+  level is not a multiple of 4 are accepted, as on Metal.
+- **Texture upload and shader compilation are serial.** The Direct3D backend uploads a level's textures
+  and compiles its material shaders on worker threads; a GL context belongs to one thread, so only
+  the MSL -> GLSL translation runs in parallel and the GL calls follow on the main thread. A level's
+  materials take 4 to 11 s to become resident on this Mac (see below).
+- **The shadow pass's slope-scaled bias is capped** only where the driver has
+  `GL_ARB/EXT_polygon_offset_clamp` (core in 4.6; Mesa has it, Apple does not). Without it the bias
+  on near-grazing surfaces is not limited to `kSunShadowSlopeBiasCap`.
+- **The shadow pass has a stand-in fragment stage.** The MSL has none (depth is all it writes); the
+  renderer links `shadow_vertex` with an empty `main()`.
 - **PNG screenshots are opaque.**
 - **No shader cache of its own.** Mesa and the vendor drivers cache compiled programs themselves.
 
@@ -137,17 +159,77 @@ It exits with 1 when anything failed, so it can gate a merge.
 |---|---|
 | `MEDGE_ME_INSTALL` | The retail install (as for the tools in `tools/retail`). |
 | `ME_RENDER_PROF=1` | Every 120 frames, print where a frame's time went, by phase, and the draw count. |
-| `ME_GL_DEBUG=1` | Create a debug context and print the driver's messages (`GL_KHR_debug`, where the driver has it; Apple's does not). |
+| `ME_GL_DEBUG=1` | Create a debug context and print the driver's messages (`GL_KHR_debug`, where the driver has it; Apple's does not, and there `glGetError` is polled after every pass instead). |
 | `ME_CULL=off\|cw\|ccw` | Material back-face culling, as on macOS. |
 | `SDL_VIDEODRIVER=offscreen` | Render without a display (Mesa). |
 
-## What was run
+## What was run (2026-10-09)
 
-- `me_glsl` on macOS (OpenGL 4.1 Metal - 90.5, Apple M5 Pro): built-in shaders 14/14 programs;
+On the macOS development machine (Apple M5 Pro, Apple's OpenGL 4.1 Metal - 90.5 driver, GLSL 4.10,
+retail game in `~/mirrorsedge`), with `mirrorsedge_opengl`. Linux itself was not run: no Linux
+machine was at hand, so the Linux build (`g++`, Mesa or a vendor driver, X11 / Wayland through SDL)
+is untested. The code avoids compiler-specific constructs and Apple headers, and was reviewed with
+GCC in mind, no more.
+
+- **`--verify-all`: all stages pass**, run from a scratch directory so the tracked Metal screenshots
+  stay as they are. Material shaders compiled: 213/213 (`Tutorial_p`), 537/537 (`Escape_p`), 289/289
+  (`Edge_p`), 6/6 (`TdMainMenu`); every texture of every library uploaded. The same run under
+  `ME_GL_DEBUG=1` reports no GL error after any pass.
+- **`me_glsl`** (OpenGL 4.1 Metal - 90.5, Apple M5 Pro): built-in shaders 14/14 programs;
   material shaders Tutorial_p 213/213, Edge_p 289/289, Stormdrain_p 397/397, Cranes_p 372/372,
   Subway_p 451/451, Mall_p 465/465, Factory_p 440/440, Boat_p 330/330, Convoy_p 362/362,
   Scraper_p 425/425, Escape_p 537/537 — every shader the game generates compiles and links.
+- **Against the Metal screenshots in `screenshots/`** (mean absolute difference over the RGB
+  channels, in units of 1/255; the fraction of pixels off by more than 8 in brackets):
+
+  | Image | MAD | Image | MAD |
+  |---|---|---|---|
+  | `tutorial_1_rooftop_start` | 0.90 (1.4 %) | `oracle_1_sprint_rooftop` | 0.80 (0.7 %) |
+  | `tutorial_2_slide_airduct_gap` | 0.64 (1.1 %) | `oracle_2_springboard_vault` | 0.34 (0.1 %) |
+  | `tutorial_3_wallrun_speedvault` | 0.63 (1.4 %) | `oracle_3_wallrun_tilt` | 0.56 (1.1 %) |
+  | `tutorial_4_balance_wallclimb` | 0.28 (0.3 %) | `oracle_4_zipline_slide` | 1.17 (2.6 %) |
+  | `tutorial_5_zipline_skillroll` | 0.84 (1.3 %) | `oracle_5_combat_disarm_reaction` | 0.20 (0.2 %) |
+  | `tutorial_6_springboard_combat` | 0.39 (0.2 %) | `oracle_6_skill_roll_upside_down` | 0.33 (0.2 %) |
+  | `oracle_6_sp01_edge_level` | 0.38 (0.0 %) | `oracle_7_chapter_select_menu` | 0.11 (0.0 %) |
+  | `oracle_8_elevator_level_streaming` | 0.22 (0.0 %) | `oracle_9_cutscene_bink_player` | 0.37 (0.0 %) |
+
+  Nothing is flipped or has its channels swapped (the same measure against the vertically flipped
+  or BGR picture is 45 to 120). What differs is at triangle edges and in texture filtering: the two
+  drivers rasterise and sample a little differently. No pass is missing in any picture.
+- **The interactive window** (`--chapter 0 --max-frames 600`, 1280x720 at Retina scale): the level
+  loads, plays and exits cleanly. `ME_RENDER_PROF=1` reports 3.5 to 4.5 ms of CPU time for the scene
+  pass and about 1 ms for the translucent one per frame, 1,434 draws; the first frame of a level
+  spends 4 s making the tutorial's 213 material programs and 486 textures resident (10.5 s for
+  `Escape_p`'s 537 and 1,174).
+- **`mirrorsedge_macos --verify-all`** still passes from the same tree (it shares `main.cpp` and the
+  CMake files with this backend).
+
+Not run: Linux (any distribution, Mesa, NVIDIA or AMD drivers, Wayland, `SDL_VIDEODRIVER=offscreen`),
+a debug context with `GL_KHR_debug`, `glPolygonOffsetClamp`, window resizing and the fullscreen
+toggle, a gamepad, a play-through of any level. The `P` key in the window was not pressed (the
+runs were unattended and this machine does not let a script send keystrokes); what it calls is the
+same `glReadPixels` of the off-screen framebuffer that produced the oracle pictures above.
 
 ## Known gaps
 
-_To be filled in when the backend is complete._
+- **Linux untested.** Everything above was measured on Apple's OpenGL implementation. Mesa and the
+  vendor drivers differ from it in what they optimise away, how strictly they validate, and their
+  GLSL front ends; the first Linux run may turn up compile errors or binding mistakes that Apple's
+  driver let pass. `me_glsl` is the first thing to run there.
+- **Material residency is slow.** Textures are uploaded and programs linked one after another on the
+  main thread, with the GLSL compiler of the driver doing the work (4 to 11 s per level here). The
+  other backends do this on worker threads. Nothing is cached between runs beyond what the driver
+  caches itself.
+- **The shadow bias cap** needs `GL_ARB/EXT_polygon_offset_clamp`; without it (Apple) steep casters
+  get a larger bias than on Metal. It did not show in the screenshots above.
+- **Sampler count.** OpenGL 4.1 guarantees only 16 sampler uniforms per fragment stage. A material
+  shader uses one per texture plus the light maps, the shadow map and the scene copies; a material
+  with 14 textures that also reads the scene would exceed the limit, fail to link, and fall back to
+  the legacy world shader with a message. No shipped material does.
+- **An L8 texture flagged sRGB costs three bytes a texel** (`GL_SRGB8` through the red channel),
+  since core OpenGL has no sRGB single-channel format.
+- **No `SDL_VIDEODRIVER=offscreen` run.** The fallback to it when the default video driver cannot start
+  is in place but was never exercised; it needs an SDL built with EGL support for the offscreen
+  driver, which not every distribution's package has.
+- As on macOS: the stand-in sky, sun and character shading, the approximated reaction-time and
+  low-health effects.

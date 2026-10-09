@@ -19,9 +19,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -782,6 +784,9 @@ struct OpenGLRenderer::Impl {
             given = own_window;
         }
         window = given;
+        // The version, profile and flags are read when the context is made (the window's pixel
+        // format was fixed by prepare_window_attributes() before the window was created).
+        set_context_attributes();
         context = SDL_GL_CreateContext(window);
         if (!context && debug) {
             // Not every driver gives a debug context; the game runs without one.
