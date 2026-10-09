@@ -4,6 +4,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <utility>
 #include <algorithm>
 #include <memory>
 #include <string_view>
@@ -533,6 +534,21 @@ struct SoundClip {
     std::vector<SoundSubtitleLine> subtitles;
 };
 
+// One node of a SoundCue's graph, as USoundNode::ParseNodes walks it when the cue plays: a mixer
+// plays all of its inputs, a random node one weighted child, delays and modulators offset / scale
+// what is below them. Other node types (attenuation, mix groups, ...) pass through to their child.
+struct SoundCueNode {
+    enum class Kind : uint8_t { Passthrough, Wave, Mixer, Random, Delay, Modulator };
+    Kind kind = Kind::Passthrough;
+    std::string wave;            // Wave: the clip's name
+    std::vector<int> children;   // indices into SoundCueDef::nodes (-1: missing)
+    std::vector<float> weights;  // Mixer: InputVolume per child; Random: Weights per child
+    float min_value = 0.0f;      // Delay: DelayDuration (s); Modulator: VolumeModulation
+    float max_value = 0.0f;
+    float min_pitch = 1.0f;      // Modulator: PitchModulation
+    float max_pitch = 1.0f;
+};
+
 struct SoundCueDef {
     std::string name;
     std::string full_path;
@@ -544,8 +560,13 @@ struct SoundCueDef {
     bool looping = false;
     bool is_concatenator = false;
     bool has_modulator = false;
+    bool has_mixer = false;             // layers waves: played by evaluating `nodes`
     std::vector<std::string> wave_names;
     std::vector<float> wave_weights;
+    std::vector<SoundCueNode> nodes;    // nodes[0] is the cue's FirstNode
+    // Waves the graph plays from other packages (imports) as {package, wave name}, e.g.
+    // {"A_CXP_Plaza", "Door_Hit"} for A_Props_Interactive's Doors.Door_Hit.
+    std::vector<std::pair<std::string, std::string>> imported_waves;
 };
 
 struct AmbientEmitterInfo {
@@ -1084,14 +1105,17 @@ struct DoorPart {
 struct BargeDoorInstance {
     std::string name;
     std::string source_package;
-    Vec3 hinge_pos{0.0f, 0.0f, 0.0f};      // World-space vertical hinge pin position
+    Vec3 hinge_pos{0.0f, 0.0f, 0.0f};      // World-space vertical hinge pin position (the leaf actor's Location)
     Vec3 center_pos{0.0f, 0.0f, 0.0f};     // World-space center of closed door slab
     AABB closed_bounds;                    // World-space AABB of doorway (for barge traces & triggers)
     DoorState state = DoorState::Closed;
     float open_angle_rad = 0.0f;           // Current signed Z-rotation around hinge_pos (radians)
-    float target_angle_rad = 0.0f;         // Target open angle (+/- ~1.66 rad = ~95 deg away from player)
-    float open_speed = 11.5f;              // Angular velocity (rad/s): fast slam on Barge, smooth on Interact
-    float hold_timer = 0.0f;               // Time remaining while held open before optional slow return
+    // The level's door Kismet (SPT_OnewayDoor_Seq): SeqEvent_TakeDamage plays the open matinee
+    // (0.6 s), a Delay of 3 s, then the close matinee (0.6 s). anim_time is the playing matinee's
+    // position; swing_sign is the side the leaf swings to (away from whoever opened it).
+    float anim_time = 0.0f;
+    float swing_sign = 1.0f;
+    float hold_timer = 0.0f;               // Delay left while held open (Open state)
     bool barged = false;                   // True when slammed open via MOVE_Barge
     std::vector<DoorPart> parts;           // Door leaf mesh, attached closer bar, and hidden doorway slab
     Mat4 model_matrix = Mat4::identity();  // T(hinge_pos) * Rz(open_angle_rad) * T(-hinge_pos)
@@ -1213,6 +1237,14 @@ struct InputFrame {
     bool spawn_combat_squad = false; // H: Spawn combat sparring squad in front of player
 };
 
+// A sound the simulation started this frame (animation notifies, the door Kismet / matinee sound
+// tracks). `cue` is a SoundCue name or package-relative path (e.g. "Doors.Door_Barge").
+struct SimSoundEvent {
+    std::string cue;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    bool at_pawn = true;  // true: played on the player (2D); false: 3D at `location`
+};
+
 // -----------------------------------------------------------------------------
 // Player Telemetry (Every simulation tick)
 // -----------------------------------------------------------------------------
@@ -1245,6 +1277,7 @@ struct PlayerTelemetry {
     // so each is played once however often the telemetry is read.
     std::string move_anim;
     uint32_t move_anim_serial = 0;
+    float move_anim_rate = 0.0f;    // the rate the move worked out for move_anim (TdMove_Barge's AnimPlayRate); 0: its script's own
     float ground_distance = -1.0f;  // falling fast: the feet above what is under them; -1 not known
     bool jump_over_gap = false;     // TdMove_Jump.StartJump: nothing to land on 1.1 x the speed ahead
     bool move_left = false;         // a dodge jump going left
@@ -1290,6 +1323,14 @@ struct PlayerTelemetry {
     bool fall_death_impact = false;
     float death_anim_progress = 0.0f;
     std::string active_subtitle;
+
+    // TdMove_Barge custom animation slot: 0 none, 1 BargeInLeft, 2 BargeOutLeft, 3 MeleeKickObject;
+    // the sequence position (seconds) and the slot's blend weight over the locomotion pose.
+    int barge_anim = 0;
+    float barge_anim_pos = 0.0f;
+    float barge_anim_weight = 0.0f;
+    // Sounds the simulation started during the last step() (drained by the game loop).
+    std::vector<SimSoundEvent> sound_events;
 
     // Cooked level intro Matinee / 1P skeletal animation playback state
     bool intro_active = false;

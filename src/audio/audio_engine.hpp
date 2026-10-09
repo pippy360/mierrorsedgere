@@ -132,13 +132,18 @@ public:
     struct PlayEvent {
         std::string name;
         const char* kind = "sound";  // "sound", "sound3d" or "vo"
-        float duration = 0.0f;       // of the wave that was picked
+        float duration = 0.0f;       // of the wave that was picked; a layered cue's longest layer, delay included
     };
     void set_play_log(bool on) { play_log_on_ = on; }
     [[nodiscard]] std::vector<PlayEvent> take_play_log() { return std::exchange(play_log_, {}); }
 
     // Access loaded clips, cues, level-loaded VO cues, and spatial ambient emitters
     [[nodiscard]] const SoundClip* get_clip(const std::string& name) const;
+    // True when `name` (a SoundCue name / package-relative path, or a wave) resolves to loaded audio.
+    [[nodiscard]] bool has_sound(const std::string& name) const;
+    // Waves one play of `name` starts: every wave a layered (mixer) cue's graph reaches, 1 for any
+    // other sound that resolves, 0 if it does not.
+    [[nodiscard]] size_t count_sound_layers(const std::string& name) const;
     [[nodiscard]] bool is_vo_playing() const { return vo_duration_ > 0.0f && vo_elapsed_ < vo_duration_; }
     [[nodiscard]] const std::string& get_active_vo_subtitle() const { return active_vo_subtitle_; }
     [[nodiscard]] const std::vector<std::string>& get_level_loaded_cues() const { return level_loaded_cues_; }
@@ -162,8 +167,32 @@ private:
     bool load_package_audio_and_cues(const std::string& pkg_path,
                                      std::vector<std::string>* out_clip_keys = nullptr,
                                      bool extract_level_loaded = false);
+    // Decodes an extracted clip (Ogg Vorbis -> PCM) and files it under its name and full path.
+    void store_clip(SoundClip clip, std::vector<std::string>* out_clip_keys);
+    // SoundCues can play waves that live in another audio package (imports: A_Props_Interactive's
+    // Doors.Door_Hit plays A_CXP_Plaza.Door_RAW.Door_Hit). UE3 loads the import's package with
+    // the cue; this loads just the referenced waves that are not loaded yet.
+    void load_imported_waves(const std::string& game_root);
     const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const;
     const SoundClip* pick_first_available_clip(std::initializer_list<const char*> candidates) const;
+
+    // Layered cues (a SoundNodeMixer in the graph, e.g. Doors.Door_Barge = impact + a delayed
+    // random bash) play every wave the graph reaches, after its delays and modulators.
+    struct CueVoice {
+        std::string clip;  // sound_clips_ key
+        float delay = 0.0f;
+        float volume = 1.0f;
+        float pitch = 1.0f;
+    };
+    struct PendingVoice {
+        CueVoice voice;
+        bool positional = false;
+        Vec3 position{0.0f, 0.0f, 0.0f};
+    };
+    void collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
+                            std::vector<CueVoice>& out) const;
+    bool play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch);
+    void start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch);
 
     bool decode_ogg_to_pcm(const uint8_t* ogg_data, size_t ogg_size,
                            std::vector<int16_t>& out_pcm, int& out_rate, int& out_channels);
@@ -230,6 +259,8 @@ private:
     std::vector<std::string> level_loaded_cues_;
     std::vector<AmbientEmitterInfo> ambient_emitters_;
     std::unordered_map<std::string, uint32_t> al_buffers_;
+    std::vector<PendingVoice> pending_voices_;                 // layered cue waves waiting out their delay
+    std::unordered_set<std::string> imported_wave_attempts_;   // "Package.Wave" imports already looked for
 };
 
 } // namespace me

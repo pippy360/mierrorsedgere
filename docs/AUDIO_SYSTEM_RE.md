@@ -141,6 +141,18 @@ Decompilation of `TdGame.u` reveals 11 custom C++ `SoundNode` subclasses impleme
       - `PitchAtMinSpeed = 1.0` → `PitchAtMaxSpeed = 1.2`
       - Drives Faith's signature 1st-person wind rush (`A_Character_Effects.upk:RunWind` → `CharacterRunWind` + `HighSpeedClothing`).
 
+### 3.1 How the port plays a cue's graph
+
+A cue whose graph has a `SoundNodeMixer` plays every wave the graph reaches, each with what the nodes above it do to it (`AudioEngine::collect_cue_voices`): a mixer passes on all its inputs, each scaled by its `InputVolume`; `SoundNodeRandom` picks one input by weight; `SoundNodeDelay` holds its branch back by a time drawn from its range; `SoundNodeModulator` scales volume and pitch by values drawn from its ranges. At most 8 layers play; the delayed ones wait in a queue that the audio update starts. A cue with no mixer plays one wave, as before. In the `--trace` play log a layered cue is one entry, lasting as long as its longest layer.
+
+| cue | graph |
+| --- | --- |
+| `Doors.Door_Barge` (`A_Props_Interactive`) | mixer: the impact, and a random bash after a delay |
+| `Doors.Door_Hit` (`A_Props_Interactive`) | mixer of two waves imported from `A_CXP_Plaza.Door_RAW` |
+| the footstep cues (`A_Material_Footstep`: 148 mixers in its 133 cues) | mostly mixers too, so footsteps now play their layers |
+
+**Imported waves.** A cue can play waves that live in another package (imports in its package's import table). UE3 loads the imported package along with the cue. The port loads only the imported waves that are not loaded yet (`AudioEngine::load_imported_waves`), from `CookedPC/Audio/<package>.upk` or, for localized packages, `CookedPC/Audio/int/<package>.upk`.
+
 ---
 
 ## 4. Surface-Aware Footsteps & Handsteps (`TdPhysicalMaterialFootSteps`)

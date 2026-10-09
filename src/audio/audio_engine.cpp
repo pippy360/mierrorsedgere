@@ -545,6 +545,27 @@ void AudioEngine::update(float dt,
                          const Vec3& listener_up,
                          float player_speed,
                          bool reaction_active) {
+    // Layered cue waves whose SoundNodeDelay has run out.
+    if (!pending_voices_.empty()) {
+        const float step = std::max(0.0f, dt);
+        std::vector<PendingVoice> due;
+        for (auto it = pending_voices_.begin(); it != pending_voices_.end();) {
+            it->voice.delay -= step;
+            if (it->voice.delay <= 0.0f) {
+                due.push_back(std::move(*it));
+                it = pending_voices_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const PendingVoice& p : due) {
+            auto cit = sound_clips_.find(p.voice.clip);
+            if (cit != sound_clips_.end()) {
+                start_voice(cit->second, p.positional ? &p.position : nullptr, p.voice.volume, p.voice.pitch);
+            }
+        }
+    }
+
     // Advance active voice-over playback timer and synchronized subtitle lines
     if (vo_duration_ > 0.0f) {
         vo_elapsed_ += std::max(0.0f, dt);
@@ -788,29 +809,9 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
     }
 
     auto clips = pkg.extract_audio();
+    const bool any_clips = !clips.empty();
     for (auto& clip : clips) {
-        if (clip.pcm_data.size() >= 4 &&
-            clip.pcm_data[0] == 'O' && clip.pcm_data[1] == 'g' &&
-            clip.pcm_data[2] == 'g' && clip.pcm_data[3] == 'S') {
-            std::vector<int16_t> pcm;
-            int rate = clip.sample_rate;
-            int channels = clip.channels;
-            if (decode_ogg_to_pcm(clip.pcm_data.data(), clip.pcm_data.size(), pcm, rate, channels)) {
-                clip.pcm_data.resize(pcm.size() * sizeof(int16_t));
-                std::memcpy(clip.pcm_data.data(), pcm.data(), clip.pcm_data.size());
-                clip.sample_rate = rate;
-                clip.channels = channels;
-                clip.duration = static_cast<float>(pcm.size()) / (static_cast<float>(rate) * static_cast<float>(channels));
-            }
-        }
-        invalidate_cached_buffer(clip.name);
-        sound_clips_[clip.name] = clip;
-        if (out_clip_keys) out_clip_keys->push_back(clip.name);
-        if (!clip.full_path.empty()) {
-            invalidate_cached_buffer(clip.full_path);
-            sound_clips_[clip.full_path] = clip;
-            if (out_clip_keys) out_clip_keys->push_back(clip.full_path);
-        }
+        store_clip(std::move(clip), out_clip_keys);
     }
 
     std::vector<SoundCueDef> cues;
@@ -830,7 +831,57 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
         pkg.extract_level_loaded_sound_cues(level_loaded_cues_);
     }
 
-    return !clips.empty() || !cues.empty();
+    return any_clips || !cues.empty();
+}
+
+void AudioEngine::store_clip(SoundClip clip, std::vector<std::string>* out_clip_keys) {
+    if (clip.pcm_data.size() >= 4 &&
+        clip.pcm_data[0] == 'O' && clip.pcm_data[1] == 'g' &&
+        clip.pcm_data[2] == 'g' && clip.pcm_data[3] == 'S') {
+        std::vector<int16_t> pcm;
+        int rate = clip.sample_rate;
+        int channels = clip.channels;
+        if (decode_ogg_to_pcm(clip.pcm_data.data(), clip.pcm_data.size(), pcm, rate, channels)) {
+            clip.pcm_data.resize(pcm.size() * sizeof(int16_t));
+            std::memcpy(clip.pcm_data.data(), pcm.data(), clip.pcm_data.size());
+            clip.sample_rate = rate;
+            clip.channels = channels;
+            clip.duration = static_cast<float>(pcm.size()) / (static_cast<float>(rate) * static_cast<float>(channels));
+        }
+    }
+    invalidate_cached_buffer(clip.name);
+    sound_clips_[clip.name] = clip;
+    if (out_clip_keys) out_clip_keys->push_back(clip.name);
+    if (!clip.full_path.empty()) {
+        invalidate_cached_buffer(clip.full_path);
+        sound_clips_[clip.full_path] = clip;
+        if (out_clip_keys) out_clip_keys->push_back(clip.full_path);
+    }
+}
+
+void AudioEngine::load_imported_waves(const std::string& game_root) {
+    namespace fs = std::filesystem;
+    std::unordered_map<std::string, std::unordered_set<std::string>> wanted;  // package -> waves
+    for (const auto& [key, cue] : sound_cues_) {
+        for (const auto& [package, wave] : cue.imported_waves) {
+            if (package.empty() || wave.empty()) continue;
+            auto it = sound_clips_.find(wave);
+            if (it != sound_clips_.end() && !it->second.pcm_data.empty()) continue;
+            if (!imported_wave_attempts_.insert(package + "." + wave).second) continue;
+            wanted[package].insert(wave);
+        }
+    }
+    for (const auto& [package, waves] : wanted) {
+        const fs::path audio_dir = fs::path(game_root) / "TdGame" / "CookedPC" / "Audio";
+        fs::path path = audio_dir / (package + ".upk");
+        if (!fs::exists(path)) path = audio_dir / "int" / (package + ".upk");  // localized (VO) packages
+        if (!fs::exists(path)) continue;
+        UPKPackage pkg(path.string());
+        if (!pkg.is_valid()) continue;
+        for (auto& clip : pkg.extract_audio()) {
+            if (waves.count(clip.name)) store_clip(std::move(clip), nullptr);
+        }
+    }
 }
 
 void AudioEngine::stitch_concatenator_cues() {
@@ -952,7 +1003,8 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
         "A_Character_Melee.upk",
         "A_WP_Pistol_BerettaM93R.upk",
         "A_HUD.upk",
-        "A_Ambience.upk"
+        "A_Ambience.upk",
+        "A_Props_Interactive.upk"  // door Kismet / matinee sounds (Doors.Door_Barge, Door_Hit, hatch.Squek)
     };
 
     for (const char* bank : kStockBanks) {
@@ -960,6 +1012,7 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
             any_loaded = true;
         }
     }
+    load_imported_waves(game_root);
     rebind_music_stem_buffers();
     return any_loaded;
 }
@@ -1079,6 +1132,7 @@ bool AudioEngine::load_level_audio(const std::string& game_root, const std::stri
         }
     }
 
+    load_imported_waves(game_root);
     stitch_concatenator_cues();
     rebind_music_stem_buffers();
     return loaded_any_aud;
@@ -1139,7 +1193,141 @@ const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float
     return nullptr;
 }
 
+bool AudioEngine::has_sound(const std::string& name) const {
+    float vol = 1.0f;
+    float pitch = 1.0f;
+    return resolve_cue_or_clip(name, vol, pitch) != nullptr;
+}
+
+size_t AudioEngine::count_sound_layers(const std::string& name) const {
+    auto cue_it = sound_cues_.find(name);
+    if (cue_it != sound_cues_.end() && cue_it->second.has_mixer && !cue_it->second.is_concatenator &&
+        !cue_it->second.looping && !cue_it->second.nodes.empty()) {
+        std::vector<CueVoice> voices;
+        collect_cue_voices(cue_it->second, 0, 0.0f, 1.0f, 1.0f, voices);
+        if (!voices.empty()) return voices.size();
+    }
+    return has_sound(name) ? 1 : 0;
+}
+
+void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
+                                     std::vector<CueVoice>& out) const {
+    if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || out.size() >= 8) return;
+    const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
+    auto in_range = [](float lo, float hi) { return lo + (hi - lo) * rand_normalized(); };
+    switch (n.kind) {
+        case SoundCueNode::Kind::Wave: {
+            auto it = sound_clips_.find(n.wave);
+            if (it != sound_clips_.end() && !it->second.pcm_data.empty()) {
+                out.push_back({n.wave, delay, volume, pitch});
+            }
+            return;
+        }
+        case SoundCueNode::Kind::Mixer:
+            // USoundNodeMixer: every input, scaled by its InputVolume.
+            for (size_t i = 0; i < n.children.size(); ++i) {
+                const float input = (i < n.weights.size()) ? n.weights[i] : 1.0f;
+                collect_cue_voices(cue, n.children[i], delay, volume * input, pitch, out);
+            }
+            return;
+        case SoundCueNode::Kind::Random: {
+            // USoundNodeRandom: one child, picked by weight.
+            if (n.children.empty()) return;
+            auto weight = [&n](size_t i) { return (i < n.weights.size()) ? std::max(n.weights[i], 0.0f) : 1.0f; };
+            float total = 0.0f;
+            for (size_t i = 0; i < n.children.size(); ++i) total += weight(i);
+            float pick = rand_normalized() * total;
+            size_t chosen = n.children.size() - 1;
+            for (size_t i = 0; i < n.children.size(); ++i) {
+                if (pick < weight(i)) {
+                    chosen = i;
+                    break;
+                }
+                pick -= weight(i);
+            }
+            collect_cue_voices(cue, n.children[chosen], delay, volume, pitch, out);
+            return;
+        }
+        case SoundCueNode::Kind::Delay:
+            if (!n.children.empty()) {
+                collect_cue_voices(cue, n.children[0], delay + in_range(n.min_value, n.max_value), volume, pitch, out);
+            }
+            return;
+        case SoundCueNode::Kind::Modulator:
+            if (!n.children.empty()) {
+                collect_cue_voices(cue, n.children[0], delay, volume * in_range(n.min_value, n.max_value),
+                                   pitch * in_range(n.min_pitch, n.max_pitch), out);
+            }
+            return;
+        case SoundCueNode::Kind::Passthrough:
+        default:
+            if (!n.children.empty()) collect_cue_voices(cue, n.children[0], delay, volume, pitch, out);
+            return;
+    }
+}
+
+bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch) {
+    auto cue_it = sound_cues_.find(name);
+    if (cue_it == sound_cues_.end()) return false;
+    const SoundCueDef& cue = cue_it->second;
+    if (!cue.has_mixer || cue.is_concatenator || cue.looping || cue.nodes.empty()) return false;
+    std::vector<CueVoice> voices;
+    collect_cue_voices(cue, 0, 0.0f, volume * cue.volume_multiplier, pitch * cue.pitch_multiplier, voices);
+    if (voices.empty()) return false;
+    if (play_log_on_) {
+        // As long as its longest layer, delay included.
+        float duration = 0.0f;
+        for (const CueVoice& v : voices) {
+            auto it = sound_clips_.find(v.clip);
+            if (it != sound_clips_.end()) duration = std::max(duration, v.delay + it->second.duration / std::max(v.pitch, 0.01f));
+        }
+        play_log_.push_back({name, world_pos ? "sound3d" : "sound", duration});
+    }
+    if (headless_ || !alc_context_) return true;
+    for (CueVoice& v : voices) {
+        if (v.delay <= 0.0f) {
+            auto it = sound_clips_.find(v.clip);
+            if (it != sound_clips_.end()) start_voice(it->second, world_pos, v.volume, v.pitch);
+        } else {
+            PendingVoice p;
+            p.voice = std::move(v);
+            p.positional = (world_pos != nullptr);
+            if (world_pos) p.position = *world_pos;
+            pending_voices_.push_back(std::move(p));
+        }
+    }
+    return true;
+}
+
+void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch) {
+#ifndef ME_NO_OPENAL
+    if (headless_ || !alc_context_) return;
+    uint32_t src = acquire_source();
+    if (!src) return;
+
+    uint32_t buf = get_or_create_buffer(clip, /*force_mono_for_3d=*/world_pos != nullptr);
+    if (!buf) return;
+
+    alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
+    alSourcef(src, AL_GAIN, std::clamp(volume * sfx_bus_gain_, 0.0f, 1.5f));
+    alSourcef(src, AL_PITCH, std::clamp(pitch * slomo_pitch_scale_, 0.25f, 2.0f));
+    if (world_pos) {
+        alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
+        alSourcef(src, AL_REFERENCE_DISTANCE, 2.5f);
+        alSourcef(src, AL_MAX_DISTANCE, 35.0f);
+        alSource3f(src, AL_POSITION, world_pos->x * 0.01f, world_pos->y * 0.01f, world_pos->z * 0.01f);
+    } else {
+        alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
+        alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
+    }
+    alSourcePlay(src);
+#else
+    (void)clip; (void)world_pos; (void)volume; (void)pitch;
+#endif
+}
+
 void AudioEngine::play_sound(const std::string& name, float volume, float pitch) {
+    if (play_layered_cue(name, nullptr, volume, pitch)) return;
     float final_vol = volume * sfx_bus_gain_;
     float final_pitch = pitch * slomo_pitch_scale_;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
@@ -1206,6 +1394,7 @@ void AudioEngine::play_level_loaded_cues() {
 }
 
 void AudioEngine::play_sound_3d(const std::string& name, const Vec3& world_pos, float volume, float pitch) {
+    if (play_layered_cue(name, &world_pos, volume, pitch)) return;
     float final_vol = volume * sfx_bus_gain_;
     float final_pitch = pitch * slomo_pitch_scale_;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
@@ -1513,6 +1702,7 @@ void AudioEngine::set_menu_music(bool active) {
 }
 
 void AudioEngine::stop_all() {
+    pending_voices_.clear();
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
     for (size_t i = 0; i < kSourcePoolSize; ++i) {

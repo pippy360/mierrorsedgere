@@ -60,14 +60,99 @@ constexpr float kGrabMaxRise = 215.0f;
 constexpr float kMantleMaxRise = 125.0f;
 // Camera roll while wallrunning (TdMove_WallRun camera modifier).
 constexpr float kWallrunCameraRoll = 15.0f;
-// TdMove_Barge defaults: BargeAddOnSpeed, BargeMaxSpeed, BargeKickThresholdSpeed. The move lengths
-// are measured from the recordings: the running barge (2026-09-26 20:40, t=121.64) lasts 1.15 s, the
-// standing kick (edge_pt1, t=215.87) 0.85 s.
+// TdMove_Barge defaults (Default__TdMove_Barge): BargeAddOnSpeed, BargeMaxSpeed,
+// BargeKickThresholdSpeed, BargeMinTraceDistance, BargeTraceTime, BargeAnimTime.
 constexpr float kBargeAddOnSpeed = 200.0f;
 constexpr float kBargeMaxSpeed = 500.0f;
 constexpr float kBargeKickThresholdSpeed = 250.0f;
-constexpr float kBargeTime = 1.15f;
-constexpr float kBargeKickTime = 0.85f;
+constexpr float kBargeMinTraceDistance = 90.0f;
+constexpr float kBargeTraceTime = 0.5f;
+constexpr float kBargeAnimTime = 0.3f;
+// The move's custom animations (AS_C1P_Unarmed): BargeInLeft runs at the door, BargeOutLeft plays
+// from the impact, MeleeKickObject is the kick (its BargeHitNotify at 0.3272 s opens the door).
+// StartBargin keeps move input off for 0.6 s of the kick.
+constexpr float kBargeInLeftLength = 0.6f;
+constexpr float kBargeOutLeftLength = 1.066667f;
+constexpr float kMeleeKickObjectLength = 0.866667f;
+constexpr float kBargeKickHitTime = 0.3272f;
+constexpr float kBargeKickIgnoreInput = 0.6f;
+
+// Sound notifies on the move's animations. FootDown notifies resolve through the floor's
+// TdPhysicalMaterialFootSteps: the walk / run slots of the default material (PM_Concrete), and the
+// attack slot (11), which PM_Concrete points at A_Material_Footstep.Wood._11_Female_FootStepAttack.
+// The oral / cloth notifies play the player's CharacterSoundCues (A_Character_Female_01).
+struct AnimSoundNotify {
+    float time;
+    const char* cue;
+};
+constexpr AnimSoundNotify kBargeInLeftNotifies[] = {
+    {0.2854f, "Concrete._03_Female_FootStepRun"},
+    {0.3695f, "Oral_Impact.Hard"},
+    {0.6f, "Concrete._03_Female_FootStepRun"},
+};
+constexpr AnimSoundNotify kBargeOutLeftNotifies[] = {
+    {0.05096f, "Wood._11_Female_FootStepAttack"},
+    {0.083f, "Oral_Impact.Medium"},
+    {0.1519f, "Concrete._03_Female_FootStepRun"},
+    {0.4896f, "Concrete._03_Female_FootStepRun"},
+    {0.8298f, "Concrete._03_Female_FootStepRun"},
+};
+constexpr AnimSoundNotify kMeleeKickObjectNotifies[] = {
+    {0.0269f, "Cloth.Run"},
+    {0.3104f, "Oral_Strain.Hard"},
+    {0.3118f, "Foot_Swoosh"},
+    {0.3624f, "Wood._11_Female_FootStepAttack"},
+    {0.6071f, "Cloth.Run"},
+    {0.7845f, "Concrete._02_Female_FootStepWalk"},
+};
+
+// The barge doors' Kismet (SP00 SPT_OnewayDoor_Seq): SeqEvent_TakeDamage turns the doorway slab's
+// collision off, plays Door_Barge on the leaf and starts the open matinee; when that completes a
+// 3 s Delay starts the close matinee, after which the slab collides again. Both matinees are 0.6 s
+// EulerTrack yaw curves (degrees, IMF_RelativeToInitial) with user tangents: the leaf slams open to
+// 103.755 deg in 0.25 s, bounces back 5.6 deg and settles; the close track reuses the open track's
+// tangents, so the leaf swings ~12.6 deg past shut and bounces twice before it settles. Sound
+// tracks: Door_Hit at 0 when opening; hatch.Squek at 0 and Door_Hit at 0.25 when closing.
+struct MatineeKey {
+    float time;
+    float value;
+    float arrive;
+    float leave;
+};
+constexpr MatineeKey kDoorOpenTrack[] = {
+    {0.0f, 0.0f, 0.0f, -294.565f},
+    {0.25f, -103.755f, -798.479f, 32.281f},
+    {0.4f, -98.1299f, 11.0229f, 11.0229f},
+    {0.6f, -103.755f, 0.0f, 0.0f},
+};
+constexpr MatineeKey kDoorCloseTrack[] = {
+    {0.0f, 0.0f, 0.0f, -294.565f},
+    {0.25f, 103.75f, -798.479f, -203.167f},
+    {0.4f, 103.75f, 126.24f, 126.24f},
+    {0.6f, 103.75f, 0.0f, 0.0f},
+};
+constexpr float kDoorMatineeLength = 0.6f;
+constexpr float kDoorOpenDelay = 3.0f;
+constexpr float kDoorCloseHitTime = 0.25f;
+
+// FInterpCurve::Eval with CIM_CurveUser keys: cubic Hermite between keys, tangents x key spacing.
+template <size_t N>
+float eval_matinee_track(const MatineeKey (&keys)[N], float t) {
+    if (t <= keys[0].time) return keys[0].value;
+    for (size_t i = 0; i + 1 < N; ++i) {
+        if (t < keys[i + 1].time) {
+            const float diff = keys[i + 1].time - keys[i].time;
+            const float a = (t - keys[i].time) / diff;
+            const float a2 = a * a;
+            const float a3 = a2 * a;
+            return (2.0f * a3 - 3.0f * a2 + 1.0f) * keys[i].value +
+                   (a3 - 2.0f * a2 + a) * keys[i].leave * diff +
+                   (a3 - a2) * keys[i + 1].arrive * diff +
+                   (-2.0f * a3 + 3.0f * a2) * keys[i + 1].value;
+        }
+    }
+    return keys[N - 1].value;
+}
 
 // TdPawn.SpeedCurve_LightWeapon: seconds of sprinting -> speed (uu/s), CIM_Linear keys.
 const std::vector<std::pair<float, float>> kSpeedCurveLightWeapon = {
@@ -415,6 +500,22 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_melee_combo_reset_timer = 0.0f;
     m_weapon_cycle_index = -1;
     m_jump_consumed = false;
+    m_barge_kick = false;
+    m_barge_door = -1;
+    m_barge_anim = 0;
+    m_barge_anim_pos = 0.0f;
+    m_barge_anim_elapsed = 0.0f;
+    m_barge_anim_rate = 1.0f;
+    m_barge_speed = 0.0f;
+    m_barge_precise = false;
+    m_barge_dealt_damage = false;
+    m_ignore_move_input = 0.0f;
+    m_walk_blocked = false;
+    m_walk_block_actor = -1;
+    m_telemetry.barge_anim = 0;
+    m_telemetry.barge_anim_pos = 0.0f;
+    m_telemetry.barge_anim_weight = 0.0f;
+    m_telemetry.sound_events.clear();
 
     m_last_jump_location = spawn_pos;
     m_pre_jump_momentum = 0.0f;
@@ -590,6 +691,7 @@ void ParkourController::equip_weapon(const std::string& weapon_name) {
 }
 
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
+    m_telemetry.sound_events.clear();
     if (dt <= 0.0f) return;
     m_telemetry.move_input = std::fabs(input.forward) > 0.01f || std::fabs(input.strafe) > 0.01f;
     if (m_telemetry.grounded) m_telemetry.ground_distance = -1.0f;
@@ -635,6 +737,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         m_balance_cooldown = std::max(0.0f, m_balance_cooldown - step_dt);
         m_ledge_walk_cooldown = std::max(0.0f, m_ledge_walk_cooldown - step_dt);
         m_swing_cooldown = std::max(0.0f, m_swing_cooldown - step_dt);
+        m_ignore_move_input = std::max(0.0f, m_ignore_move_input - step_dt);
         if (m_illegal_wall_timer > 0.0f) {
             m_illegal_wall_timer = std::max(0.0f, m_illegal_wall_timer - step_dt);
             if (m_illegal_wall_timer <= 0.0f) m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
@@ -688,8 +791,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 break;
             }
 
-            case EMovement::MOVE_Melee:
-            case EMovement::MOVE_Barge: {
+            case EMovement::MOVE_Melee: {
                 EMovement combat_gnd_state = m_telemetry.move_state;
                 float saved_timer = m_state_timer;
                 update_ground_locomotion(input, step_dt, scene);
@@ -710,6 +812,10 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
                 }
                 break;
             }
+
+            case EMovement::MOVE_Barge:
+                update_barge(input, step_dt, scene);
+                break;
 
             case EMovement::MOVE_Snatch: {
                 // TdMove_Disarm: she has no velocity of her own; AlignPawn flies her to DisarmOffset
@@ -869,6 +975,13 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         }
 
         m_jump_buffer = std::max(0.0f, m_jump_buffer - step_dt);
+    }
+
+    // The barge's custom animation only plays while the move does (walking off a ledge ends it).
+    if (m_telemetry.move_state != EMovement::MOVE_Barge) {
+        m_barge_anim = 0;
+        m_telemetry.barge_anim = 0;
+        m_telemetry.barge_anim_weight = 0.0f;
     }
 
     // 4. Combat, Weapons & Disarms
@@ -1996,6 +2109,8 @@ void ParkourController::walk_move(const Vec3& delta, float height, const LevelSc
     Vec3 remaining = delta;
     Vec3 prev_wall_normal(0.0f, 0.0f, 0.0f);
     bool has_prev_wall = false;
+    m_walk_blocked = false;
+    m_walk_block_actor = -1;
     for (int iter = 0; iter < 3 && remaining.length_sq() > 1e-6f; ++iter) {
         const TraceHit hit = move_swept(remaining, height, 0.0f, scene);
         if (!hit.hit) return;
@@ -2013,6 +2128,11 @@ void ParkourController::walk_move(const Vec3& delta, float height, const LevelSc
                 m_state_timer = 0.0f;
             }
             return;
+        }
+        // UE3 processHitWall / Bump: the move was blocked by a wall.
+        if (!m_walk_blocked) {
+            m_walk_blocked = true;
+            m_walk_block_actor = hit.actor_index;
         }
         // Wall: slide along it and drop the velocity component into it.
         Vec3 n(hit.normal.x, hit.normal.y, 0.0f);
@@ -2681,19 +2801,10 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     // What the controller asks for, and how the pawn turns it into velocity.
     float speed_mod = crouched ? c.crouch_speed_modifier : 1.0f;
     if (m_telemetry.weapon.equipped) speed_mod *= m_telemetry.weapon.mobility_scale;
-    // TdMove_Barge keeps the pawn at BargeMaxSpeed or below for the whole move: retail holds
-    // exactly 500.0 uu/s with W held until the door stops it, then accelerates normally again.
-    const bool barging = (st == EMovement::MOVE_Barge);
-    if (barging) speed_mod = std::min(speed_mod, kBargeMaxSpeed / c.ground_speed);
     float friction = c.ground_friction;
     Vec3 accel(0.0f, 0.0f, 0.0f);
     if (turning) {
         friction *= c.turn_180_friction;  // TdMove_180Turn.FrictionModifier: coast through the turn
-    } else if (barging && m_barge_kick) {
-        // The standing kick roots the pawn until it ends (retail: 0 uu/s throughout, W held).
-        m_telemetry.velocity.x = 0.0f;
-        m_telemetry.velocity.y = 0.0f;
-        m_sprint_energy = 0.0f;
     } else {
         accel = controller_acceleration(input, false);
     }
@@ -5192,7 +5303,8 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     if (input.melee && m_melee_cooldown <= 0.0f && (!ws.equipped || ws.drop_timer > 0.0f) &&
         !(m_against_wall != 0 && m_telemetry.move_state == EMovement::MOVE_Walking) &&  // TdMove_Melee.CanDoMove
         m_telemetry.move_state != EMovement::MOVE_MeleeSlide &&
-        m_telemetry.move_state != EMovement::MOVE_MeleeWallrun) {
+        m_telemetry.move_state != EMovement::MOVE_MeleeWallrun &&
+        m_telemetry.move_state != EMovement::MOVE_Barge) {
 
         Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
         m_telemetry.melee_hit_confirmed = false;
@@ -5907,106 +6019,315 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
     m_telemetry.streamed_sublevel_count = static_cast<int>(scene.loaded_sublevel_packages.size());
 }
 
+// -----------------------------------------------------------------------------
+// TdMove_Barge (MOVE_Barge) and the barge doors' Kismet
+// -----------------------------------------------------------------------------
+void ParkourController::emit_sound(const char* cue, const Vec3& location, bool at_pawn) {
+    SimSoundEvent ev;
+    ev.cue = cue;
+    ev.location = location;
+    ev.at_pawn = at_pawn;
+    m_telemetry.sound_events.push_back(std::move(ev));
+}
+
+int ParkourController::find_barge_door(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const {
+    // TdMove_Barge.CalcBargeDamage: PawnOwner.Trace(.., bTraceActors, zero extent, TRACEFLAG_Bullet)
+    // from the pawn's Location (the cylinder's centre). The first thing hit has to be interactable;
+    // a wall or the door frame in the way means no barge.
+    const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * kPawnHeight);
+    const TraceHit hit = trace_ray(start, start + dir * dist, scene, COLL_BlockZeroExtent);
+    if (!hit.hit || hit.actor_index < 0 || static_cast<size_t>(hit.actor_index) >= scene.actors.size()) return -1;
+    const int door = scene.actors[static_cast<size_t>(hit.actor_index)].barge_door;
+    if (door < 0 || static_cast<size_t>(door) >= scene.barge_doors.size()) return -1;
+    if (scene.barge_doors[static_cast<size_t>(door)].state != DoorState::Closed) return -1;
+    hit_point = hit.point;
+    return door;
+}
+
+bool ParkourController::try_initiate_barge(const LevelScene& scene) {
+    const EMovement st = m_telemetry.move_state;
+    const bool walking = m_telemetry.grounded &&
+                         (st == EMovement::MOVE_Walking || st == EMovement::MOVE_StepUp ||
+                          st == EMovement::MOVE_AutoStepUp || st == EMovement::MOVE_SoftLanding);
+    if (!walking || m_melee_cooldown > 0.0f) return false;
+
+    // TdMove_Barge.CanDoMove: no running barge with a heavy weapon; the trace reaches as far as
+    // BargeTraceTime at BargeSpeed when moving the way the pawn faces, else BargeMinTraceDistance.
+    const Vec3 vel(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f);
+    const float speed = vel.length();
+    const bool heavy = m_telemetry.weapon.equipped && m_telemetry.weapon.is_heavy;  // GetWeaponType() == 1
+    if (heavy && speed > kBargeKickThresholdSpeed) return false;
+    const float barge_speed = std::min(kBargeMaxSpeed, speed + kBargeAddOnSpeed);
+    const Vec3 facing = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();  // vector(PawnOwner.Rotation)
+    const Vec3 vel_dir = (speed > 1e-3f) ? vel * (1.0f / speed) : Vec3(0.0f, 0.0f, 0.0f);
+    const bool forward = facing.dot(vel_dir) > 0.707f;
+    const float trace_dist =
+        forward ? std::max(kBargeMinTraceDistance, barge_speed * kBargeTraceTime) : kBargeMinTraceDistance;
+    Vec3 hit_point;
+    const int door = find_barge_door(scene, facing, trace_dist, hit_point);
+    if (door < 0) return false;
+
+    // TdMove_Barge.StartMove / StartBargin.
+    m_telemetry.move_state = EMovement::MOVE_Barge;
+    m_state_timer = 0.0f;
+    m_barge_door = door;
+    m_barge_dealt_damage = false;
+    m_barge_anim_pos = 0.0f;
+    m_barge_anim_elapsed = 0.0f;
+    m_melee_cooldown = std::max(m_melee_cooldown, 0.45f);  // the press barged: no punch this frame
+    if (speed > kBargeKickThresholdSpeed && forward) {
+        // Shoulder first: Velocity = Normal(Velocity) * BargeSpeed, then SetPreciseLocation(Location +
+        // BargeTraceTime * Velocity, 1, BargeSpeed) runs the pawn straight at the door. BargeInLeft
+        // is sped up / slowed down so its impact (BargeAnimTime in) meets the door.
+        m_barge_kick = false;
+        m_barge_speed = barge_speed;
+        m_barge_dir = vel_dir;
+        m_telemetry.velocity.x = vel_dir.x * barge_speed;
+        m_telemetry.velocity.y = vel_dir.y * barge_speed;
+        m_barge_target = m_telemetry.position + vel_dir * (barge_speed * kBargeTraceTime);
+        m_barge_precise = true;
+        const float time_to_door = horiz(hit_point - m_telemetry.position).length() / barge_speed;
+        m_barge_anim_rate = std::clamp(kBargeAnimTime / std::max(time_to_door, 1e-3f), 0.7f, 1.3f);
+        m_barge_anim = 1;
+        set_move_anim("BargeInLeft", m_barge_anim_rate);  // PlayMoveAnim(CNT_UpperBody, .., AnimPlayRate, 0.2, 0.0)
+    } else {
+        // The kick (MeleeKickObject): move input is ignored for 0.6 s and the animation's
+        // BargeHitNotify opens the door.
+        m_barge_kick = true;
+        m_barge_speed = 0.0f;
+        m_barge_dir = facing;
+        m_barge_precise = false;
+        m_barge_anim_rate = 1.0f;
+        m_barge_anim = 3;
+        m_ignore_move_input = kBargeKickIgnoreInput;
+        set_move_anim("MeleeKickObject");  // PlayMoveAnim(CNT_FullBody, .., 1.0, 0.1, 0.1)
+    }
+    m_telemetry.barge_anim = m_barge_anim;
+    m_telemetry.barge_anim_pos = 0.0f;
+    m_telemetry.barge_anim_weight = 0.0f;
+    m_telemetry.combat_anim_time = 0.0f;
+    m_telemetry.combat_anim_duration = (m_barge_anim == 3) ? kMeleeKickObjectLength : kBargeInLeftLength;
+    return true;
+}
+
+void ParkourController::update_barge(const InputFrame& input, float dt, LevelScene& scene) {
+    const float prev_pos = m_barge_anim_pos;
+    m_barge_anim_pos += dt * m_barge_anim_rate;
+    m_barge_anim_elapsed += dt;
+    const Vec3 start = m_telemetry.position;
+
+    if (m_barge_precise) {
+        // TdMove precise location: straight at the target at BargeSpeed whatever the input.
+        const Vec3 to = horiz(m_barge_target - start);
+        const float d = to.length();
+        if (d <= 1.0f) {
+            m_barge_precise = false;
+        } else {
+            const float v = std::min(m_barge_speed, d / dt);
+            m_telemetry.velocity.x = to.x / d * v;
+            m_telemetry.velocity.y = to.y / d * v;
+        }
+    }
+    if (!m_barge_precise) {
+        // The rest of the move walks on the controller's input (none during the kick's first 0.6 s).
+        float speed_mod = 1.0f;
+        if (m_telemetry.weapon.equipped) speed_mod *= m_telemetry.weapon.mobility_scale;
+        const Vec3 accel =
+            (m_ignore_move_input > 0.0f) ? Vec3(0.0f, 0.0f, 0.0f) : controller_acceleration(input, false);
+        calc_velocity(accel, dt, speed_mod, m_config.ground_friction);
+    }
+    walk_move(horiz(m_telemetry.velocity) * dt, kPawnHeight, scene);
+
+    // Sound notifies of the playing animation crossed this tick.
+    const AnimSoundNotify* notifies = nullptr;
+    size_t notify_count = 0;
+    float length = kBargeInLeftLength;
+    switch (m_barge_anim) {
+        case 1:
+            notifies = kBargeInLeftNotifies;
+            notify_count = std::size(kBargeInLeftNotifies);
+            length = kBargeInLeftLength;
+            break;
+        case 2:
+            notifies = kBargeOutLeftNotifies;
+            notify_count = std::size(kBargeOutLeftNotifies);
+            length = kBargeOutLeftLength;
+            break;
+        default:
+            notifies = kMeleeKickObjectNotifies;
+            notify_count = std::size(kMeleeKickObjectNotifies);
+            length = kMeleeKickObjectLength;
+            break;
+    }
+    for (size_t i = 0; i < notify_count; ++i) {
+        if (notifies[i].time > prev_pos && notifies[i].time <= m_barge_anim_pos) {
+            emit_sound(notifies[i].cue, m_telemetry.position, true);
+        }
+    }
+
+    if (m_barge_anim == 1 && m_walk_blocked && !m_barge_dealt_damage) {
+        // HitWall / Bump -> TryGiveBargeDamage (shoulder barge, once): the door takes the hit, the
+        // pawn stops where it is (SetPreciseLocation(Location)) and BargeOutLeft plays from the
+        // impact at full weight. physWalking leaves the velocity at what the blocked move covered;
+        // after that the pawn walks on its input again.
+        m_barge_dealt_damage = true;
+        m_barge_precise = false;
+        const Vec3 moved = horiz(m_telemetry.position - start);
+        m_telemetry.velocity.x = moved.x / dt;
+        m_telemetry.velocity.y = moved.y / dt;
+        open_barge_door(m_barge_door, m_barge_dir, true, scene);
+        m_barge_anim = 2;
+        m_barge_anim_pos = 0.0f;
+        m_barge_anim_elapsed = 0.0f;
+        m_barge_anim_rate = 1.0f;
+        set_move_anim("BargeOutLeft");  // PlayMoveAnim(CNT_UpperBody, .., 1.0, 0.0, 0.2)
+        length = kBargeOutLeftLength;
+    } else if (m_barge_anim == 3 && !m_barge_dealt_damage && prev_pos < kBargeKickHitTime &&
+               m_barge_anim_pos >= kBargeKickHitTime) {
+        // The kick's BargeHitNotify: HitObject on the door.
+        m_barge_dealt_damage = true;
+        open_barge_door(m_barge_door, m_barge_dir, true, scene);
+    }
+
+    // OnCustomAnimEnd: StopCustomAnim, SetMove(MOVE_Walking).
+    if (m_barge_anim_pos >= length) {
+        m_telemetry.move_state = EMovement::MOVE_Walking;
+        m_state_timer = 0.0f;
+        m_barge_anim = 0;
+        m_barge_precise = false;
+        m_telemetry.barge_anim = 0;
+        m_telemetry.barge_anim_pos = 0.0f;
+        m_telemetry.barge_anim_weight = 0.0f;
+        return;
+    }
+
+    // The custom animation slot's weight (PlayMoveAnim blend times): BargeInLeft blends in over
+    // 0.2 s; BargeOutLeft starts at full weight and blends out over its last 0.2 s; MeleeKickObject
+    // blends in and out over 0.1 s.
+    float weight = 1.0f;
+    if (m_barge_anim == 1) {
+        weight = std::min(1.0f, m_barge_anim_elapsed / 0.2f);
+    } else if (m_barge_anim == 2) {
+        weight = std::clamp((length - m_barge_anim_pos) / 0.2f, 0.0f, 1.0f);
+    } else {
+        weight = std::clamp(std::min(m_barge_anim_elapsed / 0.1f, (length - m_barge_anim_pos) / 0.1f), 0.0f, 1.0f);
+    }
+    m_telemetry.barge_anim = m_barge_anim;
+    m_telemetry.barge_anim_pos = m_barge_anim_pos;
+    m_telemetry.barge_anim_weight = weight;
+    m_telemetry.combat_anim_time = m_barge_anim_pos;
+    m_telemetry.combat_anim_duration = length;
+}
+
+void ParkourController::open_barge_door(int door_index, const Vec3& push_dir, bool barged, LevelScene& scene) {
+    if (door_index < 0 || static_cast<size_t>(door_index) >= scene.barge_doors.size()) return;
+    BargeDoorInstance& door = scene.barge_doors[static_cast<size_t>(door_index)];
+    // SeqEvent_TakeDamage's ReTriggerDelay (4.4 s) outlasts the whole open / wait / close cycle.
+    if (door.state != DoorState::Closed) return;
+    // The leaf swings away from the player: a positive yaw moves its middle along tangent_pos.
+    Vec3 arm(door.center_pos.x - door.hinge_pos.x, door.center_pos.y - door.hinge_pos.y, 0.0f);
+    if (arm.length_sq() < 1e-3f) arm = Vec3(1.0f, 0.0f, 0.0f);
+    const Vec3 tangent_pos(-arm.y, arm.x, 0.0f);
+    door.swing_sign = (push_dir.dot(tangent_pos) >= 0.0f) ? 1.0f : -1.0f;
+    door.state = DoorState::Opening;
+    door.anim_time = 0.0f;
+    door.hold_timer = 0.0f;
+    door.barged = barged;
+    // SeqEvent_TakeDamage -> TdPlaySound Door_Barge on the leaf; the open matinee's sound track plays
+    // Door_Hit at its start. Both play at the leaf actor's location (its hinge).
+    if (barged) emit_sound("Doors.Door_Barge", door.hinge_pos, false);
+    emit_sound("Doors.Door_Hit", door.hinge_pos, false);
+}
+
+bool ParkourController::door_encroaches_pawn(const BargeDoorInstance& door, float angle_rad, bool with_blockers) const {
+    // The parts' collision is stored at the closed pose, so the pawn is turned back about the hinge
+    // instead (a vertical cylinder keeps its box under a yaw), shrunk 1 uu so resting against the
+    // leaf does not count.
+    const Vec3 extent(kPawnRadius - 1.0f, kPawnRadius - 1.0f, 0.5f * kPawnHeight - 1.0f);
+    const Vec3 centre = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * kPawnHeight);
+    const float c = std::cos(-angle_rad);
+    const float s = std::sin(-angle_rad);
+    const Vec3 r = centre - door.hinge_pos;
+    const Vec3 local = door.hinge_pos + Vec3(c * r.x - s * r.y, s * r.x + c * r.y, r.z);
+    for (const auto& part : door.parts) {
+        if (!part.collision || (part.is_blocker_only && !with_blockers)) continue;
+        if (part.collision->overlap_box(local, extent, COLL_BlockNonZeroExtent)) return true;
+    }
+    return false;
+}
+
 void ParkourController::update_barge_doors(const InputFrame& input, float dt, LevelScene& scene) {
     if (scene.barge_doors.empty()) return;
 
-    const Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
-    const Vec3 vel_2d(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f);
-    const Vec3 vel_dir = (vel_2d.length_sq() > 1e-4f) ? vel_2d.normalized() : fwd;
+    // Melee at a closed door in reach barges it (TdMove_Barge); otherwise the press is a punch.
+    if (input.melee && m_telemetry.move_state != EMovement::MOVE_Barge) {
+        try_initiate_barge(scene);
+    }
 
-    for (size_t i = 0; i < scene.barge_doors.size(); ++i) {
-        BargeDoorInstance& door = scene.barge_doors[i];
-
-        if (door.state == DoorState::Closed) {
+    // Use next to a closed door swings it open the same way, without the barge.
+    if (input.use && m_telemetry.move_state != EMovement::MOVE_Barge) {
+        const Vec3 fwd = facing_forward();
+        const Vec3 vel_2d(m_telemetry.velocity.x, m_telemetry.velocity.y, 0.0f);
+        const Vec3 push_dir = (vel_2d.length_sq() > 80.0f * 80.0f) ? vel_2d.normalized() : fwd;
+        for (size_t i = 0; i < scene.barge_doors.size(); ++i) {
+            const BargeDoorInstance& door = scene.barge_doors[i];
+            if (door.state != DoorState::Closed) continue;
             const float pz = m_telemetry.position.z;
-            const bool z_overlap = (pz + 180.0f >= door.closed_bounds.min_pt.z - 20.0f) &&
-                                   (pz <= door.closed_bounds.max_pt.z + 20.0f);
-            if (z_overlap) {
-                const float cx = std::clamp(m_telemetry.position.x, door.closed_bounds.min_pt.x, door.closed_bounds.max_pt.x);
-                const float cy = std::clamp(m_telemetry.position.y, door.closed_bounds.min_pt.y, door.closed_bounds.max_pt.y);
-                const float dx = cx - m_telemetry.position.x;
-                const float dy = cy - m_telemetry.position.y;
-                const float horiz_dist = std::sqrt(dx * dx + dy * dy);
-
-                Vec3 to_door(door.center_pos.x - m_telemetry.position.x,
-                             door.center_pos.y - m_telemetry.position.y, 0.0f);
-                if (to_door.length_sq() > 1e-4f) to_door = to_door.normalized();
-                else to_door = fwd;
-
-                const float melee_barge_range = std::max(150.0f, m_telemetry.speed_2d * 0.50f);
-
-                const bool active_melee =
-                    input.melee || (m_telemetry.move_state == EMovement::MOVE_Melee && m_state_timer < 0.25f);
-                const bool trigger_melee_barge =
-                    (active_melee && horiz_dist <= melee_barge_range && fwd.dot(to_door) > 0.05f);
-                const bool trigger_interact =
-                    (input.use && horiz_dist <= 165.0f && fwd.dot(to_door) >= 0.0f);
-
-                if (trigger_melee_barge || trigger_interact) {
-                    const bool is_barge = trigger_melee_barge;
-                    Vec3 arm(door.center_pos.x - door.hinge_pos.x, door.center_pos.y - door.hinge_pos.y, 0.0f);
-                    if (arm.length_sq() < 1e-3f) arm = Vec3(1.0f, 0.0f, 0.0f);
-                    const Vec3 tangent_pos(-arm.y, arm.x, 0.0f); // Direction leaf moves when +dtheta > 0
-                    const Vec3 push_dir = (m_telemetry.speed_2d > 80.0f) ? vel_dir : fwd;
-                    const float sign = (push_dir.dot(tangent_pos) >= 0.0f) ? 1.0f : -1.0f;
-
-                    door.target_angle_rad = sign * 1.66f; // ~95 deg wide open away from player
-                    door.state = DoorState::Opening;
-                    door.hold_timer = 8.0f;
-                    door.barged = is_barge;
-
-                    if (is_barge) {
-                        door.open_speed = 12.0f; // High-impact shoulder/kick slam
-                        // TdMove_Barge: BargeAddOnSpeed on top of the run, capped at BargeMaxSpeed;
-                        // slower than BargeKickThresholdSpeed it is a standing kick that leaves the
-                        // pawn where it is. Retail goes 619.8 -> exactly 500.0 uu/s (2026-09-26 20:40,
-                        // t=121.64) and stays at 0 through a kick from rest with W held (edge_pt1,
-                        // t=215.87).
-                        const float speed = m_telemetry.speed_2d;
-                        m_barge_kick = speed < kBargeKickThresholdSpeed;
-                        const float boosted = m_barge_kick ? 0.0f : std::min(speed + kBargeAddOnSpeed, kBargeMaxSpeed);
-                        m_telemetry.move_state = EMovement::MOVE_Barge;
-                        m_state_timer = 0.0f;
-                        m_telemetry.combat_anim_time = 0.0f;
-                        m_telemetry.combat_anim_duration = m_barge_kick ? kBargeKickTime : kBargeTime;
-                        m_melee_cooldown = 0.45f;
-                        m_telemetry.velocity.x = push_dir.x * boosted;
-                        m_telemetry.velocity.y = push_dir.y * boosted;
-                        m_telemetry.speed_2d = boosted;
-                    } else {
-                        door.open_speed = 4.2f; // Smooth manual open
-                    }
-                }
+            if (pz + kPawnHeight < door.closed_bounds.min_pt.z - 20.0f || pz > door.closed_bounds.max_pt.z + 20.0f) continue;
+            const float cx = std::clamp(m_telemetry.position.x, door.closed_bounds.min_pt.x, door.closed_bounds.max_pt.x);
+            const float cy = std::clamp(m_telemetry.position.y, door.closed_bounds.min_pt.y, door.closed_bounds.max_pt.y);
+            const float dx = cx - m_telemetry.position.x;
+            const float dy = cy - m_telemetry.position.y;
+            Vec3 to_door(door.center_pos.x - m_telemetry.position.x, door.center_pos.y - m_telemetry.position.y, 0.0f);
+            to_door = (to_door.length_sq() > 1e-4f) ? to_door.normalized() : fwd;
+            if (std::sqrt(dx * dx + dy * dy) <= 165.0f && fwd.dot(to_door) >= 0.0f) {
+                open_barge_door(static_cast<int>(i), push_dir, false, scene);
             }
         }
+    }
 
-        if (door.state == DoorState::Opening) {
-            const float diff = door.target_angle_rad - door.open_angle_rad;
-            const float step = door.open_speed * dt;
-            if (std::abs(diff) <= step) {
-                door.open_angle_rad = door.target_angle_rad;
-                door.state = DoorState::Open;
-            } else {
-                door.open_angle_rad += (diff >= 0.0f ? step : -step);
-            }
-        } else if (door.state == DoorState::Open) {
-            door.hold_timer -= dt;
-            if (door.hold_timer <= 0.0f) {
-                const float dx = m_telemetry.position.x - door.center_pos.x;
-                const float dy = m_telemetry.position.y - door.center_pos.y;
-                if (dx * dx + dy * dy > 220.0f * 220.0f) {
-                    door.state = DoorState::Closing;
-                } else {
-                    door.hold_timer = 2.0f;
+    const float open_deg = -eval_matinee_track(kDoorOpenTrack, kDoorMatineeLength);
+    for (BargeDoorInstance& door : scene.barge_doors) {
+        switch (door.state) {
+            case DoorState::Closed:
+                break;
+            case DoorState::Opening:
+                // The open matinee (relative to the closed pose).
+                door.anim_time = std::min(door.anim_time + dt, kDoorMatineeLength);
+                door.open_angle_rad = door.swing_sign * -eval_matinee_track(kDoorOpenTrack, door.anim_time) * DEG2RAD;
+                if (door.anim_time >= kDoorMatineeLength) {
+                    door.state = DoorState::Open;
+                    door.hold_timer = kDoorOpenDelay;
                 }
-            }
-        } else if (door.state == DoorState::Closing) {
-            const float step = 2.2f * dt;
-            if (std::abs(door.open_angle_rad) <= step) {
-                door.open_angle_rad = 0.0f;
-                door.state = DoorState::Closed;
-            } else {
-                door.open_angle_rad += (door.open_angle_rad >= 0.0f ? -step : step);
+                break;
+            case DoorState::Open:
+                // Delay, then the close matinee (its sound track starts with hatch.Squek).
+                door.hold_timer -= dt;
+                if (door.hold_timer <= 0.0f) {
+                    door.state = DoorState::Closing;
+                    door.anim_time = 0.0f;
+                    emit_sound("hatch.Squek", door.hinge_pos, false);
+                }
+                break;
+            case DoorState::Closing: {
+                // The close matinee (relative to the open pose). InterpActor bStopOnEncroach: the leaf
+                // holds still rather than swing into the player.
+                const float t = std::min(door.anim_time + dt, kDoorMatineeLength);
+                const float angle = door.swing_sign * (open_deg - eval_matinee_track(kDoorCloseTrack, t)) * DEG2RAD;
+                if (door_encroaches_pawn(door, angle, false)) break;
+                if (door.anim_time < kDoorCloseHitTime && t >= kDoorCloseHitTime) {
+                    emit_sound("Doors.Door_Hit", door.hinge_pos, false);
+                }
+                door.anim_time = t;
+                door.open_angle_rad = angle;
+                // ChangeCollision: the doorway slab collides again once the pawn is out of it.
+                if (t >= kDoorMatineeLength && !door_encroaches_pawn(door, 0.0f, true)) {
+                    door.state = DoorState::Closed;
+                    door.open_angle_rad = 0.0f;
+                    door.anim_time = 0.0f;
+                    door.barged = false;
+                }
+                break;
             }
         }
 

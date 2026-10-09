@@ -1595,6 +1595,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         if (telemetry.move_anim_serial != fp.move_anim_serial) {
             fp.move_anim_serial = telemetry.move_anim_serial;
             frame.move_anim = telemetry.move_anim;
+            frame.move_anim_rate = telemetry.move_anim_rate;
         }
         // Called once a rendered frame, which can be several simulated ones (the headless oracle
         // steps without drawing). A move that started in the gap started `combat_anim_time` ago (the

@@ -186,7 +186,7 @@ Where a move picks between animations by what it found in the level, the control
 | Crouch | start: `FullBody_Dir` and `LowerBody` out over 0.25; stop: `CrouchIntoStand` on `Camera` (0.2 / 0.2) |
 | Coil | state 15, `JumpCoil` (0.15 / 0.15); stop `JumpCoilEnd` (0.25 / 0.35) |
 | 180Turn | `RunTurn180` or `StandTurn180Right` (0.2 / 0.2); in the air `JumpTurnFly` (0.1 / 0.1) |
-| Barge / AirBarge | `BargeInLeft` on `UpperBody` (0.2 / 0) or `MeleeKickObject` (0.1 / 0.1), `BargeOutLeft` (0 / 0.2); state 15 and `MeleeInAir` / `AirBargeIdle` (0.15 / 0.15) |
+| Barge / AirBarge | `StartBargin`: running at the door faster than `BargeKickThresholdSpeed` 250, `ResetCameraLook(0.3)` and `BargeInLeft` on `UpperBody` (0.2 / 0) at `AnimPlayRate`, `BargeAnimTime` 0.3 over the time to the door's hit location at `BargeSpeed`, clamped to 0.7 .. 1.3; slower, `ResetCameraLook(0.2)`, `MeleeKickObject` on `FullBody` (0.1 / 0.1) and `SetIgnoreMoveInput(0.6)`. At the door (`HitWall` / `Bump`, `TryGiveBargeDamage`): `BargeOutLeft` (0 / 0.2). `OnCustomAnimEnd` and `StopMove`: `StopCustomAnim(UpperBody, 0.2)`. AirBarge: state 15 and `MeleeInAir` / `AirBargeIdle` (0.15 / 0.15) |
 | Melee | `TriggerMove`: `Camera` out over 0.05, `Weapon` over 0.1, state 1, then on `UpperBody` `MeleeStartLeft` / `Right` at 1.5 (0.1, held); hands alternate, and the third blow of a combo is `MeleeStartShove`. When the wind-up ends (0.11 s) the blow lands or misses (`TestHit`: a target within 170 and 37 degrees): `MeleeHitLeft` / `Right` at 1.5 (0.2 / 0.1) or `MeleeMissedLeft` / `Right` at 1.5 (0.08 / 0.1); the shove is `MeleeHitShove` (0 / 0.1) either way. Stop: `UpperBody` and `FullBody` out over 0.3 |
 | MeleeCrouch | state 15; `MeleeCrouchStart` (0.1, held), then `MeleeCrouchHit` (0.1 / 0.2), hit or miss |
 | MeleeAir | faster than 200: `MeleeInAir` (0.1 / 0.2), on a hit `MeleeInAirHit` (0.1 / 0.2); else `MeleeInAirStill`; on a target below, `MeleeFromAbove` (0.1 / 0.1) |
@@ -223,6 +223,8 @@ Retail (left) and the port's window (right), standing, looking down at about 76 
 - `TdMove_Swing.SetPawnRotation`: the swing control turns the body by the swing's angle about a point 94 above the mesh's origin, which is the capsule's centre.
 
 With both, the port's eye through 2,118 frames of swinging is retail's camera to 0.1 uu and under a tenth of a degree (10th to 90th percentile), where without them it was 131 uu and 69 degrees out.
+
+**The barge's turn.** `UpperBodySplit` (`AnimNodeBlendPerBone`) gives its `UpperBody` branch `SpineX` and the `EyeJoint`, so what plays on the `UpperBody` slot turns the camera with the arms. `BargeInLeft` turns the view right, into the left shoulder (16 degrees at 0.25 s of it, 40 at 0.35); the impact cuts to `BargeOutLeft`, which starts about 32 degrees right and takes the view to 55 at 0.22 s, nodding it 31 degrees down at 0.19 s and 21 at 0.36 s, and has it straight ahead again by 0.9 s. `MeleeKickObject` on `FullBody` carries the eye from 8 uu ahead of the pawn to 28 at 0.36 s, with the kicking boot coming up at the bottom of the view. Oracle Stage 12 measures both through `player_camera`.
 
 **A change of floor height** does not reach the mesh at once (`TdPawn.SmoothOffset`, `TargetMeshTranslationZ`, `NewFloorSmooth`: native). Retail over a 32 uu step, up or down, walking or running: the eye is left 20 uu behind, no more, and closes on the pawn by 0.835 a sixtieth of a second until 6.7 uu is left, then at 60 uu/s, there after 0.23 s. On a flight of stairs, which is a ramp to the pawn: 1.6 uu low climbing at 96 uu/s of rise, 14 at 249, 21 at 283 and 293; 15 to 16 high coming down at 280 to 446; no different from level ground at 79. The port holds back what the floor moves faster than 85 uu/s, up to 20 uu, and lets it out as over the step.
 
@@ -318,7 +320,8 @@ What the controller tells the animation, in `PlayerTelemetry`:
 
 | field | from |
 | --- | --- |
-| `move_anim`, `move_anim_serial` | the vault type by the ledge's height, landing on top or beyond, and pace; the ledge catch by where she came from and her fall speed; the heave that ends standing or crouched; the wall run jump that pushes off hard; `@reached` when the springboard's foot is on the step |
+| `move_anim`, `move_anim_serial` | the vault type by the ledge's height, landing on top or beyond, and pace; the ledge catch by where she came from and her fall speed; the heave that ends standing or crouched; the wall run jump that pushes off hard; `@reached` when the springboard's foot is on the step; the barge (`BargeInLeft` or `MeleeKickObject` by speed, `BargeOutLeft` when the shoulder meets the door) |
+| `move_anim_rate` | the rate the move worked out for `move_anim`, 0 for the script's own: `BargeInLeft`'s `AnimPlayRate` |
 | `ground_distance` | a trace down while falling faster than 400 |
 | `jump_over_gap` | `StartJump`'s trace 1.1 x the speed ahead and 200 down |
 | `move_left`, `hanging_free`, `climbing_pipe` | the dodge's side; no wall for the legs under a ledge; `TdLadderVolume.LadderType` |

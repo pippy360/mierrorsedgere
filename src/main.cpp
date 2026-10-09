@@ -41,6 +41,7 @@
 #include <sstream>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <unordered_map>
 
 #if defined(_WIN32)
@@ -794,12 +795,67 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool saw_move_barge = false;
     float final_door_deg = 0.0f;
     float final_door_x = 0.0f;
+    bool barge_anims_ok = false;   // BargeInLeft, then BargeOutLeft from the impact
+    bool barge_speed_ok = false;   // StartBargin: Velocity = Normal(Velocity) * min(500, speed + 200)
+    bool barge_swing_ok = false;   // the open matinee slams the leaf to 103.755 deg, away from the player
+    bool barge_sounds_ok = false;
+    bool kick_ok = false;
+    bool kick_sounds_ok = false;
+    bool door_cycle_ok = false;
+    bool barge_camera_ok = false;  // the first-person tree's eye turns with BargeInLeft / BargeOutLeft
+    bool kick_camera_ok = false;   // and lunges with MeleeKickObject
+    bool cues_ok = true;           // every sound the simulation starts resolves to a loaded cue
+    float barge_entry_speed = 0.0f;
+    float barge_expect_speed = 0.0f;
+    float kick_open_t = -1.0f;
+    float kick_end_t = -1.0f;
+    float kick_max_speed = 0.0f;
+    float close_start_t = -1.0f;
+    float close_overshoot_deg = 0.0f;
+    float barge_in_yaw_max = 0.0f;     // the view's turn from the controller's (degrees, + right)
+    float barge_out_yaw_max = 0.0f;
+    float barge_cam_pitch_min = 0.0f;
+    float barge_cam_yaw_end = 0.0f;    // after the barge
+    float kick_eye_rest = 0.0f;        // the eye ahead of the pawn (uu), standing
+    float kick_eye_lunge = 0.0f;       // and how much further the kick carries it
+    std::string missing_cues;
     if (!sp00_scene.barge_doors.empty()) {
         BargeDoorInstance& door = sp00_scene.barge_doors[0];
+        auto reset_door = [&door]() {
+            door.state = DoorState::Closed;
+            door.open_angle_rad = 0.0f;
+            door.anim_time = 0.0f;
+            door.hold_timer = 0.0f;
+            door.barged = false;
+            door.model_matrix = Mat4::identity();
+        };
+        auto collect_sounds = [&](std::set<std::string>& heard) {
+            for (const SimSoundEvent& ev : controller.get_telemetry().sound_events) {
+                if (heard.insert(ev.cue).second && !audio.has_sound(ev.cue)) {
+                    if (missing_cues.find(ev.cue) == std::string::npos) missing_cues += ev.cue + " ";
+                    cues_ok = false;
+                }
+            }
+        };
+        auto heard_all = [](const std::set<std::string>& heard, std::initializer_list<const char*> cues) {
+            for (const char* c : cues) {
+                if (!heard.count(c)) return false;
+            }
+            return true;
+        };
+        auto print_heard = [](const char* label, const std::set<std::string>& heard) {
+            std::cout << "  [" << label << " sounds]";
+            for (const std::string& c : heard) std::cout << " " << c;
+            std::cout << std::endl;
+        };
+        std::cout << "  [Door] hinge=(" << door.hinge_pos.x << ", " << door.hinge_pos.y << ", " << door.hinge_pos.z
+                  << ") centre=(" << door.center_pos.x << ", " << door.center_pos.y << ", " << door.center_pos.z
+                  << ") bounds=(" << door.closed_bounds.min_pt.x << ", " << door.closed_bounds.min_pt.y << ", "
+                  << door.closed_bounds.min_pt.z << ")-(" << door.closed_bounds.max_pt.x << ", "
+                  << door.closed_bounds.max_pt.y << ", " << door.closed_bounds.max_pt.z << ")" << std::endl;
+
         // 12A: Verify running at a closed door WITHOUT melee does NOT automatically barge it open
-        door.state = DoorState::Closed;
-        door.open_angle_rad = 0.0f;
-        door.model_matrix = Mat4::identity();
+        reset_door();
         controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
         InputFrame run_only{};
         run_only.forward = 1.0f;
@@ -809,35 +865,172 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         }
         no_auto_barge = (door.state == DoorState::Closed && controller.get_telemetry().move_state != EMovement::MOVE_Barge);
 
-        // 12B: Verify pressing melee/attack barges the door open with TdMove_Barge
-        door.state = DoorState::Closed;
-        door.open_angle_rad = 0.0f;
-        door.model_matrix = Mat4::identity();
+        // 12B: Melee while running at the door is the shoulder barge: BargeInLeft runs the pawn at
+        // BargeSpeed, the impact opens the door and BargeOutLeft plays, then on through the doorway.
+        reset_door();
         controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
-        for (int step = 0; step < 72; ++step) {
+        std::set<std::string> barge_heard;
+        bool saw_in = false;
+        bool saw_out = false;
+        // The camera is the first-person tree's EyeJoint (TdPlayerPawn.CalcCamera), and AT_C1P's
+        // UpperBodySplit gives the UpperBody slot the EyeJoint, so the barge's animations turn the view:
+        // right into the left shoulder and down through BargeInLeft, further right from the impact
+        // (BargeOutLeft) and back to straight ahead. Sampled every step, the tree sees every move
+        // change and every animation the move names, as a rendered frame would.
+        auto camera_offsets = [&](float& yaw_off, float& pitch_off, Vec3& eye) {
+            const PlayerTelemetry& ct = controller.get_telemetry();
+            Vec3 cam_pos;
+            Rotator cam_rot;
+            renderer.player_camera(ct, cam_pos, cam_rot);
+            const Vec3 r = cam_rot.to_degrees();
+            yaw_off = wrap_180(r.y - ct.yaw_deg);
+            pitch_off = wrap_180(r.x - ct.pitch_deg);
+            const Rotator body = Rotator::from_degrees(0.0f, ct.body_yaw_deg, 0.0f);
+            const Vec3 d = cam_pos - ct.position;
+            eye = Vec3(d.dot(body.forward()), d.dot(body.right()), d.z);
+        };
+        for (int step = 0; step < 120; ++step) {
             InputFrame barge_in{};
             barge_in.forward = 1.0f;
             barge_in.sprint = true;
             // Press melee as we reach the doorway
             const float dx = std::abs(controller.get_position().x - door.center_pos.x);
-            if (dx <= 185.0f && door.state == DoorState::Closed) {
+            if (dx <= 185.0f && door.state == DoorState::Closed && !saw_move_barge) {
                 barge_in.melee = true;
             }
+            const float speed_before = controller.get_telemetry().speed_2d;
             controller.step(barge_in, kDt, sp00_scene);
-            if (controller.get_telemetry().move_state == EMovement::MOVE_Barge) {
+            collect_sounds(barge_heard);
+            float yaw_off = 0.0f, pitch_off = 0.0f;
+            Vec3 eye;
+            camera_offsets(yaw_off, pitch_off, eye);
+            const PlayerTelemetry& bt = controller.get_telemetry();
+            if (bt.move_state == EMovement::MOVE_Barge) {
+                if (!saw_move_barge) {
+                    barge_entry_speed = bt.speed_2d;
+                    barge_expect_speed = std::min(500.0f, speed_before + 200.0f);
+                }
                 saw_move_barge = true;
+                if (bt.barge_anim == 1 && !saw_out) {
+                    saw_in = true;
+                    barge_in_yaw_max = std::max(barge_in_yaw_max, yaw_off);
+                }
+                if (bt.barge_anim == 2 && saw_in) {
+                    saw_out = true;
+                    barge_out_yaw_max = std::max(barge_out_yaw_max, yaw_off);
+                }
+                barge_cam_pitch_min = std::min(barge_cam_pitch_min, pitch_off);
             }
+            barge_cam_yaw_end = yaw_off;
         }
         final_door_deg = door.open_angle_rad * (180.0f / 3.14159265f);
         final_door_x = controller.get_telemetry().position.x;
-        s12_pass = no_auto_barge && saw_move_barge && (std::abs(door.open_angle_rad) > 1.5f) && (final_door_x < -4300.0f);
+        barge_anims_ok = saw_in && saw_out;
+        barge_speed_ok = std::abs(barge_entry_speed - barge_expect_speed) < 5.0f;
+        // BargeInLeft has turned the view right by the impact (15.9 deg at 0.25 s of it); BargeOutLeft
+        // takes it on to 55 at 0.22 s and down past 30, then back to straight ahead before it ends.
+        barge_camera_ok = barge_in_yaw_max > 10.0f && barge_out_yaw_max > 45.0f && barge_out_yaw_max < 65.0f &&
+                          barge_cam_pitch_min < -15.0f && std::abs(barge_cam_yaw_end) < 2.0f;
+        {
+            // The leaf's middle ends up past the doorway on the far side (the run went towards -X).
+            const float c = std::cos(door.open_angle_rad);
+            const float s = std::sin(door.open_angle_rad);
+            const Vec3 arm = door.center_pos - door.hinge_pos;
+            const float swung_x = c * arm.x - s * arm.y;
+            const float arm_len = std::sqrt(arm.x * arm.x + arm.y * arm.y);
+            barge_swing_ok = std::abs(std::abs(final_door_deg) - 103.755f) < 1.0f && swung_x < -0.8f * arm_len;
+        }
+        barge_sounds_ok = heard_all(barge_heard, {"Doors.Door_Barge", "Doors.Door_Hit",
+                                                  "Wood._11_Female_FootStepAttack", "Oral_Impact.Medium"});
+        print_heard("Barge", barge_heard);
+
+        // 12C: Melee standing at the door is the kick (MeleeKickObject): the pawn stays put and the
+        // animation's BargeHitNotify (0.3272 s) opens the door; the move ends with the animation.
+        reset_door();
+        controller.reset(Vec3(door.center_pos.x + 70.0f, door.center_pos.y, 4224.0f), 180.0f);
+        float kick_yaw_off = 0.0f, kick_pitch_off = 0.0f;
+        Vec3 kick_eye;
+        for (int step = 0; step < 10; ++step) {
+            controller.step(InputFrame{}, kDt, sp00_scene);
+            camera_offsets(kick_yaw_off, kick_pitch_off, kick_eye);
+        }
+        kick_eye_rest = kick_eye.x;
+        std::set<std::string> kick_heard;
+        bool saw_kick = false;
+        float t = 0.0f;
+        for (int step = 0; step < 60; ++step) {
+            InputFrame kick_in{};
+            kick_in.melee = (step == 0);
+            controller.step(kick_in, kDt, sp00_scene);
+            t += kDt;
+            collect_sounds(kick_heard);
+            camera_offsets(kick_yaw_off, kick_pitch_off, kick_eye);
+            const PlayerTelemetry& kt = controller.get_telemetry();
+            if (kt.move_state == EMovement::MOVE_Barge && kt.barge_anim == 3) {
+                saw_kick = true;
+                // MeleeKickObject (FullBody) carries the eye forward with the kick, 8.1 -> 27.9 uu ahead
+                // of the pawn at 0.36 s.
+                kick_eye_lunge = std::max(kick_eye_lunge, kick_eye.x - kick_eye_rest);
+            }
+            if (kick_open_t < 0.0f && door.state != DoorState::Closed) kick_open_t = t;
+            if (saw_kick && kick_end_t < 0.0f && kt.move_state == EMovement::MOVE_Walking) kick_end_t = t;
+            kick_max_speed = std::max(kick_max_speed, kt.speed_2d);
+        }
+        kick_ok = saw_kick && kick_open_t > 0.30f && kick_open_t < 0.37f &&
+                  kick_end_t > 0.84f && kick_end_t < 0.90f && kick_max_speed < 5.0f;
+        kick_camera_ok = kick_eye_lunge > 15.0f && kick_eye_lunge < 25.0f;
+        kick_sounds_ok = heard_all(kick_heard, {"Oral_Strain.Hard", "Foot_Swoosh", "Doors.Door_Barge",
+                                                "Wood._11_Female_FootStepAttack"});
+        print_heard("Kick", kick_heard);
+
+        // 12D: The door's Kismet starts the close matinee 3 s after the open one (0.6 s) completes;
+        // its sound track plays hatch.Squek, then Door_Hit as the leaf swings past shut.
+        std::set<std::string> close_heard;
+        for (int step = 0; step < 300 && door.state != DoorState::Closed; ++step) {
+            controller.step(InputFrame{}, kDt, sp00_scene);
+            t += kDt;
+            collect_sounds(close_heard);
+            if (door.state == DoorState::Closing) {
+                if (close_start_t < 0.0f) close_start_t = t;
+                close_overshoot_deg = std::max(close_overshoot_deg,
+                                               -door.swing_sign * door.open_angle_rad * (180.0f / 3.14159265f));
+            }
+        }
+        const float close_delay = close_start_t - kick_open_t;
+        door_cycle_ok = door.state == DoorState::Closed && door.open_angle_rad == 0.0f &&
+                        heard_all(close_heard, {"hatch.Squek", "Doors.Door_Hit"}) &&
+                        close_delay > 3.5f && close_delay < 3.7f;
+        print_heard("Close", close_heard);
+
+        s12_pass = no_auto_barge && saw_move_barge && barge_anims_ok && barge_speed_ok && barge_swing_ok &&
+                   (final_door_x < -4300.0f) && barge_sounds_ok && kick_ok && kick_sounds_ok && door_cycle_ok &&
+                   cues_ok;
     }
+    // Both door cues are SoundNodeMixers of two layers; Door_Hit's waves are imports from A_CXP_Plaza.
+    const size_t barge_layers = audio.count_sound_layers("Doors.Door_Barge");
+    const size_t hit_layers = audio.count_sound_layers("Doors.Door_Hit");
+    s12_pass = s12_pass && barge_layers == 2 && hit_layers == 2 && barge_camera_ok && kick_camera_ok;
     std::cout << "  -> Stage 12 Result: " << (s12_pass ? "PASS" : "FAIL")
               << " (Doors=" << sp00_scene.barge_doors.size()
               << ", NoAutoBarge=" << (no_auto_barge ? "OK" : "FAIL")
               << ", MoveBarge=" << (saw_move_barge ? "OK" : "NO")
-              << ", Swing=" << final_door_deg << " deg"
-              << ", EndX=" << final_door_x << ")" << std::endl;
+              << ", BargeInOut=" << (barge_anims_ok ? "OK" : "NO")
+              << ", BargeSpeed=" << barge_entry_speed << "/" << barge_expect_speed
+              << ", Swing=" << final_door_deg << " deg" << (barge_swing_ok ? "" : " (BAD)")
+              << ", EndX=" << final_door_x
+              << ", BargeSounds=" << (barge_sounds_ok ? "OK" : "MISSING")
+              << ", Kick=" << (kick_ok ? "OK" : "FAIL") << " (open " << kick_open_t << " s, end " << kick_end_t
+              << " s, max speed " << kick_max_speed << ")"
+              << ", KickSounds=" << (kick_sounds_ok ? "OK" : "MISSING")
+              << ", DoorClose=" << (door_cycle_ok ? "OK" : "FAIL") << " (at " << close_start_t
+              << " s, overshoot " << close_overshoot_deg << " deg)"
+              << ", Cues=" << (cues_ok ? std::string("OK") : ("UNRESOLVED " + missing_cues))
+              << ", DoorCueLayers=" << barge_layers << "/" << hit_layers
+              << ", BargeCamera=" << (barge_camera_ok ? "OK" : "FAIL") << " [in yaw " << barge_in_yaw_max
+              << ", out yaw " << barge_out_yaw_max << ", pitch min " << barge_cam_pitch_min << ", end yaw "
+              << barge_cam_yaw_end << "]"
+              << ", KickEye=" << (kick_camera_ok ? "OK" : "FAIL") << " [" << kick_eye_rest << " uu ahead, lunge +"
+              << kick_eye_lunge << "]" << ")" << std::endl;
 
     // Write complete telemetry log
     const std::string tel_path = tmp_dir + "/me_oracle_telemetry.json";
@@ -2316,8 +2509,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 case EMovement::MOVE_SpringBoarding:
                 case EMovement::MOVE_Melee:
                 case EMovement::MOVE_MeleeAir:
-                case EMovement::MOVE_MeleeWallrun:
-                case EMovement::MOVE_Barge: audio.play_effect(EAudioEffect::Vault); break;
+                case EMovement::MOVE_MeleeWallrun: audio.play_effect(EAudioEffect::Vault); break;
                 case EMovement::MOVE_Slide:
                 case EMovement::MOVE_MeleeSlide: audio.play_effect(EAudioEffect::Slide); break;
                 case EMovement::MOVE_SkillRoll: audio.play_effect(EAudioEffect::SkillRoll); break;
@@ -2327,6 +2519,18 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             prev_state = tel.move_state;
         }
+
+        // Sounds the simulation started this step (animation notifies such as TdMove_Barge's, and the
+        // barge doors' Kismet / matinee sound tracks): on the player in 2D, or 3D at the actor.
+        for (const SimSoundEvent& ev : tel.sound_events) {
+            const float vol = (ev.cue.find("FootStep") != std::string::npos) ? 0.75f : 1.0f;
+            if (ev.at_pawn) {
+                audio.play_sound(ev.cue, vol);
+            } else {
+                audio.play_sound_3d(ev.cue, ev.location, vol);
+            }
+        }
+        controller.get_telemetry().sound_events.clear();
 
         if (tel.falling_to_death && !prev_falling_to_death) {
             audio.play_effect(EAudioEffect::FallDeathScream);
@@ -2364,9 +2568,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Footstep cadence (TdPhysicalMaterialFootSteps: Sneak / Walk / Run / Sprint)
-        // (not during a cutscene: a level intro's footsteps are its animation's own notifies)
-        if (!renderer.is_menu_open() && !cutscene_player.is_playing() && tel.grounded &&
-            tel.move_state == EMovement::MOVE_Walking && tel.speed_2d > 40.0f) {
+        // (not during a cutscene: a level intro's footsteps are its animation's own notifies). Under the
+        // barge the locomotion only steps while the move's animation slot is mostly blended out.
+        const bool locomotion_feet = tel.move_state == EMovement::MOVE_Walking ||
+                                     (tel.move_state == EMovement::MOVE_Barge && tel.barge_anim_weight < 0.5f);
+        if (!renderer.is_menu_open() && !cutscene_player.is_playing() && tel.grounded && locomotion_feet &&
+            tel.speed_2d > 40.0f) {
             footstep_timer += dt;
             float stride_time = std::clamp(150.0f / tel.speed_2d, 0.22f, 0.45f);
             if (footstep_timer >= stride_time) {

@@ -21,6 +21,7 @@ extern "C" {
 #include <cctype>
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 namespace fs = std::filesystem;
 
@@ -412,7 +413,10 @@ void CutscenePlayer::pose_intro_doors(LevelScene& scene, float elapsed_sec) {
 
         const bool closed = std::abs(yaw) < 0.05f;
         door->open_angle_rad = closed ? 0.0f : yaw * DEG2RAD;
-        door->target_angle_rad = door->open_angle_rad;
+        // Held where the Matinee has it: the door's own Kismet (the 3 s Delay, then the close
+        // matinee) follows its SeqEvent_TakeDamage, which the intro's movement track does not fire.
+        door->anim_time = 0.0f;
+        door->hold_timer = closed ? 0.0f : std::numeric_limits<float>::infinity();
         door->state = closed ? DoorState::Closed : DoorState::Open;
         // The same hinge matrix the controller keeps: T(hinge) * Rz(angle) * T(-hinge)
         Mat4 m = Mat4::identity();
