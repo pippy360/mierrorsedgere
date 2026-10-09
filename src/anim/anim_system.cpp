@@ -1174,12 +1174,17 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         const char* tex_n;
     };
     static const EnemyCharacterSpec kEnemySpecs[] = {
-        {EnemyArch_SWAT,    "Characters/CH_TKY_Cop_SWAT.upk",    "CH_TKY_Cop_SWAT",       "T_TKY_Cop_SWAT_D",      "T_TKY_Cop_SWAT_S",      "T_TKY_Cop_SWAT_N"},
-        {EnemyArch_Patrol,  "Characters/CH_TKY_Cop_Patrol.upk",  "SK_TKY_Cop_Patrol_PK",  "T_TKY_CopPatrol_02_D",  "T_TKY_CopPatrol_01_S",  "T_TKY_CopPatrol_01_N"},
-        {EnemyArch_Support, "Characters/CH_TKY_Cop_Support.upk", "SK_TKY_Cop_Support",    "T_TKY_CopSupport_01_D", "T_TKY_CopSupport_01_S", "T_TKY_CopSupport_01_N"},
-        {EnemyArch_Riot,    "Characters/CH_TKY_Cop_Riot.upk",    "SK_TKY_Cop_Riot",       "T_TKY_CopRiot_01_D",    "T_TKY_CopRiot_01_S",    "T_TKY_CopRiot_01_N"},
-        {EnemyArch_Pursuit, "Characters/CH_TKY_Cop_Pursuit.upk", "SK_TKY_Cop_Pursuit",    "T_CopPursuit01_D",      "T_CopPursuit01_S",      "T_CopPursuit01_N"},
-        {EnemyArch_Celeste, "Characters/CH_Celeste.upk",         "SK_Celeste",            "Celeste_Merged_D",      "Celeste_Merged_S_2k",   "Celeste_Merged_N"}
+        {EnemyArch_SWAT,     "Characters/CH_TKY_Cop_SWAT.upk",          "CH_TKY_Cop_SWAT",           "T_TKY_Cop_SWAT_D",          "T_TKY_Cop_SWAT_S",          "T_TKY_Cop_SWAT_N"},
+        {EnemyArch_Patrol,   "Characters/CH_TKY_Cop_Patrol.upk",        "SK_TKY_Cop_Patrol_PK",      "T_TKY_CopPatrol_02_D",      "T_TKY_CopPatrol_01_S",      "T_TKY_CopPatrol_01_N"},
+        {EnemyArch_Support,  "Characters/CH_TKY_Cop_Support.upk",       "SK_TKY_Cop_Support",        "T_TKY_CopSupport_01_D",     "T_TKY_CopSupport_01_S",     "T_TKY_CopSupport_01_N"},
+        {EnemyArch_Riot,     "Characters/CH_TKY_Cop_Riot.upk",          "SK_TKY_Cop_Riot",           "T_TKY_CopRiot_01_D",        "T_TKY_CopRiot_01_S",        "T_TKY_CopRiot_01_N"},
+        {EnemyArch_Pursuit,  "Characters/CH_TKY_Cop_Pursuit.upk",       "SK_TKY_Cop_Pursuit",        "T_CopPursuit01_D",          "T_CopPursuit01_S",          "T_CopPursuit01_N"},
+        {EnemyArch_Celeste,  "Characters/CH_Celeste.upk",               "SK_Celeste",                "Celeste_Merged_D",          "Celeste_Merged_S_2k",       "Celeste_Merged_N"},
+        {EnemyArch_Kate,     "Characters/CH_TKY_Cop_Patrol_Female.upk", "SK_TKY_Cop_Patrol_Female",  "T_CopPatrolFemale_01_D",    "T_CopPatrolFemale_01_S",    "T_CopPatrolFemale_01_N"},
+        {EnemyArch_Jacknife, "Characters/CH_TKY_Crim_Jacknife.upk",     "SK_TKY_Crim_Jacknife",      "T_TKY_CriminalProwler_01_D","T_TKY_CriminalProwler_01_S","T_TKY_CriminalProwler_01_N"},
+        {EnemyArch_Ropeburn, "Characters/CH_TKY_Crim_RB.upk",           "SK_TKY_Crim_RB",            "T_TKY_CriminalRB_01_D",     "T_TKY_CriminalRB_01_S",     "T_TKY_CriminalRB_01_N"},
+        {EnemyArch_Miller,   "Characters/CH_Miller.upk",                "SK_Miller",                 "Miller_Merged_D",           "Miller_Merged_S",           "Miller_Merged_N"},
+        {EnemyArch_Kreeg,    "Characters/CH_Kreeg.upk",                 "SK_Kreeg",                  "Kreeg_Merged_D",            "Kreeg_Merged_S",            "Kreeg_Merged_N"}
     };
     for (const auto& es : kEnemySpecs) {
         UPKPackage pkg_e(cooked + es.upk_file);
@@ -1812,10 +1817,12 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
         show_lower_body = true;
         lower_body_high_kick = true;
     } else if (state == EMovement::MOVE_Barge) {
-        seq_a = resolve_seq(nullptr, nullptr, "bargeinleft", &active_set);
-        seq_b = resolve_seq(nullptr, nullptr, "MeleeHitShove", &set_b_ptr);
+        const char* barge_seq = (telemetry.barge_anim == 2) ? "bargeoutleft"
+                              : (telemetry.barge_anim == 3) ? "meleekickobject"
+                              : "bargeinleft";
+        seq_a = resolve_seq(nullptr, nullptr, barge_seq, &active_set);
         norm_time = combat_progress;
-        blend_alpha = 0.35f;
+        blend_alpha = 0.0f;
         vm_offset = Vec3(2.0f, 10.0f, 10.0f);
     } else if (telemetry.weapon.equipped) {
         // 2. Armed 1P Animation Tree (TdAnimNodeBlendByArmed + TdAnimNodeBlendByFire + TdAnimNodeWeaponPose)
@@ -2181,10 +2188,10 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
                 break;
             }
             case EMovement::MOVE_SoftLanding: {
-                seq_a = active_set->find_sequence("fallinglandsoftlanding");
-                if (!seq_a) seq_a = active_set->find_sequence("JumpLand");
-                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 0.45f;
-                norm_time = std::clamp(st / dur, 0.0f, 0.96f);
+                seq_a = active_set->find_sequence(telemetry.grounded ? "fallinglandsoftlanding" : "fallinglandintosoftlanding");
+                if (!seq_a) seq_a = active_set->find_sequence("fallinglandsoftlanding");
+                float dur = (seq_a && seq_a->length > 0.1f) ? seq_a->length : 1.8f;
+                norm_time = telemetry.grounded ? std::clamp(st / dur, 0.0f, 0.98f) : std::fmod(st, dur) / dur;
                 vm_offset = Vec3(0.0f, 15.0f, 13.0f);
                 show_lower_body = true;
                 break;
@@ -2696,7 +2703,17 @@ void AnimSystem::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, 
 AnimSystem::EnemyArchetypeId AnimSystem::resolve_enemy_archetype(const std::string& archetype_name) const {
     std::string low = to_lower_str(archetype_name);
     EnemyArchetypeId cand = EnemyArch_SWAT;
-    if (low.find("celeste") != std::string::npos || low.find("tutorial") != std::string::npos) {
+    if (low.find("kate") != std::string::npos || low.find("patrol_female") != std::string::npos) {
+        cand = EnemyArch_Kate;
+    } else if (low.find("jacknife") != std::string::npos || low == "jk" || low.find("prowler") != std::string::npos) {
+        cand = EnemyArch_Jacknife;
+    } else if (low.find("ropeburn") != std::string::npos || low.find("crim_rb") != std::string::npos) {
+        cand = EnemyArch_Ropeburn;
+    } else if (low.find("miller") != std::string::npos) {
+        cand = EnemyArch_Miller;
+    } else if (low.find("kreeg") != std::string::npos || low.find("merc") != std::string::npos) {
+        cand = EnemyArch_Kreeg;
+    } else if (low.find("celeste") != std::string::npos || low.find("tutorial") != std::string::npos) {
         cand = EnemyArch_Celeste;
     } else if (low.find("pursuit") != std::string::npos) {
         cand = EnemyArch_Pursuit;
@@ -2758,7 +2775,7 @@ void AnimSystem::build_enemy_swat_index_lists() {
 }
 
 // -----------------------------------------------------------------------------
-// Evaluate KrugerSec / CPF Officer / Runner / Celeste Skeletal Mesh + Weapon
+// Evaluate KrugerSec / CPF Officer / Runner / Story Character Skeletal Mesh + Weapon
 // -----------------------------------------------------------------------------
 void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool reaction_disarm, std::vector<Vertex>& out_triangles) const {
     out_triangles.clear();
@@ -2785,7 +2802,7 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
 
     bool two_handed = is_heavy_weapon_name(bot.weapon_name);
     const AnimSetAsset* active_set = (two_handed && !swat_2h_set_.sequences.empty()) ? &swat_2h_set_ : &swat_set_;
-    if (arch_id == EnemyArch_Celeste && !celeste_set_.sequences.empty() && !two_handed) {
+    if ((arch_id == EnemyArch_Celeste || arch_id == EnemyArch_Kate) && !celeste_set_.sequences.empty() && !two_handed) {
         active_set = &celeste_set_;
     }
     const AnimSequenceAsset* seq_a = nullptr;
@@ -2798,7 +2815,35 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         return swat_set_.find_sequence(sname);
     };
 
-    if (!bot.alive || bot.anim_state == EEnemyAnimState::KnockedOut) {
+    if (bot.is_story_npc) {
+        if (bot.cutscene_anim_exp_1 > 0 && !bot.cutscene_pkg_path.empty()) {
+            std::string cache_key = bot.cutscene_pkg_path + "#" + std::to_string(bot.cutscene_anim_exp_1);
+            std::lock_guard<std::mutex> lock(level_intro_mutex_);
+            auto it_cs = level_intro_sets_.find(cache_key);
+            if (it_cs == level_intro_sets_.end()) {
+                UPKPackage cs_pkg(bot.cutscene_pkg_path);
+                AnimSetAsset parsed_set{};
+                if (cs_pkg.is_valid() && parse_single_anim_sequence(cs_pkg, bot.cutscene_anim_exp_1, parsed_set)) {
+                    it_cs = level_intro_sets_.emplace(cache_key, std::move(parsed_set)).first;
+                }
+            }
+            if (it_cs != level_intro_sets_.end()) {
+                const AnimSequenceAsset* cs_seq = it_cs->second.find_sequence(bot.active_anim_seq);
+                if (!cs_seq && !it_cs->second.sequences.empty()) {
+                    cs_seq = &it_cs->second.sequences.begin()->second;
+                }
+                if (cs_seq && cs_seq->length > 0.0f) {
+                    active_set = &it_cs->second;
+                    seq_a = cs_seq;
+                    norm_time = std::clamp(bot.anim_timer / cs_seq->length, 0.0f, 0.9999f);
+                }
+            }
+        }
+        if (!seq_a) {
+            seq_a = find_ai_seq("Stand");
+            norm_time = std::fmod(sim_time * 0.45f, 1.0f);
+        }
+    } else if (!bot.alive || bot.anim_state == EEnemyAnimState::KnockedOut) {
         std::string dseq = bot.active_anim_seq.empty() ? "DeathByAuto" : bot.active_anim_seq;
         seq_a = find_ai_seq(dseq);
         if (!seq_a) seq_a = find_ai_seq("HitMeleeSlide");
@@ -2890,7 +2935,7 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         const size_t chunk_v = (sv.chunk_index < char_model.chunk_vert_counts.size())
                                    ? char_model.chunk_vert_counts[sv.chunk_index]
                                    : body_vertices;
-        const bool is_eye_or_visor = (arch_id != EnemyArch_Celeste && chunk_v > 0 && chunk_v < 400);
+        const bool is_eye_or_visor = (arch_id < EnemyArch_Celeste && chunk_v > 0 && chunk_v < 400);
         Vertex out_v{};
         out_v.position = skinned_pos[vi];
         out_v.normal = skinned_norm[vi];

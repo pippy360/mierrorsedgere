@@ -3785,7 +3785,9 @@ void assign_barge_doors(LevelScene& scene) {
         const std::string low_mesh = to_lower(a.mesh_name);
         const bool is_closer_bar = (low_mesh.find("doorclosingmech_01") != std::string::npos);
         const bool is_blocker_slab = (low_mesh.find("doorclosingmech_02") != std::string::npos);
-        if (!is_closer_bar && !is_blocker_slab && a.base_name.empty()) continue;
+        // S_DoorClosingMech_01 has bIgnoreBaseRotation=True on its InterpActor component: it stays bolted to the static lintel.
+        if (is_closer_bar) continue;
+        if (!is_blocker_slab && a.base_name.empty()) continue;
 
         for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
             BargeDoorInstance& door = scene.barge_doors[d];
@@ -3799,7 +3801,7 @@ void assign_barge_doors(LevelScene& scene) {
                     }
                 }
             }
-            if (!match && (is_closer_bar || is_blocker_slab)) {
+            if (!match && is_blocker_slab) {
                 const float dx = a.location.x - door.hinge_pos.x;
                 const float dy = a.location.y - door.hinge_pos.y;
                 const float dz = std::abs(a.location.z - door.hinge_pos.z);
@@ -4320,7 +4322,7 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                         if (tcls == "SeqAct_SetHeliTarget") {
                             heli.side_preference = parse_side_enum(prop_name(tprops, "SideOfHelicopter"));
                         } else if (tcls == "SeqAct_Delay") {
-                            heli.hold_fire_delay = prop_float(tprops, "Duration", 6.0f);
+                            heli.hold_fire_delay = std::max(3.5f, prop_float(tprops, "Duration", 6.0f));
                         }
                     }
                 }
@@ -4329,10 +4331,10 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
             auto trig_it = node_trigger_pos.find(idx);
             if (trig_it != node_trigger_pos.end()) {
                 heli.trigger_pos = trig_it->second;
-                heli.trigger_radius = 2800.0f;
+                heli.trigger_radius = 520.0f;
             } else {
                 heli.trigger_pos = heli.spawn_pos;
-                heli.trigger_radius = 5200.0f;
+                heli.trigger_radius = 1800.0f;
             }
             heli.retreat_dest = heli.spawn_pos + Vec3(0.0f, 0.0f, 4500.0f);
             out_helicopters.push_back(std::move(heli));
@@ -4487,6 +4489,201 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                         out_enemies->push_back(std::move(bot));
                     }
                 }
+            }
+        } else if (out_enemies && cls == "SkeletalMeshActor") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            if (prop_bool(props, "bHidden", false)) continue;
+            int32_t sk_comp = prop_object(props, "SkeletalMeshComponent");
+            if (sk_comp <= 0 || static_cast<size_t>(sk_comp) > exports_.size()) continue;
+            UPropertyList cprops;
+            parse_export_properties(*this, sk_comp, cprops);
+            int32_t sk_ref = prop_object(cprops, "SkeletalMesh");
+            if (sk_ref == 0) continue;
+            std::string sk_path = object_canonical_path(*this, sk_ref);
+            std::string low_sk = sk_path;
+            for (char& ch : low_sk) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            std::string arch;
+            if (low_sk.find("cop_patrol_female") != std::string::npos || low_sk.find("kate") != std::string::npos) {
+                arch = "Kate";
+            } else if (low_sk.find("sk_celeste") != std::string::npos || low_sk.find("pursuit_female") != std::string::npos) {
+                arch = "Celeste";
+            } else if (low_sk.find("jacknife") != std::string::npos) {
+                arch = "Jacknife";
+            } else if (low_sk.find("crim_rb") != std::string::npos) {
+                arch = "Ropeburn";
+            } else if (low_sk.find("sk_miller") != std::string::npos) {
+                arch = "Miller";
+            } else if (low_sk.find("sk_kreeg") != std::string::npos) {
+                arch = "Kreeg";
+            }
+            if (arch.empty()) continue;
+
+            Vec3 loc{};
+            if (const UProperty* lp = find_prop(props, "Location")) loc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+            if (loc.length_sq() < 1.0f) continue;
+            float yaw_deg = 0.0f;
+            if (const UProperty* rp = find_prop(props, "Rotation")) {
+                yaw_deg = static_cast<float>(rp->vi[1]) * (360.0f / 65536.0f);
+            }
+            EnemyBot npc{};
+            npc.archetype = arch;
+            npc.weapon_name = "None";
+            // Placed 3P SkeletalMeshActors have their origin at waist/capsule pivot (~72 uu above floor)
+            npc.position = loc - Vec3(0.0f, 0.0f, 72.0f);
+            npc.home_position = npc.position;
+            npc.yaw_deg = yaw_deg;
+            npc.is_story_npc = true;
+            npc.cutscene_only = false;
+            npc.sublevel_pkg = pkg_stem;
+            out_enemies->push_back(std::move(npc));
+        } else if (out_enemies && cls == "SeqAct_Interp") {
+            UPropertyList props;
+            parse_export_properties(*this, idx, props);
+            const UProperty* vlinks = find_prop(props, "VariableLinks");
+            if (!vlinks) continue;
+
+            int32_t interp_data = 0;
+            std::unordered_map<std::string, int32_t> group_actors;
+            for (const auto& vl : vlinks->elements) {
+                const UProperty* desc_p = find_prop(vl, "LinkDesc");
+                const UProperty* lvars = find_prop(vl, "LinkedVariables");
+                if (!desc_p || !lvars || lvars->ints.empty()) continue;
+                int32_t target = lvars->ints[0];
+                if (desc_p->s == "Data") {
+                    interp_data = target;
+                } else {
+                    if (target > 0 && static_cast<size_t>(target) <= exports_.size()) {
+                        UPropertyList vp;
+                        parse_export_properties(*this, target, vp);
+                        int32_t obj = prop_object(vp, "ObjValue");
+                        if (obj > 0 && static_cast<size_t>(obj) <= exports_.size()) {
+                            group_actors[desc_p->s] = obj;
+                        }
+                    }
+                }
+            }
+            if (interp_data <= 0 || static_cast<size_t>(interp_data) > exports_.size()) continue;
+            UPropertyList dprops;
+            parse_export_properties(*this, interp_data, dprops);
+            const UProperty* groups = find_prop(dprops, "InterpGroups");
+            if (!groups) continue;
+
+            const std::string matinee_label = pkg_stem + "." + export_object_name(*this, idx);
+            for (int32_t g_ref : groups->ints) {
+                if (g_ref <= 0 || static_cast<size_t>(g_ref) > exports_.size()) continue;
+                UPropertyList gprops;
+                parse_export_properties(*this, g_ref, gprops);
+                std::string gname = prop_name(gprops, "GroupName");
+                auto it_act = group_actors.find(gname);
+                if (it_act == group_actors.end()) continue;
+                int32_t actor_exp = it_act->second;
+                std::string actor_cls = get_export_class(exports_[static_cast<size_t>(actor_exp - 1)]);
+                if (actor_cls != "SkeletalMeshActor") continue;
+
+                UPropertyList aprops;
+                parse_export_properties(*this, actor_exp, aprops);
+                int32_t sk_comp = prop_object(aprops, "SkeletalMeshComponent");
+                if (sk_comp <= 0 || static_cast<size_t>(sk_comp) > exports_.size()) continue;
+                UPropertyList cprops;
+                parse_export_properties(*this, sk_comp, cprops);
+                std::string sk_path = object_canonical_path(*this, prop_object(cprops, "SkeletalMesh"));
+                std::string low_sk = sk_path;
+                for (char& ch : low_sk) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                // Skip Faith's 3P stand-in (SK_TKY_Crim_Fixer) and non-character props (Paper/Bag/Blackhawk/Handcuffs)
+                std::string arch;
+                if (low_sk.find("cop_patrol_female") != std::string::npos || low_sk.find("kate") != std::string::npos) {
+                    arch = "Kate";
+                } else if (low_sk.find("sk_celeste") != std::string::npos || low_sk.find("pursuit_female") != std::string::npos) {
+                    arch = "Celeste";
+                } else if (low_sk.find("jacknife") != std::string::npos) {
+                    arch = "Jacknife";
+                } else if (low_sk.find("crim_rb") != std::string::npos) {
+                    arch = "Ropeburn";
+                } else if (low_sk.find("sk_miller") != std::string::npos) {
+                    arch = "Miller";
+                } else if (low_sk.find("sk_kreeg") != std::string::npos) {
+                    arch = "Kreeg";
+                } else if (low_sk.find("cop_swat") != std::string::npos) {
+                    arch = "SWAT";
+                }
+                if (arch.empty()) continue;
+
+                Vec3 aloc{};
+                if (const UProperty* lp = find_prop(aprops, "Location")) aloc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+                float ayaw = 0.0f;
+                if (const UProperty* rp = find_prop(aprops, "Rotation")) {
+                    ayaw = static_cast<float>(rp->vi[1]) * (360.0f / 65536.0f);
+                }
+
+                std::string anim_seq;
+                float start_sec = 0.0f;
+                if (const UProperty* tracks = find_prop(gprops, "InterpTracks")) {
+                    for (int32_t t_ref : tracks->ints) {
+                        if (t_ref <= 0 || static_cast<size_t>(t_ref) > exports_.size()) continue;
+                        if (get_export_class(exports_[static_cast<size_t>(t_ref - 1)]) != "InterpTrackAnimControl") continue;
+                        UPropertyList tprops;
+                        parse_export_properties(*this, t_ref, tprops);
+                        if (const UProperty* keys = find_prop(tprops, "AnimSeqs")) {
+                            for (const auto& k_el : keys->elements) {
+                                std::string sname = prop_name(k_el, "AnimSeqName");
+                                if (!sname.empty()) {
+                                    anim_seq = sname;
+                                    start_sec = prop_float(k_el, "StartTime", 0.0f);
+                                    break;
+                                }
+                            }
+                        }
+                        if (!anim_seq.empty()) break;
+                    }
+                }
+
+                // Resolve 1-based AnimSequence export index inside GroupAnimSets in this package
+                int32_t anim_exp_1 = 0;
+                if (!anim_seq.empty()) {
+                    std::string low_want = anim_seq;
+                    for (char& ch : low_want) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    if (const UProperty* asets = find_prop(gprops, "GroupAnimSets")) {
+                        for (int32_t as_ref : asets->ints) {
+                            if (as_ref <= 0 || static_cast<size_t>(as_ref) > exports_.size()) continue;
+                            UPropertyList as_props;
+                            parse_export_properties(*this, as_ref, as_props);
+                            if (const UProperty* seqs = find_prop(as_props, "Sequences")) {
+                                for (int32_t seq_ref : seqs->ints) {
+                                    if (seq_ref <= 0 || static_cast<size_t>(seq_ref) > exports_.size()) continue;
+                                    UPropertyList sprops;
+                                    parse_export_properties(*this, seq_ref, sprops);
+                                    std::string sname = prop_name(sprops, "SequenceName");
+                                    for (char& ch : sname) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                                    if (sname == low_want) {
+                                        anim_exp_1 = seq_ref;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (anim_exp_1 > 0) break;
+                        }
+                    }
+                }
+
+                if (anim_exp_1 <= 0 || anim_seq.empty()) continue;
+
+                EnemyBot cs_npc{};
+                cs_npc.archetype = arch;
+                cs_npc.weapon_name = "None";
+                cs_npc.position = aloc;
+                cs_npc.home_position = aloc;
+                cs_npc.yaw_deg = ayaw;
+                cs_npc.alive = false; // Enabled only while matinee_label is actively playing!
+                cs_npc.is_story_npc = true;
+                cs_npc.cutscene_only = true;
+                cs_npc.sublevel_pkg = pkg_stem;
+                cs_npc.cutscene_label = matinee_label;
+                cs_npc.cutscene_pkg_path = file_path_;
+                cs_npc.cutscene_anim_exp_1 = anim_exp_1;
+                cs_npc.active_anim_seq = anim_seq;
+                cs_npc.cutscene_start_sec = start_sec;
+                out_enemies->push_back(std::move(cs_npc));
             }
         }
     }

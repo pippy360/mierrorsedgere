@@ -842,6 +842,13 @@ struct EnemyBot {
     float muzzle_flash_timer = 0.0f;
     int burst_shots_left = 0;
     float burst_cooldown = 0.0f;
+    bool is_story_npc = false;      // Non-combat character mesh (Kate, Celeste, Jacknife, Ropeburn, Miller, Kreeg)
+    bool cutscene_only = false;     // Shown only while matching Matinee cutscene (`cutscene_label`) is playing
+    std::string sublevel_pkg;       // Owning sublevel stem (e.g. "Escape_Off_Spt" / "Escape_Off_CS")
+    std::string cutscene_label;     // Matinee label (e.g. "Escape_Off_CS.SeqAct_Interp_8")
+    std::string cutscene_pkg_path;  // Full filesystem path to .me1 containing cutscene AnimSequence
+    int32_t cutscene_anim_exp_1 = 0;// 1-based export index of cutscene AnimSequence (for parse_single_anim_sequence)
+    float cutscene_start_sec = 0.0f;
 };
 
 // -----------------------------------------------------------------------------

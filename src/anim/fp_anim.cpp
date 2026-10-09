@@ -497,6 +497,11 @@ void AnimTree::update_list(TreeNode& n, const PawnAnimState& pawn, bool became_r
         }
         const size_t w = static_cast<size_t>(want);
         blend = w < n.blend_in.size() ? n.blend_in[w] : (want == 0 ? 0.55f : 0.35f);
+        if (pawn.movement == EMovement::MOVE_Barge || pawn.movement == EMovement::MOVE_AirBarge ||
+            pawn.movement == EMovement::MOVE_Melee || pawn.movement == EMovement::MOVE_MeleeSlide) {
+            want = 0;
+            blend = 0.0f;
+        }
     } else if (n.cls == "TdAnimNodeWeaponTypeState") {
         // Default, then "Heavy".
         want = (pawn.heavy_weapon && n.weight.size() > 1) ? 1 : 0;

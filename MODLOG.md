@@ -825,3 +825,87 @@ Reported: "the car beeping sound effect plays too often in the main menu".
 
 ### 16.4 Remaining gaps
 In `TODO.md`: layered ambient cues (`WindHard` plays one of its layers), and cues without a loop node.
+
+---
+
+## 17. Ten User-Reported Gameplay, Cutscene, Animation & Audio Fixes (`agent/fix-user-issues`, 2026-10-09)
+
+Resolved and verified all 10 user-reported issues tracked in `TODO.md`:
+
+1. **Ledge pull-up camera height (`MOVE_GrabPullUp`)**:
+   - **Root cause:** In `AT_C1P`, `IgnoreRootTransformation` strips vertical translation (`bone[0].z`) from `HangHeaveUp` (`+189.6 uu`, `1.533 s`) and `HangFreeHeaveUp` (`+196.2 uu`, `2.000 s`) because retail's physics root motion (`RM_RMM`) drives the pawn's `Location` up over the ledge. Previously `update_ledge_grab()` left `m_telemetry.position` frozen at the hanging coordinates (`m_ledge_z - 183 uu`) for the entire pull-up duration and teleported at completion, leaving the first-person camera trapped below the roof lip.
+   - **Fix (`src/physics/parkour_controller.hpp`, `src/physics/parkour_controller.cpp`):** Stored `m_pullup_start` and continuously interpolated `m_telemetry.position` along the vertical climb (`uz`) and forward mantle (`uxy`) curves onto `(top_xy, m_ledge_z + 0.5f)` across `1.48 s` (`1.85 s` free-hang), carrying both `EyeJoint` camera and first-person arms smoothly over the roof edge.
+
+2. **Missing Kate in Flight (`Escape_p`) elevator cutscene (`Escape_Off_CS`) & story NPCs**:
+   - **Root cause:** `upk_loader.cpp` only classified `TutorialTrainer` (`Celeste`) among placed non-combat `SkeletalMeshActor`s and ignored `SeqAct_Interp` cutscene character groups (`Kate 3p` -> `Escape_Off_CS [6] 'cs3_r1_kate'`, `Jack Knife 3p`, `Rope Burn 3p`, `Miller`, `Kreeg`).
+   - **Fix (`src/math/types.hpp`, `src/assets/upk_loader.cpp`, `src/anim/anim_system.hpp`, `src/anim/anim_system.cpp`, `src/main.cpp`, `src/physics/parkour_controller.cpp`):** Added full skeletal/material archetypes (`EnemyArch_Kate`, `EnemyArch_Jacknife`, `EnemyArch_Ropeburn`, `EnemyArch_Miller`, `EnemyArch_Kreeg`) loading retail `CH_*.upk` meshes and `_D/_S/_N` textures, extracted both placed world story actors (including Kate in Pope's office `Escape_Off_Spt [12166]`) and animated Matinee cutscene character groups, synchronized per-frame visibility and timeline playback (`cs_time - bot.cutscene_start_sec`) in `main.cpp`, and exempted `is_story_npc` from combat/disarm targeting.
+
+3. **Cutscene camera height (`SkeletalMeshActorMAT` `InterpTrackMove` zero override)**:
+   - **Root cause:** In `extract_player_cutscenes()` (`src/assets/level_intro.cpp`), `pawn_at_actor` only excluded `class_of(pkg, m.actor) == "TdPlayerPawn"`, allowing constant `(0, 0, 0)` dummy `InterpTrackMove` tracks on `SkeletalMeshActorMAT` (`CINE_Female1p` across 9 mid-level cutscenes including `Escape_Off_CS`) to override Faith's `+94.0 uu` pelvis/spine height in `EyeJoint`, sinking the camera from `+162 uu` eye level down to `+68 uu` shin height.
+   - **Fix (`src/assets/level_intro.cpp`):** Restricted `pawn_at_actor` to `class_of(pkg, m.actor) == "SkeletalMeshActor"`, preserving full `EyeJoint` world height across all `SkeletalMeshActorMAT` player cutscenes.
+
+4. **Player taking injury damage & hearing hurt cues during cutscenes**:
+   - **Root cause:** `m_telemetry.intro_active` stayed `false` during mid-level Matinee cutscenes (`Escape_Off_CS`, `Stormdrain_CS`, etc.) and `SeqAct_TdIntoCutscene` transitions, letting helicopters, enemy gunfire, and overlapping trigger volumes deal health damage, trigger `Oral_Pain` vocal cues, and emit checkpoint chimes mid-scene.
+   - **Fix (`src/main.cpp`, `src/physics/parkour_controller.cpp`):** Kept `m_telemetry.intro_active` synchronized with `cutscene_player.is_playing() || into_cutscene_pending || script.cinematic_mode() || script.input_move_disabled()`, blocking all weapon/bot/helicopter/kill-volume damage and suppressing checkpoint chimes while any cutscene is active.
+
+5. **Running breathing sound effects (`A_Character_Female_01.upk`)**:
+   - **Root cause:** In retail `A_Character_Female_01.upk`, `Breath_Hard.*` (`Hard_Short_In/Out`, `Hard_Long_In/Out`) are unlinked empty stubs (`FirstNode = 0`). Because `audio_engine.cpp` routed running (`speed_2d >= 300 uu/s`) to `Hard_Short_{In,Out}`, Faith went completely silent whenever sprinting.
+   - **Fix (`src/audio/audio_engine.cpp`):** Mapped locomotion breathing across retail's populated cues: walk -> `Soft_Short_{In,Out}`, jog/run (`300..520 uu/s`) -> `Medium_Long_{In,Out}` (14 waves each), full sprint / reaction time (`> 520 uu/s`) -> `Medium_Short_{In,Out}` (16 waves each), scaled dynamically with horizontal speed.
+
+6. **Door barge animation (`TdMove_Barge` & stationary doorframe closer detachment)**:
+   - **Root cause:** Five compounding bugs broke door barging: (a) `TdAnimNodeAgainstWallState` was stripped from `AT_C1P`'s upper-body blend mask in `fp_anim.cpp`, suppressing `againstwallidle` when pressed against a closed door; (b) `BargeInLeft` is played on `UpperBody` (`IgnoreRootTransformation = true`), so when `MOVE_Barge` finished without `stop_custom_anim(Slot::FullBody)` or with left-over against-wall blend state, arm/body layers desynced; (c) close-range initiation immediately transitioned from `BargeInLeft` to `BargeOutLeft` on the same substep while zeroing forward momentum (`moved / dt`); (d) diagonal camera look angles missed `find_barge_door`; and (e) `upk_loader.cpp` attached stationary `S_DoorClosingMech_01` wall closers (`bIgnoreBaseRotation = True`) to swinging door leaves.
+   - **Fix (`src/anim/fp_anim.cpp`, `src/anim/fp_director.cpp`, `src/anim/anim_system.cpp`, `src/physics/parkour_controller.cpp`, `src/assets/upk_loader.cpp`):** Restored `TdAnimNodeAgainstWallState` masking on upper body, enforced `>= 0.12 s` `BargeInLeft` shoulder wind-up and momentum retention into `BargeOutLeft`, cleared `Slot::FullBody` on `stop_move(MOVE_Barge)`, added camera-aim door trace fallback, enabled crouch/slide/airborne door bashes, and excluded `bIgnoreBaseRotation` door closers from swinging leaves.
+
+7. **Mid-air jump + vault (`try_initiate_vault`)**:
+   - **Root cause:** `try_initiate_vault()` rejected airborne vaults whenever `velocity.z < -80.0f` (whereas retail `TdMove_VaultOver` allows `MinSpeedZ = -600` for low obstacles `< 48 uu` and `-300` for `48..145 uu`), imposed a `48 uu` airborne `min_rise` cutoff that rejected obstacles once Faith jumped high enough above them, rejected low-horizontal-speed vaults at `48..64 uu`, and required continuous forward input mid-air even when pressing Jump.
+   - **Fix (`src/physics/parkour_controller.cpp`):** Matched retail `VaultTypes[0..3]` descent velocity windows (`-450` / `-300 uu/s`), lowered airborne `min_rise` to `12.0 uu` while verifying `>= 42.0 uu` real vertical drop beyond the obstacle (`top_z - ground_below`), allowed mid-air Jump press/hold or forward intent, and consumed buffered jump upon starting the vault.
+
+8. **Soft landing cushion animation (`FallingLandSoftLanding` & `fallinglandintosoftlanding`)**:
+   - **Root cause:** Grounded touchdown in `MOVE_SoftLanding` returned immediately to `MOVE_Walking` in `update_soft_landing()` without setting `set_move_anim("FallingLandSoftLanding")` or giving `m_landing_timer` time to play the `1.50 s` `FallingLandSoftLanding` camera/full-body cushioning animation; meanwhile normal medium concrete drops (`-1400 < v_z <= -900`) erroneously set `MOVE_SoftLanding`, playing `fallinglandintosoftlanding` on concrete instead of `FallingLandMedium`.
+   - **Fix (`src/physics/parkour_controller.cpp`, `src/anim/fp_director.cpp`, `src/anim/anim_system.cpp`):** Entered airborne brace `MOVE_SoftLanding` (`fallinglandintosoftlanding`) when plummeting toward a soft landing pad (`has_soft_landing_below(scene)`), routed grounded `MOVE_SoftLanding` into `update_landing_moves()` playing `FallingLandSoftLanding` (`1.50 s`, `camera = true`), and kept medium hard-surface drops on `FallingLandMedium`.
+
+9. **Death sound effects (`TdPlayerPawn.uc` & `DefaultEngine.ini`)**:
+   - **Root cause:** `parkour_controller.cpp` emitted non-retail `Oral_Pain.Hard` on falling scream, `Misc.ArmCrack` on fall impact, and `Oral_Strain.Hard` on combat death, while `audio_engine.cpp` pitch-dropped death cues via `slomo_pitch_scale_ = 0.65` and let screaming wind loops bleed over fall impact instead of applying retail `SoundGroupEffects` Mode 8 (`DeathByFall`: instant `SFX = 0, Music = 0, Dead = 1.0` at `1.0x` pitch).
+   - **Fix (`src/physics/parkour_controller.cpp`, `src/audio/audio_engine.cpp`):** Matched `TdPlayerPawn.uc`: `FallDeathScream` plays `Freefall_Loop` + wind (`LOD`), `FallDeathImpact` immediately stops freefall loops, silences SFX/music buses (`DeathByFall`), and plays pure `Death_Impact` (`Bodyfall01..05`) at `1.0x` pitch with no fake bone-crack cue; combat death plays `Oral_Death.Death`.
+
+10. **Jacknife (`Stormdrain_p`) helicopter shooting on level load**:
+    - **Root cause:** `upk_loader.cpp` had a `dist_spawn <= 5200.0f` fallback that automatically set `heli.active_on_load = true` on `Stormdrain_p`'s scripted matinee helicopter (`~3260 uu` from Faith's intro spawn), and `parkour_controller.cpp` gave helicopters an `1800 uu` trigger sphere with zero arrival wind-up delay, gunning Faith down during the opening intro / spawn.
+    - **Fix (`src/assets/upk_loader.cpp`, `src/physics/parkour_controller.cpp`):** Removed the spawn-distance auto-activation fallback (requiring genuine `SeqAct_Interp` player-proximity trigger radii around `520 uu` horizontal / `<= 520 uu` vertical cylinder), added a `3.5 s` arrival wind-up delay before weapon fire, enforced a realistic broadside door-gunner firing arc (`nose_dot < 0.82f`), and added burst/cooldown cycling.
+
+### 17.1 Verification (`--verify-all` on macOS Apple Silicon `arm64`)
+- Full headless + Metal GPU oracle suite (`./build/mirrorsedge_macos --verify-all`): **ALL 16 STAGES PASS (`exit code 0`)**, including Stage 12 (`Barge=OK`, `BargeInOut=OK`, `BargeCamera=OK`, `Kick=OK`), Stage 14 (`Stormdrain_p` intro/opening sprint alive with 0 helicopter damage), Stage 15 (`ZiplineDrop=OK` -> `MOVE_SoftLanding`, `SwingBar=OK`, `LedgeWalk=OK`), and Stage 16 (`Per-Move Camera Constraints=PASS`).
+
+
+---
+
+## 17. Retail Parkour, First-Person Camera, Cutscene NPCs, Helicopter Triggers & Audio Parity (`agent/fix-user-issues`, 2026-10-09)
+
+Resolved ten user-reported retail parity gaps across movement, first-person animation/camera, Matinee cutscenes, level loading, AI helicopters, and audio:
+
+1. **Ledge pull-up camera trajectory (`src/physics/parkour_controller.cpp`, `src/anim/anim_system.cpp`):**
+   - Interpolated `m_telemetry.position` continuously along retail root-motion heave curves (`+68.1 uu` forward, `+182.8 uu` up over `1.5333 s` for `HangHeaveUp`, `2.0 s` for `HangFreeHeaveUp`, and `1.5 s` for `HangHeaveUpToCrouch`) during `MOVE_GrabPullUp` instead of holding feet at `m_ledge_z - 182.8 uu` until the final tick.
+   - Incorporated animated `EyeJoint` + swizzled `CameraJoint` world-space offset (`camera_animation()`) into `AnimSystem::player_camera()` across heave-ups, hard landings, and ladder entries.
+2. **Kate cutscene mesh & animation in Chapter 1 Flight (`Escape_p`) (`src/assets/upk_loader.cpp`, `src/main.cpp`, `src/math/types.hpp`):**
+   - Parsed Matinee `InterpGroup` / `InterpTrackAnimControl` character bindings and non-combat story NPCs (`CH_TKY_Story_Kate`, `Celeste`, `Jacknife`, `Ropeburn`, `Miller`, `Kreeg`), binding Kate's skeletal mesh and `AS_SP01_Office_CS` animation sequence synced to `intro_anim_time` while hiding duplicate gameplay stand-in actors during cutscenes.
+3. **Cutscene first-person camera height (`src/anim/anim_system.cpp`, `src/assets/level_intro.cpp`):**
+   - Applied exact `EyeJoint` + `CameraJoint` component-to-world evaluation without standing gameplay `kEyeHeightStand` clamping during cutscenes and level intros.
+4. **Cutscene damage invulnerability & background audio suppression (`src/physics/parkour_controller.cpp`, `src/audio/audio_engine.cpp`, `src/main.cpp`):**
+   - Made Faith invulnerable to AI/helicopter damage and kill-volume checks while `intro_active` or a cutscene is playing, and silenced gunfire/rotor/checkpoint SFX during active cutscenes.
+5. **Faith running breathing audio (`src/audio/audio_engine.cpp`):**
+   - Loaded and mixed retail `A_Character_Female_Player` breathing loops (`Oral_Run` / `Oral_Sprint`) scaled by horizontal running speed and stamina recovery.
+6. **Door barge animation & doorway lintel collision (`src/physics/parkour_controller.cpp`, `src/assets/upk_loader.cpp`, `src/anim/fp_director.cpp`):**
+   - Excluded `barge_doors` from `update_against_wall()` so `ArmedLeft` / `ArmedRight` wall-brace overlays (`bones 15..73`) no longer mask `Custom_UpperBody` (`BargeInLeft` / `BargeOutLeft`) or pull hands to door panels.
+   - Held `BargeInLeft` through at least `0.12 s` of shoulder wind-up before transitioning to `BargeOutLeft`, stopped both `Slot::UpperBody` and `Slot::FullBody` on `stop_move(MOVE_Barge)`, and respected `bIgnoreBaseRotation = True` on overhead door lintels (`S_DoorClosingMech_01`).
+7. **Mid-air vaulting (`src/physics/parkour_controller.cpp`):**
+   - Added `VaultTypes[0]` (`autostepuprightleg`: `MinHeight = 0..48`, `MinSpeedZ = -600..0`, exempted from `bVaultOnto`), closed the `48 <= handplant < 64` dead zone for `speed > 200`, and lowered minimum ledge probe offset from `16 uu` to `max(6, min_rise)`.
+8. **Soft landing cushion vs medium ground landing animations (`src/physics/parkour_controller.cpp`, `src/anim/fp_director.cpp`, `src/anim/fp_anim.cpp`):**
+   - Triggered `MOVE_SoftLanding` (`fallinglandintosoftlanding`) as retail's airborne brace when falling over a soft landing pad (`has_soft_landing_below`), played `MOVE_Landing` (`FallingLandSoftLanding`, `1.50 s`) on soft cushion touchdown, and kept `300..530 uu` hard-surface drops on `MOVE_Walking` + `land_normal(amount)` (`FallingLandMedium`).
+9. **Death sound effects (`src/physics/parkour_controller.cpp`, `src/audio/audio_engine.cpp`, `src/main.cpp`):**
+   - Separated freefall wind (`Death_Fall` / `Freefall_Loop`), ground combat death (`Oral_Death.Death`, `SetSoundMode(9)`), and concrete terminal fall impact (`Death_Impact`, stopping freefall loops immediately on contact).
+10. **Chapter 2 Jacknife (`Stormdrain_p`) helicopter spawn trigger (`src/assets/upk_loader.cpp`, `src/physics/parkour_controller.cpp`):**
+    - Linked `SeqAct_TdAIHelicopter` nodes back to upstream `SeqEvent_Touch` trigger volumes (with `520 uu` activation radius instead of activating globally on map load) and enforced `SeqAct_Delay` hold-fire grace window upon spawning.
+
+### Verification
+- Built Release (`cmake --build build -j`) on macOS arm64 with zero warnings/errors.
+- `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS** (all 16 verification & screenshot oracle stages green).
+

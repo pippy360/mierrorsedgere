@@ -1867,8 +1867,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             controller.reset(location + Vec3(0.0f, 0.0f, 2.0f), yaw_deg);
         };
-        host.player_fail = [&]() { controller.get_telemetry().health = 0.0f; };
+        host.player_fail = [&]() {
+            if (cutscene_player.is_playing() || into_cutscene_pending || script.cinematic_mode()) return;
+            controller.get_telemetry().health = 0.0f;
+        };
         host.damage_player = [&](float amount) {
+            if (cutscene_player.is_playing() || into_cutscene_pending || script.cinematic_mode()) return;
             PlayerTelemetry& t = controller.get_telemetry();
             t.health = std::max(0.0f, t.health - amount);
             t.damage_flash_timer = 0.45f;
@@ -2786,6 +2790,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         controller.reset(Vec3(wx, wy, wz), wyaw);
                     }
                 }
+                const bool cinematic_lock = cutscene_player.is_playing() || into_cutscene_pending ||
+                                            script.cinematic_mode() || script.input_move_disabled();
+                controller.get_telemetry().intro_active = cinematic_lock;
                 if (into_cutscene_pending) {
                     // TdMove_IntoCutscene: the pawn glides onto its mark over 0.4 s and faces it.
                     into_cutscene_timer += dt;
@@ -2881,6 +2888,28 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 const LevelIntroSequence* playing = cutscene_player.active_sequence(active_scene);
                 controller.get_telemetry().skip_prompt = playing != nullptr && playing->skippable &&
                                                          !(script.valid() && script.skip_disabled());
+                const float cs_time = controller.get_telemetry().intro_anim_time;
+                for (auto& bot : active_scene.enemies) {
+                    if (!bot.is_story_npc) continue;
+                    if (bot.cutscene_only) {
+                        bot.alive = (playing != nullptr && !bot.cutscene_pkg_path.empty() &&
+                                     playing->package_path == bot.cutscene_pkg_path &&
+                                     cs_time >= bot.cutscene_start_sec);
+                        if (bot.alive) {
+                            bot.anim_timer = std::max(0.0f, cs_time - bot.cutscene_start_sec);
+                        }
+                    } else {
+                        bool replaced_by_cs = false;
+                        for (const auto& cs_bot : active_scene.enemies) {
+                            if (cs_bot.is_story_npc && cs_bot.cutscene_only && cs_bot.archetype == bot.archetype &&
+                                playing != nullptr && cs_bot.cutscene_pkg_path == playing->package_path) {
+                                replaced_by_cs = true;
+                                break;
+                            }
+                        }
+                        bot.alive = !replaced_by_cs;
+                    }
+                }
             }
 
             // The subtitle slot: with a script, retail's text only (voice-over subtitles); the
@@ -3013,14 +3042,27 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         controller.get_telemetry().sound_events.clear();
 
         if (tel.falling_to_death && !prev_falling_to_death) {
-            audio.play_effect(EAudioEffect::FallDeathScream);
+            if (tel.fall_death_impact) {
+                // Direct lethal ground impact without prior freefall wind entry
+                audio.play_effect(EAudioEffect::FallDeathImpact);
+            } else if (tel.grounded) {
+                // Combat / bullet death on ground: SetSoundMode(9) + Oral_Death.Death (NO freefall wind or Bodyfall splat)
+                audio.set_sound_group_mode(ESoundGroupEffectMode::DeathGeneric);
+                audio.play_sound("Death", 1.15f, 1.0f);
+            } else {
+                // Entering lethal freefall: SetSoundMode(6) + Death_Fall (Freefall_Loop + LOD wind)
+                audio.play_effect(EAudioEffect::FallDeathScream);
+            }
             if (script.valid()) script.player_died();  // SeqEvt_TdPlayerDeath
-        }
-        if (tel.fall_death_impact && !prev_fall_death_impact) {
+        } else if (tel.fall_death_impact && !prev_fall_death_impact) {
+            // Hitting ground after freefall: cuts freefall wind + background audio & plays pure Death_Impact thud
             audio.play_effect(EAudioEffect::FallDeathImpact);
         }
         if (!tel.falling_to_death && !tel.fall_death_impact &&
             (prev_falling_to_death || prev_fall_death_impact)) {
+            audio.stop_cue("Death_Fall");
+            audio.stop_cue("Freefall_Loop");
+            audio.stop_cue("LOD");
             audio.set_sound_group_mode(ESoundGroupEffectMode::Normal);
         }
         prev_falling_to_death = tel.falling_to_death;
@@ -3034,9 +3076,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
         level_intro_running = level_intro_now;
 
-        if (intro_handover_frames > 0) {
-            // Standing where the intro left Faith is not reaching a checkpoint.
-            --intro_handover_frames;
+        if (intro_handover_frames > 0 || cutscene_player.is_playing() || into_cutscene_pending) {
+            // Standing where an intro/cutscene sets or hands over a checkpoint does not chime BagFound.
+            if (intro_handover_frames > 0) --intro_handover_frames;
             prev_checkpoint = tel.active_checkpoint;
         }
         if (tel.active_checkpoint != prev_checkpoint) {
@@ -3044,7 +3086,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             prev_checkpoint = tel.active_checkpoint;
         }
 
-        if (tel.weapon.fired_this_tick) {
+        if (tel.weapon.fired_this_tick && !cutscene_player.is_playing()) {
             audio.play_effect(EAudioEffect::Gunshot);
         }
 
@@ -3065,14 +3107,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             footstep_timer = 0.0f;
         }
 
-        // Trigger helicopter rotor & FNMinimi gunfire audio cues
-        for (const auto& heli : active_scene.helicopters) {
+        // Trigger helicopter rotor & FNMinimi gunfire audio cues (and always clear transient flags so a
+        // helicopter firing right before a cutscene never loops FNMinimi_Fire during the cutscene)
+        for (auto& heli : active_scene.helicopters) {
             if (heli.just_spawned) {
-                audio.load_sound_bank(game_root, "A_Vehicle_Helicopter");
-                audio.play_cue("Helicopter.Helicopter", false, 0.85f);
+                heli.just_spawned = false;
+                if (!cutscene_player.is_playing() && !into_cutscene_pending) {
+                    audio.load_sound_bank(game_root, "A_Vehicle_Helicopter");
+                    audio.play_cue("Helicopter.Helicopter", false, 0.85f);
+                }
             }
             if (heli.just_fired) {
-                audio.play_sound_3d("FNMinimi_Fire", heli.position, 0.55f);
+                heli.just_fired = false;
+                if (!cutscene_player.is_playing() && !into_cutscene_pending) {
+                    audio.play_sound_3d("FNMinimi_Fire", heli.position, 0.55f);
+                }
             }
         }
 
@@ -3080,9 +3129,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         audio.set_menu_music(renderer.is_menu_open());
         Vec3 ear = tel.position + Vec3(0, 0, tel.eye_height);
         Rotator ear_rot = Rotator::from_degrees(tel.pitch_deg, tel.yaw_deg, tel.camera_roll_deg);
-        // A cutscene's motion is not the player's running: no speed-driven wind for it.
-        audio.update(dt, ear, ear_rot.forward(), ear_rot.up(), cutscene_player.is_playing() ? 0.0f : tel.speed_2d,
-                     tel.reaction_active);
+        // A cutscene's motion is not the player's running: no speed-driven wind or breathing for it.
+        audio.update(dt, ear, ear_rot.forward(), ear_rot.up(),
+                     (cutscene_player.is_playing() || into_cutscene_pending) ? 0.0f : tel.speed_2d,
+                     tel.reaction_active && !cutscene_player.is_playing());
 
         // The screen fade (TdHUD): in from white when the player starts or restarts, and whatever
         // the level intro's Kismet asks for on the way.

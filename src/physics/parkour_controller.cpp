@@ -768,9 +768,16 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_Crouch:
             case EMovement::MOVE_StepUp:
             case EMovement::MOVE_AutoStepUp:
-            case EMovement::MOVE_SoftLanding:
             case EMovement::MOVE_180Turn:
                 update_ground_locomotion(input, step_dt, scene);
+                break;
+
+            case EMovement::MOVE_SoftLanding:
+                if (m_telemetry.grounded) {
+                    update_landing_moves(input, step_dt, scene);
+                } else {
+                    update_air_locomotion(input, step_dt, scene);
+                }
                 break;
 
             case EMovement::MOVE_Jump:
@@ -1267,7 +1274,10 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
             const float side = k == 0 ? -1.0f : 1.0f;
             const Vec3 start = centre + right * (14.0f * side) + Vec3(0.0f, 0.0f, crouched ? 26.0f : 68.0f);
             const TraceHit hit = sweep_box(start, extent, fwd * reach, scene);
-            if (hit.hit && hit.normal.dot(fwd) < -0.5f) {
+            const bool is_barge_door = hit.hit && hit.actor_index >= 0 &&
+                                       static_cast<size_t>(hit.actor_index) < scene.actors.size() &&
+                                       scene.actors[static_cast<size_t>(hit.actor_index)].barge_door >= 0;
+            if (hit.hit && hit.normal.dot(fwd) < -0.5f && !(is_barge_door && m_telemetry.velocity.dot(fwd) > 180.0f)) {
                 hand[k] = true;
                 m_telemetry.against_wall_hand[k] = hit.point - right * (side * look_down * 15.0f);
                 normal = normal + horiz(hit.normal);
@@ -1277,8 +1287,12 @@ void ParkourController::update_against_wall(float dt, const LevelScene& scene) {
         state = hand[0] && hand[1] ? 1 : hand[0] ? (heavy ? 1 : 2) : hand[1] ? (heavy ? 1 : 3) : 0;
         if (state != 0 && normal.length_sq() > 1e-4f) m_against_wall_yaw = yaw_of(-normal);
     }
-    // UpdateAgainstWall: the state holds for 0.15 s after the check last found a wall.
-    if (state != 0) {
+    if (m == EMovement::MOVE_Barge || m == EMovement::MOVE_AirBarge ||
+        m == EMovement::MOVE_Melee || m == EMovement::MOVE_MeleeSlide) {
+        m_against_wall = 0;
+        m_against_wall_off = 0.15f;
+    } else if (state != 0) {
+        // UpdateAgainstWall: the state holds for 0.15 s after the check last found a wall.
         m_against_wall = state;
         m_against_wall_off = 0.0f;
     } else if (m_against_wall != 0) {
@@ -2628,16 +2642,18 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
 
     // TdPlayerPawn.TakeFallingDamage / TdMove_Landing.LandOnSoftObject:
     // Landing on a soft object (cardboard landing cushion, mattress, airbag, trash container)
-    // cancels all fall damage and lethal fall death regardless of drop height.
+    // cancels all fall damage and lethal fall death regardless of drop height and plays the full
+    // 1.50 s FallingLandSoftLanding cushion sink + get-up animation.
     if (soft_surface && fall >= c.hard_landing_min_fall) {
         m_telemetry.falling_to_death = false;
         m_telemetry.fall_death_impact = false;
         m_telemetry.move_state = EMovement::MOVE_SoftLanding;
-        m_landing_timer = 0.65f;
+        m_landing_timer = 1.50f;
         m_state_timer = 0.0f;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
         m_sprint_energy = 0.0f;
         m_telemetry.camera_roll_deg = 0.0f;
+        set_move_anim("FallingLandSoftLanding");
         set_stance(kEyeHeightStand);
         return;
     }
@@ -2720,12 +2736,9 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
     }
     m_sprint_energy = std::max(0.0f, speed - c.speed_max_base_velocity);
 
-    if (fall >= c.soft_landing_min_fall) {
-        m_telemetry.move_state = EMovement::MOVE_SoftLanding;  // animation only: input works
-        m_landing_timer = 0.2f;
-    } else {
-        m_telemetry.move_state = EMovement::MOVE_Walking;
-    }
+    // TdMove_Landing.StartMove: ordinary medium landings on normal ground transition directly to
+    // MOVE_Walking so Director::tick() triggers LandNormal (FallingLandMedium + TdAnimNodeLandOffset).
+    m_telemetry.move_state = EMovement::MOVE_Walking;
     set_stance(kEyeHeightStand);
 }
 
@@ -2856,6 +2869,9 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
     if (soft_below && m_telemetry.falling_to_death) {
         m_telemetry.falling_to_death = false;
         m_telemetry.camera_roll_deg *= std::max(0.0f, 1.0f - 8.0f * dt);
+    }
+    if (soft_below && fall_dist >= 240.0f && m_telemetry.velocity.z < -250.0f && st != EMovement::MOVE_SoftLanding) {
+        st = EMovement::MOVE_SoftLanding;
     } else if (!soft_below && fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
         if (!m_telemetry.falling_to_death) {
             m_telemetry.falling_to_death = true;
@@ -3567,10 +3583,25 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
 
     if (st == EMovement::MOVE_GrabPullUp) {
-        // The camera rises with the body over the pull-up; the body lands on the ledge at the end.
-        const float progress = std::clamp(m_state_timer / std::max(c.grab_pull_up_time, 1e-3f), 0.0f, 1.0f);
-        set_stance(kEyeHeightStand + progress * (m_ledge_z - m_telemetry.position.z));
-        if (m_state_timer >= c.grab_pull_up_time) {
+        // TdMove_GrabPullUp (UseRootMotion(true)): HangHeaveUp (1.53 s) / HangFreeHeaveUp (2.00 s)
+        // translates Root (+68.1 fwd, +186.0 up), while AT_C1P's IgnoreRootTransformation strips Root
+        // on Mesh1p so Pawn.Location carries both the 1P mesh and EyeJoint smoothly up over the lip.
+        const float pull_dur = std::max(m_telemetry.combat_anim_duration, 1.35f);
+        const float progress = std::clamp(m_state_timer / pull_dur, 0.0f, 1.0f);
+        const float uz_t = std::clamp(progress / 0.84f, 0.0f, 1.0f);
+        const float uz = uz_t * uz_t * (3.0f - 2.0f * uz_t);
+        const float uxy_t = std::clamp((progress - 0.38f) / 0.58f, 0.0f, 1.0f);
+        const float uxy = uxy_t * uxy_t * (3.0f - 2.0f * uxy_t);
+        const Vec3 end_xy = m_pullup_start + into * (2.0f * kPawnRadius + 5.0f);
+        const Vec3 next_pos(m_pullup_start.x + (end_xy.x - m_pullup_start.x) * uxy,
+                            m_pullup_start.y + (end_xy.y - m_pullup_start.y) * uxy,
+                            m_pullup_start.z + ((m_ledge_z + 0.5f) - m_pullup_start.z) * uz);
+        if (dt > 1e-5f) {
+            m_telemetry.velocity = (next_pos - m_telemetry.position) * (1.0f / dt);
+        }
+        m_telemetry.position = next_pos;
+        set_stance(kEyeHeightStand);
+        if (m_state_timer >= pull_dur) {
             if (climb_onto_ledge(n, m_ledge_z, scene)) {
                 const bool stand = has_room(kPawnHeight, scene);
                 st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
@@ -3610,7 +3641,8 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
             }
             st = EMovement::MOVE_GrabPullUp;
             m_state_timer = 0.0f;
-            m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+            m_pullup_start = m_telemetry.position;
+            m_telemetry.combat_anim_duration = m_telemetry.hanging_free ? 1.85f : 1.48f;
             {
                 // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
                 // room to stand on top.
@@ -3635,7 +3667,8 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
     if (input.forward > 0.8f && facing_wall && m_hang_time > 0.1f && !m_grab_rail) {
         st = EMovement::MOVE_GrabPullUp;
         m_state_timer = 0.0f;
-        m_telemetry.combat_anim_duration = c.grab_pull_up_time;
+        m_pullup_start = m_telemetry.position;
+        m_telemetry.combat_anim_duration = m_telemetry.hanging_free ? 1.85f : 1.48f;
         {
             // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
             // room to stand on top.
@@ -3815,27 +3848,34 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
 
 bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelScene& scene) {
     const MovementConfig& c = m_config;
-    if (input.forward <= 0.8f) return false;
     const bool grounded = m_telemetry.grounded;
     const EMovement st = m_telemetry.move_state;
     const Vec3 fwd = facing_forward();
     const Vec3 h = horiz(m_telemetry.velocity);
     const float speed = h.length();
 
-    // TdMove_SpeedVault / TdMove_VaultOver (faith-runner vault::plan VaultTypes[1..5]):
-    // Checked both on ground jump press and while rising in the air (velocity.z >= 0 for 48..148,
-    // velocity.z >= 50 for 145..192). Falling across a rooftop gap (velocity.z < 0) does not vault.
+    // On ground, vault requires forward intent (> 0.8); in mid-air, allow vaulting whenever holding
+    // forward (> 0.25) OR pressing/holding Jump while carrying horizontal momentum toward the obstacle.
+    if (grounded) {
+        if (input.forward <= 0.8f) return false;
+    } else {
+        if (input.forward <= 0.25f && !jump_pressed() && !input.jump && h.dot(fwd) < 120.0f) return false;
+    }
+
+    // TdMove_SpeedVault / TdMove_VaultOver (DefaultPawnMovement.ini VaultTypes[0..5]):
+    // VaultTypes[0] (autostepuprightleg, 0..48 uu) allows MinSpeedZ = -600.0; VaultTypes[1..3] allow
+    // MinSpeedZ = -300.0 (e.g. jumping from 2..4 m away and reaching the railing just past jump apex!).
     if (!grounded) {
         if (st == EMovement::MOVE_DodgeJump || st == EMovement::MOVE_180TurnInAir ||
             st == EMovement::MOVE_MeleeAir || st == EMovement::MOVE_MeleeWallrun) {
             return false;
         }
-        if (m_telemetry.velocity.z < 0.0f) return false;
+        if (m_telemetry.velocity.z < -450.0f) return false;
     }
 
     // TimeToHandPlant: the ledge must be reachable within 0.4 s at the current speed (300 at least).
     const float reach = std::max(speed, 300.0f) * c.vault_max_handplant_time - kPawnRadius;
-    const float min_rise = grounded ? kMaxStepHeight : 48.0f;
+    const float min_rise = grounded ? kMaxStepHeight : 12.0f;
     const float max_rise = kVaultHighMaxHeight;
     const Ledge ledge = find_ledge(fwd, reach, min_rise, max_rise, scene);
     if (!ledge.found) return false;
@@ -3846,10 +3886,20 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     }
     const float handplant = ledge.top_z - m_telemetry.position.z;
     if (handplant < min_rise || handplant > max_rise) return false;
+    if (!grounded && handplant >= 48.0f && m_telemetry.velocity.z < -300.0f) return false;
     if (!grounded && handplant >= kVaultHighMinHeight && m_telemetry.velocity.z < 50.0f) return false;
 
     const Vec3 dir = horiz(fwd).normalized();
     const Vec3 into = -ledge.normal;
+    // When handplant < 48 in mid-air (feet already jumped up near the railing top), verify the obstacle
+    // actually rises >= 42 uu above the floor in front of it so flat ground / low curbs never trigger a vault.
+    if (!grounded && handplant < 48.0f) {
+        const Vec3 front_probe = ledge.top_point - into * 24.0f;
+        const TraceHit gnd = trace_ray(Vec3(front_probe.x, front_probe.y, ledge.top_z + 4.0f),
+                                       Vec3(front_probe.x, front_probe.y, ledge.top_z - 160.0f), scene);
+        if (gnd.hit && (ledge.top_z - gnd.point.z) < 42.0f) return false;
+    }
+
     const float end_dist = std::max(48.0f, speed * 0.3f);
     const float top_z = ledge.top_z;
     const float probe_extra = std::max(0.0f, (ledge.top_point - m_telemetry.position).dot(into) - ledge.wall_distance);
@@ -3929,6 +3979,9 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
         m_path_p2 = Vec3(end.x, end.y, top_z);
         m_path_end_move = EMovement::MOVE_Walking;
     }
+    if (!grounded) {
+        consume_jump();
+    }
     const bool high_vault = (handplant >= kVaultHighMinHeight);
     // VaultOverHigh / VaultOntoHigh have an up phase (VaultTimeUp 0.28 / 0.27 s) with look input
     // ignored until the hand plant; the other vault types start in the over phase.
@@ -3950,7 +4003,7 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
     set_move_anim(handplant < 48.0f ? "autostepuprightleg"
                   : high_vault ? (over ? "VaultOverHigh" : "VaultOntoHigh")
                   : over ? "VaultOver"
-                  : (speed <= 200.0f ? "stepuprightleg88" : "VaultOnto"));
+                  : (speed <= 200.0f && handplant < 64.0f ? "stepuprightleg88" : "VaultOnto"));
     m_takeoff_move = EMovement::MOVE_VaultOver;
     m_state_timer = 0.0f;
     m_telemetry.combat_anim_duration = m_path_t1 + m_path_t2;
@@ -5014,7 +5067,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     bool candidate_from_back = false;
     bool disarm_out_of_time = false;  // an armed enemy in reach, but not open to it
     for (auto& bot : scene.enemies) {
-        if (!bot.alive || bot.weapon_name == "None" || bot.weapon_name.empty()) continue;
+        if (!bot.alive || bot.is_story_npc || bot.weapon_name == "None" || bot.weapon_name.empty()) continue;
         float dist = m_telemetry.position.distance(bot.position);
         if (dist < 210.0f) {
             disarm_out_of_time = true;
@@ -5292,6 +5345,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     // 3. Wallrun Kick Hit Detection (while airborne in MOVE_MeleeWallrun)
     if (m_telemetry.move_state == EMovement::MOVE_MeleeWallrun && m_state_timer < 0.35f) {
         for (auto& bot : scene.enemies) {
+            if (bot.is_story_npc) continue;
             if (bot.alive && m_telemetry.position.distance(bot.position) < 195.0f) {
                 bot.health -= 90.0f;
                 bot.stunned = true;
@@ -5321,6 +5375,15 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 
         Vec3 fwd = Rotator::from_degrees(0.0f, m_telemetry.yaw_deg, 0.0f).forward();
         m_telemetry.melee_hit_confirmed = false;
+
+        // Airborne / Crouched melee near a closed door opens the door (`TdMove_AirBarge` / `TdMove_MeleeCrouch`).
+        {
+            Vec3 door_hit;
+            const int door_ahead = find_barge_door(scene, fwd, 185.0f, door_hit);
+            if (door_ahead >= 0) {
+                open_barge_door(door_ahead, fwd, true, scene);
+            }
+        }
 
         if (!m_telemetry.grounded) {
             // Airborne Flying Jump Kick (`TdMove_MeleeAir`: `JumpKickStart` -> `JumpKickEnd`)
@@ -5361,7 +5424,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 
         // Melee Hit Detection & Target Magnetism (from DefaultAIMeleeAttacks.ini)
         for (auto& bot : scene.enemies) {
-            if (!bot.alive) continue;
+            if (!bot.alive || bot.is_story_npc) continue;
             float reach = (m_telemetry.move_state == EMovement::MOVE_MeleeAir) ? 225.0f : 195.0f;
             float dist = m_telemetry.position.distance(bot.position);
             if (dist < reach) {
@@ -5437,6 +5500,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 // -----------------------------------------------------------------------------
 void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
     for (auto& bot : scene.enemies) {
+        if (bot.is_story_npc) continue;
         bot.anim_timer += dt;
         if (bot.muzzle_flash_timer > 0.0f) {
             bot.muzzle_flash_timer = std::max(0.0f, bot.muzzle_flash_timer - dt);
@@ -5534,8 +5598,9 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.from_player = false;
                 scene.active_tracers.push_back(tr);
 
-                // Deal damage if line-of-sight is clear and Faith isn't actively evading
-                bool evading = (m_telemetry.move_state == EMovement::MOVE_Slide ||
+                // Deal damage if line-of-sight is clear and Faith isn't actively evading or in a cutscene
+                bool evading = (m_telemetry.intro_active ||
+                                m_telemetry.move_state == EMovement::MOVE_Slide ||
                                 m_telemetry.move_state == EMovement::MOVE_MeleeSlide ||
                                 m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
                                 m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
@@ -5564,7 +5629,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 bot.attack_timer = 0.0f;
                 bot.anim_timer = 0.0f;
                 bot.anim_state = EEnemyAnimState::MeleeStrike;
-                if (m_telemetry.move_state != EMovement::MOVE_Snatch) {
+                if (m_telemetry.move_state != EMovement::MOVE_Snatch && !m_telemetry.intro_active) {
                     m_telemetry.health = std::max(0.0f, m_telemetry.health - 22.0f);
                     m_telemetry.damage_flash_timer = 0.35f;
                     m_damage_cooldown = m_config.health_regen_delay;
@@ -5583,10 +5648,12 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
 
         if (heli.state == EHeliState::Destroyed) continue;
 
-        float dist_trig = (m_telemetry.position - heli.trigger_pos).length();
-        float dist_spawn = (m_telemetry.position - heli.spawn_pos).length();
+        Vec3 trig_delta = m_telemetry.position - heli.trigger_pos;
+        float dist_trig_xy = std::sqrt(trig_delta.x * trig_delta.x + trig_delta.y * trig_delta.y);
+        float dist_trig_z = std::abs(trig_delta.z);
         if (heli.state == EHeliState::Dormant) {
-            if (dist_trig <= heli.trigger_radius || dist_spawn <= 5200.0f) {
+            if (!m_telemetry.intro_active &&
+                dist_trig_xy <= heli.trigger_radius && dist_trig_z <= 520.0f) {
                 heli.state = (heli.hold_fire_delay > 0.05f) ? EHeliState::Arriving : EHeliState::Engaging;
                 heli.active_timer = 0.0f;
                 heli.just_spawned = true;
@@ -5667,8 +5734,17 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
         heli.pitch_deg = std::clamp(-fwd_spd * 0.008f, -12.0f, 12.0f);
         heli.roll_deg = std::clamp(side_spd * 0.010f, -15.0f, 15.0f);
 
-        // Door gunner FNMinimi bursts when Engaging
-        if (heli.state == EHeliState::Engaging && to_player.length() < 6500.0f) {
+        // Door gunner FNMinimi bursts when Engaging, in broadside door arc, and outside cutscenes
+        Vec3 heli_fwd(cy, sy, 0.0f);
+        Vec3 dir_player_2d = Vec3(to_player.x, to_player.y, 0.0f).normalized();
+        float nose_dot = std::abs(heli_fwd.dot(dir_player_2d));
+        float burst_cycle = std::fmod(heli.active_timer, 2.20f);
+        bool in_burst_window = (burst_cycle < 0.85f);
+        if (!m_telemetry.intro_active &&
+            heli.state == EHeliState::Engaging &&
+            in_burst_window &&
+            nose_dot < 0.82f &&
+            to_player.length() < 6500.0f) {
             heli.burst_timer += dt;
             if (heli.burst_timer >= 0.14f) {
                 heli.burst_timer = 0.0f;
@@ -5678,7 +5754,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 Vec3 right(-sy, cy, 0.0f);
                 float side_sign = (side_offset < 0.0f) ? 1.0f : -1.0f;
                 Vec3 gun_muzzle = heli.position + right * (side_sign * 165.0f) - Vec3(0.0f, 0.0f, 45.0f);
-                float spread_scale = heli.perfect_aim_active ? 18.0f : 95.0f;
+                float spread_scale = heli.perfect_aim_active ? 24.0f : 115.0f;
                 float phase = m_telemetry.sim_time * 13.7f;
                 Vec3 aim_pt = m_telemetry.position + Vec3(std::sin(phase) * spread_scale,
                                                           std::cos(phase * 1.3f) * spread_scale,
@@ -5699,9 +5775,9 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                                 m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
                                 m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
                                 m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
-                                m_telemetry.speed_2d > 560.0f);
+                                m_telemetry.speed_2d > 480.0f);
                 if (!los.hit && !evading) {
-                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 5.5f);
+                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 4.5f);
                     m_telemetry.damage_flash_timer = 0.20f;
                     m_damage_cooldown = m_config.health_regen_delay;
                 }
@@ -5747,6 +5823,11 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
 // Health Regeneration Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_health_and_regen(float dt) {
+    if (m_telemetry.intro_active) {
+        m_telemetry.health = 100.0f;
+        m_telemetry.damage_flash_timer = 0.0f;
+        return;
+    }
     if (m_damage_cooldown > 0.0f) {
         m_damage_cooldown -= dt;
     } else if (m_telemetry.health < 100.0f && m_telemetry.health > 0.0f) {
@@ -5758,6 +5839,10 @@ void ParkourController::update_health_and_regen(float dt) {
 // Checkpoints, Kill Volumes & Collectibles Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
+    if (m_telemetry.intro_active) {
+        m_last_checkpoint_pos.z = std::min(m_last_checkpoint_pos.z, m_telemetry.position.z);
+        return;
+    }
     // When grounded safely on a lower rooftop/cushion after a zipline or elevator drop, lower the
     // checkpoint vertical void baseline so multi-story descents never trigger a false abyss kill.
     if (m_telemetry.grounded && m_telemetry.health > 0.0f && m_telemetry.position.z < m_last_checkpoint_pos.z) {
@@ -5771,19 +5856,19 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
                            (m_telemetry.position.z < void_ref_z - 2200.0f) &&
                            !has_soft_landing_below(scene);
 
-    // 1. Fall Death (WorldInfo.KillZ, lethal drop into void below checkpoint, or health <= 0) -> Play Death Sequence -> Respawn
+    // 1. Non-floor Death (WorldInfo.KillZ, void drop below checkpoint, or combat health <= 0):
+    // Note: fall_death_impact is ONLY set on physical floor impact in land(); void/combat deaths
+    // do NOT play concrete body-splat (Death_Impact).
     if (m_telemetry.position.z < scene.kill_z ||
         void_fall ||
         m_telemetry.health <= 0.0f) {
-        if (!m_telemetry.fall_death_impact) {
+        if (!m_telemetry.falling_to_death) {
             m_telemetry.falling_to_death = true;
-            m_telemetry.fall_death_impact = true;
             m_telemetry.health = 0.0f;
             m_death_total_duration = m_telemetry.grounded ? 1.35f : 0.90f;
             m_death_timer = m_death_total_duration;
             m_telemetry.death_anim_progress = 0.0f;
             m_telemetry.damage_flash_timer = 0.45f;
-            m_telemetry.active_subtitle = "Lethal Fall";
         } else {
             m_death_timer -= m_frame_dt;
             m_telemetry.death_anim_progress = std::clamp(
@@ -6069,8 +6154,9 @@ int ParkourController::find_barge_door(const LevelScene& scene, const Vec3& dir,
 bool ParkourController::try_initiate_barge(const LevelScene& scene) {
     const EMovement st = m_telemetry.move_state;
     const bool walking = m_telemetry.grounded &&
-                         (st == EMovement::MOVE_Walking || st == EMovement::MOVE_StepUp ||
-                          st == EMovement::MOVE_AutoStepUp || st == EMovement::MOVE_SoftLanding);
+                         (st == EMovement::MOVE_Walking || st == EMovement::MOVE_Crouch ||
+                          st == EMovement::MOVE_StepUp || st == EMovement::MOVE_AutoStepUp ||
+                          st == EMovement::MOVE_SoftLanding);
     if (!walking || m_melee_cooldown > 0.0f) return false;
 
     // TdMove_Barge.CanDoMove: no running barge with a heavy weapon; the trace reaches as far as
@@ -6081,12 +6167,14 @@ bool ParkourController::try_initiate_barge(const LevelScene& scene) {
     if (heavy && speed > kBargeKickThresholdSpeed) return false;
     const float barge_speed = std::min(kBargeMaxSpeed, speed + kBargeAddOnSpeed);
     const Vec3 facing = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();  // vector(PawnOwner.Rotation)
+    const Vec3 cam_fwd = facing_forward();
     const Vec3 vel_dir = (speed > 1e-3f) ? vel * (1.0f / speed) : Vec3(0.0f, 0.0f, 0.0f);
-    const bool forward = facing.dot(vel_dir) > 0.707f;
+    const bool forward = (facing.dot(vel_dir) > 0.707f || cam_fwd.dot(vel_dir) > 0.707f);
     const float trace_dist =
         forward ? std::max(kBargeMinTraceDistance, barge_speed * kBargeTraceTime) : kBargeMinTraceDistance;
     Vec3 hit_point;
-    const int door = find_barge_door(scene, facing, trace_dist, hit_point);
+    int door = find_barge_door(scene, facing, trace_dist, hit_point);
+    if (door < 0) door = find_barge_door(scene, cam_fwd, trace_dist, hit_point);
     if (door < 0) return false;
 
     // TdMove_Barge.StartMove / StartBargin.
@@ -6187,23 +6275,27 @@ void ParkourController::update_barge(const InputFrame& input, float dt, LevelSce
         }
     }
 
-    if (m_barge_anim == 1 && m_walk_blocked && !m_barge_dealt_damage) {
-        // HitWall / Bump -> TryGiveBargeDamage (shoulder barge, once): the door takes the hit, the
-        // pawn stops where it is (SetPreciseLocation(Location)) and BargeOutLeft plays from the
-        // impact at full weight. physWalking leaves the velocity at what the blocked move covered;
-        // after that the pawn walks on its input again.
-        m_barge_dealt_damage = true;
-        m_barge_precise = false;
-        const Vec3 moved = horiz(m_telemetry.position - start);
-        m_telemetry.velocity.x = moved.x / dt;
-        m_telemetry.velocity.y = moved.y / dt;
-        open_barge_door(m_barge_door, m_barge_dir, true, scene);
-        m_barge_anim = 2;
-        m_barge_anim_pos = 0.0f;
-        m_barge_anim_elapsed = 0.0f;
-        m_barge_anim_rate = 1.0f;
-        set_move_anim("BargeOutLeft");  // PlayMoveAnim(CNT_UpperBody, .., 1.0, 0.0, 0.2)
-        length = kBargeOutLeftLength;
+    if (m_barge_anim == 1 && (m_walk_blocked || m_barge_dealt_damage)) {
+        // HitWall / Bump -> TryGiveBargeDamage (shoulder barge, once): open the door immediately
+        // on contact so Faith powers cleanly through the leaf, and transition from BargeInLeft to
+        // BargeOutLeft once at least 0.12 s of the shoulder wind-up has played.
+        if (!m_barge_dealt_damage) {
+            m_barge_dealt_damage = true;
+            m_barge_precise = false;
+            const Vec3 moved = horiz(m_telemetry.position - start);
+            const float retain = std::max(moved.length() / dt, m_barge_speed * 0.72f);
+            m_telemetry.velocity.x = m_barge_dir.x * retain;
+            m_telemetry.velocity.y = m_barge_dir.y * retain;
+            open_barge_door(m_barge_door, m_barge_dir, true, scene);
+        }
+        if (m_barge_anim_pos >= 0.12f) {
+            m_barge_anim = 2;
+            m_barge_anim_pos = 0.0f;
+            m_barge_anim_elapsed = 0.0f;
+            m_barge_anim_rate = 1.0f;
+            set_move_anim("BargeOutLeft");  // PlayMoveAnim(CNT_UpperBody, .., 1.0, 0.0, 0.2)
+            length = kBargeOutLeftLength;
+        }
     } else if (m_barge_anim == 3 && !m_barge_dealt_damage && prev_pos < kBargeKickHitTime &&
                m_barge_anim_pos >= kBargeKickHitTime) {
         // The kick's BargeHitNotify: HitObject on the door.
