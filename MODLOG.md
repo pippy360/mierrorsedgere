@@ -791,3 +791,37 @@ how it was read.
 In `docs/GAMEPLAY_SCRIPTING_RE.md`, section 7: the training area's challenge system (the tutorial keeps
 the port's staged version), AI factories' `All Dead`, positioned Matinee sounds, the hint card's picture,
 retail's text layout, the Ropeburn disarm (given to the player).
+
+## 16. Ambient emitters: silent behind the menus, and the vehicle packs wait between sounds (agent/menu-car-horn, 2026-10-09)
+
+Reported: "the car beeping sound effect plays too often in the main menu".
+
+### 16.1 Root causes
+- The port loads a level behind its front end (the Training Area at start-up) and kept running that
+  level's `AmbientSound` emitters with the listener at the world's origin. In `Tutorial_p` the origin is
+  next to `AmbientSound` `VehiclePack_02` at (-767, 640, 122) and inside `WindHard`'s radius, so both played.
+- An emitter was one looping OpenAL source on one wave of its cue. `VehiclePack_02`
+  (`A_Ambience_Vehicles.VehiclePacks`, cooked into the `*_Aud.me1` sublevels) is
+  `TdSoundNodeMixGroup` -> `SoundNodeAttenuation` -> `SoundNodeLooping` -> `SoundNodeDelay` (7 to 15 s) ->
+  `SoundNodeModulator` -> `SoundNodeRandom` (six groups weighted 7/3/8/8/5/7: brakes, buses, cars, horns,
+  motorcycles, trucks; 38 waves). The port looped its first wave end to end, with no delay.
+- Retail's front end is its own map. `Maps/Menu/TdMainMenu.me1` has no `AmbientSound` and no Kismet that
+  plays a sound: `SeqAct_CrossFadeMusicTracks` for the menu music and four `UIAction_PlaySound`
+  (`A_HUD.Menu.Accept`) are all of it.
+
+### 16.2 Changes
+- `src/audio/audio_engine.*`: with a menu up (`is_menu_music_`: the front end or the pause menu) the
+  emitter pool is stopped. `next_ambient_voice()` evaluates the cue's graph (`collect_cue_voices`): a
+  cue with a delay under its loop waits the drawn delay, plays the picked wave once at the drawn volume
+  and pitch, and draws again when the source stops; other cues loop as before.
+- `docs/AUDIO_SYSTEM_RE.md` section 7, `docs/MAIN_MENU_SYSTEM_RE.md` section 7.
+
+### 16.3 Results (Windows, `mirrorsedge_windows`, a temporary log of the emitter pool)
+- Front end for 20 s: no emitter starts (before: `VehiclePack_02` and `WindHard` at once, looping).
+- In the Training Area next to that emitter (`ME_WARP=-767,640,200,0`), 75 s: delays of 10.76, 9.79,
+  8.47, 12.38, 11.32 and 11.14 s, each followed by one sound played once (a motorcycle, brakes, a horn,
+  brakes, a horn), 1.1 to 6.1 s long.
+- `--verify-all`: ALL SYSTEMS PASS. macOS: compiles and links on `macos-15` (CI on a throwaway branch).
+
+### 16.4 Remaining gaps
+In `TODO.md`: layered ambient cues (`WindHard` plays one of its layers), and cues without a loop node.
