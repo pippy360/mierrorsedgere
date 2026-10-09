@@ -1,5 +1,7 @@
 #include "upk_loader.hpp"
 #include "level_intro.hpp"
+#include "level_lightmaps.hpp"
+#include "level_postprocess.hpp"
 #include "material_system.hpp"
 #include "package_manager.hpp"
 #include "ue3_props.hpp"
@@ -240,38 +242,76 @@ void append_capsule(std::vector<Vec3>& out, const ElemMatrix& tm, float radius, 
 
 } // namespace
 
-void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out) {
+namespace {
+
+// One KConvexElem: its faces as triangles, or the hull of its vertices when it lists none.
+void append_convex_elem_triangles(const UPKPackage& pkg, const UPropertyList& el, std::vector<Vec3>& out) {
     const auto& d = pkg.get_data();
-    for (const UProperty& f : agg_geom.fields) {
-        if (f.name == "ConvexElems") {
-            for (const UPropertyList& el : f.elements) {
-                std::vector<Vec3> verts;
-                if (const UProperty* vd = find_prop(el, "VertexData")) {
-                    if (vd->value_offset + 4 <= d.size()) {
-                        int32_t count = 0;
-                        std::memcpy(&count, d.data() + vd->value_offset, 4);
-                        if (count > 0 && count < 100000 &&
-                            vd->value_offset + 4 + static_cast<size_t>(count) * 12 <= d.size() &&
-                            static_cast<size_t>(vd->size) == 4 + static_cast<size_t>(count) * 12) {
-                            verts.resize(static_cast<size_t>(count));
-                            for (int32_t k = 0; k < count; ++k) {
-                                std::memcpy(&verts[k], d.data() + vd->value_offset + 4 + static_cast<size_t>(k) * 12, 12);
-                            }
-                        }
-                    }
-                }
-                if (verts.size() < 3) continue;
-                const UProperty* ft = find_prop(el, "FaceTriData");
-                if (ft && ft->ints.size() >= 3) {
-                    for (size_t t = 0; t + 2 < ft->ints.size(); t += 3) {
-                        const int32_t i0 = ft->ints[t], i1 = ft->ints[t + 1], i2 = ft->ints[t + 2];
-                        if (i0 < 0 || i1 < 0 || i2 < 0 || static_cast<size_t>(std::max({i0, i1, i2})) >= verts.size()) continue;
-                        push_tri(out, verts[i0], verts[i1], verts[i2]);
-                    }
-                } else {
-                    convex_hull_triangles(verts, out);
+    std::vector<Vec3> verts;
+    if (const UProperty* vd = find_prop(el, "VertexData")) {
+        if (vd->value_offset + 4 <= d.size()) {
+            int32_t count = 0;
+            std::memcpy(&count, d.data() + vd->value_offset, 4);
+            if (count > 0 && count < 100000 &&
+                vd->value_offset + 4 + static_cast<size_t>(count) * 12 <= d.size() &&
+                static_cast<size_t>(vd->size) == 4 + static_cast<size_t>(count) * 12) {
+                verts.resize(static_cast<size_t>(count));
+                for (int32_t k = 0; k < count; ++k) {
+                    std::memcpy(&verts[k], d.data() + vd->value_offset + 4 + static_cast<size_t>(k) * 12, 12);
                 }
             }
+        }
+    }
+    if (verts.size() < 3) return;
+    const UProperty* ft = find_prop(el, "FaceTriData");
+    if (ft && ft->ints.size() >= 3) {
+        for (size_t t = 0; t + 2 < ft->ints.size(); t += 3) {
+            const int32_t i0 = ft->ints[t], i1 = ft->ints[t + 1], i2 = ft->ints[t + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || static_cast<size_t>(std::max({i0, i1, i2})) >= verts.size()) continue;
+            push_tri(out, verts[i0], verts[i1], verts[i2]);
+        }
+    } else {
+        convex_hull_triangles(verts, out);
+    }
+}
+
+}  // namespace
+
+void read_actor_brush_hulls(const UPKPackage& pkg, int32_t actor_export_1based, std::vector<std::vector<Vec3>>& out) {
+    UPropertyList actor;
+    parse_export_properties(pkg, actor_export_1based, actor);
+    const int32_t component = prop_object(actor, "BrushComponent");
+    if (component <= 0 || static_cast<size_t>(component) > pkg.get_exports().size()) return;
+    UPropertyList comp;
+    parse_export_properties(pkg, component, comp);
+    const UProperty* agg = find_prop(comp, "BrushAggGeom");
+    if (!agg) return;
+
+    Vec3 location(0.0f, 0.0f, 0.0f), pre_pivot(0.0f, 0.0f, 0.0f), scale3(1.0f, 1.0f, 1.0f);
+    Rotator rotation(0, 0, 0);
+    if (const UProperty* p = find_prop(actor, "Location")) location = Vec3(p->v[0], p->v[1], p->v[2]);
+    if (const UProperty* p = find_prop(actor, "PrePivot")) pre_pivot = Vec3(p->v[0], p->v[1], p->v[2]);
+    if (const UProperty* p = find_prop(actor, "DrawScale3D")) scale3 = Vec3(p->v[0], p->v[1], p->v[2]);
+    if (const UProperty* p = find_prop(actor, "Rotation")) rotation = Rotator(p->vi[0], p->vi[1], p->vi[2]);
+    const float scale = prop_float(actor, "DrawScale", 1.0f);
+    const ActorTransform xf(location, rotation, scale3 * scale, pre_pivot);
+
+    for (const UProperty& f : agg->fields) {
+        if (f.name != "ConvexElems") continue;
+        for (const UPropertyList& el : f.elements) {
+            std::vector<Vec3> local;
+            append_convex_elem_triangles(pkg, el, local);
+            if (local.size() < 12) continue;  // a closed piece has four faces at least
+            for (Vec3& v : local) v = xf.apply(v);
+            out.push_back(std::move(local));
+        }
+    }
+}
+
+void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out) {
+    for (const UProperty& f : agg_geom.fields) {
+        if (f.name == "ConvexElems") {
+            for (const UPropertyList& el : f.elements) append_convex_elem_triangles(pkg, el, out);
         } else if (f.name == "BoxElems") {
             for (const UPropertyList& el : f.elements) {
                 const ElemMatrix tm = read_elem_matrix(pkg, el);
@@ -1256,6 +1296,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             };
             bool has_materials = false;
             a.material_overrides = read_component_materials(comp_idx, has_materials);
+            a.lightmap = read_component_lightmap(*this, comp_idx);
             if (!has_materials && comp_exp.archetype > 0 && static_cast<size_t>(comp_exp.archetype) <= exports_.size()) {
                 a.material_overrides = read_component_materials(comp_exp.archetype, has_materials);
             }
@@ -2430,6 +2471,9 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
         if (auto it = mesh_props.find("UseSimpleLineCollision"); it != mesh_props.end()) {
             asset.use_simple_line_collision = it->second.bool_val;
         }
+        if (auto it = mesh_props.find("LightMapCoordinateIndex"); it != mesh_props.end()) {
+            asset.lightmap_uv_index = std::clamp(it->second.int_val, 0, 7);
+        }
         int32_t body_setup_ref = 0;
         std::memcpy(&body_setup_ref, rem + 28, 4);
         if (body_setup_ref > 0 && static_cast<size_t>(body_setup_ref) <= exports_.size()) {
@@ -2658,6 +2702,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
                                        (static_cast<uint32_t>(sv[8]) << 16) | (static_cast<uint32_t>(sv[11]) << 24))
                                     : 0xFFFFFFFFu;
                 asset.triangles.push_back(v);
+                asset.source_vertex.push_back(idx[k]);
             }
         };
 
@@ -2805,24 +2850,25 @@ void UPKPackage::extract_bsp_collision(std::vector<Vec3>& out_triangles) const {
     }
 }
 
-void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, std::vector<Vertex>>>& out_bins,
-                                             AABB& inout_bounds) const {
+void UPKPackage::extract_bsp_render_geometry(std::vector<BspRenderBin>& out_bins, AABB& inout_bounds,
+                                             LightMapSets* lightmaps) const {
     constexpr uint32_t PF_Invisible = 0x00000001u;
     constexpr uint32_t PF_TwoSided  = 0x00000100u;
     constexpr uint32_t PF_Portal    = 0x04000000u;
 
     std::unordered_map<std::string, size_t> bin_index;
+    const auto bin_name = [](const std::string& mat_path, int32_t set) { return to_lower(mat_path) + "#" + std::to_string(set); };
     for (size_t i = 0; i < out_bins.size(); ++i) {
-        bin_index.emplace(to_lower(out_bins[i].first), i);
+        bin_index.emplace(bin_name(out_bins[i].material, out_bins[i].lightmap_set), i);
     }
-    auto get_bin = [&](const std::string& mat_path) -> std::vector<Vertex>& {
-        const std::string key = to_lower(mat_path);
+    auto get_bin = [&](const std::string& mat_path, int32_t set) -> std::vector<Vertex>& {
+        const std::string key = bin_name(mat_path, set);
         auto it = bin_index.find(key);
-        if (it != bin_index.end()) return out_bins[it->second].second;
+        if (it != bin_index.end()) return out_bins[it->second].vertices;
         const size_t idx = out_bins.size();
-        out_bins.emplace_back(mat_path, std::vector<Vertex>{});
+        out_bins.push_back(BspRenderBin{mat_path, set, {}});
         bin_index.emplace(key, idx);
-        return out_bins.back().second;
+        return out_bins.back().vertices;
     };
 
     auto unpack_normal = [](const uint8_t* b) {
@@ -2888,6 +2934,20 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, 
             }
         }
 
+        // The baked lighting of the elements that draw this model's nodes, and the texture set
+        // each is in.
+        std::vector<ActorLightMap> light_maps;
+        std::vector<int32_t> node_light_map;
+        std::vector<int32_t> light_map_set;
+        if (lightmaps) {
+            read_model_lightmaps(*this, static_cast<int32_t>(i) + 1, light_maps, node_light_map);
+            light_map_set.reserve(light_maps.size());
+            for (const ActorLightMap& lm : light_maps) {
+                const int32_t set = lightmaps->index_of(lm.package_path, lm.textures);
+                light_map_set.push_back(set < 2047 ? set : -1);
+            }
+        }
+
         for (int32_t n = 0; n < nodes.count; ++n) {
             const uint8_t* nd = data_.data() + nodes.data + static_cast<size_t>(n) * 64;
             int32_t vert_pool = 0, surf = 0, vert_idx = 0;
@@ -2935,6 +2995,22 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, 
                 std::memcpy(&tex_v, data_.data() + vectors.data + static_cast<size_t>(v_tex_v) * 12, 12);
             }
 
+            // The node's light map. Its vertices' ShadowTexCoord runs 0..1 across the element's
+            // rectangle of the atlas, and only the cooked vertex buffer has it.
+            const ActorLightMap* lm = nullptr;
+            int32_t lm_set = -1;
+            if (static_cast<size_t>(n) < node_light_map.size() && node_light_map[static_cast<size_t>(n)] >= 0 && vb_data) {
+                const size_t at = static_cast<size_t>(node_light_map[static_cast<size_t>(n)]);
+                if (light_map_set[at] >= 0) {
+                    lm = &light_maps[at];
+                    lm_set = light_map_set[at];
+                }
+            }
+            uint32_t lm_scale[3] = {0u, 0u, 0u};
+            if (lm) {
+                for (int k = 0; k < 3; ++k) lm_scale[k] = pack_rgb9e5(lm->scale[k]);
+            }
+
             Vertex poly_v[256];
             int count = 0;
             for (int k = 0; k < num_verts; ++k) {
@@ -2968,6 +3044,17 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, 
                         std::memcpy(&v.v2, fv + 12, 4);
                     }
                 }
+                if (lm) {
+                    v.lm_u = std::max(0.0f, v.u2 * lm->coord_scale[0] + lm->coord_bias[0]);
+                    v.lm_v = v.v2 * lm->coord_scale[1] + lm->coord_bias[1];
+                    v.lm0 = lm_scale[0];
+                    v.lm1 = lm_scale[1];
+                    v.lm2 = lm_scale[2];
+                } else if (lightmaps) {
+                    // Baked no light map: it takes no light (three samples of nothing).
+                    v.lm_u = -1.0f;
+                    v.lm0 = v.lm1 = v.lm2 = 0u;
+                }
                 // A model's vertex factory gives materials one texture coordinate set, TexCoord
                 // (UModelComponent binds ShadowTexCoord as the light-map coordinate only), so
                 // every TextureCoordinate index reads it, as the last set does on any mesh.
@@ -2978,7 +3065,7 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<std::pair<std::string, 
             }
             if (count < 3) continue;
 
-            std::vector<Vertex>& dst = get_bin(mat_path);
+            std::vector<Vertex>& dst = get_bin(mat_path, lm_set);
             for (int k = 1; k + 1 < count; ++k) {
                 const Vertex& a = poly_v[0];
                 const Vertex& b = poly_v[k];
@@ -3073,8 +3160,12 @@ AABB transformed_mesh_bounds(const LevelActor& a, const StaticMeshAsset& sm) {
 // Emits StaticMeshActor LOD0 triangles in world space, binned per scene material.
 class MeshEmitter {
 public:
-    explicit MeshEmitter(std::vector<std::string>* material_paths, MaterialUVResolver* material_uvs = nullptr)
-        : material_paths_(material_paths), material_uvs_(material_uvs) {
+    // A bin is the geometry of one material lit by one light-map texture set.
+    static int32_t bin_key(int32_t material, int32_t lightmap_set) { return material | ((lightmap_set + 1) << 20); }
+
+    explicit MeshEmitter(std::vector<std::string>* material_paths, MaterialUVResolver* material_uvs = nullptr,
+                         LightMapSets* lightmaps = nullptr)
+        : material_paths_(material_paths), material_uvs_(material_uvs), lightmaps_(lightmaps) {
         if (material_paths_) {
             for (size_t i = 0; i < material_paths_->size(); ++i) {
                 ids_.emplace(to_lower((*material_paths_)[i]), static_cast<int32_t>(i));
@@ -3083,14 +3174,15 @@ public:
     }
     [[nodiscard]] bool use_materials() const { return material_paths_ != nullptr; }
 
-    void emit_bsp(const std::vector<std::pair<std::string, std::vector<Vertex>>>& bsp_bins,
+    void emit_bsp(const std::vector<BspRenderBin>& bsp_bins,
                   std::map<int32_t, std::vector<Vertex>>& bins,
                   std::vector<Vertex>& flat) {
-        for (const auto& [mat_path, verts] : bsp_bins) {
+        for (const BspRenderBin& bin : bsp_bins) {
+            const std::vector<Vertex>& verts = bin.vertices;
             if (verts.empty()) continue;
             if (use_materials()) {
-                const int32_t mat = material_id(mat_path);
-                auto& dst = bins[mat];
+                const int32_t mat = material_id(bin.material);
+                auto& dst = bins[bin_key(mat, bin.lightmap_set)];
                 dst.insert(dst.end(), verts.begin(), verts.end());
             } else {
                 const size_t base = flat.size();
@@ -3115,6 +3207,22 @@ public:
         const uint32_t color = legacy_palette_color(a, to_lower(a.mesh_name));
         AABB box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
 
+        // The component's baked lighting: a place in a set of light-map textures, or a sample per
+        // mesh vertex. Without either the vertices say so (lm_u = -2).
+        const ActorLightMap& lm = a.lightmap;
+        static const bool show_unbaked = std::getenv("ME_SHOW_UNBAKED") != nullptr;
+        int32_t lm_set = -1;
+        uint32_t lm_scale[3] = {0u, 0u, 0u};
+        bool lm_texture = false;
+        if (lightmaps_ && lm.kind == ActorLightMap::Kind::Texture) {
+            lm_set = lightmaps_->index_of(lm.package_path, lm.textures);
+            for (int k = 0; k < 3; ++k) lm_scale[k] = pack_rgb9e5(lm.scale[k]);
+            lm_texture = lm_set >= 0 && lm_set < 2047;
+            if (!lm_texture) lm_set = -1;
+        }
+        const bool lm_vertex = lightmaps_ && lm.kind == ActorLightMap::Kind::Vertex &&
+                               sm.source_vertex.size() == sm.triangles.size();
+
         // The section's material decides which two of the mesh's UV sets the vertex carries.
         MaterialUVSlots slots;
         auto emit_vertex = [&](std::vector<Vertex>& dst, uint32_t index, bool keep_vertex_color) {
@@ -3134,6 +3242,29 @@ public:
             wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
             wv.tangent_sign = lv.tangent_sign * det_sign;
             if (!keep_vertex_color) wv.color = color;
+            if (lm_texture) {
+                float lu = 0.0f, lv2 = 0.0f;
+                sm.uv(index, sm.lightmap_uv_index, lu, lv2);
+                wv.lm_u = std::max(0.0f, lu * lm.coord_scale[0] + lm.coord_bias[0]);
+                wv.lm_v = lv2 * lm.coord_scale[1] + lm.coord_bias[1];
+                wv.lm0 = lm_scale[0];
+                wv.lm1 = lm_scale[1];
+                wv.lm2 = lm_scale[2];
+            } else if (lm_vertex) {
+                const size_t sample = static_cast<size_t>(sm.source_vertex[index]) * 3;
+                if (sample + 2 < lm.vertex_samples.size()) {
+                    wv.lm_u = -1.0f;
+                    wv.lm0 = lm.vertex_samples[sample];
+                    wv.lm1 = lm.vertex_samples[sample + 1];
+                    wv.lm2 = lm.vertex_samples[sample + 2];
+                }
+            } else if (lightmaps_) {
+                // Level geometry nothing was baked for (the sky dome, the far skyline's cards) is lit
+                // by nothing: every light of these levels is in the light maps, and the lights left
+                // dynamic do not reach the static channels. It shows what it emits.
+                wv.lm_u = -1.0f;
+                if (show_unbaked) wv.lm0 = wv.lm1 = wv.lm2 = pack_rgb9e5(Vec3(3.0f, 0.0f, 3.0f));
+            }
             dst.push_back(wv);
             box.expand(wp);
         };
@@ -3163,7 +3294,7 @@ public:
                 const std::string& mat_path = overridden ? a.material_overrides[e] : el.material;
                 const int32_t mat = material_id(mat_path);
                 slots = uv_slots(mat, mat_path);
-                emit_range(bins[mat], el.first_vertex, el.vertex_count, true);
+                emit_range(bins[bin_key(mat, lm_set)], el.first_vertex, el.vertex_count, true);
             }
         } else {
             emit_range(flat, 0, static_cast<uint32_t>(sm.triangles.size()), false);
@@ -3175,12 +3306,13 @@ public:
         size_t total = mb.vertices.size();
         for (const auto& [mat, verts] : bins) total += verts.size();
         mb.vertices.reserve(total);
-        for (auto& [mat, verts] : bins) {
+        for (auto& [key, verts] : bins) {
             if (verts.empty()) continue;
             MeshSection s;
             s.first_vertex = static_cast<uint32_t>(mb.vertices.size());
             s.vertex_count = static_cast<uint32_t>(verts.size());
-            s.material = mat;
+            s.material = key & 0xFFFFF;
+            s.lightmap = (key >> 20) - 1;
             mb.vertices.insert(mb.vertices.end(), verts.begin(), verts.end());
             mb.sections.push_back(s);
             std::vector<Vertex>().swap(verts);
@@ -3210,6 +3342,7 @@ private:
 
     std::vector<std::string>* material_paths_;
     MaterialUVResolver* material_uvs_;
+    LightMapSets* lightmaps_;
     std::unordered_map<std::string, int32_t> ids_;
     std::unordered_map<int32_t, MaterialUVSlots> uv_slots_;
 };
@@ -3263,9 +3396,10 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           CollisionWorld& out_collision,
                           const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib,
                           std::vector<std::string>* out_material_paths,
-                          const std::vector<std::pair<std::string, std::vector<Vertex>>>* bsp_render_bins,
+                          const std::vector<BspRenderBin>* bsp_render_bins,
                           const AABB* bsp_bounds,
-                          MaterialUVResolver* material_uvs) {
+                          MaterialUVResolver* material_uvs,
+                          LightMapSets* lightmaps) {
     out_meshes.clear();
 
     // Batched world buffers for single-draw-call-per-material rendering
@@ -3275,7 +3409,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
     rv_batch.name = "UE3_Level_RunnerVision_Geometry";
     rv_batch.is_runner_vision = true;
 
-    MeshEmitter emitter(out_material_paths, material_uvs);
+    MeshEmitter emitter(out_material_paths, material_uvs, lightmaps);
     std::map<int32_t, std::vector<Vertex>> world_bins;
     std::map<int32_t, std::vector<Vertex>> rv_bins;
 
@@ -4609,14 +4743,15 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     // then the moving elevator parts with their own buffers and collision.
     std::vector<std::string> material_paths;
     auto collision = std::make_shared<CollisionWorld>();
-    std::vector<std::pair<std::string, std::vector<Vertex>>> bsp_render_bins;
+    std::vector<BspRenderBin> bsp_render_bins;
     AABB bsp_bounds(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+    LightMapSets lightmap_sets;
     {
         // Level BSP (rooms, interiors blocked out with brushes) collides and renders as world geometry.
         std::vector<Vec3> bsp;
         for (const auto& pkg : loaded_packages) {
             pkg->extract_bsp_collision(bsp);
-            pkg->extract_bsp_render_geometry(bsp_render_bins, bsp_bounds);
+            pkg->extract_bsp_render_geometry(bsp_render_bins, bsp_bounds, pm ? &lightmap_sets : nullptr);
         }
         collision->reserve(bsp.size() / 3 + 1024);
         for (size_t i = 0; i + 2 < bsp.size(); i += 3) {
@@ -4628,7 +4763,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     std::unique_ptr<MaterialUVResolver> material_uvs;
     if (pm) material_uvs = std::make_unique<MaterialUVResolver>(*pm);
     build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr,
-                         &bsp_render_bins, &bsp_bounds, material_uvs.get());
+                         &bsp_render_bins, &bsp_bounds, material_uvs.get(), pm ? &lightmap_sets : nullptr);
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
     build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
@@ -4643,6 +4778,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         break;
     }
     out_scene.collision = std::move(collision);
+    extract_level_postprocess(*master_pkg, loaded_packages, out_scene);
 
     // Resolve, translate and load every material referenced by the level geometry
     // (ME_MATERIAL_VERBOSE=1 prints per-material diagnostics, ME_MAX_TEXTURE_SIZE caps mip size).
@@ -4650,7 +4786,10 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         MaterialBuildOptions mopts;
         if (const char* v = std::getenv("ME_MATERIAL_VERBOSE")) mopts.verbose = (v[0] != '\0' && v[0] != '0');
         if (const char* s = std::getenv("ME_MAX_TEXTURE_SIZE")) mopts.max_texture_size = std::max(16, std::atoi(s));
-        out_scene.materials = build_scene_materials(*pm, material_paths, mopts);
+        std::shared_ptr<SceneMaterialLibrary> library = build_scene_materials(*pm, material_paths, mopts);
+        // The baked light maps the geometry was emitted against.
+        if (library) lightmap_sets.load(*pm, loaded_packages, library->lightmap_textures);
+        out_scene.materials = std::move(library);
     }
     pm.reset();
 

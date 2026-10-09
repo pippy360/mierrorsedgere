@@ -484,6 +484,15 @@ struct Vertex {
     float v2 = 0.0f;
     uint32_t color = 0xFFFFFFFF;
     float tangent_sign = 1.0f; // Binormal = cross(normal, tangent) * tangent_sign (UE3 TangentZ.w)
+    // Baked lighting (assets/level_lightmaps.hpp). lm_u >= 0: (lm_u, lm_v) is where the vertex sits in
+    // its section's light-map textures, and lm0..2 are the three coefficients' scales. lm_u == -1: the
+    // vertex has its own samples, lm0..2 the three coefficients. lm_u == -2: nothing was baked for it.
+    // lm0..2 are linear RGB packed as RGB9E5 (pack_rgb9e5).
+    float lm_u = -2.0f;
+    float lm_v = 0.0f;
+    uint32_t lm0 = 0;
+    uint32_t lm1 = 0;
+    uint32_t lm2 = 0;
 };
 
 // A contiguous range of MeshBuffer::vertices drawn with one scene material
@@ -492,6 +501,7 @@ struct MeshSection {
     uint32_t first_vertex = 0;
     uint32_t vertex_count = 0;
     int32_t material = -1;
+    int32_t lightmap = -1;  // light-map texture set (SceneMaterialLibrary::lightmap_textures[3 * lightmap ..]), -1 = none
 };
 
 struct MeshBuffer {
@@ -551,6 +561,97 @@ struct AmbientEmitterInfo {
 // -----------------------------------------------------------------------------
 // Level Actor (Shared Contract across Agents 5, 6, 7)
 // -----------------------------------------------------------------------------
+// The level's post-process settings (assets/level_postprocess.hpp): the members of UE3's
+// PostProcessSettings, as DICE extended it, that the game's chain takes from the world. The values
+// here are the struct's defaults.
+struct PostProcessSettings {
+    // TdToneMappingPostProcess
+    float scene_desaturation = 0.0f;
+    Vec3 scene_highlights{1.0f, 1.0f, 1.0f};
+    Vec3 scene_midtones{1.0f, 1.0f, 1.0f};
+    Vec3 scene_shadows{0.0f, 0.0f, 0.0f};
+    float exposure_manual = 1.0f;
+    float exposure_speed_up = 3.5f;
+    float exposure_speed_down = 4.5f;
+    float exposure_high = 1.65f;
+    float exposure_low = 0.85f;
+    bool has_curves = false;
+    Vec3 curve_m[16];  // per segment and channel: out = in * m + b
+    Vec3 curve_b[16];
+    // TdDirectionalHazePostProcess
+    bool haze_enabled = false;
+    Vec3 haze_color{1.0f, 1.0f, 0.8f};
+    float haze_angle_curve = 5.0f;
+    float haze_angle_start = 0.5f;
+    float haze_distance_curve = 1.5f;
+    float haze_distance_divider = 7500.0f;
+    float haze_angle_clamp_high = 2.0f;
+    float haze_total_clamp_close_high = 10.0f;
+    float haze_total_clamp_far_high = 10.0f;
+    float haze_total_clamp_far_distance = 1.0f;
+    float haze_multiplier = 1.0f;
+    float haze_total_clamp_low = 0.0f;
+    Vec3 haze_sun_location{0.0f, 0.0f, 0.0f};
+    // How long the view takes to go over to these settings (Scene_InterpolationDuration).
+    float interpolation_duration = 1.0f;
+};
+
+// A PostProcessVolume: its settings hold wherever the view is inside its brush, over the world's
+// and over every volume of lower priority.
+struct PostProcessVolumeInfo {
+    struct Plane {
+        Vec3 normal{0.0f, 0.0f, 1.0f};  // outward
+        float d = 0.0f;                 // dot(normal, p) + d <= 0 inside
+    };
+    float priority = 0.0f;
+    bool enabled = true;
+    PostProcessSettings settings;
+    std::vector<std::vector<Plane>> hulls;  // the brush's convex pieces, world space
+    AABB bounds{Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f)};
+
+    [[nodiscard]] bool holds(const Vec3& p) const {
+        if (p.x < bounds.min_pt.x || p.y < bounds.min_pt.y || p.z < bounds.min_pt.z || p.x > bounds.max_pt.x || p.y > bounds.max_pt.y ||
+            p.z > bounds.max_pt.z) {
+            return false;
+        }
+        for (const auto& hull : hulls) {
+            bool inside = !hull.empty();
+            for (const Plane& plane : hull) {
+                if (plane.normal.dot(p) + plane.d > 0.01f) {
+                    inside = false;
+                    break;
+                }
+            }
+            if (inside) return true;
+        }
+        return false;
+    }
+};
+
+// One HeightFog actor.
+struct HeightFogLayer {
+    float height = 0.0f;                       // the fog plane: the actor's z
+    float density = 0.00005f;
+    float start_distance = 0.0f;
+    float extinction_distance = 100000000.0f;
+    Vec3 color{1.0f, 1.0f, 1.0f};              // LightColor (linear) * LightBrightness
+};
+
+// The baked lighting of an actor's StaticMeshComponent (assets/level_lightmaps.hpp).
+struct ActorLightMap {
+    enum class Kind : uint8_t { None = 0, Texture, Vertex };
+    Kind kind = Kind::None;
+    // Texture: three LightMapTexture2D exports of the package file, their scales, and where the
+    // mesh's light-map UVs sit in them.
+    std::string package_path;
+    int32_t textures[3] = {0, 0, 0};
+    Vec3 scale[3];
+    float coord_scale[2] = {1.0f, 1.0f};
+    float coord_bias[2] = {0.0f, 0.0f};
+    // Vertex: three coefficients per LOD0 vertex of the mesh, scaled, as RGB9E5.
+    std::vector<uint32_t> vertex_samples;
+};
+
 struct LevelActor {
     std::string class_name;
     std::string object_name;
@@ -596,6 +697,7 @@ struct LevelActor {
     bool is_bag = false;
     bool is_elevator_part = false;
     std::string source_package;
+    ActorLightMap lightmap;
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     // TdZiplineVolume.SplineLocations: the cable the pawn rides, NumSplineSegments + 1 points on the
@@ -1115,6 +1217,12 @@ struct InputFrame {
 // Player Telemetry (Every simulation tick)
 // -----------------------------------------------------------------------------
 struct PlayerTelemetry {
+    // The screen fade (TdHUD's FadeInEffect): 1 = the picture, 0 = all fade_color.
+    float fade_amount = 1.0f;
+    Vec3 fade_color{1.0f, 1.0f, 1.0f};
+    // TdHUD.PostBeginPlay's WorldInfo.SetSceneExposureReset: for this frame, the exposure goes back
+    // to where a level opens (its high clamp) and adapts from there.
+    bool exposure_reset = false;
     uint32_t tick = 0;
     float sim_time = 0.0f;
     Vec3 position{0.0f, 0.0f, 0.0f};
@@ -1232,6 +1340,15 @@ struct IntroSoundEvent {
     bool voice = false;  // a dialogue line
 };
 
+// One screen fade a level intro asks for (SeqAct_TdFadeEffect): at its start, behind one of the
+// Matinee's event keys, or when another fade completes.
+struct IntroFadeEvent {
+    float time = 0.0f;      // seconds from the start of the Matinee
+    bool fade_out = false;  // towards the colour; else back to the picture
+    float duration = 0.5f;  // FadeTime
+    Vec3 color{0.0f, 0.0f, 0.0f};
+};
+
 // A door the intro swings: the InterpActor one of its movement tracks turns (the door Faith kicks
 // open in Boat, barges through in Subway and the Mall), as its yaw from closed through the Matinee.
 struct IntroDoorSwing {
@@ -1262,6 +1379,7 @@ struct LevelIntroSequence {
     std::vector<Vec3> root_pos;
 
     std::vector<IntroSoundEvent> sounds;   // sorted by time
+    std::vector<IntroFadeEvent> fades;     // sorted by time
     std::vector<std::string> stop_cues;    // cues the Matinee stops when it completes or is skipped
     std::vector<IntroDoorSwing> door_swings;
 };
@@ -1275,6 +1393,7 @@ struct LevelScene {
     Vec3 player_spawn_pos{0.0f, 0.0f, 100.0f};
     float player_spawn_yaw = 0.0f;
     LevelIntroSequence level_intro{};
+    std::vector<PostProcessVolumeInfo> post_volumes;  // highest priority first
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)
@@ -1333,6 +1452,8 @@ struct LevelScene {
     std::vector<std::string> subtitles;
     // Resolved + compiled Mirror's Edge materials and textures referenced by MeshSection::material
     std::shared_ptr<const SceneMaterialLibrary> materials;
+    PostProcessSettings post;
+    std::vector<HeightFogLayer> height_fog;  // highest first, at most four
 };
 
 } // namespace me

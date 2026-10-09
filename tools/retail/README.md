@@ -16,6 +16,7 @@ The recorder half comes from [tesseract](https://github.com/pippy360/tesseract)'
 | `replay.py` | anywhere | Turns a trace into a `me_replay` script, runs it and scores the result. |
 | `intro_capture.py` | Windows | Boots retail at each chapter's first checkpoint and records the start-of-level intro (camera, pawn, sounds, optionally a frame a second). No key is sent to the game. |
 | `intro_check.py` | Windows to play, anywhere to compare | Plays the port's intros with `--trace` and lays them over those recordings: eye position, view direction, the hand-over, and every sound cue. `docs/LEVEL_INTROS.md` has the method and the results. |
+| `render_check.py` | Windows to render, anywhere to compare | Asks the port for the pictures of each level intro at the moments of the retail frames (`--intro-shots`) and measures each pair: mean colour, luminance, saturation, and the difference on a 32 x 18 grid. `docs/RENDERING_RE.md` is built on it. |
 | `anim_check.py` | anywhere, with `me_anim` built | Runs the port's first-person animation tree (`me_anim`) over the recordings and scores what it plays against the `anim1p` records retail logged, per movement state. `docs/FIRST_PERSON_ANIMATION_RE.md` has the method and the results. |
 | `src/tools/replay_main.cpp` → `me_replay` | anywhere | Headless: loads the level from the retail packages and steps the controller once per recorded retail frame. |
 
@@ -48,6 +49,19 @@ python -m tools.retail.intro_check compare
 * A sample's camera fields (`x y z yaw pitch roll`) are up to a frame older than its pawn fields (`px py pz`, `cyaw cpitch`, `anim1p`): the hook reads the camera out of the frame being presented and the pawn out of the game thread as it is at that moment, which runs up to a frame ahead. In stretches the two are a sample apart (about two thirds of a recording) and in others level; across a hitch two or three apart. Sample for sample the camera then seems to trail the pawn by a frame's travel (10 uu at 600 uu/s). Anything that compares the two has to find the lag per stretch.
 * `anim1p` is the three heaviest sequence players and no more. A sequence under a per-bone blend's target (the weapon arm's `standready`, `standfire`) does not show in it at all.
 * For about six seconds at the start of a chapter the trace's yaw and pitch read 0 and 90, and no sound is logged for the first second or so.
+
+### Rendering against retail's pictures
+
+```bash
+python -m tools.retail.intro_capture --frames 1.0                              # the retail frames, once
+python -m tools.retail.render_check shots build-win/mirrorsedge_windows.exe    # -> build/retail/render_port/<map>/
+python -m tools.retail.render_check compare --sheet                            # figures, and a side-by-side page per chapter
+```
+
+* The intros are matched cameras: the port's intro camera is retail's to within a unit. `shots` plays each intro
+  through from its start, so exposure and fades are where the game has them at each picture.
+* A retail frame carries the skip prompt and, early on, the chapter's title. Both are small on the grid.
+* Run with the system Python (numpy, Pillow), not MSYS2's.
 
 ## 2. Replay
 

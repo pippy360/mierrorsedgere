@@ -60,4 +60,9 @@ private:
 // Shared MSL prelude (vertex function, FMaterialParameters equivalent, lighting).
 const char* material_common_msl();
 
+// The prelude followed by a material of no graph that calls each of its entry points: what a
+// generated shader looks like to the compiler, for checking the prelude where there is no game
+// data to generate one from (--dump-shaders, docs/RENDERING_RE.md).
+std::string material_check_msl();
+
 }  // namespace me

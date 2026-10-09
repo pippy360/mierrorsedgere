@@ -184,6 +184,103 @@ void collect_sounds(const Packages& packages, const UPKPackage& pkg, const UProp
     }
 }
 
+// The screen fades an output of a Kismet op leads to: SeqAct_TdFadeEffect actions linked to it
+// directly, behind a SeqAct_Delay, or behind another fade (the action is latent: its Completed
+// output fires when the fade has run). `link` empty = every output.
+void collect_fades(const UPKPackage& pkg, const UPropertyList& op_props, const std::string& link, float time,
+                   LevelIntroSequence& out, int depth) {
+    const UProperty* outputs = find_prop(op_props, "OutputLinks");
+    if (!outputs || depth > 6) return;
+    for (const auto& output : outputs->elements) {
+        if (!link.empty() && to_lower(prop_string(output, "LinkDesc")) != to_lower(link)) continue;
+        if (prop_bool(output, "bDisabled", false)) continue;
+        const UProperty* links = find_prop(output, "Links");
+        if (!links) continue;
+        for (const auto& l : links->elements) {
+            const int32_t op = prop_object(l, "LinkedOp");
+            const int32_t input = prop_int(l, "InputLinkIdx", 0);
+            const std::string cls = class_of(pkg, op);
+            if (input != 0 || (cls != "SeqAct_TdFadeEffect" && cls != "SeqAct_Delay")) continue;
+            UPropertyList props;
+            parse_export_properties(pkg, op, props);
+            float at = time + prop_float(output, "ActivateDelay", 0.0f);
+            if (const UProperty* inputs = find_prop(props, "InputLinks"); inputs && !inputs->elements.empty()) {
+                if (prop_bool(inputs->elements[0], "bDisabled", false)) continue;
+                at += prop_float(inputs->elements[0], "ActivateDelay", 0.0f);
+            }
+            if (cls == "SeqAct_Delay") {
+                collect_fades(pkg, props, "Finished", at + prop_float(props, "Duration", 0.0f), out, depth + 1);
+                continue;
+            }
+            IntroFadeEvent ev;
+            ev.time = at;
+            ev.fade_out = prop_name(props, "FadeEffect") == "FadeOut";
+            ev.duration = prop_float(props, "FadeTime", 0.5f);
+            // SeqAct_TdFadeEffect divides each channel by 255 as integers: 1 at 255, else 0.
+            if (const UProperty* c = find_prop(props, "FadeColor")) {
+                ev.color = Vec3(c->v[0] >= 0.999f ? 1.0f : 0.0f, c->v[1] >= 0.999f ? 1.0f : 0.0f, c->v[2] >= 0.999f ? 1.0f : 0.0f);
+            }
+            bool known = false;
+            for (const IntroFadeEvent& have : out.fades) {
+                known = known || (std::abs(have.time - ev.time) < 1e-3f && have.fade_out == ev.fade_out &&
+                                  std::abs(have.duration - ev.duration) < 1e-3f);
+            }
+            if (known) continue;
+            out.fades.push_back(ev);
+            collect_fades(pkg, props, "Completed", at + std::max(ev.duration, 0.0166f), out, depth + 1);
+        }
+    }
+}
+
+// The ops of `pkg` with an output linked to the first input of `target`.
+std::vector<int32_t> feeders_of(const UPKPackage& pkg, int32_t target) {
+    std::vector<int32_t> found;
+    const auto& exports = pkg.get_exports();
+    for (size_t i = 0; i < exports.size(); ++i) {
+        if (pkg.get_export_class(exports[i]).compare(0, 3, "Seq") != 0) continue;
+        UPropertyList props;
+        parse_export_properties(pkg, static_cast<int32_t>(i) + 1, props);
+        const UProperty* outputs = find_prop(props, "OutputLinks");
+        if (!outputs) continue;
+        bool feeds = false;
+        for (const auto& output : outputs->elements) {
+            const UProperty* links = find_prop(output, "Links");
+            if (!links || prop_bool(output, "bDisabled", false)) continue;
+            for (const auto& l : links->elements) {
+                feeds = feeds || (prop_object(l, "LinkedOp") == target && prop_int(l, "InputLinkIdx", 0) == 0);
+            }
+        }
+        if (feeds) found.push_back(static_cast<int32_t>(i) + 1);
+    }
+    return found;
+}
+
+// The fades that start with the intro: what plays its Matinee (a remote event, as a rule) fades the
+// picture in on another of its links, and so can what leads to it: the op that activates that
+// remote event, the checkpoint event behind that. Three steps back at most.
+void collect_start_fades(const Packages& packages, const UPKPackage& pkg, int32_t target, LevelIntroSequence& out, int depth = 0) {
+    if (depth > 3) return;
+    for (int32_t feeder : feeders_of(pkg, target)) {
+        UPropertyList props;
+        parse_export_properties(pkg, feeder, props);
+        collect_fades(pkg, props, "", 0.0f, out, 0);
+        collect_start_fades(packages, pkg, feeder, out, depth + 1);
+        if (class_of(pkg, feeder) != "SeqEvent_RemoteEvent") continue;
+        const std::string event = to_lower(prop_name(props, "EventName"));
+        if (event.empty()) continue;
+        for (const auto& other : packages) {
+            const auto& exports = other->get_exports();
+            for (size_t i = 0; i < exports.size(); ++i) {
+                if (other->get_export_class(exports[i]) != "SeqAct_ActivateRemoteEvent") continue;
+                UPropertyList activate;
+                parse_export_properties(*other, static_cast<int32_t>(i) + 1, activate);
+                if (to_lower(prop_name(activate, "EventName")) != event) continue;
+                collect_start_fades(packages, *other, static_cast<int32_t>(i) + 1, out, depth + 1);
+            }
+        }
+    }
+}
+
 // The doors a Matinee's movement tracks turn: for each group whose actor is an InterpActor, its
 // rotation track's yaw sampled into out.door_swings, as degrees from the actor's closed rotation.
 void collect_door_swings(const UPKPackage& pkg, const UPropertyList& interp_props, const UPropertyList& data_props, float time,
@@ -295,6 +392,8 @@ void collect_matinee(const Packages& packages, const UPKPackage& pkg, const UPro
                         for (const auto& k : keys->elements) {
                             collect_sounds(packages, pkg, interp_props, prop_name(k, "EventName"),
                                            time + prop_float(k, "Time", 0.0f) / rate, out, depth);
+                            collect_fades(pkg, interp_props, prop_name(k, "EventName"), time + prop_float(k, "Time", 0.0f) / rate,
+                                          out, depth);
                         }
                     }
                 } else if (cls.find("InterpTrackSound") != std::string::npos) {
@@ -311,6 +410,7 @@ void collect_matinee(const Packages& packages, const UPKPackage& pkg, const UPro
     }
     collect_door_swings(pkg, interp_props, data_props, time, rate, out);
     collect_sounds(packages, pkg, interp_props, "Completed", time + prop_float(data_props, "InterpLength", 0.0f) / rate, out, depth);
+    collect_fades(pkg, interp_props, "Completed", time + prop_float(data_props, "InterpLength", 0.0f) / rate, out, depth);
 }
 
 // The sounds the animation itself asks for: AnimNotify_Sound, AnimNotify_Footstep and
@@ -565,7 +665,9 @@ void extract_level_intro(const std::string& game_root, const Packages& packages,
 
             for (const auto& [time, name] : events) {
                 collect_sounds(packages, pkg, interp_props, name, time, out, 0);
+                collect_fades(pkg, interp_props, name, time, out, 0);
             }
+            collect_fades(pkg, interp_props, "Completed", prop_float(data_props, "InterpLength", 0.0f), out, 0);
             collect_notifies(pkg, best_seq, seq.length, anim_start, out.sounds);
             // The doors the intro's own Matinee turns (the Mall's), beside those behind its events.
             collect_door_swings(pkg, interp_props, data_props, 0.0f, 1.0f, out);
@@ -591,6 +693,13 @@ void extract_level_intro(const std::string& game_root, const Packages& packages,
             }
             std::stable_sort(out.sounds.begin(), out.sounds.end(),
                              [](const IntroSoundEvent& a, const IntroSoundEvent& b) { return a.time < b.time; });
+            collect_start_fades(packages, pkg, m.interp, out);
+            std::stable_sort(out.fades.begin(), out.fades.end(),
+                             [](const IntroFadeEvent& a, const IntroFadeEvent& b) { return a.time < b.time; });
+            for (const IntroFadeEvent& f : out.fades) {
+                std::cout << "[Level] Level intro fade " << (f.fade_out ? "out" : "in") << " at " << f.time << " s over " << f.duration
+                          << " s, colour (" << f.color.x << "," << f.color.y << "," << f.color.z << ")" << std::endl;
+            }
 
             const Vec3 end_fwd = out.cam_forward.back();
             out.valid = true;

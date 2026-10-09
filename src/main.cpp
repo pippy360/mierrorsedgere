@@ -10,10 +10,14 @@
 #include "assets/ini_config.hpp"
 #include "audio/audio_engine.hpp"
 #include "cutscene/cutscene_player.hpp"
+#include "cutscene/screen_fade.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
 #include "platform/platform.hpp"
 #include "renderer/renderer.hpp"
+#include "renderer/builtin_shaders_msl.hpp"
+#include "renderer/sun_shadow.hpp"
+#include "assets/material_system.hpp"
 #include "ui/frontend/frontend.hpp"
 #include "ui/frontend/soft_render.hpp"
 
@@ -1265,6 +1269,82 @@ static std::string frontend_key_name(SDL_Keycode sym) {
 // -----------------------------------------------------------------------------
 // Interactive SDL2 Window Gameplay Loop (Metal on macOS, Direct3D 11 on Windows)
 // -----------------------------------------------------------------------------
+// --intro-shots: the level's intro posed at given Matinee times and rendered headless, one PNG a
+// time. The intro's camera is retail's to within a unit (docs/LEVEL_INTROS.md), so each picture
+// has a retail frame taken from the same place to be held against (tools/retail/render_check.py).
+// -----------------------------------------------------------------------------
+static int run_intro_shots(const std::string& game_root, const std::string& map_rel, const std::string& times_csv,
+                           const std::string& out_dir) {
+    using namespace me;
+    Renderer renderer;
+    renderer.set_game_root(game_root);
+    if (!renderer.init_headless(1280, 720)) {
+        std::cerr << "[Shots] Renderer::init_headless failed" << std::endl;
+        return 1;
+    }
+    LevelScene scene;
+    if (!load_level_scene(game_root, map_rel, scene) || !scene.level_intro.valid) {
+        std::cerr << "[Shots] " << map_rel << ": not loaded, or it has no intro" << std::endl;
+        return 1;
+    }
+    stream_level_to_checkpoint(game_root, scene, 0);
+    ensure_dir(out_dir);
+
+    MovementConfig move_cfg;
+    load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+    ParkourController controller(move_cfg);
+    controller.reset(scene.player_spawn_pos, scene.player_spawn_yaw);
+
+    std::string stem = map_rel.substr(map_rel.find_last_of("/\\") + 1);
+    stem = stem.substr(0, stem.find('.'));
+    std::transform(stem.begin(), stem.end(), stem.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    std::vector<float> wanted;
+    {
+        std::stringstream times(times_csv);
+        std::string item;
+        while (std::getline(times, item, ',')) wanted.push_back(static_cast<float>(std::atof(item.c_str())));
+        std::sort(wanted.begin(), wanted.end());
+    }
+
+    // The intro played through from its start in steps of a thirtieth of a second at most, so that
+    // what adapts over time (the exposure, which a level opens at its brightest) is where the game
+    // would have it at each picture.
+    CutscenePlayer cutscene;
+    PlayerTelemetry tel = controller.get_telemetry();
+    cutscene.play_in_engine_intro(scene, tel);
+    ScreenFade fade;
+    fade.restart();
+    float now = 0.0f;
+    int written = 0;
+    auto frame = [&](float dt) {
+        cutscene.update(dt, scene, tel);
+        now += dt;
+        (void)cutscene.take_intro_sounds();
+        for (const IntroFadeEvent& ev : cutscene.take_intro_fades()) fade.apply(ev);
+        fade.update(dt);
+        CutscenePlayer::pose_intro_doors(scene, now);
+        tel.speed_2d = 0.0f;  // no speed effects
+        tel.sim_time = now;
+        tel.fade_amount = fade.amount;
+        tel.fade_color = fade.color;
+        tel.exposure_reset = dt <= 0.0f;  // the level opens
+        renderer.render_frame(scene, tel);
+    };
+    frame(0.0f);
+    for (float t : wanted) {
+        const int steps = std::max(1, static_cast<int>(std::ceil((t - now) * 30.0f)));
+        const float dt = (t - now) / static_cast<float>(steps);
+        for (int i = 0; i < steps && dt > 0.0f; ++i) frame(dt);
+        char name[64];
+        std::snprintf(name, sizeof(name), "%s_%06.2f.png", stem.c_str(), t);
+        if (renderer.save_screenshot_png(out_dir + "/" + name)) ++written;
+    }
+    std::cout << "[Shots] " << stem << ": " << written << " frame(s) in " << out_dir << std::endl;
+    return written > 0 ? 0 : 1;
+}
+
+// -----------------------------------------------------------------------------
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
                               const std::string& custom_level, int max_frames,
                               bool start_in_main_menu, const std::string& trace_path) {
@@ -1507,6 +1587,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     // Interactive Loop
     bool running = true;
+    ScreenFade screen_fade;
+    bool fade_intro_before = false;
+    float fade_last_sim_time = 1.0e30f;
+    std::string fade_map;
     int frame_counter = 0;
     auto last_time = std::chrono::high_resolution_clock::now();
 
@@ -2295,6 +2379,23 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         audio.update(dt, ear, ear_rot.forward(), ear_rot.up(), cutscene_player.is_playing() ? 0.0f : tel.speed_2d,
                      tel.reaction_active);
 
+        // The screen fade (TdHUD): in from white when the player starts or restarts, and whatever
+        // the level intro's Kismet asks for on the way.
+        {
+            const bool intro_now = cutscene_player.is_level_intro();
+            const bool restarted = tel.sim_time < fade_last_sim_time && !fade_intro_before;
+            const bool level_opened = active_scene.map_name != fade_map;
+            if ((intro_now && !fade_intro_before) || restarted || level_opened) screen_fade.restart();
+            controller.get_telemetry().exposure_reset = level_opened;
+            for (const IntroFadeEvent& ev : cutscene_player.take_intro_fades()) screen_fade.apply(ev);
+            if (!renderer.is_menu_open()) screen_fade.update(dt);
+            fade_intro_before = intro_now;
+            fade_last_sim_time = tel.sim_time;
+            fade_map = active_scene.map_name;
+            controller.get_telemetry().fade_amount = screen_fade.amount;
+            controller.get_telemetry().fade_color = screen_fade.color;
+        }
+
         // Render frame
         renderer.render_frame(active_scene, tel);
         write_trace(tel, /*in_frontend=*/false);
@@ -2322,6 +2423,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 int main(int argc, char* argv[]) {
     std::string game_root = me::default_game_root();
     bool verify_all = false;
+    std::string shots_map, shots_times, shots_dir;
     std::string script_json = "";
     int initial_chapter = 0;
     std::string custom_level = "";
@@ -2331,7 +2433,22 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--verify-all") {
+        if (arg == "--intro-shots") {
+            if (i + 3 < argc) {
+                shots_map = argv[++i];
+                shots_times = argv[++i];
+                shots_dir = argv[++i];
+            }
+        } else if (arg == "--dump-shaders") {
+            // The Metal Shading Language sources as the renderer compiles them, for checking them
+            // with a compiler on a machine that has no game data (xcrun metal -c).
+            const std::string dir = (i + 1 < argc) ? argv[++i] : ".";
+            me::ensure_dir(dir);
+            std::ofstream(dir + "/builtin.metal", std::ios::binary) << me::sun_shadow_msl() << me::kBuiltinShadersMSL;
+            std::ofstream(dir + "/material_check.metal", std::ios::binary) << me::material_check_msl();
+            std::cout << "Wrote builtin.metal and material_check.metal to " << dir << std::endl;
+            return 0;
+        } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
             verify_all = true;
@@ -2364,6 +2481,8 @@ int main(int argc, char* argv[]) {
                       << "Options:\n"
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
+                      << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
+                      << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
                       << "  --test-replay <trace>    Replay physics trace headless\n"
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
@@ -2382,6 +2501,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (!shots_map.empty()) {
+        return run_intro_shots(game_root, shots_map, shots_times, shots_dir);
+    }
     if (verify_all) {
         return run_oracle_verification(game_root, script_json);
     }

@@ -681,3 +681,51 @@ drawn. Section 5 of `docs/LEVEL_INTROS.md` has the list.
   up from rest; the roll now ends in that speed range.
 - **Windows not built.** `D3D11Renderer` gets the same `player_camera()` as `MetalRenderer`, and the shared oracle
   calls it. Neither was compiled or run on Windows here: this Mac has no MinGW toolchain.
+
+## 14. Retail's rendering: baked light maps and the post-process chain (agent/retail-rendering, 2026-10-09)
+
+The renderer's lighting and finishing were stand-ins: a forward sun with shadow cascades and a hemisphere for
+light, a filmic curve and screen-space ambient occlusion for the picture. They are replaced by what the retail
+game does, read from its shipped shader sources, its post-process chain asset, the level data and its
+executable. `docs/RENDERING_RE.md` has what retail does, the layouts, the addresses and the figures.
+
+### 14.1 Changes
+- **Baked lighting** (`src/assets/level_lightmaps.*`, new): the `FLightMap2D` / `FLightMap1D` of every
+  `StaticMeshComponent`, and of every `ModelComponent` element for the BSP. `Vertex` grows to 80 bytes
+  (light-map UV and three RGB9E5 values); world geometry is binned by material and light-map texture set.
+  The material prelude looks the three coefficients up (bicubic) and applies them in the Half-Life 2 basis.
+  Level geometry takes no other light.
+- **Linear scene colour.** Materials write unbounded linear light; the built-in sky, world and view-model
+  shaders are converted on output. The far plane goes to 10,000,000 uu: the levels' sky domes are meshes
+  840,000 uu out and were clipped.
+- **The chain** (`src/renderer/post_process.hpp`, new; `builtin_shaders_msl.hpp` section 4 rewritten): height
+  fog, haze, bloom gather and blur, the exposure's metering and step, blend + tone mapping + curves + fade.
+  The old post pass (ambient occlusion, filmic curve, vignette, wind streaks) is gone.
+- **From the executable:** a fog fills the slab down to the next fog's plane (`0x0104d0e0`); the exposure is
+  metered through 16-bit fixed-point buffers, so nothing counts for more than 1, the speeds are capped at 2.5
+  and 3, and a level opens at its high clamp (`0x012d65bf`, `0x012d3b1e`, `0x012d6993`).
+- **`PostProcessVolume`s** (`src/assets/level_postprocess.*`, new): the settings in force are those of the
+  volume the view is in, blended over `Scene_InterpolationDuration`.
+- **The screen fade** (`src/cutscene/screen_fade.hpp`, new): `TdHUD`'s fade state and the chain's
+  `FadeInEffect`; a start or restart fades in from white, and the level intros' Kismet fades are followed
+  (`LevelIntroSequence::fades`).
+- **Both renderers.** `d3d11_renderer.cpp` and `metal_renderer.mm` run the same passes.
+- **Tools:** `--intro-shots`, `--dump-shaders`, `ME_EXPOSURE`, `ME_NO_HUD`, `ME_SHOW_UNBAKED`;
+  `tools/retail/render_check.py`.
+
+### 14.2 Results
+- **Against retail's pictures** (the ten level intros, 110 pairs, same cameras): the grid difference falls
+  from 68.5 to 31.9; mean luminance 139 in both games (the old renderer sat near 120 in every level);
+  saturation 57 against retail's 57 (was 35). Per chapter: The Shard 12.7, Heat 19.7, Ropeburn 20.6,
+  The Boat 27.3, New Eden 28.6, Pirandello Kruger 31.1, Flight 34.1, Jacknife 37.2, Prologue 43.8,
+  Kate 64.3 (one frame, inside its opening fade).
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS. The tracked `screenshots/oracle_*.png` and
+  `tutorial_*.png` are regenerated: every picture changed.
+- **macOS:** the app compiles and links on `macos-15`, and both Metal shader sources compile with Apple's
+  `metal` compiler (`--dump-shaders`). It was not run: no Mac was at hand.
+
+### 14.3 Remaining gaps
+Listed in `docs/RENDERING_RE.md`, section 10. The large ones: light for dynamic objects (retail's light
+environments; the old sun-and-hemisphere stand-in is still what movers, characters and the first-person body
+get), lens flares, `TdMotionBlur`, the chain's material effects, fog on translucent surfaces, modulated
+shadows, decals and particles.

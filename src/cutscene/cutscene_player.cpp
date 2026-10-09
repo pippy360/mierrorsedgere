@@ -442,6 +442,8 @@ void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
     level_intro_ = false;
     intro_next_sound_ = 0;
     intro_sounds_.clear();
+    intro_next_fade_ = 0;
+    intro_fades_.clear();
 
     const LevelIntroSequence& intro = scene.level_intro;
     if (intro.valid && intro.cam_pos.size() >= 2 && intro.matinee_length_sec > 0.0f) {
@@ -635,6 +637,9 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             // Every sound whose time has come, including those of the last stretch.
             while (intro_next_sound_ < intro.sounds.size() && intro.sounds[intro_next_sound_].time <= elapsed_sec_) {
                 intro_sounds_.push_back(intro.sounds[intro_next_sound_++]);
+            }
+            while (intro_next_fade_ < intro.fades.size() && intro.fades[intro_next_fade_].time <= elapsed_sec_) {
+                intro_fades_.push_back(intro.fades[intro_next_fade_++]);
             }
         }
         if (elapsed_sec_ >= duration_sec_) {

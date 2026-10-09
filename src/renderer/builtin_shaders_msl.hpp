@@ -24,6 +24,10 @@ struct VertexIn {
     float u2, v2;
     uint color;
     float tangent_sign;
+    float lm_u, lm_v;  // baked lighting: see me::Vertex
+    uint lm0;
+    uint lm1;
+    uint lm2;
 };
 
 struct FrameUniforms {
@@ -52,6 +56,12 @@ struct FrameUniforms {
     float shadow_enabled;
     float4x4 sun_view_proj_far;
 };
+
+// The scene buffer is linear. The stand-in passes below (sky, untextured geometry, characters) were
+// written in display values: this takes one of their results to scene values.
+inline float4 scene_out(float4 display) {
+    return float4(pow(max(display.rgb, float3(0.0)), float3(2.2)), display.a);
+}
 
 struct ShadowVertexOut {
     float4 clip_pos [[position]];
@@ -154,7 +164,7 @@ fragment float4 sky_fragment(SkyVertexOut in [[stage_in]],
         final_sky = mix(final_sky, float3(0.55, 0.66, 0.78), down_t);
     }
 
-    return float4(final_sky, 1.0);
+    return scene_out(float4(final_sky, 1.0));
 }
 
 // -----------------------------------------------------------------------------
@@ -416,7 +426,7 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     float3 fog_col = float3(0.76, 0.86, 0.96);
     lit_color = mix(lit_color, fog_col, fog_factor * 0.65);
 
-    return float4(lit_color, 1.0);
+    return scene_out(float4(lit_color, 1.0));
 }
 
 // -----------------------------------------------------------------------------
@@ -461,7 +471,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
     int slot = int(round(in.uv2.x));
     if (slot == 0) {
         // Emissive muzzle flash star
-        return float4(in.color.rgb * 1.35, 1.0);
+        return scene_out(float4(in.color.rgb * 1.35, 1.0));
     }
 
     float3 dpdx = dfdx(in.world_pos);
@@ -489,7 +499,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         float spec = pow(max(dot(N, H), 0.0), 20.0) * 0.14;
         float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.10;
         float3 col = albedo * (0.44 + 0.56 * wrap) + float3(spec + rim) * float3(1.0, 0.95, 0.90);
-        return float4(col, 1.0);
+        return scene_out(float4(col, 1.0));
     }
 
     if (slot == 2) {
@@ -505,7 +515,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         float spec = pow(max(dot(N, H), 0.0), 26.0) * 0.24;
         float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0) * 0.12;
         float3 col = albedo * (0.44 + 0.56 * NdotL) + float3(spec + rim);
-        return float4(col, 1.0);
+        return scene_out(float4(col, 1.0));
     }
 
     if (slot == 3) {
@@ -519,7 +529,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         }
         float NdotL = max(dot(N, L), 0.0);
         float spec = pow(max(dot(N, H), 0.0), 22.0) * 0.15;
-        return float4(albedo * (0.46 + 0.54 * NdotL) + float3(spec), 1.0);
+        return scene_out(float4(albedo * (0.46 + 0.54 * NdotL) + float3(spec), 1.0));
     }
 
     if (slot == 5) {
@@ -529,7 +539,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         float NdotL = max(dot(N, L), 0.0);
         float spec_brass = pow(max(dot(N, H), 0.0), 36.0) * 0.75 + pow(max(dot(N, H), 0.0), 12.0) * 0.25;
         float3 col = albedo * (0.35 + 0.65 * NdotL) + float3(0.95, 0.78, 0.40) * spec_brass;
-        return float4(col, 1.0);
+        return scene_out(float4(col, 1.0));
     }
 
     if (slot == 6) {
@@ -539,7 +549,7 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
         float2 centered = abs(fract(in.uv) - 0.5);
         float crosshair = (min(centered.x, centered.y) < 0.006 && max(centered.x, centered.y) < 0.35) ? 0.18 : 0.0;
         float3 glass_col = float3(0.03, 0.08, 0.14) + float3(0.30, 0.56, 0.88) * fresnel * 0.65 + float3(glint * 0.95) + float3(crosshair * 0.12);
-        return float4(glass_col, 1.0);
+        return scene_out(float4(glass_col, 1.0));
     }
 
     // Slot 4: Equipped Weapon High-Resolution UE3 Material Graph (WP_*.upk M_<Weapon>)
@@ -592,11 +602,13 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
     float3 spec_col = s_lin * (spec_lobe * 0.95 + float3(0.55, 0.70, 0.92) * fresnel * (0.25 + m_lin * 0.75));
 
     float3 col = ue3_diffuse_color * (ambient_light + direct_sun) + spec_col;
-    return float4(col, 1.0);
+    return scene_out(float4(col, 1.0));
 }
 
 // -----------------------------------------------------------------------------
-// 4. Post-Processing, SSAO & Tone Mapping (AmbientOcclusionShader + TdToneMapping + TdMotionBlur)
+// 4. Post-processing: the game's chain (docs/RENDERING_RE.md), from its own shaders.
+//    HeightFogPixelShader.usf, TdDirHazePixelShader.usf, DOFAndBloomGather/Blend,
+//    FilterPixelShader.usf, TdToneMapExposurePixelShader.usf, TdToneMappingPixelShader.usf
 // -----------------------------------------------------------------------------
 struct PostVertexOut {
     float4 position [[position]];
@@ -611,148 +623,258 @@ vertex PostVertexOut post_vertex(uint vertex_id [[vertex_id]]) {
     return out;
 }
 
+// Must match PostUniformsGPU in the renderers.
+struct PostUniforms {
+    float4 fog_distance_scale;   // per layer: log2(1 - Density)
+    float4 fog_extinction;
+    float4 fog_start;
+    float4 fog_min_height;       // world z
+    float4 fog_max_height;
+    float4 fog_inscatter[4];     // LightColor / ln(0.5)
+    float4 haze_sun;             // xyz: unit vector to HazeSunLocation; w: 1 when the haze is on
+    float4 haze_color;           // rgb: HazeColor; w: HazeMultiplier
+    float4 haze_packed;          // AngleCurve, AngleStart, DistanceCurve, DistanceDivider
+    float4 haze_packed2;         // AngleClampHigh, TotalClampCloseHigh, TotalClampFarHigh, TotalClampFarDistance
+    float4 dof_packed;           // FocusDistance, 1 / FocusRadius, FocusExponent, BloomScale
+    float4 misc;                 // haze TotalClampLow, near blur clamp, far blur clamp, 0
+    float4 exposure;             // Manual, MaxDeltaUp, LowClamp, HighClamp
+    float4 exposure2;            // MaxDeltaDown, 1 = settle on the target at once (2 = hold z), held exposure, 0
+    float4 shadows_desat;        // SceneShadows, 1 - SceneDesaturation
+    float4 inv_highlights;       // 1 / SceneHighLights
+    float4 midtones;
+    float4 lum_weights;          // (0.3, 0.59, 0.11) * SceneDesaturation
+    float4 gamma;                // GammaColorScale, 1 / gamma
+    float4 overlay;
+    float4 fade;                 // rgb: FadeColor; a: FadeInAmount (1 = the picture, 0 = the colour)              // GammaOverlayColor
+    float4 curve_m[16];
+    float4 curve_b[16];
+    float4 filter_taps[16];      // x: offset in texels along the axis, y: weight
+    float4 filter_axis;          // xy: one texel along the blur axis, z: tap count
+    float4 texel;                // xy: one scene texel, zw: one texel of the pass's source
+};
+
+// View-space depth (clip w) of a depth-buffer value: the renderer's projection has near 5,
+// far 10000000 (kFarPlane, render_common.hpp) and a depth range of [0.05, 1].
 inline float post_linear_depth(float d) {
     float ndc = saturate((d - 0.05) / 0.95);
-    return (5.0 * 65000.0) / (65000.0 - ndc * (65000.0 - 5.0));
+    return (5.0 * 10000000.0) / (10000000.0 - ndc * (10000000.0 - 5.0));
 }
-
-// Symmetric-pair horizon Screen-Space Ambient Occlusion (AmbientOcclusionShader.usf):
-// Opposite sample pairs (uv + off, uv - off) cancel linear surface slope on flat floors/walls
-// so flat surfaces have zero self-occlusion while concave corners, curbs, solar panel bases,
-// and wall-floor junctions receive smooth cool-azure contact darkening.
-inline float compute_ssao(float2 uv, float2 frag_xy, depth2d<float> depth_tex, float aspect) {
+inline float post_scene_depth(depth2d<float> depth_tex, float2 uv) {
     constexpr sampler dsmp(coord::normalized, filter::nearest, address::clamp_to_edge);
-    float d0 = depth_tex.sample(dsmp, uv);
-    if (d0 < 0.052 || d0 > 0.9992) return 1.0;
-    float z0 = post_linear_depth(d0);
-    if (z0 > 10000.0) return 1.0;
+    return post_linear_depth(depth_tex.sample(dsmp, uv));
+}
+// The world-space vector from the eye through a pixel, of view depth 1.
+inline float3 post_screen_vector(float2 uv, constant FrameUniforms& F) {
+    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    return float3(F.cam_forward) + float3(F.cam_right) * (ndc.x * F.fov_tan * F.aspect) + float3(F.cam_up) * (ndc.y * F.fov_tan);
+}
+// Common.usf: pow is taken of max(|x|, 0.0001).
+inline float3 post_pow(float3 x, float3 y) { return pow(max(abs(x), float3(0.0001)), y); }
+inline float post_pow(float x, float y) { return pow(max(abs(x), 0.0001), y); }
 
-    float ign = fract(52.9829189 * fract(dot(frag_xy, float2(0.06711056, 0.00583715))));
-    float base_ang = ign * 3.14159265;
-    float max_rad = clamp(95.0 / z0, 0.0025, 0.018);
-    float max_range = clamp(z0 * 0.042, 14.0, 48.0);
-    float bias = max(1.4, z0 * 0.0016);
-    float norm_scale = max(18.0, z0 * 0.018);
-
-    float occ = 0.0;
-    for (int i = 0; i < 8; ++i) {
-        float t = (float(i) + 0.5) * (1.0 / 8.0);
-        float r = max_rad * (0.20 + 0.80 * t);
-        float theta = base_ang + float(i) * 1.1780972;
-        float2 off = float2(cos(theta) / aspect, sin(theta)) * r;
-        float dp = depth_tex.sample(dsmp, uv + off);
-        float dn = depth_tex.sample(dsmp, uv - off);
-        if (dp < 0.052 || dn < 0.052) continue;
-        float zp = post_linear_depth(dp);
-        float zn = post_linear_depth(dn);
-        if (abs(zp - z0) < max_range && abs(zn - z0) < max_range) {
-            float concavity = z0 - 0.5 * (zp + zn);
-            occ += saturate((concavity - bias) / norm_scale);
-        }
-    }
-    float dist_fade = 1.0 - smoothstep(4500.0, 9500.0, z0);
-    return 1.0 - saturate(occ * (1.0 / 8.0) * 1.85) * dist_fade;
+// HeightFogPixelShader.usf, FourLayerMain. Blended One, SrcAlpha: scene * scattering + fog.
+fragment float4 fog_fragment(PostVertexOut in [[stage_in]],
+                             depth2d<float> depth_tex [[texture(1)]],
+                             constant FrameUniforms& F [[buffer(0)]],
+                             constant PostUniforms& P [[buffer(1)]]) {
+    float depth = clamp(post_scene_depth(depth_tex, in.uv), 1.0, 65535.0);
+    float3 world = post_screen_vector(in.uv, F) * depth;
+    float cam_z = float3(F.camera_pos).z;
+    float wz = (abs(world.z) <= 0.001) ? 0.001 : world.z;
+    float4 min_pct = (P.fog_min_height - cam_z) / wz;
+    float4 max_pct = (P.fog_max_height - cam_z) / wz;
+    float4 layer = max(float4(0.0), float4(depth) - P.fog_start) * abs(saturate(max_pct) - saturate(min_pct));
+    float4 scattering = exp2(P.fog_distance_scale * layer);
+    if (layer.x >= P.fog_extinction.x) scattering.x = 0.0;
+    if (layer.y >= P.fog_extinction.y) scattering.y = 0.0;
+    if (layer.z >= P.fog_extinction.z) scattering.z = 0.0;
+    if (layer.w >= P.fog_extinction.w) scattering.w = 0.0;
+    float4 in_scattering = scattering - 1.0;
+    float a4 = scattering.w;
+    float a34 = a4 * scattering.z;
+    float a234 = a34 * scattering.y;
+    float a1234 = a234 * scattering.x;
+    float3 fog = in_scattering.w * P.fog_inscatter[3].rgb + a4 * in_scattering.z * P.fog_inscatter[2].rgb +
+                 a34 * in_scattering.y * P.fog_inscatter[1].rgb + a234 * in_scattering.x * P.fog_inscatter[0].rgb;
+    return float4(fog, a1234);
 }
 
-fragment float4 post_fragment(PostVertexOut in [[stage_in]],
+// TdDirHazePixelShader.usf: a glow towards the sun that grows with distance, added to the scene.
+fragment float4 haze_fragment(PostVertexOut in [[stage_in]],
                               texture2d<float> scene_tex [[texture(0)]],
                               depth2d<float> depth_tex [[texture(1)]],
                               sampler smp [[sampler(0)]],
-                              constant FrameUniforms& uniforms [[buffer(0)]]) {
-    float2 uv = in.uv;
-    float speed = uniforms.speed_2d;
+                              constant FrameUniforms& F [[buffer(0)]],
+                              constant PostUniforms& P [[buffer(1)]]) {
+    float4 color = scene_tex.sample(smp, in.uv);
+    if (P.haze_sun.w < 0.5) return color;
+    float3 ray = post_screen_vector(in.uv, F);
+    float z_correction = length(ray);  // the forward vector is of length 1
+    float3 world_vector = ray / z_correction;
+    float device_z = min(65535.0, post_scene_depth(depth_tex, in.uv) * z_correction);
+    float scene_depth = clamp(post_pow(device_z / P.haze_packed.w, P.haze_packed.z), 0.0, 500.0);
+    float sun_view = post_pow(clamp((dot(P.haze_sun.xyz, world_vector) + P.haze_packed.y) / (1.0 + P.haze_packed.y), 0.0,
+                                    P.haze_packed2.x), P.haze_packed.x);
+    float high = (device_z > P.haze_packed2.w) ? P.haze_packed2.z : P.haze_packed2.y;
+    float3 haze = clamp(sun_view * P.haze_color.rgb * scene_depth, float3(P.misc.x), float3(high));
+    return float4(P.haze_color.w * haze + color.rgb, color.a);
+}
 
-    // 1. Radial Velocity Motion Blur & Aerodynamic Dispersion (TdMotionBlurShader.usf - peripheral only)
-    float3 scene_color = float3(0.0);
-    float2 D = uv - float2(0.5, 0.5);
-    float r = length(D);
-    float max_wind = smoothstep(640.0, 715.0, speed);
-    if (speed > 420.0 && r > 0.20) {
-        float speed_factor = saturate((speed - 420.0) / 300.0);
-        float periph = smoothstep(0.20, 0.68, r);
-        float delta_r = min((0.024 * speed_factor + 0.018 * max_wind) * periph, 0.044);
-        float2 dir_uv = (r > 1e-4) ? (D / r) : float2(0.0);
-        float2 v_step = dir_uv * (delta_r / 8.0);
+// DepthOfFieldCommon.usf
+inline float post_unfocused(float scene_depth, constant PostUniforms& P) {
+    float relative = scene_depth - P.dof_packed.x;
+    float most = (relative < 0.0) ? P.misc.y : P.misc.z;
+    return min(most, post_pow(saturate(abs(relative) * P.dof_packed.y), P.dof_packed.z));
+}
 
-        float total_weight = 0.0;
-        for (int k = 0; k < 8; ++k) {
-            float w = 1.0 - float(k) / 8.0;
-            float2 sample_uv = clamp(uv - float(k) * v_step, 0.001, 0.999);
-            scene_color += scene_tex.sample(smp, sample_uv).rgb * w;
-            total_weight += w;
-        }
-        scene_color /= total_weight;
-
-        // Subtle peripheral R/B aerodynamic dispersion at max speed
-        if (max_wind > 0.01) {
-            float2 disp = dir_uv * (0.0032 * max_wind * periph);
-            scene_color.r = mix(scene_color.r, scene_tex.sample(smp, clamp(uv - disp, 0.001, 0.999)).r, 0.45);
-            scene_color.b = mix(scene_color.b, scene_tex.sample(smp, clamp(uv + disp, 0.001, 0.999)).b, 0.45);
-        }
-    } else {
-        scene_color = scene_tex.sample(smp, uv).rgb;
+// DOFAndBloomGatherPixelShader.usf, Main: a quarter-size picture of what blooms (any channel above
+// 1, nearer than 60000) and of what is out of focus, over MAX_SCENE_COLOR.
+fragment float4 bloom_gather_fragment(PostVertexOut in [[stage_in]],
+                                      texture2d<float> scene_tex [[texture(0)]],
+                                      depth2d<float> depth_tex [[texture(1)]],
+                                      sampler smp [[sampler(0)]],
+                                      constant PostUniforms& P [[buffer(1)]]) {
+    float3 bloom = float3(0.0);
+    float4 average = float4(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float2 offset = float2((i & 1) != 0 ? 1.0 : -1.0, (i & 2) != 0 ? 1.0 : -1.0) * P.texel.xy;
+        float2 uv = in.uv + offset;
+        float3 c = scene_tex.sample(smp, uv).rgb;
+        float depth = post_scene_depth(depth_tex, uv);
+        average += float4(c, depth);
+        if (c.r > 1.0 || c.g > 1.0 || c.b > 1.0) bloom += c * clamp(60000.0 - depth, 0.0, 1.0);
     }
+    bloom *= P.dof_packed.w * 0.25;
+    average *= 0.25;
+    float unfocused = post_unfocused(average.a, P);
+    return float4(unfocused * average.rgb + bloom, unfocused) * 0.25;
+}
 
-    // 1b. Screen-Space Ambient Occlusion (AmbientOcclusionShader.usf - cool azure-slate crevice AO)
-    if (uniforms.shadow_enabled > 0.5) {
-        float ao = compute_ssao(uv, in.position.xy, depth_tex, max(uniforms.aspect, 1.0));
-        float3 ao_tint = mix(float3(0.24, 0.37, 0.56), float3(1.0), ao);
-        scene_color *= ao_tint;
+// FilterPixelShader.usf: one axis of the Gaussian, its taps and weights worked out on the CPU.
+fragment float4 filter_fragment(PostVertexOut in [[stage_in]],
+                                texture2d<float> source_tex [[texture(0)]],
+                                sampler smp [[sampler(0)]],
+                                constant PostUniforms& P [[buffer(1)]]) {
+    float4 sum = float4(0.0);
+    int taps = int(P.filter_axis.z);
+    for (int i = 0; i < taps; ++i) {
+        sum += source_tex.sample(smp, in.uv + P.filter_axis.xy * P.filter_taps[i].x) * P.filter_taps[i].y;
     }
+    return sum;
+}
 
-    // 2. Balanced Filmic DICE Shoulder Tone Mapping (preserves highlight detail without #FFFFFF clipping)
-    float3 x = max(scene_color * 1.02, 0.0);
-    float3 toned = (x * (1.06 * x + 0.16)) / (x * (1.08 * x + 0.44) + 0.14);
+// DOFAndBloomBlendPixelShader.usf: the blurred bloom (and what is out of focus) over the scene.
+inline float3 post_bloom_blend(texture2d<float> scene_tex, depth2d<float> depth_tex, texture2d<float> blurred_tex,
+                               sampler smp, float2 uv, constant PostUniforms& P) {
+    float3 focused = scene_tex.sample(smp, uv).rgb;
+    float focused_weight = saturate(1.0 - post_unfocused(post_scene_depth(depth_tex, uv), P));
+    float4 unfocused = 4.0 * blurred_tex.sample(smp, uv);
+    return (focused * focused_weight + unfocused.rgb) / max(focused_weight + unfocused.a, 0.001);
+}
+
+// The exposure's metering, first step: the scene as the tone mapper is given it, into the first of
+// the fixed-point buffers. texel.xy is a source texel, texel.z the taps per axis (n): n x n taps a
+// source texel apart from -n/2, taken here as 4 x 4 over the same span. Nothing leaves above 1.
+fragment float4 meter_scene_fragment(PostVertexOut in [[stage_in]],
+                                     texture2d<float> scene_tex [[texture(0)]],
+                                     depth2d<float> depth_tex [[texture(1)]],
+                                     texture2d<float> blurred_tex [[texture(2)]],
+                                     sampler smp [[sampler(0)]],
+                                     constant PostUniforms& P [[buffer(1)]]) {
+    float3 sum = float3(0.0);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            float2 offset = (float2(float(x), float(y)) * 0.25 - 0.5) * P.texel.z * P.texel.xy;
+            sum += post_bloom_blend(scene_tex, depth_tex, blurred_tex, smp, in.uv + offset, P);
+        }
+    }
+    return float4(saturate(sum * (1.0 / 16.0)), 1.0);
+}
+
+// The later steps: one buffer into the next, the same taps.
+fragment float4 meter_fragment(PostVertexOut in [[stage_in]],
+                               texture2d<float> source_tex [[texture(0)]],
+                               sampler smp [[sampler(0)]],
+                               constant PostUniforms& P [[buffer(1)]]) {
+    float3 sum = float3(0.0);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            float2 offset = (float2(float(x), float(y)) * 0.25 - 0.5) * P.texel.z * P.texel.xy;
+            sum += source_tex.sample(smp, in.uv + offset).rgb;
+        }
+    }
+    return float4(saturate(sum * (1.0 / 16.0)), 1.0);
+}
+
+// TdToneMapExposurePixelShader.usf: the exposure moves towards sqrt(0.25 / luminance), between its
+// clamps, at a pace set by how far it has to go. Kept as exposure squared, over 64.
+fragment float4 exposure_fragment(PostVertexOut in [[stage_in]],
+                                  texture2d<float> small_tex [[texture(0)]],
+                                  texture2d<float> previous_tex [[texture(1)]],
+                                  sampler smp [[sampler(0)]],
+                                  constant PostUniforms& P [[buffer(1)]]) {
+    // SceneDownsampledTexture: the one texel the metering ends in.
+    float3 mean = small_tex.sample(smp, float2(0.5, 0.5)).rgb;
+    if (!(mean.r > 0.0) && !(mean.r < 0.0)) mean = float3(0.25);
+    float luminosity = dot(mean, float3(0.3, 0.59, 0.11));
+    float target = clamp(sqrt(0.25 / clamp(luminosity, 0.0000001, 5000.0)), P.exposure.z, P.exposure.w);
+    float last = clamp(sqrt(previous_tex.sample(smp, float2(0.5, 0.5)).r * 64.0), P.exposure.z, P.exposure.w);
+    float a = abs(target - last);
+    float next = last + clamp((target - last) * a, -P.exposure2.x * a * a, P.exposure.y * a * a);
+    if (P.exposure2.y > 0.5) next = target;
+    if (P.exposure2.y > 1.5) return float4(P.exposure2.z / 64.0);
+    return float4(next * next * P.exposure.x / 64.0);
+}
+
+// DOFAndBloomBlendPixelShader.usf, then TdToneMappingPixelShader.usf: the blurred bloom over the
+// scene, exposure, shadows / highlights / midtones, desaturation, gamma, and the level's curves.
+fragment float4 tonemap_fragment(PostVertexOut in [[stage_in]],
+                                 texture2d<float> scene_tex [[texture(0)]],
+                                 depth2d<float> depth_tex [[texture(1)]],
+                                 texture2d<float> blurred_tex [[texture(2)]],
+                                 texture2d<float> exposure_tex [[texture(3)]],
+                                 sampler smp [[sampler(0)]],
+                                 constant FrameUniforms& F [[buffer(0)]],
+                                 constant PostUniforms& P [[buffer(1)]]) {
+    float3 color = post_bloom_blend(scene_tex, depth_tex, blurred_tex, smp, in.uv, P);
+
+    float exposure = exposure_tex.sample(smp, float2(0.5, 0.5)).r * 64.0;
+    color = post_pow(saturate(color * exposure) * P.inv_highlights.rgb - P.shadows_desat.rgb, P.midtones.rgb);
+    float scaled_luminance = dot(color, P.lum_weights.rgb);
+    float3 graded = P.overlay.rgb + color * P.shadows_desat.a + float3(scaled_luminance);
+    float3 toned = post_pow(saturate(graded * P.gamma.rgb), float3(P.gamma.a));
+
+    // The curves: sixteen texels of slope and intercept per channel, looked up at value * 15 / 16.
+    int sr = clamp(int(saturate(toned.r) * 15.0), 0, 15);
+    int sg = clamp(int(saturate(toned.g) * 15.0), 0, 15);
+    int sb = clamp(int(saturate(toned.b) * 15.0), 0, 15);
+    toned = float3(toned.r * P.curve_m[sr].r + P.curve_b[sr].r,
+                   toned.g * P.curve_m[sg].g + P.curve_b[sg].g,
+                   toned.b * P.curve_m[sb].b + P.curve_b[sb].b);
     toned = saturate(toned);
 
-    // 2b. On-Screen Max-Speed Wind Streamlines (FX_Wind_Streaks peripheral airflow rays)
-    if (max_wind > 0.01) {
-        float2 D_asp = D * float2(max(uniforms.aspect, 1.0), 1.0);
-        float r_asp = length(D_asp);
-        float periph_mask = smoothstep(0.32, 0.72, r_asp);
-        if (periph_mask > 0.001) {
-            float theta = atan2(D_asp.y, D_asp.x);
-
-            // Layer 1: Primary fast aerodynamic wind filaments
-            float a1 = theta * 14.0;
-            float id1 = floor(a1);
-            float f1 = abs(fract(a1) - 0.5) * 2.0;
-            float h1 = fract(sin(id1 * 127.1 + 311.7) * 43758.5453);
-            float streak_t1 = fract(r_asp * 2.1 - uniforms.sim_time * (2.6 + 1.4 * h1) + h1 * 6.2831);
-            float ray1 = smoothstep(0.45, 0.0, f1) * smoothstep(0.0, 0.25, streak_t1) * smoothstep(0.95, 0.35, streak_t1);
-
-            // Layer 2: Secondary fine high-frequency air slipstream threads
-            float a2 = theta * 26.0 + 1.7;
-            float id2 = floor(a2);
-            float f2 = abs(fract(a2) - 0.5) * 2.0;
-            float h2 = fract(sin(id2 * 269.5 + 183.3) * 43758.5453);
-            float streak_t2 = fract(r_asp * 2.8 - uniforms.sim_time * (3.4 + 1.6 * h2) + h2 * 6.2831);
-            float ray2 = smoothstep(0.38, 0.0, f2) * smoothstep(0.0, 0.22, streak_t2) * smoothstep(0.92, 0.40, streak_t2);
-
-            float wind_streak = saturate((ray1 * 0.65 + ray2 * 0.45) * periph_mask * max_wind);
-            toned = saturate(toned + float3(0.88, 0.95, 1.0) * (wind_streak * 0.28));
-        }
-    }
-
-    // Subtle vignette for crisp screen framing
-    float vig_dist = length(D * float2(1.0, 0.85));
-    toned *= (1.0 - smoothstep(0.45, 0.95, vig_dist) * 0.15);
-
-    // 3. Reaction Time Cool Blue / Cyan Slow-Mo Tint
-    if (uniforms.reaction_active > 0.5) {
+    // Stand-ins for the chain's material effects, which are not translated yet: reaction time
+    // (M_FX_FullScreenFX_Reactiontime_01) and low health (M_FX_FullScreenFX_HealthEffect_01).
+    if (F.reaction_active > 0.5) {
         float luma = dot(toned, float3(0.299, 0.587, 0.114));
-        float3 cool_grade = mix(float3(luma) * float3(0.70, 0.88, 1.08), toned, 0.65);
-        toned = saturate(cool_grade);
+        toned = saturate(mix(float3(luma) * float3(0.70, 0.88, 1.08), toned, 0.65));
     }
-
-    // 4. Low-Health Red Vignette (pulsing border when health < 50)
-    if (uniforms.health < 50.0) {
-        float dmg = saturate((50.0 - uniforms.health) / 50.0);
-        float dist = length(uv - 0.5) * 1.414;
-        float vig = pow(saturate(dist - 0.4), 2.5) * dmg * (0.8 + 0.2 * sin(uniforms.sim_time * 8.0));
+    if (F.health < 50.0) {
+        float dmg = saturate((50.0 - F.health) / 50.0);
+        float dist = length(in.uv - 0.5) * 1.414;
+        float vig = pow(saturate(dist - 0.4), 2.5) * dmg * (0.8 + 0.2 * sin(F.sim_time * 8.0));
         toned = mix(toned, float3(0.85, 0.02, 0.02), vig);
     }
 
+    // The chain's FadeInEffect (FX_PostProcess.FadeInEffect, after the tone mapping): the picture
+    // towards FadeColor as FadeInAmount falls from 1 to 0, what is already near the colour first.
+    float away = 1.0 - P.fade.a;
+    if (away > 0.0) {
+        float3 diff = P.fade.rgb - toned;
+        float weight = pow(away, 1.5);
+        float near_first = saturate((1.0 - saturate(0.577 * dot(diff, diff))) * 2.5 * away);
+        toned = mix(mix(toned, P.fade.rgb, near_first), toned + diff * weight, weight);
+    }
     return float4(toned, 1.0);
 }
 
