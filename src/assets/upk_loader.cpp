@@ -6,6 +6,7 @@
 #include "package_manager.hpp"
 #include "ue3_props.hpp"
 #include "../anim/anim_system.hpp"
+#include "../game/level_script.hpp"
 #include "../physics/collision_world.hpp"
 #include <fstream>
 #include <cstring>
@@ -4673,6 +4674,31 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 
     // The chapter's start-of-level intro: its Matinee, baked first-person camera and sounds.
     extract_level_intro(game_root, loaded_packages, out_scene.level_intro);
+
+    // Every Matinee that drives the pawn (the intro among them), and the level's Kismet that
+    // starts them, sets the checkpoints, puts text on the screen and ends the chapter.
+    std::unordered_map<std::string, int> cutscene_of;
+    extract_player_cutscenes(game_root, loaded_packages, out_scene.level_intro, out_scene.cutscenes, cutscene_of);
+    // The training area's Kismet hangs on its movement-challenge system (SeqAct_TdStartMovementChallenge,
+    // SeqEvt_TdMovementChallenge*), which the port does not run; it keeps its staged tutorial.
+    if (low_prefix != "tutorial") {
+        auto graph = std::make_shared<ScriptGraph>();
+        std::vector<std::string> warnings;
+        if (graph->load(loaded_packages, cutscene_of, warnings)) {
+            size_t events = 0, triggers = 0;
+            for (const ScriptGraph::Node& n : graph->nodes) {
+                if (n.cls.rfind("SeqEvent", 0) == 0 || n.cls.rfind("SeqEvt", 0) == 0) ++events;
+                if (n.cls == "SeqEvent_Touch" || n.cls == "SeqEvent_TdTouch") ++triggers;
+            }
+            std::cout << "[Level] Kismet: " << graph->nodes.size() << " sequence objects in " << graph->packages.size()
+                      << " packages, " << events << " events (" << triggers << " touch), " << graph->actors.size()
+                      << " actors, " << graph->matinees.size() << " Matinees, " << out_scene.cutscenes.size()
+                      << " player cutscenes" << (warnings.empty() ? "" : ", " + std::to_string(warnings.size()) + " warnings")
+                      << std::endl;
+            out_scene.script = std::move(graph);
+            out_scene.script_checkpoints = true;
+        }
+    }
 
     // Link each extracted elevator to the checkpoints at its start and destination floors so
     // riding the elevator streams in the destination zone's sub-packages (SeqAct_MultiLevelStreaming)

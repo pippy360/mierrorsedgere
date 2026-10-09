@@ -14,6 +14,7 @@
 #include "../ui/main_menu.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2512,9 +2513,9 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         if (cp->is_level_intro()) {
-            // A level's own intro carries what retail shows over it: the skip prompt, top left.
-            impl->draw_ui_text(cs_hud, "Press SPACE to skip", w * 0.074f, h * 0.105f, 1.9f,
-                               ui_color(0.86f, 0.88f, 0.90f, 0.85f));
+            // A level's own cutscene carries what retail shows over it: the skip prompt, top
+            // left, when the Matinee is skippable (telemetry.skip_prompt), and the script's text.
+            impl->draw_script_text(cs_hud, telemetry);
         } else {
             // Top-right Skip / Next Cutscene controls + progress bar
             std::string ctrl_str = "[SPACE / ENTER] SKIP CUTSCENE   |   [C] NEXT CUTSCENE";

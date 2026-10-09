@@ -31,6 +31,9 @@ public:
 
     // Reset player position and orientation
     void reset(const Vec3& spawn_pos, float spawn_yaw = 0.0f);
+    // The active checkpoint as the level script sets it (SeqAct_TdCheckpoint): where the player
+    // respawns, and which one the HUD counts. `feet` is the pawn's feet.
+    void set_checkpoint(const Vec3& feet, float yaw_deg, int index, const std::string& name);
 
     // Retail replay harness (tools/retail/replay.py, src/tools/replay_main.cpp): reset the pawn to a
     // recorded retail frame - feet, velocity, view - and hand it the state retail's PlayerMove carries
@@ -457,6 +460,10 @@ private:
     // Spawn / Respawn tracking
     Vec3 m_last_checkpoint_pos{0.0f, 0.0f, 100.0f};
     float m_last_checkpoint_yaw = 0.0f;
+    // Where a death puts the player back when the level script owns the checkpoints: the
+    // checkpoint itself, not the void baseline above, which follows the pawn down.
+    Vec3 m_respawn_pos{0.0f, 0.0f, 100.0f};
+    float m_respawn_yaw = 0.0f;
     float m_death_timer = 0.0f;
     float m_death_total_duration = 1.35f;
 };

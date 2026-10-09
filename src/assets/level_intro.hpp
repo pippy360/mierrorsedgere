@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace me {
@@ -29,5 +30,15 @@ class UPKPackage;
 
 void extract_level_intro(const std::string& game_root, const std::vector<std::shared_ptr<UPKPackage>>& packages,
                          LevelIntroSequence& out);
+
+// Every Matinee that drives the local pawn with a placed body, baked the same way: the intro
+// (copied from `intro` when it is one of them, so the two agree to the frame), the cutscenes
+// the level's triggers start, the outro. A pawn group that plays several animations in turn
+// (sp01b_outro_part1 then part2) is baked onto one timeline, its segments listed. `cutscene_of`
+// maps "<package stem, lower case>:<SeqAct_Interp export index>" to the index in `out`, for the
+// level script to play them by.
+void extract_player_cutscenes(const std::string& game_root, const std::vector<std::shared_ptr<UPKPackage>>& packages,
+                              const LevelIntroSequence& intro, std::vector<LevelIntroSequence>& out,
+                              std::unordered_map<std::string, int>& cutscene_of);
 
 }  // namespace me

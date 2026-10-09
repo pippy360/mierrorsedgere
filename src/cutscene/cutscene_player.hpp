@@ -53,6 +53,11 @@ public:
     // fly-in the EXTRAS menu offers, ending at Faith's spawn viewpoint after duration_sec.
     void play_in_engine_intro(const LevelScene& scene, const PlayerTelemetry& telemetry, float duration_sec = 5.5f);
 
+    // One of the level's player cutscenes (LevelScene::cutscenes[index]), as the level script
+    // starts it: played like the intro, at the Matinee's PlayRate.
+    void play_level_cutscene(const LevelScene& scene, int index, float play_rate = 1.0f);
+    [[nodiscard]] int level_cutscene_index() const { return cutscene_index_; }
+
     // Stop / skip current cutscene immediately (if Bink movie has chain_in_engine_intro, transitions or skips cleanly)
     void stop();
 
@@ -81,6 +86,15 @@ public:
     // Matinee has them `elapsed_sec` in. Past the last key they rest where it leaves them, which is
     // also where a skipped intro puts them.
     static void pose_intro_doors(LevelScene& scene, float elapsed_sec);
+    static void pose_sequence_doors(LevelScene& scene, const LevelIntroSequence& sequence, float elapsed_sec);
+    // The baked sequence playing: one of LevelScene::cutscenes or the intro (null outside a level cutscene).
+    [[nodiscard]] const LevelIntroSequence* active_sequence(const LevelScene& scene) const {
+        if (!is_level_intro()) return nullptr;
+        if (cutscene_index_ >= 0 && static_cast<size_t>(cutscene_index_) < scene.cutscenes.size()) {
+            return &scene.cutscenes[static_cast<size_t>(cutscene_index_)];
+        }
+        return &scene.level_intro;
+    }
     // Where the level intro's animation has its root this frame (Faith's feet).
     [[nodiscard]] Vec3 intro_root_pos() const { return intro_root_pos_; }
 
@@ -135,6 +149,8 @@ private:
 
     // The level intro being played: which of its sounds are still to come, and those just reached
     bool level_intro_ = false;
+    int cutscene_index_ = -1;      // LevelScene::cutscenes index, -1 = LevelScene::level_intro
+    float play_rate_ = 1.0f;       // SeqAct_Interp.PlayRate: Matinee seconds per real second
     size_t intro_next_sound_ = 0;
     std::vector<IntroSoundEvent> intro_sounds_;
     size_t intro_next_fade_ = 0;

@@ -386,7 +386,11 @@ bool CutscenePlayer::play_bink_movie(const std::string& movie_name, bool chain_i
 }
 
 void CutscenePlayer::pose_intro_doors(LevelScene& scene, float elapsed_sec) {
-    for (const IntroDoorSwing& swing : scene.level_intro.door_swings) {
+    pose_sequence_doors(scene, scene.level_intro, elapsed_sec);
+}
+
+void CutscenePlayer::pose_sequence_doors(LevelScene& scene, const LevelIntroSequence& sequence, float elapsed_sec) {
+    for (const IntroDoorSwing& swing : sequence.door_swings) {
         if (swing.yaw_keys.empty()) continue;
         BargeDoorInstance* door = nullptr;
         for (BargeDoorInstance& candidate : scene.barge_doors) {
@@ -444,6 +448,8 @@ void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
     elapsed_sec_ = 0.0f;
     letterbox_amount_ = 1.0f;
     level_intro_ = false;
+    cutscene_index_ = -1;
+    play_rate_ = 1.0f;
     intro_next_sound_ = 0;
     intro_sounds_.clear();
     intro_next_fade_ = 0;
@@ -503,11 +509,36 @@ void CutscenePlayer::play_in_engine_intro(const LevelScene& scene,
     active_subtitle_.clear();
 }
 
+void CutscenePlayer::play_level_cutscene(const LevelScene& scene, int index, float play_rate) {
+    if (index < 0 || static_cast<size_t>(index) >= scene.cutscenes.size()) return;
+    const LevelIntroSequence& cs = scene.cutscenes[static_cast<size_t>(index)];
+    if (!cs.valid || cs.cam_pos.size() < 2 || cs.matinee_length_sec <= 0.0f) return;
+    close_bink_streams();
+    mode_ = ECutsceneMode::InEngineMatinee;
+    chain_in_engine_after_bink_ = false;
+    elapsed_sec_ = 0.0f;
+    letterbox_amount_ = 0.0f;
+    level_intro_ = true;
+    cutscene_index_ = index;
+    play_rate_ = std::max(0.01f, play_rate);
+    intro_next_sound_ = 0;
+    intro_sounds_.clear();
+    intro_next_fade_ = 0;
+    intro_fades_.clear();
+    matinee_keys_.clear();
+    active_subtitle_.clear();
+    current_movie_name_ = cs.seq_name;
+    duration_sec_ = cs.matinee_length_sec;
+    std::cout << "[Cutscene] Playing level cutscene '" << current_movie_name_ << "' (" << duration_sec_ << " s Matinee at "
+              << play_rate_ << "x, " << cs.sounds.size() << " sounds)" << std::endl;
+}
+
 void CutscenePlayer::stop() {
     close_bink_streams();
     mode_ = ECutsceneMode::None;
     letterbox_amount_ = 0.0f;
     active_subtitle_.clear();
+    cutscene_index_ = -1;
 }
 
 void CutscenePlayer::decode_until_time(float target_sec) {
@@ -607,7 +638,9 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
         return;
     }
 
-    elapsed_sec_ += std::max(0.0f, dt);
+    // Matinee seconds: a SeqAct_Interp's position advances by dt * PlayRate (the Flight outro
+    // runs at 0.8). A movie's clock is real time.
+    elapsed_sec_ += std::max(0.0f, dt) * (mode_ == ECutsceneMode::InEngineMatinee ? play_rate_ : 1.0f);
 
     if (mode_ == ECutsceneMode::BinkVideo) {
         decode_until_time(elapsed_sec_);
@@ -635,7 +668,8 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             }
         }
     } else if (mode_ == ECutsceneMode::InEngineMatinee) {
-        const LevelIntroSequence& intro = scene.level_intro;
+        const bool indexed = cutscene_index_ >= 0 && static_cast<size_t>(cutscene_index_) < scene.cutscenes.size();
+        const LevelIntroSequence& intro = indexed ? scene.cutscenes[static_cast<size_t>(cutscene_index_)] : scene.level_intro;
         const bool level_intro = level_intro_ && intro.valid && intro.cam_pos.size() >= 2;
         if (level_intro) {
             // Every sound whose time has come, including those of the last stretch.
@@ -692,6 +726,16 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             io_telemetry.intro_pkg_path = intro.package_path;
             io_telemetry.intro_anim_exp_1 = intro.anim_export_index_1;
             io_telemetry.intro_anim_time = anim_t;
+            // A cutscene of several animations: the mesh plays the one the Matinee is in.
+            if (intro.segments.size() > 1) {
+                const LevelIntroSequence::Segment* seg = &intro.segments.front();
+                for (const auto& s : intro.segments) {
+                    if (s.start_sec <= elapsed_sec_ + 1e-4f) seg = &s;
+                }
+                io_telemetry.intro_anim_name = seg->seq_name;
+                io_telemetry.intro_anim_exp_1 = seg->anim_export_index_1;
+                io_telemetry.intro_anim_time = std::clamp(elapsed_sec_ - seg->start_sec, 0.0f, seg->length_sec);
+            }
             return;
         }
 

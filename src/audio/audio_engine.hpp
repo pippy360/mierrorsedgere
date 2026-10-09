@@ -121,6 +121,8 @@ public:
 
     // SoundCues by "Group.Name" (or bare name), as Kismet and animation notifies refer to them.
     [[nodiscard]] bool has_cue(const std::string& group_and_name) const;
+    // The length in seconds of the wave the cue resolves to (0 when it is not loaded).
+    [[nodiscard]] float cue_duration(const std::string& group_and_name) const;
     // Loads the content package a cue lives in ("A_Props_Interactive", "A_VO_CS01_CUE") from
     // CookedPC/Audio or its int/ voice folder, once. A voice cue package brings its waves along.
     bool load_cue_bank(const std::string& game_root, const std::string& package);
