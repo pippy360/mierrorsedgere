@@ -329,8 +329,13 @@ struct OpenGLRenderer::Impl {
     // Uniform buffers
     GLuint cb_frame = 0;     // FrameUniforms: vertex b1, fragment b0
     GLuint cb_screen = 0;    // float2 screen size: HUD / UI vertex b1
-    GLuint cb_material = 0;  // float4 material uniforms: fragment b1
+    GLuint cb_material = 0;  // float4 material uniforms: fragment b1 (the menu's per-frame override)
     static constexpr int kMaxMaterialUniforms = 256;
+    // Every material instance's float4 uniforms, uploaded once when its library becomes resident,
+    // so a section binds a range of this buffer instead of uploading its values (mat_uniform_offsets).
+    GLuint mat_uniform_buffer = 0;
+    std::vector<GLintptr> mat_uniform_offsets;  // per SceneMaterial; -1 = none
+    GLint uniform_offset_alignment = 256;
 
     // Framebuffer targets
     UITexture offscreen_color_tex;  // the finished frame (RGBA8); the window shows a blit of it
@@ -431,6 +436,7 @@ struct OpenGLRenderer::Impl {
         if (!gl::loaded()) return;
         if (b.vao) glDeleteVertexArrays(1, &b.vao);
         if (b.vbo) glDeleteBuffers(1, &b.vbo);
+        if (cur_vao == b.vao) cur_vao = 0;
         b = GpuBuffer{};
     }
 
@@ -487,14 +493,16 @@ struct OpenGLRenderer::Impl {
     // Makes `b` (or, for null, nothing) the vertex source, laid out as `kind`.
     void bind_vertices(GpuBuffer* b, VertexKind kind) {
         if (!b || kind == VertexKind::None) {
-            glBindVertexArray(empty_vao);
+            if (cur_vao != empty_vao) glBindVertexArray(empty_vao);
+            cur_vao = empty_vao;
             return;
         }
         if (!b->vao) {
             glGenVertexArrays(1, &b->vao);
             b->vao_kind = VertexKind::None;
         }
-        glBindVertexArray(b->vao);
+        if (cur_vao != b->vao) glBindVertexArray(b->vao);
+        cur_vao = b->vao;
         if (b->vao_kind == kind) return;
         const VertexLayout& layout = layouts[static_cast<int>(kind)];
         const VertexLayout& old = layouts[static_cast<int>(b->vao_kind)];
@@ -590,6 +598,37 @@ struct OpenGLRenderer::Impl {
     std::atomic<uint64_t> prof_posed{0};  // enemies skinned
     double prof_seconds[kProfPhases] = {};
     int prof_frames = 0;
+    // The GPU's time per frame (one GL_TIME_ELAPSED query; several per frame would split the
+    // driver's command buffers and inflate the result), read a frame late so the CPU never waits for
+    // it. The wall-clock time between frames gives the frame rate itself.
+    GLuint prof_queries[2] = {0, 0};
+    bool prof_query_pending[2] = {false, false};
+    double prof_gpu_seconds = 0.0;
+    int prof_gpu_frames = 0;
+    std::chrono::steady_clock::time_point prof_last_frame{};
+    double prof_wall_seconds = 0.0;
+
+    void prof_gpu_begin() {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (prof_last_frame.time_since_epoch().count() != 0) prof_wall_seconds += std::chrono::duration<double>(now - prof_last_frame).count();
+        prof_last_frame = now;
+        if (!prof_queries[0]) glGenQueries(2, prof_queries);
+        const int slot = static_cast<int>(frame_index & 1u);
+        if (prof_query_pending[slot]) {
+            GLuint64 ns = 0;
+            glGetQueryObjectui64v(prof_queries[slot], GL_QUERY_RESULT, &ns);
+            prof_gpu_seconds += static_cast<double>(ns) * 1e-9;
+            ++prof_gpu_frames;
+            prof_query_pending[slot] = false;
+        }
+        glBeginQuery(GL_TIME_ELAPSED, prof_queries[slot]);
+    }
+    void prof_gpu_end() {
+        if (!profile || !prof_queries[0]) return;
+        glEndQuery(GL_TIME_ELAPSED);
+        prof_query_pending[frame_index & 1u] = true;
+    }
 
     void draw(GLsizei vertex_count, GLint first_vertex) {
         flush_bindings();
@@ -607,8 +646,26 @@ struct OpenGLRenderer::Impl {
         glBufferSubData(GL_UNIFORM_BUFFER, 0, static_cast<GLsizeiptr>(length), data);
     }
 
-    // Fixed-function state helpers
+    // Fixed-function state helpers. Each remembers what it last set and skips a repeat: the passes
+    // set the full state per section, as the other backends do, and a GL call costs several
+    // microseconds on some drivers even when it changes nothing.
+    int cur_depth = -1;
+    BlendState cur_blend;
+    bool cur_blend_valid = false;
+    int cur_cull = -1;
+    int cur_viewport[2] = {-1, -1};
+    float cur_depth_range[2] = {-1.0f, -1.0f};
+    GLuint cur_vao = 0;
+    struct UniformBinding {
+        GLuint buffer = 0;
+        GLintptr offset = 0;
+        GLsizeiptr size = 0;  // 0 = the whole buffer (glBindBufferBase)
+    };
+    UniformBinding cur_uniform_binding[kFragmentBlockBase * 2];
+
     void set_depth(DepthState s) {
+        if (cur_depth == static_cast<int>(s)) return;
+        cur_depth = static_cast<int>(s);
         switch (s) {
             case DepthState::Write:
                 glEnable(GL_DEPTH_TEST);
@@ -627,6 +684,12 @@ struct OpenGLRenderer::Impl {
         }
     }
     void set_blend(const BlendState& b) {
+        if (cur_blend_valid && b.enable == cur_blend.enable &&
+            (!b.enable || (b.src == cur_blend.src && b.dst == cur_blend.dst && b.src_a == cur_blend.src_a && b.dst_a == cur_blend.dst_a))) {
+            return;
+        }
+        cur_blend = b;
+        cur_blend_valid = true;
         if (b.enable) {
             glEnable(GL_BLEND);
             glBlendEquation(GL_FUNC_ADD);
@@ -636,6 +699,8 @@ struct OpenGLRenderer::Impl {
         }
     }
     void set_cull(bool cull_back) {
+        if (cur_cull == (cull_back ? 1 : 0)) return;
+        cur_cull = cull_back ? 1 : 0;
         if (cull_back) {
             glEnable(GL_CULL_FACE);
             glCullFace(GL_BACK);
@@ -656,17 +721,39 @@ struct OpenGLRenderer::Impl {
     void clear_shadow_bias() { glDisable(GL_POLYGON_OFFSET_FILL); }
     // The viewport with its depth range (the viewmodel draws into [0, 0.05], the world into [0.05, 1]).
     void set_viewport(int w, int h, float min_depth, float max_depth) {
-        glViewport(0, 0, w, h);
-        glDepthRange(min_depth, max_depth);
+        if (w != cur_viewport[0] || h != cur_viewport[1]) {
+            glViewport(0, 0, w, h);
+            cur_viewport[0] = w;
+            cur_viewport[1] = h;
+        }
+        if (min_depth != cur_depth_range[0] || max_depth != cur_depth_range[1]) {
+            glDepthRange(min_depth, max_depth);
+            cur_depth_range[0] = min_depth;
+            cur_depth_range[1] = max_depth;
+        }
     }
     void set_render_target(GLuint fbo) { glBindFramebuffer(GL_FRAMEBUFFER, fbo); }
     void clear_color(const float rgba[4]) { glClearBufferfv(GL_COLOR, 0, rgba); }
     void clear_depth() {
         glDepthMask(GL_TRUE);  // glClear honours the depth write mask
+        cur_depth = -1;        // so the next set_depth() restores the mask it wants
         const GLfloat one = 1.0f;
         glClearBufferfv(GL_DEPTH, 0, &one);
     }
-    void bind_uniform_block(GLuint binding, GLuint buffer) { glBindBufferBase(GL_UNIFORM_BUFFER, binding, buffer); }
+    void bind_uniform_block(GLuint binding, GLuint buffer) { bind_uniform_range(binding, buffer, 0, 0); }
+    // `size` 0 binds the whole buffer. Repeats of the current binding are skipped.
+    void bind_uniform_range(GLuint binding, GLuint buffer, GLintptr offset, GLsizeiptr size) {
+        UniformBinding& cur = cur_uniform_binding[binding];
+        if (cur.buffer == buffer && cur.offset == offset && cur.size == size) return;
+        cur.buffer = buffer;
+        cur.offset = offset;
+        cur.size = size;
+        if (size == 0) {
+            glBindBufferBase(GL_UNIFORM_BUFFER, binding, buffer);
+        } else {
+            glBindBufferRange(GL_UNIFORM_BUFFER, binding, buffer, offset, size);
+        }
+    }
 
     // With ME_GL_DEBUG=1 (and no GL_KHR_debug to report them as they happen), the errors a pass left.
     void check_errors(const char* where) {
@@ -699,6 +786,21 @@ struct OpenGLRenderer::Impl {
     static constexpr uint8_t kSecShadowCaster = 1u << 0;
     static constexpr uint8_t kSecTranslucent = 1u << 1;
     std::vector<std::vector<uint8_t>> cached_section_flags;
+    // The shadow pass draws no material state, so a mesh's casting sections that follow each other in
+    // its vertex buffer are drawn as one range (the depth result is the same whatever the order).
+    struct VertexRange {
+        GLint first = 0;
+        GLsizei count = 0;
+    };
+    std::vector<std::vector<VertexRange>> cached_shadow_ranges;
+    // The opaque pass's order of each mesh's sections: by material shader, then material, then light
+    // map (ME_GL_SORT=0: the buffer's order, as the other backends draw). A level is a handful of
+    // vertex buffers holding hundreds of sections, nearly all with a different material, and the GL
+    // driver pays for every program change; sorted, a program is switched to once per mesh. Opaque
+    // geometry depth-tests the same whatever the order, except at exact depth ties. UE3 sorts its base
+    // pass the same way.
+    std::vector<std::vector<uint32_t>> cached_opaque_order;
+    bool sort_opaque = true;
 
     // -------------------------------------------------------------------------
     // Mirror's Edge material system (LevelScene::materials) GPU cache
@@ -722,6 +824,7 @@ struct OpenGLRenderer::Impl {
     bool mat_front_ccw = true;
 
     void configure_material_culling() {
+        if (const char* env = std::getenv("ME_GL_SORT")) sort_opaque = !(env[0] == '0');
         if (const char* env = std::getenv("ME_CULL")) {
             const std::string v = env;
             if (v == "0" || v == "off" || v == "none") {
@@ -819,7 +922,11 @@ struct OpenGLRenderer::Impl {
             std::cerr << "[OpenGLRenderer] OpenGL " << major << "." << minor << " context; 4.1 core is needed." << std::endl;
             return false;
         }
-        if (!headless) SDL_GL_SetSwapInterval(1);
+        // ME_VSYNC=0 lets the frame rate run free (to measure it); otherwise the display's.
+        if (!headless) {
+            const char* vsync = std::getenv("ME_VSYNC");
+            SDL_GL_SetSwapInterval((vsync && vsync[0] == '0') ? 0 : 1);
+        }
 
         has_s3tc = gl::has_extension("GL_EXT_texture_compression_s3tc");
         has_anisotropy = gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic");
@@ -828,6 +935,8 @@ struct OpenGLRenderer::Impl {
         }
         glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_units);
         max_units = std::min<GLint>(max_units, kMaxUnits);
+        glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &uniform_offset_alignment);
+        if (uniform_offset_alignment < 16) uniform_offset_alignment = 16;
         GLint max_blocks = 0;
         glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &max_blocks);
         if (max_blocks < static_cast<GLint>(kFragmentBlockBase) + 2) {
@@ -849,6 +958,7 @@ struct OpenGLRenderer::Impl {
         glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
         glGenVertexArrays(1, &empty_vao);
         glBindVertexArray(empty_vao);
+        cur_vao = empty_vao;
         return true;
     }
 
@@ -1405,6 +1515,7 @@ struct OpenGLRenderer::Impl {
             if (lib->lightmap_textures[i].valid()) lm_textures[i] = upload_scene_texture(lib->lightmap_textures[i]);
         }
         compile_material_shaders(*lib);
+        upload_material_uniforms(*lib);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::cout << "[OpenGLRenderer] Material library resident: " << lib->materials.size() << " materials, "
                   << uploaded << "/" << n_tex << " textures uploaded in " << secs << " s" << std::endl;
@@ -1425,11 +1536,40 @@ struct OpenGLRenderer::Impl {
         return p;
     }
 
+    // Uploads values that differ from the material's own (the menu's 'Selected' parameter) and binds
+    // them in place of its range.
     void set_material_uniforms(const std::vector<std::array<float, 4>>& values, int count) {
         std::array<std::array<float, 4>, kMaxMaterialUniforms> padded;
         const size_t n = static_cast<size_t>(std::min(count, kMaxMaterialUniforms));
         for (size_t i = 0; i < n; ++i) padded[i] = (i < values.size()) ? values[i] : std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f};
         update_constants(cb_material, padded.data(), n * 16);
+        bind_uniform_block(block_binding(false, matbind::kMaterialBuffer), cb_material);
+    }
+
+    // One buffer with every material's uniforms, each shader's count of float4s at an offset the
+    // driver accepts for glBindBufferRange.
+    void upload_material_uniforms(const SceneMaterialLibrary& lib) {
+        if (mat_uniform_buffer) glDeleteBuffers(1, &mat_uniform_buffer);
+        mat_uniform_buffer = 0;
+        mat_uniform_offsets.assign(lib.materials.size(), -1);
+        std::vector<float> data;
+        const size_t align_floats = static_cast<size_t>(uniform_offset_alignment) / sizeof(float);
+        for (size_t mi = 0; mi < lib.materials.size(); ++mi) {
+            const SceneMaterial& m = lib.materials[mi];
+            if (m.shader < 0 || static_cast<size_t>(m.shader) >= lib.shaders.size()) continue;
+            const int count = std::min(lib.shaders[static_cast<size_t>(m.shader)].num_uniforms, kMaxMaterialUniforms);
+            if (count <= 0) continue;
+            const size_t start = (data.size() + align_floats - 1) / align_floats * align_floats;
+            data.resize(start + static_cast<size_t>(count) * 4, 0.0f);
+            for (size_t i = 0; i < static_cast<size_t>(count) && i < m.uniforms.size(); ++i) {
+                std::memcpy(&data[start + i * 4], m.uniforms[i].data(), 16);
+            }
+            mat_uniform_offsets[mi] = static_cast<GLintptr>(start * sizeof(float));
+        }
+        if (data.empty()) return;
+        glGenBuffers(1, &mat_uniform_buffer);
+        glBindBuffer(GL_UNIFORM_BUFFER, mat_uniform_buffer);
+        glBufferData(GL_UNIFORM_BUFFER, static_cast<GLsizeiptr>(data.size() * sizeof(float)), data.data(), GL_STATIC_DRAW);
     }
 
     // Binds a section's three light-map coefficient textures (texture(24..26), sampler(15)). A
@@ -1476,7 +1616,16 @@ struct OpenGLRenderer::Impl {
             bind_texture(n2d + j, t);
             bind_sampler(n2d + j, mat_cube_sampler);
         }
-        if (sh.num_uniforms > 0) set_material_uniforms(m.uniforms, sh.num_uniforms);
+        if (sh.num_uniforms > 0) {
+            const size_t mi = static_cast<size_t>(&m - mat_lib->materials.data());
+            const GLintptr offset = (mi < mat_uniform_offsets.size()) ? mat_uniform_offsets[mi] : -1;
+            if (offset >= 0 && mat_uniform_buffer) {
+                bind_uniform_range(block_binding(false, matbind::kMaterialBuffer), mat_uniform_buffer, offset,
+                                   static_cast<GLsizeiptr>(std::min(sh.num_uniforms, kMaxMaterialUniforms)) * 16);
+            } else {
+                set_material_uniforms(m.uniforms, sh.num_uniforms);
+            }
+        }
         if (sh.uses_scene_color || sh.uses_scene_depth) {
             bind_texture(matbind::kSceneColorTexture, scene_color_copy.get());
             bind_texture(matbind::kSceneDepthTexture, scene_depth_copy.get());
@@ -1802,6 +1951,8 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         prof_mark = now;
     };
 
+    impl->prof_gpu_begin();
+
     // ---------------------------------------------------------------------
     // Main Menu / Load Chapter State: Switch to TdMainMenu.me1 3D City
     // ---------------------------------------------------------------------
@@ -1905,7 +2056,16 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
     const bool scene_hidden = impl->frontend_rgba != nullptr && impl->frontend_w > 0 && impl->frontend_h > 0;
 
     // The frame uniforms as the shaders see them from here on (vertex b1 and fragment b0 share one buffer).
-    auto push_uniforms = [&]() { impl->update_constants(impl->cb_frame, &uniforms, sizeof(uniforms)); };
+    // The passes push them per mesh; most meshes change nothing (identity model matrix), so only a
+    // change is uploaded.
+    FrameUniformsGPU pushed_uniforms{};
+    bool pushed_valid = false;
+    auto push_uniforms = [&]() {
+        if (pushed_valid && std::memcmp(&pushed_uniforms, &uniforms, sizeof(uniforms)) == 0) return;
+        impl->update_constants(impl->cb_frame, &uniforms, sizeof(uniforms));
+        pushed_uniforms = uniforms;
+        pushed_valid = true;
+    };
     auto set_viewport = [&](float w, float h, float min_depth, float max_depth) {
         impl->set_viewport(static_cast<int>(w), static_cast<int>(h), min_depth, max_depth);
     };
@@ -1959,10 +2119,16 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         impl->cached_has_translucent = false;
         impl->cached_needs_scene_copies = false;
         impl->cached_section_flags.assign(active_scene.meshes.size(), {});
+        impl->cached_shadow_ranges.assign(active_scene.meshes.size(), {});
+        impl->cached_opaque_order.assign(active_scene.meshes.size(), {});
         for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
             const auto& mesh = active_scene.meshes[i];
             auto& sflags = impl->cached_section_flags[i];
             sflags.assign(mesh.sections.size(), 0u);
+            auto& ranges = impl->cached_shadow_ranges[i];
+            auto& order = impl->cached_opaque_order[i];
+            order.reserve(mesh.sections.size());
+            std::vector<int> order_shader(mesh.sections.size(), -1);
             for (size_t si = 0; si < mesh.sections.size(); ++si) {
                 const auto& s = mesh.sections[si];
                 const MaterialShader* sh = nullptr;
@@ -1982,8 +2148,29 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     if (sh->uses_scene_color || sh->uses_scene_depth) {
                         impl->cached_needs_scene_copies = true;
                     }
+                } else if (s.vertex_count > 0 &&
+                           static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size()) {
+                    order.push_back(static_cast<uint32_t>(si));
+                    order_shader[si] = (ps && m) ? m->shader : -1;
                 }
                 sflags[si] = fl;
+                if ((fl & Impl::kSecShadowCaster) && s.vertex_count > 0 &&
+                    static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size()) {
+                    if (!ranges.empty() && ranges.back().first + ranges.back().count == static_cast<GLint>(s.first_vertex)) {
+                        ranges.back().count += static_cast<GLsizei>(s.vertex_count);
+                    } else {
+                        ranges.push_back({static_cast<GLint>(s.first_vertex), static_cast<GLsizei>(s.vertex_count)});
+                    }
+                }
+            }
+            if (impl->sort_opaque) {
+                std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                    const MeshSection& sa = mesh.sections[a];
+                    const MeshSection& sb = mesh.sections[b];
+                    if (order_shader[a] != order_shader[b]) return order_shader[a] < order_shader[b];
+                    if (sa.material != sb.material) return sa.material < sb.material;
+                    return sa.lightmap < sb.lightmap;
+                });
             }
         }
     }
@@ -2165,13 +2352,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     impl->draw(static_cast<GLsizei>(mesh.vertices.size()), 0);
                     continue;
                 }
-                const auto& sflags = impl->cached_section_flags[i];
-                for (size_t si = 0; si < mesh.sections.size(); ++si) {
-                    const auto& s = mesh.sections[si];
-                    if (!section_in_range(mesh, s)) continue;
-                    if ((sflags[si] & Impl::kSecShadowCaster) == 0) continue;
-                    impl->draw(static_cast<GLsizei>(s.vertex_count), static_cast<GLint>(s.first_vertex));
-                }
+                for (const Impl::VertexRange& r : impl->cached_shadow_ranges[i]) impl->draw(r.count, r.first);
             }
             set_matrix(uniforms.model, identity);
 
@@ -2308,12 +2489,24 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     continue;
                 }
                 // Opaque + masked material sections (UE3 base pass). Translucent ones are deferred.
-                for (const auto& s : mesh.sections) {
-                    if (!section_in_range(mesh, s)) continue;
+                // Sections that follow each other with the same material and light map (one mesh
+                // element batched for several placements) are one draw: the order is kept.
+                const std::vector<uint32_t>& order = impl->cached_opaque_order[i];
+                for (size_t oi = 0; oi < order.size(); ++oi) {
+                    const auto& s = mesh.sections[order[oi]];
                     const MaterialShader* sh = nullptr;
                     const SceneMaterial* m = nullptr;
                     const Impl::Program* ps = impl->section_shader(s, &sh, &m);
-                    if (ps && mat_blend_is_translucent(sh->blend)) continue;
+                    GLsizei run_count = static_cast<GLsizei>(s.vertex_count);
+                    while (oi + 1 < order.size()) {
+                        const auto& n = mesh.sections[order[oi + 1]];
+                        if (n.material != s.material || n.lightmap != s.lightmap ||
+                            static_cast<GLint>(s.first_vertex) + run_count != static_cast<GLint>(n.first_vertex)) {
+                            break;
+                        }
+                        run_count += static_cast<GLsizei>(n.vertex_count);
+                        ++oi;
+                    }
                     if (ps) {
                         use_material_pipeline(*ps, *sh, *m, impl->mat_cull_enabled && !sh->two_sided && !in_main_menu);
                         impl->bind_lightmap(s.lightmap);
@@ -2330,7 +2523,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     } else {
                         use_world_pipeline();
                     }
-                    impl->draw(static_cast<GLsizei>(s.vertex_count), static_cast<GLint>(s.first_vertex));
+                    impl->draw(run_count, static_cast<GLint>(s.first_vertex));
                 }
             }
             set_matrix(uniforms.model, identity);
@@ -2752,6 +2945,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
     impl->check_errors("overlays");
 
     prof(Impl::kProfOverlays);
+    impl->prof_gpu_end();
     if (!impl->headless) {
         // The off-screen frame to the window. Its rows run top-down (the vertex shaders' y flip), the
         // window's bottom-up, so the blit inverts y.
@@ -2776,10 +2970,16 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
             std::fprintf(stderr, " %s %.2f", Impl::kProfNames[i], impl->prof_seconds[i] / 120.0 * 1000.0);
             impl->prof_seconds[i] = 0.0;
         }
-        std::fprintf(stderr, "; %llu draws, %.1f of %zu enemies posed\n", static_cast<unsigned long long>(impl->prof_draws / 120),
+        const double wall_ms = impl->prof_wall_seconds / 120.0 * 1000.0;
+        std::fprintf(stderr, "; gpu %.2f; frame %.2f (%.0f fps); %llu draws, %.1f of %zu enemies posed\n",
+                     impl->prof_gpu_frames > 0 ? impl->prof_gpu_seconds / impl->prof_gpu_frames * 1000.0 : 0.0, wall_ms,
+                     wall_ms > 0.0 ? 1000.0 / wall_ms : 0.0, static_cast<unsigned long long>(impl->prof_draws / 120),
                      static_cast<double>(impl->prof_posed.exchange(0)) / 120.0, active_scene.enemies.size());
         impl->prof_frames = 0;
         impl->prof_draws = 0;
+        impl->prof_gpu_seconds = 0.0;
+        impl->prof_gpu_frames = 0;
+        impl->prof_wall_seconds = 0.0;
     }
 
     impl->frame_index++;
