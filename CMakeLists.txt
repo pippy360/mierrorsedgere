@@ -115,7 +115,7 @@ endif()
 # me_glsl: translates every built-in and material shader to GLSL and compiles it on the GPU
 # (docs/LINUX_PORT.md). Builds wherever SDL2 is available.
 if(UNIX)
-    add_executable(me_glsl src/tools/glsl_main.cpp src/renderer/msl_to_glsl.cpp ${CORE_SOURCES})
+    add_executable(me_glsl src/tools/glsl_main.cpp src/renderer/msl_to_glsl.cpp src/platform/platform.cpp ${CORE_SOURCES})
     target_link_libraries(me_glsl PRIVATE ZLIB::ZLIB Threads::Threads)
     if(APPLE)
         target_link_libraries(me_glsl PRIVATE SDL2)
