@@ -13,6 +13,7 @@
 #include "fp_anim.hpp"
 #include "fp_controls.hpp"
 
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -105,7 +106,9 @@ private:
     int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn
     // The pawn's axes in the mesh component's space, read off the reference pose's eye.
     Vec3 fwd_{1.0f, 0.0f, 0.0f}, right_{0.0f, 1.0f, 0.0f}, up_{0.0f, 0.0f, 1.0f};
-    mutable std::vector<Pose> scratch_;
+    // One scratch pose per recursion depth. A deque: atoms() holds a reference into it while the
+    // deeper calls grow it, which a vector's reallocation would leave dangling.
+    mutable std::deque<Pose> scratch_;
 };
 
 }  // namespace me::fp

@@ -579,8 +579,21 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
+    m_respawn_pos = spawn_pos;
+    m_respawn_yaw = spawn_yaw;
     m_death_timer = 0.0f;
     m_death_total_duration = 1.35f;
+}
+
+// SeqAct_TdCheckpoint, through the level script: the checkpoint the player respawns at and is
+// counted as having reached. Replaces the proximity test of update_checkpoints_and_volumes.
+void ParkourController::set_checkpoint(const Vec3& feet, float yaw_deg, int index, const std::string& name) {
+    m_last_checkpoint_pos = feet;
+    m_last_checkpoint_yaw = yaw_deg;
+    m_respawn_pos = feet;
+    m_respawn_yaw = yaw_deg;
+    m_telemetry.active_checkpoint = index;
+    m_telemetry.active_checkpoint_name = name;
 }
 
 void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw, float pitch,
@@ -5776,15 +5789,24 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
             m_telemetry.death_anim_progress = std::clamp(
                 1.0f - (m_death_timer / std::max(0.10f, m_death_total_duration)), 0.0f, 1.0f);
             if (m_death_timer <= 0.0f) {
-                reset(m_last_checkpoint_pos, m_last_checkpoint_yaw);
-                m_telemetry.active_subtitle = "Respawned at Checkpoint";
+                // The level script's checkpoint when it has one; the drifting void baseline otherwise.
+                const Vec3 respawn = scene.script_checkpoints ? m_respawn_pos : m_last_checkpoint_pos;
+                const float respawn_yaw = scene.script_checkpoints ? m_respawn_yaw : m_last_checkpoint_yaw;
+                const int keep_index = m_telemetry.active_checkpoint;
+                const std::string keep_name = m_telemetry.active_checkpoint_name;
+                reset(respawn, respawn_yaw);
+                m_telemetry.active_checkpoint = keep_index;
+                m_telemetry.active_checkpoint_name = keep_name;
+                m_telemetry.respawned = true;
+                if (!scene.script_checkpoints) m_telemetry.active_subtitle = "Respawned at Checkpoint";
             }
         }
         return;
     }
 
-    // 2. Checkpoints & TdCheckpoint.StreamingLevels
-    for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
+    // 2. Checkpoints & TdCheckpoint.StreamingLevels. With a level script the checkpoints are its
+    // SeqAct_TdCheckpoint actions (set_checkpoint); the proximity test is for levels without one.
+    for (size_t i = 0; i < scene.checkpoints.size() && !scene.script_checkpoints; ++i) {
         if (m_telemetry.position.distance(scene.checkpoints[i]) < 240.0f) {
             if (static_cast<int>(i) > m_telemetry.active_checkpoint) {
                 m_telemetry.active_checkpoint = static_cast<int>(i);

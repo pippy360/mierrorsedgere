@@ -90,10 +90,12 @@ first got wrong.
 | `src/cutscene/cutscene_player.cpp` | Plays it for the Matinee's length: interpolates the baked camera, hands the sounds whose time has come to the game, poses the doors. |
 | `src/audio/audio_engine.cpp` | `play_cue()`, `play_footstep_number()`, `load_cue_bank()` (a cue's own package, and the packages its waves are imported from), `stop_cue()`. |
 | `src/main.cpp` | Loads the intro's cue packages with the level, plays the sounds, stops them and settles the doors when the intro ends or is skipped. `--trace <file>` writes the camera and every sound per frame. |
+| `src/game/level_script.cpp` | Starts the intro the way retail does: the level's Kismet, run from the checkpoint's `SeqEvt_TdCheckpointLoaded`, reaches the `SeqAct_Interp` through its remote event and plays it; the Matinee's event keys fire their Kismet (the voice lines, the teleports, the fades) as it plays, and a skip sets the Matinee to its end and fires `Completed` ([GAMEPLAY_SCRIPTING_RE.md](GAMEPLAY_SCRIPTING_RE.md)). The other pawn Matinees of a chapter are baked and played the same way. |
 
 A level without an intro in its data plays none after its movie. The camera fly-in the port used to play at
 every chapter start is kept only for the EXTRAS menu and the cutscene keys, where a scene without an intro
-still has something to show.
+still has something to show. A level whose Kismet does not reach its intro (none of the ten does this)
+plays it directly and says so in the log.
 
 ## 4. The measurement
 

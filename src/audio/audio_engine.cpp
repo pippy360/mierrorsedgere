@@ -1482,6 +1482,16 @@ bool AudioEngine::has_cue(const std::string& group_and_name) const {
     return false;
 }
 
+float AudioEngine::cue_duration(const std::string& group_and_name) const {
+    const size_t dot = group_and_name.rfind('.');
+    const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    for (const std::string& name : {group_and_name, bare}) {
+        float v = 1.0f, p = 1.0f;
+        if (const SoundClip* clip = resolve_cue_or_clip(name, v, p)) return clip->duration;
+    }
+    return 0.0f;
+}
+
 bool AudioEngine::load_cue_bank(const std::string& game_root, const std::string& package) {
     namespace fs = std::filesystem;
     if (package.empty() || !cue_banks_tried_.insert(package).second) return false;

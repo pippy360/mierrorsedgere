@@ -5,6 +5,7 @@
 #include "../anim/anim_system.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <cmath>
 #include <iostream>
 
@@ -434,6 +435,7 @@ void collect_notifies(const UPKPackage& pkg, int32_t sequence, float sequence_le
         parse_export_properties(pkg, notify, np);
         IntroSoundEvent ev;
         ev.time = start_time + t;
+        ev.from_notify = true;
         if (cls == "AnimNotify_Sound") {
             const int32_t cue = prop_object(np, "SoundCue");
             if (cue == 0) continue;
@@ -472,6 +474,332 @@ struct IntroMatinee {
     std::string group;        // the group linked to the local pawn
 };
 
+// The Matinee that drives the local pawn together with a placed skeletal mesh, if this
+// SeqAct_Interp is one.
+bool find_pawn_matinee(const UPKPackage& pkg, int32_t interp, const UPropertyList& interp_props, IntroMatinee& m) {
+    const UProperty* var_links = find_prop(interp_props, "VariableLinks");
+    if (!var_links) return false;
+    m = IntroMatinee{};
+    m.pkg = &pkg;
+    m.interp = interp;
+    for (const auto& link : var_links->elements) {
+        const UProperty* vars = find_prop(link, "LinkedVariables");
+        if (!vars) continue;
+        bool pawn = false;
+        int32_t actor = 0;
+        for (int32_t v : vars->ints) {
+            const std::string cls = class_of(pkg, v);
+            if (cls == "InterpData") m.data = v;
+            if (cls == "SeqVar_TdLocalPawn") pawn = true;
+            if (cls != "SeqVar_Object") continue;
+            UPropertyList vp;
+            parse_export_properties(pkg, v, vp);
+            const int32_t obj = prop_object(vp, "ObjValue");
+            const std::string ocls = class_of(pkg, obj);
+            if (ocls == "SkeletalMeshActorMAT" || ocls == "SkeletalMeshActor") actor = obj;
+        }
+        if (pawn && actor > 0) {
+            m.actor = actor;
+            m.group = prop_string(link, "LinkDesc");
+        }
+    }
+    return m.data > 0 && m.actor > 0;
+}
+
+// One animation of the pawn's group, baked: the first-person view per animation frame in the
+// rig's own space, and the full-body root it rides on when the level ships one.
+struct BakedAnim {
+    int32_t seq_export = 0;
+    std::string name;
+    float length = 0.0f;
+    size_t tracks = 0;
+    bool on_full_body_root = false;
+    float root_apart = 0.0f;
+    std::vector<AnimSystem::CannedCameraFrame> frames;
+};
+
+// The sequence of that name that animates the first-person skeleton. A level can carry several
+// with one name (a second body, a prop); the one that drives the most first-person bones, EyeJoint
+// among them, is the view's.
+//
+// Edge and Boat also ship the full-body version (89 tracks to the first-person 82), and that is
+// the one the pawn's own mesh plays: its root is what moves the pawn, and the first-person body
+// rides on the pawn. The two roots are not always the same - in Edge they part by up to 29 uu and
+// 14 degrees for a few seconds, and retail's pawn and camera follow the full-body one.
+bool bake_anim(const std::string& game_root, const UPKPackage& pkg, const std::string& anim_name, BakedAnim& out) {
+    const auto& exports = pkg.get_exports();
+    int32_t best_seq = 0;
+    int best_score = 0;
+    size_t best_tracks = 0;
+    AnimSetAsset best_set;
+    struct Body {
+        int32_t seq = 0;
+        AnimSetAsset set;
+    };
+    std::vector<Body> bodies;  // every sequence of that name that animates a body
+    for (size_t e = 0; e < exports.size(); ++e) {
+        if (pkg.get_export_class(exports[e]) != "AnimSequence") continue;
+        UPropertyList sp;
+        parse_export_properties(pkg, static_cast<int32_t>(e) + 1, sp);
+        if (to_lower(prop_name(sp, "SequenceName")) != to_lower(anim_name)) continue;
+        AnimSetAsset set;
+        if (!AnimSystem::parse_single_anim_sequence(pkg, static_cast<int32_t>(e) + 1, set) || set.sequences.empty()) continue;
+        const size_t tracks = set.track_bone_names.size();
+        if (set.bone_to_track.count("root") && set.bone_to_track.count("hips")) {
+            bodies.push_back({static_cast<int32_t>(e) + 1, set});
+        }
+        bool has_eye = false;
+        const int score = AnimSystem::count_first_person_tracks(game_root, set, &has_eye);
+        if (!has_eye) continue;
+        if (score > best_score || (score == best_score && tracks < best_tracks)) {
+            best_seq = static_cast<int32_t>(e) + 1;
+            best_score = score;
+            best_tracks = tracks;
+            best_set = std::move(set);
+        }
+    }
+    if (best_seq <= 0) return false;
+    const AnimSequenceAsset& seq = best_set.sequences.begin()->second;
+
+    // The full-body root, when there is one and it is a different track from the view's own.
+    const AnimTrack* pawn_root = nullptr;
+    float root_apart = 0.0f;
+    size_t body_tracks = best_tracks;
+    const Body* full_body = nullptr;
+    for (const Body& b : bodies) {
+        if (b.seq == best_seq || b.set.track_bone_names.size() <= body_tracks) continue;
+        body_tracks = b.set.track_bone_names.size();
+        full_body = &b;
+    }
+    if (full_body) {
+        const AnimSetAsset& body_set = full_body->set;
+        const AnimSequenceAsset& body_seq = body_set.sequences.begin()->second;
+        const size_t body_root = static_cast<size_t>(body_set.bone_to_track.at("root"));
+        const auto own = best_set.bone_to_track.find("root");
+        if (body_root < body_seq.tracks.size() && own != best_set.bone_to_track.end() &&
+            static_cast<size_t>(own->second) < seq.tracks.size() && body_seq.num_frames == seq.num_frames) {
+            const AnimTrack& theirs = body_seq.tracks[body_root];
+            const AnimTrack& ours = seq.tracks[static_cast<size_t>(own->second)];
+            if (theirs.positions.size() == ours.positions.size()) {
+                for (size_t k = 0; k < ours.positions.size(); ++k) {
+                    root_apart = std::max(root_apart, (theirs.positions[k] - ours.positions[k]).length());
+                }
+            }
+            pawn_root = &theirs;
+        }
+    }
+
+    out = BakedAnim{};
+    if (!AnimSystem::bake_canned_camera(game_root, best_set, seq, out.frames, pawn_root) || out.frames.size() < 2) return false;
+    out.seq_export = best_seq;
+    out.name = seq.name;
+    out.length = seq.length;
+    out.tracks = best_tracks;
+    out.on_full_body_root = pawn_root != nullptr;
+    out.root_apart = root_apart;
+    return true;
+}
+
+struct AnimKey {
+    std::string name;
+    float start = 0.0f;  // StartTime in the Matinee
+};
+
+// Bakes one pawn Matinee into `out`. With `intro_rule` the pawn group's first animation whose
+// name contains "intro" is the one and only segment, as the intro has always been read; otherwise
+// every animation of the group's AnimControl track is a segment, baked onto one timeline at the
+// first segment's frame rate (between segments the pose holds).
+bool bake_pawn_matinee(const std::string& game_root, const Packages& packages, const IntroMatinee& m, bool intro_rule,
+                       LevelIntroSequence& out) {
+    const UPKPackage& pkg = *m.pkg;
+    out = LevelIntroSequence{};
+    UPropertyList interp_props;
+    parse_export_properties(pkg, m.interp, interp_props);
+    UPropertyList data_props;
+    parse_export_properties(pkg, m.data, data_props);
+    const UProperty* groups = find_prop(data_props, "InterpGroups");
+    if (!groups) return false;
+
+    // The pawn's group: its animations, where in the Matinee they start, and how the actor moves.
+    std::vector<AnimKey> anims;
+    KeyedVector move;
+    std::vector<std::pair<float, std::string>> events;  // every group's event keys
+    for (int32_t g : groups->ints) {
+        if (!is_export(pkg, g)) continue;
+        UPropertyList gp;
+        parse_export_properties(pkg, g, gp);
+        const bool pawn_group = to_lower(prop_name(gp, "GroupName")) == to_lower(m.group);
+        const UProperty* tracks = find_prop(gp, "InterpTracks");
+        if (!tracks) continue;
+        for (int32_t t : tracks->ints) {
+            const std::string cls = class_of(pkg, t);
+            if (cls.empty()) continue;
+            UPropertyList tp;
+            parse_export_properties(pkg, t, tp);
+            if (cls == "InterpTrackEvent") {
+                if (const UProperty* keys = find_prop(tp, "EventTrack")) {
+                    for (const auto& k : keys->elements) {
+                        events.emplace_back(prop_float(k, "Time", 0.0f), prop_name(k, "EventName"));
+                    }
+                }
+            } else if (pawn_group && cls == "InterpTrackAnimControl" && anims.empty()) {
+                if (const UProperty* seqs = find_prop(tp, "AnimSeqs")) {
+                    for (const auto& k : seqs->elements) {
+                        const std::string name = prop_name(k, "AnimSeqName");
+                        if (name.empty()) continue;
+                        if (intro_rule && to_lower(name).find("intro") == std::string::npos) continue;
+                        anims.push_back({name, prop_float(k, "StartTime", 0.0f)});
+                        if (intro_rule) break;
+                    }
+                }
+            } else if (pawn_group && cls == "InterpTrackMove") {
+                move = read_vector_curve(tp, "PosTrack");
+            }
+        }
+    }
+    if (anims.empty()) return false;
+    std::stable_sort(anims.begin(), anims.end(), [](const AnimKey& a, const AnimKey& b) { return a.start < b.start; });
+
+    std::vector<BakedAnim> baked;
+    for (const AnimKey& key : anims) {
+        BakedAnim b;
+        if (!bake_anim(game_root, pkg, key.name, b)) {
+            if (baked.empty()) return false;  // the view is not in it
+            continue;                          // a later segment without an eye: the pose holds
+        }
+        baked.push_back(std::move(b));
+        out.segments.push_back({baked.back().name, baked.back().seq_export, key.start, baked.back().length});
+    }
+
+    UPropertyList actor_props;
+    parse_export_properties(pkg, m.actor, actor_props);
+    Vec3 actor_loc(0.0f, 0.0f, 0.0f);
+    float actor_yaw = 90.0f;
+    if (const UProperty* lp = find_prop(actor_props, "Location")) actor_loc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+    if (const UProperty* rp = find_prop(actor_props, "Rotation")) {
+        actor_yaw = Rotator(rp->vi[0], rp->vi[1], rp->vi[2]).to_degrees().y;
+    }
+
+    // Where the animation's root sits against the placed actor. Retail, from its pawn and
+    // camera through all ten intros: the root is at the actor, so the pawn's Location rides
+    // kPawnAboveRoot over it, floor under the actor or not (Jacknife's is in mid-air). Boat is
+    // the exception, and the one intro whose pawn group has a movement track: there the
+    // pawn's Location itself is at the actor, which the level places that far above the deck,
+    // and the root is kPawnAboveRoot below.
+    const bool pawn_at_actor = !move.keys.empty();
+    Vec3 anim_origin = actor_loc;
+    if (pawn_at_actor) anim_origin.z -= kPawnAboveRoot;
+
+    // One timeline: the first segment's frames as they are; later segments resampled onto the
+    // same spacing, the pose held through any gap. A single segment is left frame for frame.
+    const float first_start = out.segments.front().start_sec;
+    float span = 0.0f;
+    for (const auto& seg : out.segments) span = std::max(span, seg.start_sec + seg.length_sec - first_start);
+    const float frame_dt = baked.front().length / static_cast<float>(baked.front().frames.size() - 1);
+    const size_t frame_count = baked.size() == 1 ? baked.front().frames.size()
+                                                 : static_cast<size_t>(std::ceil(span / frame_dt)) + 1;
+    const auto sample = [&](float t) -> AnimSystem::CannedCameraFrame {
+        // The last segment started by t; before the first, the first's first frame.
+        size_t si = 0;
+        for (size_t k = 0; k < out.segments.size(); ++k) {
+            if (out.segments[k].start_sec <= t + 1e-4f) si = k;
+        }
+        const BakedAnim& b = baked[si];
+        const float local = std::clamp(t - out.segments[si].start_sec, 0.0f, b.length);
+        const float b_dt = b.length / static_cast<float>(b.frames.size() - 1);
+        const float fidx = std::clamp(local / std::max(1e-6f, b_dt), 0.0f, static_cast<float>(b.frames.size() - 1));
+        const size_t i0 = std::min(static_cast<size_t>(fidx), b.frames.size() - 1);
+        const size_t i1 = std::min(i0 + 1, b.frames.size() - 1);
+        const float a = fidx - static_cast<float>(i0);
+        AnimSystem::CannedCameraFrame f;
+        f.eye_pos = b.frames[i0].eye_pos + (b.frames[i1].eye_pos - b.frames[i0].eye_pos) * a;
+        f.forward = (b.frames[i0].forward + (b.frames[i1].forward - b.frames[i0].forward) * a).normalized();
+        f.up = (b.frames[i0].up + (b.frames[i1].up - b.frames[i0].up) * a).normalized();
+        f.root_pos = b.frames[i0].root_pos + (b.frames[i1].root_pos - b.frames[i0].root_pos) * a;
+        return f;
+    };
+
+    out.cam_pos.reserve(frame_count);
+    for (size_t f = 0; f < frame_count; ++f) {
+        const float t = first_start + static_cast<float>(f) * frame_dt;
+        const AnimSystem::CannedCameraFrame frame = baked.size() == 1 ? baked.front().frames[f] : sample(t);
+        // An InterpTrackMove carries the pawn, and the animation with it, from where it started.
+        RigFrame rig(anim_origin, actor_yaw);
+        rig.origin = anim_origin + rig.actor_offset(move.at(t));
+        out.cam_pos.push_back(rig.pos(frame.eye_pos));
+        out.cam_forward.push_back(rig.dir(frame.forward).normalized());
+        out.cam_up.push_back(rig.dir(frame.up).normalized());
+        out.root_pos.push_back(rig.pos(frame.root_pos));
+    }
+
+    for (const auto& [time, name] : events) {
+        collect_sounds(packages, pkg, interp_props, name, time, out, 0);
+        collect_fades(pkg, interp_props, name, time, out, 0);
+    }
+    collect_fades(pkg, interp_props, "Completed", prop_float(data_props, "InterpLength", 0.0f), out, 0);
+    for (size_t k = 0; k < baked.size(); ++k) {
+        collect_notifies(pkg, baked[k].seq_export, baked[k].length, out.segments[k].start_sec, out.sounds);
+    }
+    // The doors the Matinee itself turns (the Mall's), beside those behind its events.
+    collect_door_swings(pkg, interp_props, data_props, 0.0f, 1.0f, out);
+    for (IntroDoorSwing& swing : out.door_swings) {
+        std::stable_sort(swing.yaw_keys.begin(), swing.yaw_keys.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    // What the Matinee's Completed output stops (input 1 of a sound action): the long tracks
+    // it started, which must not play on when the intro is skipped.
+    if (const UProperty* outputs = find_prop(interp_props, "OutputLinks")) {
+        for (const auto& output : outputs->elements) {
+            if (to_lower(prop_string(output, "LinkDesc")) != "completed") continue;
+            const UProperty* links = find_prop(output, "Links");
+            if (!links) continue;
+            for (const auto& l : links->elements) {
+                const int32_t op = prop_object(l, "LinkedOp");
+                if (prop_int(l, "InputLinkIdx", 0) != 1 || class_of(pkg, op).find("PlaySound") == std::string::npos) continue;
+                UPropertyList op_props;
+                parse_export_properties(pkg, op, op_props);
+                if (const int32_t cue = prop_object(op_props, "PlaySound")) out.stop_cues.push_back(cue_name(pkg, cue));
+            }
+        }
+    }
+    std::stable_sort(out.sounds.begin(), out.sounds.end(),
+                     [](const IntroSoundEvent& a, const IntroSoundEvent& b) { return a.time < b.time; });
+    collect_start_fades(packages, pkg, m.interp, out);
+    std::stable_sort(out.fades.begin(), out.fades.end(),
+                     [](const IntroFadeEvent& a, const IntroFadeEvent& b) { return a.time < b.time; });
+
+    const Vec3 end_fwd = out.cam_forward.back();
+    out.valid = true;
+    out.seq_name = baked.front().name;
+    out.package_path = pkg.get_file_path();
+    out.anim_export_index_1 = baked.front().seq_export;
+    out.actor_location = actor_loc;
+    out.actor_yaw_deg = actor_yaw;
+    out.start_offset_sec = first_start;
+    out.duration_sec = baked.size() == 1 ? baked.front().length : span;
+    out.matinee_length_sec = std::max(prop_float(data_props, "InterpLength", 0.0f), first_start + out.duration_sec);
+    out.start_feet_pos = out.root_pos.front();
+    out.end_feet_pos = out.root_pos.back();
+    out.end_yaw_deg = std::atan2(end_fwd.y, end_fwd.x) * RAD2DEG;
+    out.interp_package = to_lower(std::filesystem::path(pkg.get_file_path()).stem().string());
+    out.interp_export_index_1 = m.interp;
+    out.skippable = prop_bool(interp_props, "bIsSkippable", false);
+
+    int voices = 0;
+    for (const auto& s : out.sounds) voices += s.voice ? 1 : 0;
+    std::cout << "[Level] " << (intro_rule ? "Level intro '" : "Player cutscene '") << out.seq_name << "' (" << out.duration_sec
+              << " s animation from " << first_start << " s of a " << out.matinee_length_sec << " s Matinee, " << frame_count
+              << " frames, " << baked.front().tracks << " tracks";
+    if (baked.size() > 1) std::cout << ", " << baked.size() << " segments";
+    std::cout << "): start=(" << int(out.start_feet_pos.x) << "," << int(out.start_feet_pos.y) << "," << int(out.start_feet_pos.z)
+              << ") -> end=(" << int(out.end_feet_pos.x) << "," << int(out.end_feet_pos.y) << "," << int(out.end_feet_pos.z)
+              << ", yaw=" << int(out.end_yaw_deg) << "); " << (pawn_at_actor ? "movement track, root below the placed actor; " : "");
+    if (!out.door_swings.empty()) std::cout << out.door_swings.size() << " door(s) swung; ";
+    if (baked.front().on_full_body_root) std::cout << "on the full-body root (up to " << baked.front().root_apart << " uu from its own); ";
+    std::cout << out.sounds.size() << " sounds, " << voices << " of them voice lines" << std::endl;
+    return true;
+}
+
 }  // namespace
 
 void extract_level_intro(const std::string& game_root, const Packages& packages, LevelIntroSequence& out) {
@@ -484,253 +812,41 @@ void extract_level_intro(const std::string& game_root, const Packages& packages,
             if (pkg.get_export_class(exports[i]) != "SeqAct_Interp") continue;
             UPropertyList interp_props;
             parse_export_properties(pkg, static_cast<int32_t>(i) + 1, interp_props);
-            const UProperty* var_links = find_prop(interp_props, "VariableLinks");
-            if (!var_links) continue;
-
-            // The Matinee that drives the local pawn together with a placed skeletal mesh.
             IntroMatinee m;
-            m.pkg = &pkg;
-            m.interp = static_cast<int32_t>(i) + 1;
-            for (const auto& link : var_links->elements) {
-                const UProperty* vars = find_prop(link, "LinkedVariables");
-                if (!vars) continue;
-                bool pawn = false;
-                int32_t actor = 0;
-                for (int32_t v : vars->ints) {
-                    const std::string cls = class_of(pkg, v);
-                    if (cls == "InterpData") m.data = v;
-                    if (cls == "SeqVar_TdLocalPawn") pawn = true;
-                    if (cls != "SeqVar_Object") continue;
-                    UPropertyList vp;
-                    parse_export_properties(pkg, v, vp);
-                    const int32_t obj = prop_object(vp, "ObjValue");
-                    const std::string ocls = class_of(pkg, obj);
-                    if (ocls == "SkeletalMeshActorMAT" || ocls == "SkeletalMeshActor") actor = obj;
-                }
-                if (pawn && actor > 0) {
-                    m.actor = actor;
-                    m.group = prop_string(link, "LinkDesc");
-                }
-            }
-            if (m.data <= 0 || m.actor <= 0) continue;
-
-            UPropertyList data_props;
-            parse_export_properties(pkg, m.data, data_props);
-            const UProperty* groups = find_prop(data_props, "InterpGroups");
-            if (!groups) continue;
-
-            // The pawn's group: its animation, where in the Matinee it starts, and how the actor moves.
-            std::string anim_name;
-            float anim_start = 0.0f;
-            KeyedVector move;
-            std::vector<std::pair<float, std::string>> events;  // every group's event keys
-            for (int32_t g : groups->ints) {
-                if (!is_export(pkg, g)) continue;
-                UPropertyList gp;
-                parse_export_properties(pkg, g, gp);
-                const bool pawn_group = to_lower(prop_name(gp, "GroupName")) == to_lower(m.group);
-                const UProperty* tracks = find_prop(gp, "InterpTracks");
-                if (!tracks) continue;
-                for (int32_t t : tracks->ints) {
-                    const std::string cls = class_of(pkg, t);
-                    if (cls.empty()) continue;
-                    UPropertyList tp;
-                    parse_export_properties(pkg, t, tp);
-                    if (cls == "InterpTrackEvent") {
-                        if (const UProperty* keys = find_prop(tp, "EventTrack")) {
-                            for (const auto& k : keys->elements) {
-                                events.emplace_back(prop_float(k, "Time", 0.0f), prop_name(k, "EventName"));
-                            }
-                        }
-                    } else if (pawn_group && cls == "InterpTrackAnimControl" && anim_name.empty()) {
-                        if (const UProperty* seqs = find_prop(tp, "AnimSeqs")) {
-                            for (const auto& k : seqs->elements) {
-                                const std::string name = prop_name(k, "AnimSeqName");
-                                if (to_lower(name).find("intro") == std::string::npos) continue;
-                                anim_name = name;
-                                anim_start = prop_float(k, "StartTime", 0.0f);
-                                break;
-                            }
-                        }
-                    } else if (pawn_group && cls == "InterpTrackMove") {
-                        move = read_vector_curve(tp, "PosTrack");
-                    }
-                }
-            }
-            if (anim_name.empty()) continue;
-
-            // The sequence of that name that animates the first-person skeleton. A level can carry
-            // several with one name (a second body, a prop); the one that drives the most
-            // first-person bones, EyeJoint among them, is the view's.
-            //
-            // Edge and Boat also ship the full-body version (89 tracks to the first-person 82), and
-            // that is the one the pawn's own mesh plays: its root is what moves the pawn, and the
-            // first-person body rides on the pawn. The two roots are not always the same - in Edge
-            // they part by up to 29 uu and 14 degrees for a few seconds, and retail's pawn and camera
-            // follow the full-body one.
-            int32_t best_seq = 0;
-            int best_score = 0;
-            size_t best_tracks = 0;
-            AnimSetAsset best_set;
-            struct Body {
-                int32_t seq = 0;
-                AnimSetAsset set;
-            };
-            std::vector<Body> bodies;  // every sequence of that name that animates a body
-            for (size_t e = 0; e < exports.size(); ++e) {
-                if (pkg.get_export_class(exports[e]) != "AnimSequence") continue;
-                UPropertyList sp;
-                parse_export_properties(pkg, static_cast<int32_t>(e) + 1, sp);
-                if (to_lower(prop_name(sp, "SequenceName")) != to_lower(anim_name)) continue;
-                AnimSetAsset set;
-                if (!AnimSystem::parse_single_anim_sequence(pkg, static_cast<int32_t>(e) + 1, set) || set.sequences.empty()) continue;
-                const size_t tracks = set.track_bone_names.size();
-                if (set.bone_to_track.count("root") && set.bone_to_track.count("hips")) {
-                    bodies.push_back({static_cast<int32_t>(e) + 1, set});
-                }
-                bool has_eye = false;
-                const int score = AnimSystem::count_first_person_tracks(game_root, set, &has_eye);
-                if (!has_eye) continue;
-                if (score > best_score || (score == best_score && tracks < best_tracks)) {
-                    best_seq = static_cast<int32_t>(e) + 1;
-                    best_score = score;
-                    best_tracks = tracks;
-                    best_set = std::move(set);
-                }
-            }
-            if (best_seq <= 0) continue;
-            const AnimSequenceAsset& seq = best_set.sequences.begin()->second;
-
-            // The full-body root, when there is one and it is a different track from the view's own.
-            const AnimTrack* pawn_root = nullptr;
-            float root_apart = 0.0f;
-            size_t body_tracks = best_tracks;
-            const Body* full_body = nullptr;
-            for (const Body& b : bodies) {
-                if (b.seq == best_seq || b.set.track_bone_names.size() <= body_tracks) continue;
-                body_tracks = b.set.track_bone_names.size();
-                full_body = &b;
-            }
-            if (full_body) {
-                const AnimSetAsset& body_set = full_body->set;
-                const AnimSequenceAsset& body_seq = body_set.sequences.begin()->second;
-                const size_t body_root = static_cast<size_t>(body_set.bone_to_track.at("root"));
-                const auto own = best_set.bone_to_track.find("root");
-                if (body_root < body_seq.tracks.size() && own != best_set.bone_to_track.end() &&
-                    static_cast<size_t>(own->second) < seq.tracks.size() && body_seq.num_frames == seq.num_frames) {
-                    const AnimTrack& theirs = body_seq.tracks[body_root];
-                    const AnimTrack& ours = seq.tracks[static_cast<size_t>(own->second)];
-                    if (theirs.positions.size() == ours.positions.size()) {
-                        for (size_t k = 0; k < ours.positions.size(); ++k) {
-                            root_apart = std::max(root_apart, (theirs.positions[k] - ours.positions[k]).length());
-                        }
-                    }
-                    pawn_root = &theirs;
-                }
-            }
-
-            std::vector<AnimSystem::CannedCameraFrame> rig_frames;
-            if (!AnimSystem::bake_canned_camera(game_root, best_set, seq, rig_frames, pawn_root) || rig_frames.size() < 2) continue;
-
-            UPropertyList actor_props;
-            parse_export_properties(pkg, m.actor, actor_props);
-            Vec3 actor_loc(0.0f, 0.0f, 0.0f);
-            float actor_yaw = 90.0f;
-            if (const UProperty* lp = find_prop(actor_props, "Location")) actor_loc = Vec3(lp->v[0], lp->v[1], lp->v[2]);
-            if (const UProperty* rp = find_prop(actor_props, "Rotation")) {
-                actor_yaw = Rotator(rp->vi[0], rp->vi[1], rp->vi[2]).to_degrees().y;
-            }
-
-            // Where the animation's root sits against the placed actor. Retail, from its pawn and
-            // camera through all ten intros: the root is at the actor, so the pawn's Location rides
-            // kPawnAboveRoot over it, floor under the actor or not (Jacknife's is in mid-air). Boat is
-            // the exception, and the one intro whose pawn group has a movement track: there the
-            // pawn's Location itself is at the actor, which the level places that far above the deck,
-            // and the root is kPawnAboveRoot below.
-            const bool pawn_at_actor = !move.keys.empty();
-            Vec3 anim_origin = actor_loc;
-            if (pawn_at_actor) anim_origin.z -= kPawnAboveRoot;
-
-            out.cam_pos.reserve(rig_frames.size());
-            const float frame_dt = seq.length / static_cast<float>(rig_frames.size() - 1);
-            for (size_t f = 0; f < rig_frames.size(); ++f) {
-                // An InterpTrackMove carries the pawn, and the animation with it, from where it started.
-                RigFrame rig(anim_origin, actor_yaw);
-                rig.origin = anim_origin + rig.actor_offset(move.at(anim_start + static_cast<float>(f) * frame_dt));
-                out.cam_pos.push_back(rig.pos(rig_frames[f].eye_pos));
-                out.cam_forward.push_back(rig.dir(rig_frames[f].forward).normalized());
-                out.cam_up.push_back(rig.dir(rig_frames[f].up).normalized());
-                out.root_pos.push_back(rig.pos(rig_frames[f].root_pos));
-            }
-
-            for (const auto& [time, name] : events) {
-                collect_sounds(packages, pkg, interp_props, name, time, out, 0);
-                collect_fades(pkg, interp_props, name, time, out, 0);
-            }
-            collect_fades(pkg, interp_props, "Completed", prop_float(data_props, "InterpLength", 0.0f), out, 0);
-            collect_notifies(pkg, best_seq, seq.length, anim_start, out.sounds);
-            // The doors the intro's own Matinee turns (the Mall's), beside those behind its events.
-            collect_door_swings(pkg, interp_props, data_props, 0.0f, 1.0f, out);
-            for (IntroDoorSwing& swing : out.door_swings) {
-                std::stable_sort(swing.yaw_keys.begin(), swing.yaw_keys.end(),
-                                 [](const auto& a, const auto& b) { return a.first < b.first; });
-            }
-            // What the Matinee's Completed output stops (input 1 of a sound action): the long tracks
-            // it started, which must not play on when the intro is skipped.
-            if (const UProperty* outputs = find_prop(interp_props, "OutputLinks")) {
-                for (const auto& output : outputs->elements) {
-                    if (to_lower(prop_string(output, "LinkDesc")) != "completed") continue;
-                    const UProperty* links = find_prop(output, "Links");
-                    if (!links) continue;
-                    for (const auto& l : links->elements) {
-                        const int32_t op = prop_object(l, "LinkedOp");
-                        if (prop_int(l, "InputLinkIdx", 0) != 1 || class_of(pkg, op).find("PlaySound") == std::string::npos) continue;
-                        UPropertyList op_props;
-                        parse_export_properties(pkg, op, op_props);
-                        if (const int32_t cue = prop_object(op_props, "PlaySound")) out.stop_cues.push_back(cue_name(pkg, cue));
-                    }
-                }
-            }
-            std::stable_sort(out.sounds.begin(), out.sounds.end(),
-                             [](const IntroSoundEvent& a, const IntroSoundEvent& b) { return a.time < b.time; });
-            collect_start_fades(packages, pkg, m.interp, out);
-            std::stable_sort(out.fades.begin(), out.fades.end(),
-                             [](const IntroFadeEvent& a, const IntroFadeEvent& b) { return a.time < b.time; });
-            for (const IntroFadeEvent& f : out.fades) {
-                std::cout << "[Level] Level intro fade " << (f.fade_out ? "out" : "in") << " at " << f.time << " s over " << f.duration
-                          << " s, colour (" << f.color.x << "," << f.color.y << "," << f.color.z << ")" << std::endl;
-            }
-
-            const Vec3 end_fwd = out.cam_forward.back();
-            out.valid = true;
-            out.seq_name = seq.name;
-            out.package_path = pkg.get_file_path();
-            out.anim_export_index_1 = best_seq;
-            out.actor_location = actor_loc;
-            out.actor_yaw_deg = actor_yaw;
-            out.start_offset_sec = anim_start;
-            out.duration_sec = seq.length;
-            out.matinee_length_sec = std::max(prop_float(data_props, "InterpLength", 0.0f), anim_start + seq.length);
-            out.start_feet_pos = out.root_pos.front();
-            out.end_feet_pos = out.root_pos.back();
-            out.end_yaw_deg = std::atan2(end_fwd.y, end_fwd.x) * RAD2DEG;
-
-            int voices = 0;
-            for (const auto& s : out.sounds) voices += s.voice ? 1 : 0;
-            std::cout << "[Level] Level intro '" << seq.name << "' (" << seq.length << " s animation from "
-                      << anim_start << " s of a " << out.matinee_length_sec << " s Matinee, " << rig_frames.size()
-                      << " frames, " << best_tracks << " tracks): start=(" << int(out.start_feet_pos.x) << ","
-                      << int(out.start_feet_pos.y) << "," << int(out.start_feet_pos.z) << ") -> end=("
-                      << int(out.end_feet_pos.x) << "," << int(out.end_feet_pos.y) << "," << int(out.end_feet_pos.z)
-                      << ", yaw=" << int(out.end_yaw_deg) << "); "
-                      << (pawn_at_actor ? "movement track, root below the placed actor; " : "");
-            if (!out.door_swings.empty()) std::cout << out.door_swings.size() << " door(s) swung; ";
-            if (pawn_root) std::cout << "on the full-body root (up to " << root_apart << " uu from its own); ";
-            std::cout
-                      << out.sounds.size() << " sounds, " << voices
-                      << " of them voice lines" << std::endl;
+            if (!find_pawn_matinee(pkg, static_cast<int32_t>(i) + 1, interp_props, m)) continue;
+            LevelIntroSequence baked;
+            if (bake_pawn_matinee(game_root, packages, m, /*intro_rule=*/true, baked)) out = std::move(baked);
         }
         if (out.valid) break;
+    }
+}
+
+void extract_player_cutscenes(const std::string& game_root, const Packages& packages, const LevelIntroSequence& intro,
+                              std::vector<LevelIntroSequence>& out, std::unordered_map<std::string, int>& cutscene_of) {
+    out.clear();
+    cutscene_of.clear();
+    for (const auto& pkg_ptr : packages) {
+        const UPKPackage& pkg = *pkg_ptr;
+        const std::string stem = to_lower(std::filesystem::path(pkg.get_file_path()).stem().string());
+        const auto& exports = pkg.get_exports();
+        for (size_t i = 0; i < exports.size(); ++i) {
+            if (pkg.get_export_class(exports[i]) != "SeqAct_Interp") continue;
+            const int32_t interp = static_cast<int32_t>(i) + 1;
+            UPropertyList interp_props;
+            parse_export_properties(pkg, interp, interp_props);
+            IntroMatinee m;
+            if (!find_pawn_matinee(pkg, interp, interp_props, m)) continue;
+            LevelIntroSequence baked;
+            if (intro.valid && intro.interp_export_index_1 == interp && intro.interp_package == stem) {
+                baked = intro;
+            } else if (!bake_pawn_matinee(game_root, packages, m, /*intro_rule=*/false, baked)) {
+                std::cout << "[Level] Player Matinee " << export_object_name(pkg, interp) << " in " << stem
+                          << " has no first-person animation to bake; it runs without a camera" << std::endl;
+                continue;
+            }
+            cutscene_of[stem + ":" + std::to_string(interp)] = static_cast<int>(out.size());
+            out.push_back(std::move(baked));
+        }
     }
 }
 

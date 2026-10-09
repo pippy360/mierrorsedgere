@@ -16,6 +16,7 @@
 #include "audio/audio_engine.hpp"
 #include "cutscene/cutscene_player.hpp"
 #include "cutscene/screen_fade.hpp"
+#include "game/level_script.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
 #include "platform/platform.hpp"
@@ -43,6 +44,14 @@
 #include <cstdio>
 #include <set>
 #include <unordered_map>
+
+namespace {
+// Lower-case copy, for map and checkpoint names (compared case-insensitively, as UE3 names are).
+std::string lower(std::string v) {
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+}
+}  // namespace
 
 #if defined(_WIN32)
 // The window's HWND for the Direct3D swap chain. Last, because <windows.h> defines macros
@@ -1686,7 +1695,238 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     bool pending_level_loaded_audio = false;
     bool was_vo_playing = false;
 
-    auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path, bool play_intro = true) {
+    // The level's Kismet, run against the player (src/game/level_script.hpp), and the localized
+    // text it puts on the screen.
+    LocalizedStrings strings;
+    strings.load(game_root);
+    LevelScript script;
+    bool splash_hint_open = false;      // SeqAct_TdTriggerSplashHint pauses the game under its card
+    bool into_cutscene_pending = false; // SeqAct_TdIntoCutscene: the pawn is being moved onto the mark
+    Vec3 into_cutscene_target(0.0f, 0.0f, 0.0f);
+    float into_cutscene_yaw = 0.0f;
+    float into_cutscene_timer = 0.0f;
+    struct PendingTransition {
+        bool pending = false;
+        std::string level;
+        std::string checkpoint;
+        float delay = 0.0f;
+    } pending_transition;
+    std::string start_checkpoint_name;  // the checkpoint the level was entered at
+
+    // "Escape_p" -> "Maps/SP01/Escape_p.me1": the chapter maps by file name, any case.
+    auto find_map_file = [&](const std::string& level_name) -> std::string {
+        namespace fs = std::filesystem;
+        const std::string want = lower(level_name) + ".me1";
+        const fs::path maps = fs::path(game_root) / "TdGame" / "CookedPC" / "Maps";
+        std::error_code ec;
+        for (const auto& dir : fs::directory_iterator(maps, ec)) {
+            if (!dir.is_directory()) continue;
+            for (const auto& f : fs::directory_iterator(dir.path(), ec)) {
+                if (f.is_regular_file() && lower(f.path().filename().string()) == want) {
+                    return "Maps/" + dir.path().filename().string() + "/" + f.path().filename().string();
+                }
+            }
+        }
+        return std::string();
+    };
+
+    // Config/DefaultEngine.ini [LoadMovies]: the movie that plays while a chapter loads (Edge has
+    // none; the training area and every other chapter their scene_NN).
+    std::unordered_map<std::string, std::string> load_movies;
+    {
+        IniConfig engine_ini;
+        if (engine_ini.load_file(get_config_path(game_root, "DefaultEngine.ini"))) {
+            for (const auto& [key, values] : engine_ini.get_section_keys("LoadMovies")) {
+                if (!values.empty()) load_movies[lower(key)] = values.back();
+            }
+        }
+    }
+    auto load_movie_for = [&](const std::string& map_file) -> std::string {
+        const std::string stem = lower(std::filesystem::path(map_file).stem().string());
+        auto it = load_movies.find(stem);
+        if (it != load_movies.end()) return it->second;
+        return load_movies.empty() ? CutscenePlayer::get_chapter_intro_movie(map_file) : std::string();
+    };
+
+    // The screen fade (TdHUD's FadeInEffect), declared here for the script host below.
+    ScreenFade screen_fade;
+    bool level_play_pending = false;  // the loading movie is on; the level begins play after it
+
+    // Where a cutscene leaves the pawn: at its animation's root unless its Kismet teleported the
+    // pawn elsewhere on the way (Edge's skip puts her at the After_Intro checkpoint).
+    Vec3 handover_pos(0.0f, 0.0f, 0.0f);
+    float handover_yaw = 0.0f;
+    bool handover_set = false;
+    auto hand_over = [&](const LevelIntroSequence& seq) {
+        if (handover_set) controller.reset(handover_pos, handover_yaw);
+        else controller.reset(seq.end_feet_pos + Vec3(0.0f, 0.0f, 2.0f), seq.end_yaw_deg);
+        handover_set = false;
+    };
+
+    // What the level's Kismet does to the game. docs/GAMEPLAY_SCRIPTING_RE.md.
+    auto make_script_host = [&]() {
+        ScriptHost host;
+        host.log = [&](const std::string& line) {
+            std::cout << std::fixed << std::setprecision(2) << "[" << script.time() << "s] " << line << std::defaultfloat << std::endl;
+        };
+        host.set_checkpoint = [&](const ScriptActor& cp, bool teleport, bool /*save*/) {
+            // The index the HUD counts is the checkpoint's place in the chapter's weighted list.
+            int index = controller.get_telemetry().active_checkpoint;
+            for (size_t c = 0; c < active_scene.checkpoint_infos.size(); ++c) {
+                if (lower(active_scene.checkpoint_infos[c].checkpoint_name) == lower(cp.checkpoint_name)) {
+                    index = static_cast<int>(c);
+                    if (!active_scene.checkpoint_infos[c].streaming_levels.empty()) {
+                        active_scene.loaded_sublevel_packages = active_scene.checkpoint_infos[c].streaming_levels;
+                        script.set_loaded_packages(active_scene.loaded_sublevel_packages);
+                    }
+                }
+            }
+            controller.set_checkpoint(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.yaw_deg, index, cp.checkpoint_name);
+            if (teleport) controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.yaw_deg);
+        };
+        host.level_completed = [&](const std::string& next_level, const std::string& next_checkpoint) {
+            if (pending_transition.pending) return;
+            pending_transition.pending = true;
+            pending_transition.level = next_level;
+            pending_transition.checkpoint = next_checkpoint;
+            pending_transition.delay = 0.0f;
+        };
+        host.show_tutorial = [&](const std::string& key, float /*duration*/, bool /*replace*/) {
+            controller.get_telemetry().tutorial_text = strings.tutorial_message(key);
+        };
+        host.hide_tutorial = [&]() { controller.get_telemetry().tutorial_text.clear(); };
+        host.show_supers = [&](const std::string& text, float duration) {
+            controller.get_telemetry().supers_text = strings.resolve(text);
+            controller.get_telemetry().supers_time_left = duration;
+        };
+        host.show_subtitle = [&](const std::string& text, float duration) {
+            controller.get_telemetry().sign_text = strings.resolve(text);
+            controller.get_telemetry().sign_time_left = duration;
+        };
+        host.splash_hint = [&](int number) {
+            const std::string text = strings.splash_hint(number);
+            if (text.empty()) return;
+            controller.get_telemetry().splash_hint_title = strings.lookup("TdGameUI", "TdSplashHints", "TitleLabelText");
+            if (controller.get_telemetry().splash_hint_title.empty()) controller.get_telemetry().splash_hint_title = "HINT";
+            controller.get_telemetry().splash_hint_text = text;
+            splash_hint_open = true;
+        };
+        host.fade = [&](bool fade_out, float time, const Vec3& color) {
+            IntroFadeEvent ev;
+            ev.time = 0.0f;
+            ev.fade_out = fade_out;
+            ev.duration = time;
+            ev.color = color;
+            screen_fade.apply(ev);
+        };
+        host.play_cutscene = [&](int index, float play_rate) {
+            handover_set = false;
+            cutscene_player.play_level_cutscene(active_scene, index, play_rate);
+        };
+        host.stop_cutscene = [&]() {
+            if (cutscene_player.is_level_intro()) {
+                if (const LevelIntroSequence* seq = cutscene_player.active_sequence(active_scene)) {
+                    CutscenePlayer::pose_sequence_doors(active_scene, *seq, 1.0e9f);
+                    hand_over(*seq);
+                }
+                controller.get_telemetry().intro_active = false;
+                cutscene_player.stop();
+            }
+        };
+        host.into_cutscene = [&](const Vec3& location, float yaw_deg) {
+            // TdMove_IntoCutscene: the pawn is carried onto the mark over a short blend.
+            into_cutscene_pending = true;
+            into_cutscene_target = location;
+            into_cutscene_yaw = yaw_deg;
+            into_cutscene_timer = 0.0f;
+        };
+        host.play_sound = [&](const std::string& cue, const std::string& bank, bool voice, float volume, const Vec3* at) -> float {
+            if (!audio.has_cue(cue)) audio.load_cue_bank(game_root, bank);
+            if (!audio.has_cue(cue)) {
+                std::cout << "[Script] sound not loaded: " << cue << " (" << bank << ")" << std::endl;
+                return 0.0f;
+            }
+            if (at && !voice) {
+                audio.play_sound_3d(cue, *at, std::clamp(volume, 0.0f, 1.5f));
+            } else if (!audio.play_cue(cue, voice, std::clamp(volume, 0.0f, 1.5f))) {
+                return 0.0f;
+            }
+            return std::max(0.05f, audio.cue_duration(cue));
+        };
+        host.stop_sound = [&](const std::string& cue) { audio.stop_cue(cue); };
+        host.teleport_player = [&](const Vec3& location, float yaw_deg) {
+            // During a cutscene the camera is the animation's; a teleport onto the cutscene's
+            // stand-in is the attach that starts it (the root motion carries the pawn from there),
+            // any other is where the pawn stands when the Matinee hands over.
+            if (const LevelIntroSequence* seq = cutscene_player.active_sequence(active_scene)) {
+                if ((location - seq->actor_location).length() < 1.0f) return;
+                handover_pos = location + Vec3(0.0f, 0.0f, 2.0f);
+                handover_yaw = yaw_deg;
+                handover_set = true;
+                return;
+            }
+            controller.reset(location + Vec3(0.0f, 0.0f, 2.0f), yaw_deg);
+        };
+        host.player_fail = [&]() { controller.get_telemetry().health = 0.0f; };
+        host.damage_player = [&](float amount) {
+            PlayerTelemetry& t = controller.get_telemetry();
+            t.health = std::max(0.0f, t.health - amount);
+            t.damage_flash_timer = 0.45f;
+        };
+        host.stream_levels = [&](const std::vector<std::string>& levels, bool load) {
+            auto& loaded = active_scene.loaded_sublevel_packages;
+            for (const std::string& l : levels) {
+                auto it = std::find_if(loaded.begin(), loaded.end(), [&](const std::string& s) { return lower(s) == lower(l); });
+                if (load && it == loaded.end()) loaded.push_back(l);
+                if (!load && it != loaded.end()) loaded.erase(it);
+            }
+            script.set_loaded_packages(loaded);
+        };
+        host.line_clear = [&](const Vec3& from, const Vec3& to) {
+            Vec3 hit, normal;
+            return !controller.leg_line_check(from, to, active_scene, hit, normal);
+        };
+        return host;
+    };
+
+    // The level begins play (after its loading movie, or at once): retail's
+    // TdSPStoryGame.TriggerEventsOnLevelReload, which fires every SeqEvent_LevelLoaded and the
+    // active checkpoint's SeqEvt_TdCheckpointLoaded / Activated. The chapter's intro Matinee is
+    // what those chains reach; a level whose script does not reach one plays it directly, as
+    // before, and says so.
+    auto begin_level_play = [&]() {
+        level_play_pending = false;
+        if (active_scene.script && active_scene.script->valid()) {
+            script.init(active_scene.script, make_script_host());
+            script.set_loaded_packages(active_scene.loaded_sublevel_packages);
+            const ScriptActor* cp = script.begin_play(start_checkpoint_name);
+            const bool at_default = start_checkpoint_name.empty() || (cp && cp->default_checkpoint);
+            if (cp) {
+                int index = controller.get_telemetry().active_checkpoint;
+                for (size_t c = 0; c < active_scene.checkpoint_infos.size(); ++c) {
+                    if (lower(active_scene.checkpoint_infos[c].checkpoint_name) == lower(cp->checkpoint_name)) index = static_cast<int>(c);
+                }
+                // The pawn spawns at the checkpoint (TdSPStoryGame.FindPlayerStart), as retail's does;
+                // the intro's Kismet teleports it from there onto its mark. (Without a script the
+                // level's spawn is the intro's end, for the hand-over.)
+                if (cp->location.length_xy() > 1.0f) controller.reset(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg);
+                controller.set_checkpoint(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg, index, cp->checkpoint_name);
+            }
+            ScriptPlayerState ps;
+            ps.position = controller.get_telemetry().position;
+            ps.eye = ps.position + Vec3(0.0f, 0.0f, controller.get_telemetry().eye_height);
+            script.update(0.0f, ps);
+            if (script.playing_cutscene() < 0 && active_scene.level_intro.valid && at_default) {
+                std::cout << "[Script] the chapter's start did not reach its intro Matinee; playing it directly" << std::endl;
+                cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+            }
+        } else if (active_scene.level_intro.valid && start_checkpoint_name.empty()) {
+            cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+        }
+    };
+
+    auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path, bool play_intro = true,
+                                     const std::string& checkpoint_name = std::string()) {
         std::string map_file = custom_path;
         if (map_file.empty()) {
             static const char* kChapterMaps[10] = {
@@ -1711,31 +1951,70 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                       << (active_scene.meshes.empty() ? "" : " (staying in the current level)") << std::endl;
             return false;
         }
+        cutscene_player.stop();
+        script.init(nullptr, ScriptHost{});
         active_scene = std::move(loaded_scene);
         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
         controller.get_telemetry().active_checkpoint = 0;
+        controller.get_telemetry().tutorial_text.clear();
+        controller.get_telemetry().supers_text.clear();
+        controller.get_telemetry().sign_text.clear();
+        controller.get_telemetry().splash_hint_text.clear();
+        splash_hint_open = false;
+        into_cutscene_pending = false;
+        pending_transition = PendingTransition{};
+        start_checkpoint_name = checkpoint_name;
         if (!active_scene.subtitles.empty() && !active_scene.subtitles[0].empty()) {
             controller.get_telemetry().active_subtitle = active_scene.subtitles[0];
         }
         audio.load_level_audio(game_root, map_file);
-        // The level intro's cues come from packages of their own (door hits, cutscene foley, the
-        // opening's long tracks): whatever is not loaded yet is fetched from the one it names.
+        // The cutscenes' cues come from packages of their own (door hits, cutscene foley, the
+        // opening's long tracks, the voice lines): whatever is not loaded yet is fetched from the
+        // one it names.
         for (const IntroSoundEvent& ev : active_scene.level_intro.sounds) {
             if (!ev.cue.empty() && !audio.has_cue(ev.cue)) audio.load_cue_bank(game_root, ev.bank);
+        }
+        for (const LevelIntroSequence& cs : active_scene.cutscenes) {
+            for (const IntroSoundEvent& ev : cs.sounds) {
+                if (!ev.cue.empty() && !audio.has_cue(ev.cue)) audio.load_cue_bank(game_root, ev.bank);
+            }
+        }
+        if (active_scene.script) {
+            for (const ScriptGraph::Node& n : active_scene.script->nodes) {
+                if (!n.cue.empty() && !audio.has_cue(n.cue)) audio.load_cue_bank(game_root, n.cue_bank);
+            }
+            for (const ScriptMatinee& m : active_scene.script->matinees) {
+                for (const ScriptSound& s : m.sounds) {
+                    if (!s.cue.empty() && !audio.has_cue(s.cue)) audio.load_cue_bank(game_root, s.bank);
+                }
+            }
         }
         pending_level_loaded_audio = true;
         was_vo_playing = false;
 
-        // Play authentic chapter opening cutscene (.bik animated story movie + 3D rooftop camera fly-in).
-        // When loading a direct map via --level, enter the 3D level directly so SeqEvent_LevelLoaded VO plays immediately.
-        if (max_frames == 0 && play_intro) {
-            std::string intro_movie = custom_path.empty() ? CutscenePlayer::get_chapter_intro_movie(map_file) : "";
-            if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/true)) {
-                // Bink movie started; the level's own intro follows it
-            } else if (active_scene.level_intro.valid) {
-                cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
+        // A checkpoint other than the chapter's first: the player stands there, with its sublevels.
+        if (!checkpoint_name.empty()) {
+            for (size_t c = 0; c < active_scene.checkpoint_infos.size(); ++c) {
+                const LevelCheckpointInfo& cp = active_scene.checkpoint_infos[c];
+                if (lower(cp.checkpoint_name) != lower(checkpoint_name)) continue;
+                stream_level_to_checkpoint(game_root, active_scene, static_cast<int>(c));
+                controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.rotation.to_degrees().y);
+                controller.get_telemetry().active_checkpoint = static_cast<int>(c);
+                controller.get_telemetry().active_checkpoint_name = cp.checkpoint_name;
+                break;
             }
         }
+
+        // The chapter's loading movie (DefaultEngine.ini [LoadMovies]); the level begins play when
+        // it ends. Without one the level begins at once.
+        if (max_frames == 0 && play_intro) {
+            const std::string intro_movie = load_movie_for(map_file);
+            if (!intro_movie.empty() && cutscene_player.play_bink_movie(intro_movie, /*chain_in_engine=*/false)) {
+                level_play_pending = true;
+                return true;  // begin_level_play() follows the movie
+            }
+        }
+        begin_level_play();
         return true;
     };
 
@@ -1797,7 +2076,6 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     // Interactive Loop
     bool running = true;
-    ScreenFade screen_fade;
     bool fade_intro_before = false;
     float fade_last_sim_time = 1.0e30f;
     std::string fade_map;
@@ -1838,6 +2116,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     EMovement prev_state = EMovement::MOVE_Walking;
     int prev_checkpoint = 0;
     int intro_handover_frames = 0;  // frames since a cutscene handed the player over
+    bool prev_use_held = false;     // the Use key last frame, for its press edge (SeqEvent_TdUsed)
     bool level_intro_running = false;
     bool prev_falling_to_death = false;
     bool prev_fall_death_impact = false;
@@ -2004,26 +2283,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     if (lower(map_name) == kChapterFiles[c]) chapter = c;
                 }
                 // A chapter of the list starts with its opening; any other map (Flight is the second
-                // half of the Prologue's folder) is loaded by path.
+                // half of the Prologue's folder) is loaded by path. A checkpoint other than the first
+                // is where the level begins play (its sublevels in, the player standing there).
                 const std::string map_path = chapter >= 0 ? std::string() : frontend->map_path(map_name);
                 if ((chapter >= 0 || !map_path.empty()) &&
-                    load_chapter_or_level(chapter >= 0 ? chapter : current_chapter_idx, map_path, /*play_intro=*/true)) {
+                    load_chapter_or_level(chapter >= 0 ? chapter : current_chapter_idx, map_path, /*play_intro=*/true, checkpoint_name)) {
                     if (chapter >= 0) {
                         current_chapter_idx = chapter;
                         renderer.set_selected_chapter(current_chapter_idx);
                     }
                     leave_frontend();
                     set_menu_active(false);
-                    // A checkpoint other than the first: stream its sublevels in and stand there.
-                    for (size_t c = 1; c < active_scene.checkpoint_infos.size() && !checkpoint_name.empty(); ++c) {
-                        const LevelCheckpointInfo& cp = active_scene.checkpoint_infos[c];
-                        if (lower(cp.checkpoint_name) != lower(checkpoint_name)) continue;
-                        stream_level_to_checkpoint(game_root, active_scene, static_cast<int>(c));
-                        cutscene_player.stop();
-                        controller.get_telemetry().intro_active = false;
-                        controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.rotation.to_degrees().y);
-                        break;
-                    }
                 }
             }
 
@@ -2224,13 +2494,30 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 if (key == SDLK_ESCAPE) {
                     if (renderer.is_menu_open()) {
                         running = false;
+                    } else if (splash_hint_open) {
+                        splash_hint_open = false;
+                        controller.get_telemetry().splash_hint_text.clear();
+                        script.accept_message();
                     } else if (cutscene_player.is_playing()) {
-                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
-                        controller.get_telemetry().intro_active = false;
-                        cutscene_player.stop();
+                        if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && level_play_pending) {
+                            cutscene_player.stop();
+                            begin_level_play();
+                        } else if (script.playing_cutscene() >= 0) {
+                            std::cout << "[Script] skip asked for (Escape)" << std::endl;
+                            script.skip_cutscene();  // SkipCutscene: only if the Matinee allows it
+                        } else {
+                            controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                            controller.get_telemetry().intro_active = false;
+                            cutscene_player.stop();
+                        }
                     } else {
                         set_menu_active(true);
                     }
+                } else if (splash_hint_open && (key == SDLK_SPACE || key == SDLK_RETURN)) {
+                    suppress_space_until_release = true;
+                    splash_hint_open = false;
+                    controller.get_telemetry().splash_hint_text.clear();
+                    script.accept_message();
                 } else if (renderer.is_menu_open() && (key == SDLK_LEFT || key == SDLK_a)) {
                     int tab = (renderer.selected_menu_tab() + 3) % 4;
                     renderer.set_selected_menu_tab(tab);
@@ -2258,8 +2545,18 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     activate_menu_selection();
                 } else if ((key == SDLK_SPACE || key == SDLK_RETURN) && cutscene_player.is_playing()) {
                     suppress_space_until_release = true;
-                    if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && active_scene.level_intro.valid) {
-                        // Skipping the chapter's movie leads into the level's own intro, as it ends would.
+                    if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && level_play_pending) {
+                        // Skipping the chapter's loading movie: the level begins play, as it would
+                        // when the movie ends.
+                        cutscene_player.stop();
+                        begin_level_play();
+                    } else if (script.playing_cutscene() >= 0) {
+                        // SpaceBar is "GBA_Jump | SkipCutscene" (DefaultInput.ini): the Matinee stops
+                        // if it is skippable and no SeqAct_TdDisablePlayerInput forbade it, and its
+                        // Aborted output runs.
+                        std::cout << "[Script] skip asked for (" << SDL_GetKeyName(key) << ")" << std::endl;
+                        script.skip_cutscene();
+                    } else if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && active_scene.level_intro.valid) {
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
                         cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 3.2f);
                     } else {
@@ -2281,6 +2578,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     input.drop_weapon = true;
                 } else if (key == SDLK_h) {
                     input.spawn_combat_squad = true;
+                } else if (key == SDLK_r && script.valid()) {
+                    // Load last checkpoint (TdPlayerController.CanLoadFromLastCheckpoint): the
+                    // level starts over at the active checkpoint, its script with it.
+                    if (!script.load_from_checkpoint_disabled()) {
+                        cutscene_player.stop();
+                        controller.get_telemetry().intro_active = false;
+                        if (const ScriptActor* cp = script.active_checkpoint()) {
+                            controller.reset(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg);
+                        }
+                        controller.get_telemetry().tutorial_text.clear();
+                        controller.get_telemetry().sign_text.clear();
+                        script.reload_checkpoint();
+                    }
                 } else if (key == SDLK_r) {
                     controller.get_telemetry().intro_active = false;
                     cutscene_player.stop();
@@ -2393,22 +2703,48 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) input.turn_180 = true;
         }
 
-        // Advance simulation or active cutscene step (paused while Main Menu is open)
+        // SeqAct_TdDisablePlayerInput: the script holds the player's movement and look (a cutscene
+        // about to start, an elevator ride) until SeqAct_TdEnablePlayerInput.
+        const bool use_edge = input.use && !prev_use_held;
+        prev_use_held = input.use;
+        if (script.valid() && script.input_move_disabled()) {
+            input.forward = 0.0f;
+            input.strafe = 0.0f;
+            input.jump = false;
+            input.crouch = false;
+            input.turn_180 = false;
+            input.melee = false;
+            input.fire = false;
+            input.disarm = false;
+            input.use = false;
+        }
+        if (script.valid() && script.input_look_disabled()) {
+            input.look_yaw_delta = 0.0f;
+            input.look_pitch_delta = 0.0f;
+        }
+
+        // Advance simulation or active cutscene step (paused while Main Menu is open or a hint card is up)
         Vec3 pre_vel = controller.get_velocity();
-        if (!renderer.is_menu_open()) {
+        if (!renderer.is_menu_open() && !splash_hint_open) {
             if (cutscene_player.get_mode() != ECutsceneMode::BinkVideo && pending_level_loaded_audio) {
                 pending_level_loaded_audio = false;
                 audio.play_level_loaded_cues();
             }
             if (cutscene_player.is_playing()) {
+                const bool was_level_cutscene = cutscene_player.is_level_intro();
                 cutscene_player.update(dt, active_scene, controller.get_telemetry());
-                // The doors the level intro goes through swing as its Matinee has them.
-                if (cutscene_player.is_level_intro()) {
-                    CutscenePlayer::pose_intro_doors(active_scene, cutscene_player.get_current_time());
+                // The doors the cutscene goes through swing as its Matinee has them.
+                if (const LevelIntroSequence* seq = cutscene_player.active_sequence(active_scene)) {
+                    CutscenePlayer::pose_sequence_doors(active_scene, *seq, cutscene_player.get_current_time());
                 }
-                // The level intro's own sounds: its animation's footsteps, clothing and foley, and the
+                // The cutscene's own sounds: its animation's footsteps, clothing and foley, and the
                 // voice lines and effects behind its Matinee's event keys.
+                // With the level's script running, the Kismet-side sounds (the voice lines and
+                // effects behind the event keys, the sound tracks) are the script's to play; the
+                // baked list supplies the animation's notifies alone.
+                const bool script_owns_sounds = script.valid() && script.playing_cutscene() >= 0;
                 for (const IntroSoundEvent& ev : cutscene_player.take_intro_sounds()) {
+                    if (script_owns_sounds && !ev.from_notify) continue;
                     if (ev.footstep > 0) {
                         audio.play_footstep_number(ESurfaceMaterial::Concrete, ev.footstep);
                     } else if (!audio.play_cue(ev.cue, ev.voice)) {
@@ -2416,8 +2752,27 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     }
                 }
                 if (!cutscene_player.is_playing()) {
-                    controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
-                    intro_handover_frames = 30;
+                    if (level_play_pending) {
+                        // The loading movie ended: the level begins play.
+                        begin_level_play();
+                    } else if (was_level_cutscene) {
+                        // The Matinee ran out: the player stands where its animation left her.
+                        const LevelIntroSequence* seq = nullptr;
+                        if (script.valid() && script.playing_cutscene() >= 0 &&
+                            static_cast<size_t>(script.playing_cutscene()) < active_scene.cutscenes.size()) {
+                            seq = &active_scene.cutscenes[static_cast<size_t>(script.playing_cutscene())];
+                        }
+                        if (seq) {
+                            hand_over(*seq);
+                        } else {
+                            controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        }
+                        if (script.valid()) script.cutscene_finished();
+                        intro_handover_frames = 30;
+                    } else {
+                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+                        intro_handover_frames = 30;
+                    }
                 }
             } else {
                 // ME_WARP="x,y,z,yaw" puts the player there (feet) as play starts: a test aid, for
@@ -2431,7 +2786,22 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         controller.reset(Vec3(wx, wy, wz), wyaw);
                     }
                 }
-                controller.step(input, dt, active_scene);
+                if (into_cutscene_pending) {
+                    // TdMove_IntoCutscene: the pawn glides onto its mark over 0.4 s and faces it.
+                    into_cutscene_timer += dt;
+                    const float u = std::clamp(into_cutscene_timer / 0.4f, 0.0f, 1.0f);
+                    const Vec3 from = controller.get_telemetry().position;
+                    const Vec3 to = into_cutscene_target + Vec3(0.0f, 0.0f, 2.0f);
+                    controller.set_position(from + (to - from) * u);
+                    controller.set_velocity(Vec3(0.0f, 0.0f, 0.0f));
+                    if (u >= 1.0f) {
+                        controller.reset(to, into_cutscene_yaw);
+                        into_cutscene_pending = false;
+                        script.into_cutscene_finished();
+                    }
+                } else {
+                    controller.step(input, dt, active_scene);
+                }
                 // TdPlayerPawn.CalcCamera: the move checks the camera against the walls with the
                 // eye the first-person tree has for this frame.
                 Vec3 eye;
@@ -2440,6 +2810,81 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 const Vec3 off = controller.get_telemetry().camera_mesh_offset;
                 controller.update_camera_collision(eye - Vec3(off.x, off.y, 0.0f), dt, active_scene);
             }
+
+            // The level's Kismet, against the player as she is after this frame's move. It runs
+            // through its own cutscenes (it owns their Matinees) but not under the loading movie.
+            if (script.valid() && !level_play_pending) {
+                PlayerTelemetry& t = controller.get_telemetry();
+                if (t.respawned) {
+                    // A death reloads the level at the checkpoint (TdSPStoryGame.ResetLevel).
+                    t.respawned = false;
+                    t.tutorial_text.clear();
+                    t.sign_text.clear();
+                    cutscene_player.stop();
+                    t.intro_active = false;
+                    script.reload_checkpoint();
+                }
+                ScriptPlayerState ps;
+                ps.position = cutscene_player.is_level_intro() ? cutscene_player.intro_root_pos() : t.position;
+                ps.eye = t.position + Vec3(0.0f, 0.0f, t.eye_height);
+                ps.view_dir = Rotator::from_degrees(t.pitch_deg, t.yaw_deg, 0.0f).forward();
+                ps.fov_deg = t.fov_deg;
+                ps.speed = t.speed_2d;
+                ps.use_pressed = use_edge && !cutscene_player.is_playing();
+                ps.dead = t.falling_to_death || t.fall_death_impact || t.health <= 0.0f;
+                ps.in_cutscene = cutscene_player.is_playing();
+                // ME_SCRIPT_EVENT="Name@seconds[,Name@seconds..]" fires remote events at those
+                // script times and ME_SCRIPT_SKIP="seconds" skips the cutscene then: test aids,
+                // for driving a chapter's chains (its end, its skips) without playing to them.
+                {
+                    static const char* ev_env = std::getenv("ME_SCRIPT_EVENT");
+                    static const char* skip_env = std::getenv("ME_SCRIPT_SKIP");
+                    static std::vector<std::pair<std::string, float>> test_events;
+                    static bool parsed = false, skip_done = false;
+                    if (ev_env && !parsed) {
+                        parsed = true;
+                        std::string all = ev_env;
+                        size_t pos = 0;
+                        while (pos <= all.size()) {
+                            const size_t comma = all.find(',', pos);
+                            const std::string spec = all.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                            const size_t at = spec.find('@');
+                            if (!spec.empty()) {
+                                test_events.emplace_back(spec.substr(0, at), at == std::string::npos ? 0.0f : std::strtof(spec.c_str() + at + 1, nullptr));
+                            }
+                            if (comma == std::string::npos) break;
+                            pos = comma + 1;
+                        }
+                    }
+                    for (size_t k = 0; k < test_events.size();) {
+                        if (script.time() >= test_events[k].second) {
+                            std::cout << "[Script] test: firing remote event '" << test_events[k].first << "'" << std::endl;
+                            script.fire_remote_event(test_events[k].first);
+                            test_events.erase(test_events.begin() + static_cast<std::ptrdiff_t>(k));
+                        } else {
+                            ++k;
+                        }
+                    }
+                    if (skip_env && !skip_done && script.time() >= std::strtof(skip_env, nullptr) && script.playing_cutscene() >= 0) {
+                        skip_done = true;
+                        std::cout << "[Script] test: skipping the cutscene" << std::endl;
+                        script.skip_cutscene();
+                    }
+                }
+                script.update(dt, ps);
+                if (t.supers_time_left > 0.0f) t.supers_time_left -= dt;
+                if (t.sign_time_left > 0.0f) t.sign_time_left -= dt;
+            } else {
+                controller.get_telemetry().respawned = false;
+            }
+            {
+                const LevelIntroSequence* playing = cutscene_player.active_sequence(active_scene);
+                controller.get_telemetry().skip_prompt = playing != nullptr && playing->skippable &&
+                                                         !(script.valid() && script.skip_disabled());
+            }
+
+            // The subtitle slot: with a script, retail's text only (voice-over subtitles); the
+            // controller's own notes otherwise.
             if (audio.is_vo_playing()) {
                 was_vo_playing = true;
                 std::string vo_sub = audio.get_active_vo_subtitle();
@@ -2451,9 +2896,44 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
                                     std::max(0, static_cast<int>(active_scene.subtitles.size()) - 1));
                 controller.get_telemetry().active_subtitle =
-                    (!active_scene.subtitles.empty() && !active_scene.subtitles[cp].empty())
+                    (!active_scene.subtitles.empty() && !active_scene.subtitles[cp].empty() && !active_scene.script)
                         ? active_scene.subtitles[cp]
                         : "";
+            } else if (active_scene.script) {
+                controller.get_telemetry().active_subtitle.clear();
+            }
+
+            // SeqAct_TdLevelCompleted: the next chapter, at its first checkpoint, behind its loading
+            // movie. A frame later than the action, so the frame it fires in still draws.
+            if (pending_transition.pending) {
+                pending_transition.delay += dt;
+                if (pending_transition.delay > 0.05f) {
+                    const PendingTransition tr = pending_transition;
+                    pending_transition = PendingTransition{};
+                    if (lower(tr.level) == "tdmainmenu") {
+                        // The Shard's end: back to the main menu (after the credits in retail).
+                        std::cout << "[Script] chapter complete: to the main menu" << std::endl;
+                        set_menu_active(true);
+                    } else {
+                        const std::string map_file = find_map_file(tr.level);
+                        if (map_file.empty()) {
+                            std::cout << "[Script] no map file for '" << tr.level << "'" << std::endl;
+                        } else {
+                            static const char* const kChapterFiles[10] = {"tutorial_p", "edge_p", "stormdrain_p", "cranes_p", "subway_p",
+                                                                          "mall_p", "factory_p", "boat_p", "convoy_p", "scraper_p"};
+                            for (int c = 0; c < 10; ++c) {
+                                if (lower(tr.level) == kChapterFiles[c]) {
+                                    current_chapter_idx = c;
+                                    renderer.set_selected_chapter(c);
+                                }
+                            }
+                            // The next chapter's own loading movie plays over the load; the
+                            // checkpoint it names is where play begins (retail's "Start" is the
+                            // chapter's first, which also runs its intro).
+                            load_chapter_or_level(current_chapter_idx, map_file, /*play_intro=*/true, tr.checkpoint);
+                        }
+                    }
+                }
             }
         }
         const auto& tel = controller.get_telemetry();
@@ -2534,6 +3014,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         if (tel.falling_to_death && !prev_falling_to_death) {
             audio.play_effect(EAudioEffect::FallDeathScream);
+            if (script.valid()) script.player_died();  // SeqEvt_TdPlayerDeath
         }
         if (tel.fall_death_impact && !prev_fall_death_impact) {
             audio.play_effect(EAudioEffect::FallDeathImpact);
@@ -2547,7 +3028,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         // What the intro's Matinee stops when it ends, whether it ran out or was skipped.
         const bool level_intro_now = cutscene_player.is_level_intro();
-        if (level_intro_running && !level_intro_now) {
+        if (level_intro_running && !level_intro_now && !script.valid()) {
             for (const std::string& cue : active_scene.level_intro.stop_cues) audio.stop_cue(cue);
             CutscenePlayer::pose_intro_doors(active_scene, 1.0e9f);
         }
@@ -2606,13 +3087,20 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         // The screen fade (TdHUD): in from white when the player starts or restarts, and whatever
         // the level intro's Kismet asks for on the way.
         {
-            const bool intro_now = cutscene_player.is_level_intro();
+            const LevelIntroSequence* now_seq = cutscene_player.active_sequence(active_scene);
+            const bool intro_now = now_seq != nullptr &&
+                                   (now_seq == &active_scene.level_intro ||
+                                    (now_seq->interp_export_index_1 == active_scene.level_intro.interp_export_index_1 &&
+                                     now_seq->interp_package == active_scene.level_intro.interp_package));
             const bool restarted = tel.sim_time < fade_last_sim_time && !fade_intro_before;
             const bool level_opened = active_scene.map_name != fade_map;
             if ((intro_now && !fade_intro_before) || restarted || level_opened) screen_fade.restart();
             controller.get_telemetry().exposure_reset = level_opened;
-            for (const IntroFadeEvent& ev : cutscene_player.take_intro_fades()) screen_fade.apply(ev);
-            if (!renderer.is_menu_open()) screen_fade.update(dt);
+            const bool script_owns_fades = script.valid() && script.playing_cutscene() >= 0;
+            for (const IntroFadeEvent& ev : cutscene_player.take_intro_fades()) {
+                if (!script_owns_fades) screen_fade.apply(ev);
+            }
+            if (!renderer.is_menu_open() && !splash_hint_open) screen_fade.update(dt);
             fade_intro_before = intro_now;
             fade_last_sim_time = tel.sim_time;
             fade_map = active_scene.map_name;

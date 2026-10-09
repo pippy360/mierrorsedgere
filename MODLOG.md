@@ -729,3 +729,65 @@ Listed in `docs/RENDERING_RE.md`, section 10. The large ones: light for dynamic 
 environments; the old sun-and-hemisphere stand-in is still what movers, characters and the first-person body
 get), lens flares, `TdMotionBlur`, the chain's material effects, fog on translucent surfaces, modulated
 shadows, decals and particles.
+
+## 15. The level's script: cutscene triggers, chapter transitions, on-screen text (agent/gameplay-logic-parity, 2026-10-09)
+
+What ran a chapter was the port's own: the intro played at load, checkpoints were reached by walking within
+240 uu of the checkpoint actor, `SeqAct_TdLevelCompleted` was read and never acted on, the HUD showed text of
+the port's making. The chapter's Kismet now runs. `docs/GAMEPLAY_SCRIPTING_RE.md` has what retail does and
+how it was read.
+
+### 15.1 Reverse engineering
+- **Start of a level.** `TdSPStoryGame.TriggerEventsOnLevelReload` (bytecode): every `SeqEvent_LevelLoaded`,
+  then the active checkpoint's `SeqEvt_TdCheckpointLoaded` and `SeqEvt_TdCheckpointActivated`. All ten
+  intros hang on that chain (The Shard's on the Activated event). A death reloads the script levels.
+- **Checkpoints** are set by `SeqAct_TdCheckpoint` from trigger volumes and remote events, never by the
+  checkpoint actor's position; setting one fires its Activated events.
+- **Cutscenes**: 36 pawn Matinees across the campaign; how each is started (survey in the doc, section 2);
+  `SeqAct_TdIntoCutscene`, the input locks, `bIsSkippable`. A skip sets the Matinee to its end and fires
+  `Completed` (the Edge intro's gate-closed-by-`Land` teleport only works that way; `Aborted` is wired as a
+  subset of `Completed` everywhere it is wired).
+- **Transitions**: the chains to each `SeqAct_TdLevelCompleted`; Edge's needs both the fade's `Completed`
+  (+2 s) and `Final_VO_Finished` (a counter switch). `[LoadMovies]` in `DefaultEngine.ini`.
+- **Text**: `SeqAct_TdSupersMessage` (`[TdSupersMessage]`), `SeqAct_TdTutorialMessage`
+  (`[TdTutorialMessages]`, with `<StringAliasBindings:GBA_*>` resolved through `DefaultInput.ini`),
+  `SeqAct_TdTriggerSubtitle` from `Trigger_LOS` (`TdLookAt.int`), `SeqAct_TdTriggerSplashHint`
+  (`[TdSplashHints]`), `[TdPopUps]`. Retail's HUD has no text for a checkpoint, a lift or a death.
+
+### 15.2 Changes
+- `src/game/level_script.*` (new): the graph reader (every loaded package's `Main_Sequence`, trigger actors
+  with their cylinders and brush hulls, Matinee event and sound keys) and the runner (USequence ordering,
+  events against the player, remote events, delays, gates, switches, latent sounds and fades, the Td actions
+  through `ScriptHost`), plus `LocalizedStrings`.
+- `src/assets/level_intro.cpp`: `extract_player_cutscenes()`; the intro's bake is unchanged and shared.
+  `LevelIntroSequence::segments` for multi-animation cutscenes.
+- `src/cutscene/cutscene_player.*`: `play_level_cutscene(index, PlayRate)`.
+- `src/main.cpp`: `begin_level_play()`, the host, input locks, hand-over, chapter transitions behind the
+  next chapter's movie, `R` as load-last-checkpoint, test aids `ME_SCRIPT_EVENT` / `ME_SCRIPT_SKIP`.
+- `src/physics/parkour_controller.*`: `set_checkpoint()`; proximity checkpoints and the drifting respawn
+  baseline only without a script.
+- `src/renderer/overlay_ui.inl`: `draw_script_text()`; the port's notes leave the subtitle slot.
+- `src/audio/audio_engine.*`: `cue_duration()`.
+- Fixed on the way: the loading movie was picked by substring of the map path and matched the folder
+  (`SP02/Stormdrain_p` played Flight's `scene_02`; chapters 2 to 9 all played the previous chapter's movie).
+- Fixed on the way (found by AddressSanitizer when `--verify-all` began to crash in Stage 1 after these
+  changes shifted the heap): `fp::PoseEvaluator::atoms` held a reference into `scratch_`, a
+  `std::vector<Pose>`, across the recursive call that grows it; the reference dangled after a
+  reallocation (`fp_pose.cpp:208/242`). `scratch_` is a `std::deque` now, whose growth at the end keeps
+  references valid.
+
+### 15.3 Results
+- Edge from `Edge_Start`: the intro starts from `SeqEvt_TdCheckpointLoaded_15` in the first tick with its
+  4 s fade in; the path's triggers fire as the root passes (`Trigger_10` 23.65 s, `Trigger_12` 36.29 s,
+  `Trigger_9` 53.82 s, `Trigger_8` (supers) 59.7 s, `Trigger_6` 60.17 s), `Merc_Intro` at 62.6 s,
+  `After_Intro` set at 63.16 s. Skipped at 4 s: `Completed` -> gate -> teleport to `TdCheckpoint_0`
+  (19309, -3009, 8522), where the retail recording `20261002_102817_edge_pt1` has its pawn after the intro.
+- `Finish_Level` + `Final_VO_Finished` (test aid): fade out 3 s later over 5 s, `SeqAct_TdLevelCompleted`
+  2 s after -> `Escape_p` loads at `Start`, whose script starts `sp01_intro_b` from
+  `SeqEvt_TdCheckpointLoaded_17` with its own fade.
+- `--verify-all` on macOS: ALL SYSTEMS PASS (16 stages). Screenshots regenerated.
+
+### 15.4 Remaining gaps
+In `docs/GAMEPLAY_SCRIPTING_RE.md`, section 7: the training area's challenge system (the tutorial keeps
+the port's staged version), AI factories' `All Dead`, positioned Matinee sounds, the hint card's picture,
+retail's text layout, the Ropeburn disarm (given to the player).

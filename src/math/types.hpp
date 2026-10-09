@@ -1323,6 +1323,23 @@ struct PlayerTelemetry {
     bool fall_death_impact = false;
     float death_anim_progress = 0.0f;
     std::string active_subtitle;
+    // The controller put the player back at the checkpoint this frame (a death). The game resets
+    // the level script on it, as retail reloads the level.
+    bool respawned = false;
+
+    // What the level's Kismet puts on the screen (docs/GAMEPLAY_SCRIPTING_RE.md, section 4):
+    // TdUIScene_TutorialHUDMessage's card (SeqAct_TdTutorialMessage), the supers line with the
+    // district and time of day (SeqAct_TdSupersMessage), a sign's text when it is looked at
+    // (SeqAct_TdTriggerSubtitle) and the pausing hint card (SeqAct_TdTriggerSplashHint).
+    std::string tutorial_text;
+    std::string supers_text;
+    float supers_time_left = 0.0f;
+    std::string sign_text;
+    float sign_time_left = 0.0f;
+    std::string splash_hint_title;
+    std::string splash_hint_text;
+    // The skip prompt (TdPopUps.PopUp4): a skippable cutscene is playing.
+    bool skip_prompt = false;
 
     // TdMove_Barge custom animation slot: 0 none, 1 BargeInLeft, 2 BargeOutLeft, 3 MeleeKickObject;
     // the sequence position (seconds) and the slot's blend weight over the locomotion pose.
@@ -1379,6 +1396,9 @@ struct IntroSoundEvent {
     std::string bank;    // the content package the cue lives in ("A_Props_Interactive"); empty for a footstep
     int footstep = 0;    // AnimNotify_Footstep: the footstep cue's number (1 Sneak .. 10 LandHard); 0 = play `cue`
     bool voice = false;  // a dialogue line
+    // From the animation's own notifies rather than from Kismet. When the level script runs the
+    // Kismet itself, only these are played from the baked list; the rest come from the script.
+    bool from_notify = false;
 };
 
 // One screen fade a level intro asks for (SeqAct_TdFadeEffect): at its start, behind one of the
@@ -1423,17 +1443,43 @@ struct LevelIntroSequence {
     std::vector<IntroFadeEvent> fades;     // sorted by time
     std::vector<std::string> stop_cues;    // cues the Matinee stops when it completes or is skipped
     std::vector<IntroDoorSwing> door_swings;
+
+    // The animations the pawn's group plays in turn (InterpTrackAnimControl.AnimSeqs), for the
+    // first-person mesh: which sequence is on at a Matinee time. The intro has one; the Flight
+    // outro two (sp01b_outro_part1, then part2 from 1.83 s). Empty for a pre-segment sequence
+    // (seq_name / anim_export_index_1 / start_offset_sec / duration_sec describe the one).
+    struct Segment {
+        std::string seq_name;
+        int32_t anim_export_index_1 = 0;
+        float start_sec = 0.0f;   // StartTime in the Matinee
+        float length_sec = 0.0f;  // SequenceLength
+    };
+    std::vector<Segment> segments;
+    std::string interp_package;        // stem of the package holding the SeqAct_Interp, lower case
+    int32_t interp_export_index_1 = 0; // the SeqAct_Interp
+    bool skippable = true;             // SeqAct_Interp.bIsSkippable
 };
 
 // -----------------------------------------------------------------------------
 // Level Scene representation
 // -----------------------------------------------------------------------------
+struct ScriptGraph;
+
 struct LevelScene {
     std::string map_name;
     std::string chapter_title;
     Vec3 player_spawn_pos{0.0f, 0.0f, 100.0f};
     float player_spawn_yaw = 0.0f;
     LevelIntroSequence level_intro{};
+    // Every Matinee that moves the local pawn (SeqVar_TdLocalPawn in one of its groups), baked
+    // like the intro: the intro itself, the cutscenes the level's triggers start, the outro.
+    // LevelScene::script plays them by index (ScriptMatinee::player_cutscene).
+    std::vector<LevelIntroSequence> cutscenes;
+    // The level's Kismet (src/game/level_script.hpp); null when the level has none.
+    std::shared_ptr<const ScriptGraph> script;
+    // The script sets the checkpoints (SeqAct_TdCheckpoint): the controller's proximity
+    // checkpoints are off. False for a level without a script (the tutorial's staged list).
+    bool script_checkpoints = false;
     std::vector<PostProcessVolumeInfo> post_volumes;  // highest priority first
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight

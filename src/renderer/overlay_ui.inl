@@ -609,13 +609,111 @@
                          ui_color(0.902f, 0.078f, 0.078f, 1.0f));
         }
 
-        // 6. Active Subtitle / Tutorial Prompt Banner (Bottom Center)
-        std::string prompt = telemetry.active_subtitle.empty()
-            ? "[LMB/F] MELEE/FIRE | [RMB/E] DISARM | [T/Y] CYCLE 11 GUNS | [G] DROP | [H] SPAWN SQUAD"
-            : telemetry.active_subtitle;
+        // 6. Active Subtitle / Tutorial Prompt Banner (Bottom Center). With a level script the slot
+        // carries retail's text only (voice-over subtitles); the key legend is the port's own.
+        std::string prompt = telemetry.active_subtitle;
+        if (prompt.empty() && !scene.script) {
+            prompt = "[LMB/F] MELEE/FIRE | [RMB/E] DISARM | [T/Y] CYCLE 11 GUNS | [G] DROP | [H] SPAWN SQUAD";
+        }
+        if (!prompt.empty()) {
+            float banner_w = float(prompt.length()) * 11.0f + 40.0f;
+            float banner_x = (w - banner_w) * 0.5f;
+            draw_ui_quad(verts, banner_x, h - 42.0f, banner_w, 28.0f, ui_color(0.04f, 0.06f, 0.09f, 0.80f));
+            draw_ui_text(verts, prompt, banner_x + 20.0f, h - 35.0f, 1.8f, ui_color(0.98f, 0.98f, 0.98f, 1.0f));
+        }
+        draw_script_text(verts, telemetry);
+    }
 
-        float banner_w = float(prompt.length()) * 11.0f + 40.0f;
-        float banner_x = (w - banner_w) * 0.5f;
-        draw_ui_quad(verts, banner_x, h - 42.0f, banner_w, 28.0f, ui_color(0.04f, 0.06f, 0.09f, 0.80f));
-        draw_ui_text(verts, prompt, banner_x + 20.0f, h - 35.0f, 1.8f, ui_color(0.98f, 0.98f, 0.98f, 1.0f));
+    // Wraps `text` into lines of at most `max_chars` at the spaces.
+    static std::vector<std::string> wrap_ui_text(const std::string& text, size_t max_chars) {
+        std::vector<std::string> lines;
+        std::string cur;
+        size_t pos = 0;
+        while (pos <= text.size()) {
+            size_t nl = text.find('\n', pos);
+            const std::string para = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+            size_t p = 0;
+            cur.clear();
+            while (p < para.size()) {
+                size_t sp = para.find(' ', p);
+                const std::string word = para.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+                if (!cur.empty() && cur.size() + 1 + word.size() > max_chars) {
+                    lines.push_back(cur);
+                    cur.clear();
+                }
+                cur += (cur.empty() ? "" : " ") + word;
+                if (sp == std::string::npos) break;
+                p = sp + 1;
+            }
+            if (!cur.empty()) lines.push_back(cur);
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+        return lines;
+    }
+
+    // The text the level's Kismet asks for (docs/GAMEPLAY_SCRIPTING_RE.md, section 4), over the
+    // game and over its cutscenes alike:
+    //   - the supers (SeqAct_TdSupersMessage): the district and the time of day, lower left, for
+    //     the action's Duration (6 s), as the chapter opens;
+    //   - a tutorial card (SeqAct_TdTutorialMessage, TdUIScene_TutorialHUDMessage): the training
+    //     area's instructions, top centre, until the move is done or the next card replaces it;
+    //   - a sign's text (SeqAct_TdTriggerSubtitle, from a Trigger_LOS): bottom centre, 5 s;
+    //   - a hint card (SeqAct_TdTriggerSplashHint): "HINT" and the text, the game paused under it;
+    //   - the skip prompt of a skippable cutscene (TdPopUps.PopUp4).
+    void draw_script_text(std::vector<HUDVertex>& verts, const PlayerTelemetry& telemetry) {
+        const float w = float(width);
+        const float h = float(height);
+        if (!telemetry.supers_text.empty() && telemetry.supers_time_left > 0.0f) {
+            const float a = std::clamp(telemetry.supers_time_left / 0.6f, 0.0f, 1.0f);
+            std::string upper = telemetry.supers_text;
+            for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            draw_ui_text(verts, upper, w * 0.074f, h * 0.80f, 3.2f, ui_color(1.0f, 1.0f, 1.0f, 0.96f * a));
+        }
+        if (!telemetry.tutorial_text.empty()) {
+            const std::vector<std::string> lines = wrap_ui_text(telemetry.tutorial_text, 70);
+            float max_chars = 0.0f;
+            for (const std::string& l : lines) max_chars = std::max(max_chars, float(l.size()));
+            const float box_w = std::min(w - 80.0f, max_chars * 11.0f + 48.0f);
+            const float box_h = 22.0f * float(lines.size()) + 26.0f;
+            const float box_x = (w - box_w) * 0.5f;
+            const float box_y = h * 0.14f;
+            draw_ui_quad(verts, box_x, box_y, box_w, box_h, ui_color(1.0f, 1.0f, 1.0f, 0.86f));
+            draw_ui_quad(verts, box_x, box_y, 4.0f, box_h, ui_color(0.902f, 0.078f, 0.078f, 1.0f));
+            for (size_t i = 0; i < lines.size(); ++i) {
+                draw_ui_text(verts, lines[i], box_x + 22.0f, box_y + 13.0f + 22.0f * float(i), 1.8f, ui_color(0.08f, 0.09f, 0.11f, 1.0f));
+            }
+        }
+        if (!telemetry.sign_text.empty() && telemetry.sign_time_left > 0.0f) {
+            const std::vector<std::string> lines = wrap_ui_text(telemetry.sign_text, 80);
+            float max_chars = 0.0f;
+            for (const std::string& l : lines) max_chars = std::max(max_chars, float(l.size()));
+            const float box_w = std::min(w - 80.0f, max_chars * 10.6f + 40.0f);
+            const float box_h = 21.0f * float(lines.size()) + 12.0f;
+            const float box_x = (w - box_w) * 0.5f;
+            const float box_y = h - 100.0f - box_h;
+            draw_ui_quad(verts, box_x, box_y, box_w, box_h, ui_color(0.03f, 0.05f, 0.08f, 0.82f));
+            for (size_t i = 0; i < lines.size(); ++i) {
+                draw_ui_text(verts, lines[i], box_x + 20.0f, box_y + 7.0f + 21.0f * float(i), 1.75f, ui_color(0.99f, 0.99f, 1.0f, 1.0f));
+            }
+        }
+        if (!telemetry.splash_hint_text.empty()) {
+            draw_ui_quad(verts, 0.0f, 0.0f, w, h, ui_color(0.0f, 0.0f, 0.0f, 0.55f));
+            const std::vector<std::string> lines = wrap_ui_text(telemetry.splash_hint_text, 64);
+            const float box_w = std::min(w - 120.0f, 760.0f);
+            const float box_h = 22.0f * float(lines.size()) + 96.0f;
+            const float box_x = (w - box_w) * 0.5f;
+            const float box_y = (h - box_h) * 0.5f;
+            draw_ui_quad(verts, box_x, box_y, box_w, box_h, ui_color(1.0f, 1.0f, 1.0f, 0.94f));
+            draw_ui_quad(verts, box_x, box_y, box_w, 6.0f, ui_color(0.902f, 0.078f, 0.078f, 1.0f));
+            draw_ui_text(verts, telemetry.splash_hint_title, box_x + 24.0f, box_y + 20.0f, 2.6f, ui_color(0.902f, 0.078f, 0.078f, 1.0f));
+            for (size_t i = 0; i < lines.size(); ++i) {
+                draw_ui_text(verts, lines[i], box_x + 24.0f, box_y + 58.0f + 22.0f * float(i), 1.8f, ui_color(0.08f, 0.09f, 0.11f, 1.0f));
+            }
+            draw_ui_text(verts, "GAME PAUSED  -  PRESS SPACE TO CONTINUE", box_x + 24.0f, box_y + box_h - 26.0f, 1.5f,
+                         ui_color(0.35f, 0.38f, 0.42f, 1.0f));
+        }
+        if (telemetry.skip_prompt) {
+            draw_ui_text(verts, "Press SPACE to skip", w * 0.074f, h * 0.105f, 1.9f, ui_color(0.86f, 0.88f, 0.90f, 0.85f));
+        }
     }

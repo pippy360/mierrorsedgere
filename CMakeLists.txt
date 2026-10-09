@@ -47,6 +47,7 @@ set(CORE_SOURCES
     src/assets/level_intro.cpp
     src/assets/level_lightmaps.cpp
     src/assets/level_postprocess.cpp
+    src/game/level_script.cpp
     src/physics/collision_world.cpp
     src/physics/parkour_controller.cpp
 )
