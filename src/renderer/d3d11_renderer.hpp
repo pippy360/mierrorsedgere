@@ -2,6 +2,7 @@
 
 #include "../math/types.hpp"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -47,6 +48,8 @@ public:
     // The first-person camera render_frame() draws `telemetry` from (outside the menu): the eyes and
     // view rotation with the current move's camera animation (TdPlayerPawn.CalcCamera) applied.
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
+    // The level, as the first-person mesh's foot placement asks about it (AnimSystem::set_world_trace).
+    void set_world_trace(std::function<bool(const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal)> trace);
 
     // State inspection
     [[nodiscard]] bool is_initialized() const;

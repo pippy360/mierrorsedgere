@@ -9,6 +9,7 @@
 // -----------------------------------------------------------------------------
 
 #include "fp_anim.hpp"
+#include "fp_controls.hpp"
 #include "fp_pose.hpp"
 
 #include <string>
@@ -44,9 +45,6 @@ struct PawnFrame {
     float balance_lean = 0.0f;   // -1 .. 1 off the beam
     int balance_danger = 0;      // losing her balance to the left (-1) or the right (1)
     int against_wall = 0;        // TdPlayerPawn.AgainstWallState: 0 no, 1 both hands, 2 the left, 3 the right
-    float against_wall_left = -1.0f;   // how far ahead of her centre the wall is, by shoulder (-1 none)
-    float against_wall_right = -1.0f;
-    float against_wall_height = 0.0f;  // and how high above her feet
     bool climbing_pipe = false;  // on a pipe, not a ladder
     float climb_top = -1.0f;     // uu up to the ladder's last step, down to its first (-1 not known)
     float climb_bottom = -1.0f;
@@ -54,6 +52,16 @@ struct PawnFrame {
     // whether it lands. -1: the move names its animations itself (move_anim).
     int melee_variant = -1;
     bool melee_hit = false;
+    // The ledge a hang or a vault is on (TdPawn.MoveLedgeLocation, MoveNormal, MoveLedgeNormal),
+    // for the hands the moves set on it.
+    bool ledge_known = false;
+    Vec3 ledge_point{0.0f, 0.0f, 0.0f};
+    Vec3 ledge_wall_normal{0.0f, 0.0f, 0.0f};
+    Vec3 ledge_top_normal{0.0f, 0.0f, 1.0f};
+    // TdPawn.AgainstWallLeftHand / AgainstWallRightHand: where each hand's trace met the wall.
+    Vec3 wall_hand[2];
+    bool floor_sloped = false;   // Floor.Z != 1
+    float smooth_offset = 0.0f;  // TdPawn.SmoothOffset: how far the mesh is behind a change of floor height
 };
 
 class Director {
@@ -66,6 +74,9 @@ public:
     [[nodiscard]] AnimTree& tree() { return tree_; }
     [[nodiscard]] const AnimTree& tree() const { return tree_; }
     [[nodiscard]] const PawnAnimState& pawn() const { return pawn_; }
+    // The tree's skeletal controls, ticked with it.
+    [[nodiscard]] SkelControls& controls() { return controls_; }
+    [[nodiscard]] const SkelControls& controls() const { return controls_; }
 
     // Where the moves put the whole mesh against the pawn, which the pose does not hold: the root
     // offset (TdPawn.SetRootOffset) and the swing's turn about the bar (TdMove_Swing.SetPawnRotation).
@@ -89,6 +100,11 @@ private:
     void set_root_offset(const Vec3& offset, float blend_time);
     void tick_weapon(const PawnFrame& frame);
     void tick_swan_neck(const PawnFrame& frame);
+    void tick_controls(const PawnFrame& frame);
+    // TdPawn.SetLeftHandWorldIKLocation / SetRightHandWorldIKLocation and DisableHandsWorldIK.
+    void set_hand_ik(int side, const Vec3& target, float blend);
+    void clear_hand_ik(float blend);
+    void vault_ik(const PawnFrame& frame);
     // TdMove.PlayMoveAnim.
     void play(Slot slot, const char* name, float rate, float blend_in, float blend_out) {
         tree_.play_custom_anim(slot, name, rate, blend_in, blend_out, false, true);
@@ -144,6 +160,18 @@ private:
     // TdMove_Melee: 1 while the wind-up plays, 2 after the blow.
     int melee_phase_ = 0;
     int melee_variant_ = -1;
+    SkelControls controls_;
+    // The hands' world IK as the moves have set it, and a vault's timers for it.
+    bool hand_ik_[2] = {false, false};
+    Vec3 hand_ik_target_[2];
+    float hand_ik_blend_[2] = {0.0f, 0.0f};
+    float vault_ik_on_ = -1.0f, vault_ik_off_ = -1.0f;
+    bool vault_ik_both_ = false;
+    PawnFrame vault_frame_;
+    // TdPlayerPawn.EnableFootPlacement, and the pawn's timer that calls DisableFootPlacement.
+    bool foot_placement_ = false;
+    float foot_blend_ = 0.2f;
+    float foot_timer_ = -1.0f;
 };
 
 }  // namespace me::fp

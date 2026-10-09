@@ -11,6 +11,7 @@
 
 #include "anim_system.hpp"
 #include "fp_anim.hpp"
+#include "fp_controls.hpp"
 
 #include <unordered_map>
 #include <vector>
@@ -47,19 +48,13 @@ public:
     // TdAnimNodeWeaponPoseOffset.bDisable: a disarm turns the grip offsets off while it plays.
     void set_grip_enabled(bool on) { grip_ = on; }
 
-    // TdSkelControlAim1p on SpineXRight / SpineXLeft: how far each arm is turned with the view's pitch.
+    // What the single-bone controls the scripts set add to the pose.
     struct Aim {
-        float pitch_deg = 0.0f;
-        float right = 0.0f;
-        float left = 0.0f;
-        // Where the swan neck has the camera off the eye (forward, down): the armed arm goes with it.
+        // Where the swan neck has the camera off the eye (forward along the view's yaw, down), and
+        // how far the view's yaw is off the pawn's: the aimed arms go with the camera.
         float swan_forward = 0.0f;
         float swan_down = 0.0f;
-        // Against a wall: how far each arm is on it (0 .. 1) and how far ahead of her centre the
-        // wall is there, for the hand to be set on it (-1 not known).
-        float wall_left = 0.0f, wall_right = 0.0f;
-        float wall_ahead_left = -1.0f, wall_ahead_right = -1.0f;
-        float wall_height = 0.0f;  // those points' height above her feet
+        float look_yaw_deg = 0.0f;
         // OneHandedRightShoulderOffset: the weapon's own nudge of the right shoulder, in the bone's
         // space, at the ready (TdWeapon.OneHandedRightShoulderTranslationOffset).
         Vec3 shoulder{0.0f, 0.0f, 0.0f};
@@ -69,7 +64,8 @@ public:
     };
 
     // The tree's pose this frame.
-    void evaluate(const AnimTree& tree, Pose& out, const Aim& aim) const;
+    // `controls`, when given, are laid over it (fp_controls), with the mesh at `place` in the world.
+    void evaluate(const AnimTree& tree, Pose& out, const Aim& aim, SkelControls* controls = nullptr, const MeshPlace* place = nullptr) const;
     void evaluate(const AnimTree& tree, Pose& out) const { evaluate(tree, out, Aim{}); }
     // Every bone in the mesh component's space.
     void component_space(const Pose& pose, std::vector<Vec3>& pos, std::vector<Quat4>& rot) const;
@@ -82,6 +78,10 @@ public:
                                  float yaw_offset_deg, float swan_forward, float swan_down) const;
 
     [[nodiscard]] int eye_bone() const { return eye_; }
+    // The pawn's axes in the mesh component's space.
+    [[nodiscard]] const Vec3& forward_axis() const { return fwd_; }
+    [[nodiscard]] const Vec3& right_axis() const { return right_; }
+    [[nodiscard]] const Vec3& up_axis() const { return up_; }
 
 private:
     void atoms(const AnimTree& tree, int index, Pose& out, size_t depth) const;
@@ -90,7 +90,6 @@ private:
     void apply_aim(const TreeNode& n, size_t node_index, Pose& out) const;
 
     const std::vector<int>& tracks(const AnimSetAsset* set) const;
-    void turn_arm(int bone, float degrees, const Vec3& shift, Pose& out) const;
 
     const SkeletalMeshAsset* mesh_ = nullptr;
     const AnimSetAsset* base_set_ = nullptr;
@@ -100,9 +99,7 @@ private:
     std::vector<Quat4> pose_rot_;
     std::vector<Vec3> pose_pos_;
     bool grip_ = true;
-    int spine_right_ = -1, spine_left_ = -1, shoulder_right_ = -1, hips_ = -1;
-    int arm_[2] = {-1, -1}, forearm_[2] = {-1, -1}, hand_[2] = {-1, -1};  // left, right
-    void reach_hand(int side, const Vec3& shift, Pose& out) const;
+    int shoulder_right_ = -1, hips_ = -1;
     std::vector<std::vector<int>> aim_bone_;  // per tree node: the bone of each aim component
     int eye_ = 0;
     int camera_ = 0;  // CameraJoint, the eye's child: what the Camera slot's animations turn

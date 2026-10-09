@@ -2175,6 +2175,10 @@ bool MetalRenderer::save_screenshot_png(const std::string& path) {
     return success;
 }
 
+void MetalRenderer::set_world_trace(std::function<bool(const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal)> trace) {
+    impl_->anim_system.set_world_trace(std::move(trace));
+}
+
 void MetalRenderer::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
     // Without the character assets camera_animation() plays nothing: the plain eyes and view rotation.
     impl_->anim_system.player_camera(telemetry, out_pos, out_rot);

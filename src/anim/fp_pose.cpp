@@ -75,16 +75,8 @@ void PoseEvaluator::init(const SkeletalMeshAsset& mesh, const AnimSetAsset& set,
     for (size_t b = 0; b < bones; ++b) {
         const std::string key = lower(mesh.bones[b].name);
         if (key == "eyejoint") eye_ = camera_ = static_cast<int>(b);
-        if (key == "spinexright") spine_right_ = static_cast<int>(b);
-        if (key == "spinexleft") spine_left_ = static_cast<int>(b);
         if (key == "rightshoulder") shoulder_right_ = static_cast<int>(b);
         if (key == "hips") hips_ = static_cast<int>(b);
-        if (key == "leftarm") arm_[0] = static_cast<int>(b);
-        if (key == "leftforearm") forearm_[0] = static_cast<int>(b);
-        if (key == "lefthand") hand_[0] = static_cast<int>(b);
-        if (key == "rightarm") arm_[1] = static_cast<int>(b);
-        if (key == "rightforearm") forearm_[1] = static_cast<int>(b);
-        if (key == "righthand") hand_[1] = static_cast<int>(b);
     }
     for (size_t b = 0; b < bones; ++b) {
         if (lower(mesh.bones[b].name) == "camerajoint") camera_ = static_cast<int>(b);
@@ -134,81 +126,6 @@ void PoseEvaluator::set_weapon_pose(const AnimSetAsset* weapon_set, const AnimSe
         pose_rot_.push_back(rot);
         pose_pos_.push_back(a.positions[0] - rot.rotate(c.positions[0]));
     }
-}
-
-// The arm from `bone` out is turned about that bone by `degrees` of pitch, in the mesh's space.
-// TdSkelControlAim1p (native): the armed arm keeps its place in the view. In retail's frames a
-// pistol and a rifle are at the same spot on the screen at every pitch from 75 degrees up to 75
-// down, with the camera craned out over the feet by the swan neck or not. So the arm, from its
-// spine bone out, is carried rigidly with the camera: turned by the view's pitch about the eye,
-// and moved by what the swan neck moves the camera.
-void PoseEvaluator::turn_arm(int bone, float degrees, const Vec3& shift, Pose& out) const {
-    if (bone < 0 || (degrees == 0.0f && shift.length_sq() == 0.0f)) return;
-    auto place = [&](int b, Vec3& pos, Quat4& rot) {
-        // The bone's place and turn in the mesh's space, by its chain up to the root.
-        std::vector<int> chain;
-        for (int k = b; k >= 0; k = (k == 0 ? -1 : mesh_->bones[static_cast<size_t>(k)].parent_index)) chain.push_back(k);
-        pos = Vec3(0.0f, 0.0f, 0.0f);
-        rot = Quat4();
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            const size_t k = static_cast<size_t>(*it);
-            pos = pos + rot.rotate(out.pos[k]);
-            rot = Quat4::multiply(rot, out.rot[k]).normalized();
-        }
-    };
-    const int up = mesh_->bones[static_cast<size_t>(bone)].parent_index;
-    Vec3 parent_pos, eye_pos;
-    Quat4 parent, eye_rot;
-    place(up, parent_pos, parent);
-    place(eye_, eye_pos, eye_rot);
-    // About the pawn's side axis, forward towards up.
-    const Vec3 axis = fwd_.cross(up_).normalized();
-    const float half = degrees * DEG2RAD * 0.5f;
-    const Quat4 turn(axis.x * std::sin(half), axis.y * std::sin(half), axis.z * std::sin(half), std::cos(half));
-    const size_t i = static_cast<size_t>(bone);
-    const Vec3 at = parent_pos + parent.rotate(out.pos[i]);
-    const Vec3 moved = eye_pos + turn.rotate(at - eye_pos) + shift;
-    out.pos[i] = parent.conjugate().rotate(moved - parent_pos);
-    out.rot[i] = Quat4::multiply(parent.conjugate(), Quat4::multiply(turn, Quat4::multiply(parent, out.rot[i]))).normalized();
-}
-
-// A hand moved by `shift` (in the mesh's space) with the arm following: the upper arm and the
-// forearm keep their lengths, the elbow stays in the plane it is in, and the hand keeps its turn.
-void PoseEvaluator::reach_hand(int side, const Vec3& shift, Pose& out) const {
-    const int upper = arm_[side], lower = forearm_[side], hand = hand_[side];
-    if (upper < 0 || lower < 0 || hand < 0 || shift.length_sq() < 1e-6f) return;
-    if (mesh_->bones[static_cast<size_t>(lower)].parent_index != upper || mesh_->bones[static_cast<size_t>(hand)].parent_index != lower) return;
-    std::vector<Vec3> pos;
-    std::vector<Quat4> rot;
-    component_space(out, pos, rot);
-    const size_t u = static_cast<size_t>(upper), l = static_cast<size_t>(lower), h = static_cast<size_t>(hand);
-    const Vec3 a = pos[u], b = pos[l], c = pos[h];
-    const float l1 = (b - a).length(), l2 = (c - b).length();
-    if (l1 < 1e-3f || l2 < 1e-3f) return;
-    const Vec3 to = c + shift - a;
-    const float d = std::clamp(to.length(), std::fabs(l1 - l2) + 0.1f, l1 + l2 - 0.1f);
-    const Vec3 dir = to.normalized();
-    Vec3 pole = (b - a) - dir * (b - a).dot(dir);
-    if (pole.length_sq() < 1e-6f) pole = up_ * -1.0f;
-    pole = pole.normalized();
-    const float along = (l1 * l1 - l2 * l2 + d * d) / (2.0f * d);
-    const float out_of_line = std::sqrt(std::max(0.0f, l1 * l1 - along * along));
-    const Vec3 elbow = a + dir * along + pole * out_of_line;
-    const Vec3 target = a + dir * d;
-    auto between = [](const Vec3& from, const Vec3& onto) {
-        const Vec3 f = from.normalized(), t = onto.normalized();
-        const Vec3 axis = f.cross(t);
-        return Quat4(axis.x, axis.y, axis.z, 1.0f + f.dot(t)).normalized();
-    };
-    const Quat4 q1 = between(b - a, elbow - a);
-    const Quat4 upper_rot = Quat4::multiply(q1, rot[u]).normalized();
-    const Quat4 q2 = between(q1.rotate(c - b), target - elbow);
-    const Quat4 lower_rot = Quat4::multiply(q2, Quat4::multiply(q1, rot[l])).normalized();
-    const int up_parent = mesh_->bones[u].parent_index;
-    const Quat4 parent = up_parent >= 0 ? rot[static_cast<size_t>(up_parent)] : Quat4();
-    out.rot[u] = Quat4::multiply(parent.conjugate(), upper_rot).normalized();
-    out.rot[l] = Quat4::multiply(upper_rot.conjugate(), lower_rot).normalized();
-    out.rot[h] = Quat4::multiply(lower_rot.conjugate(), rot[h]).normalized();
 }
 
 void PoseEvaluator::reference(Pose& out) const {
@@ -344,53 +261,30 @@ void PoseEvaluator::atoms(const AnimTree& tree, int index, Pose& out, size_t dep
     }
 }
 
-void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim) const {
+void PoseEvaluator::evaluate(const AnimTree& tree, Pose& out, const Aim& aim, SkelControls* controls, const MeshPlace* place) const {
     if (!mesh_) return;
     int root = -1;
     for (size_t i = 0; i < tree.nodes().size(); ++i) {
         if (tree.nodes()[i].cls == "AnimTree") root = static_cast<int>(i);
     }
     atoms(tree, root, out, 0);
-    // The aim controls: the weapon arm (both, with a two-handed weapon) follows the view's pitch.
-    if (shoulder_right_ >= 0 && aim.right > 0.0f) {
+    // OneHandedRightShoulderOffset, on with a light weapon at the ready (TdPawn.UpdateWeaponSkelControls).
+    const float shoulder = controls ? controls->shoulder_strength() : 0.0f;
+    if (shoulder_right_ >= 0 && shoulder > 0.0f) {
         const size_t b = static_cast<size_t>(shoulder_right_);
-        out.pos[b] += out.rot[b].rotate(aim.shoulder) * aim.right;
+        out.pos[b] += out.rot[b].rotate(aim.shoulder) * shoulder;
     }
     if (hips_ >= 0 && (aim.hips.x != 0.0f || aim.hips.y != 0.0f || aim.hips.z != 0.0f)) {
         // The hips hang off the root, which no animation turns.
         const size_t b = static_cast<size_t>(hips_);
         out.pos[b] += out.rot[0].conjugate().rotate(fwd_ * aim.hips.x + right_ * aim.hips.y + up_ * aim.hips.z);
     }
-    const Vec3 swan = fwd_ * aim.swan_forward - up_ * aim.swan_down;
-    turn_arm(spine_right_, aim.pitch_deg * aim.right, swan * aim.right, out);
-    turn_arm(spine_left_, aim.pitch_deg * aim.left, swan * aim.left, out);
-    // Against a wall the hands are set on it (TdPawn.AgainstWallLeftHand / RightHand and the limb
-    // controls, native; the skeleton has an IK bone for the left hand only, LeftHand_GameIK). In
-    // retail's frames at a flat wall the left fingers are where they would be with the wrist 15 uu
-    // out from her middle and 17 under the eye, on the wall: 4 further in and 6 lower than the
-    // animation alone has it, which also has both hands 3 uu inside the wall. The right hand is
-    // where the animation has it. At a fence she stood further from, the left hand reaches out to
-    // it. So: the left wrist goes to the point of the wall in front of its shoulder (where the
-    // controller found it), a hand's thickness short of it; the right is only brought out to the
-    // wall's surface; the arms bend or reach to suit and the hands keep their turn.
-    if ((aim.wall_left > 0.0f && aim.wall_ahead_left >= 0.0f) || (aim.wall_right > 0.0f && aim.wall_ahead_right >= 0.0f)) {
-        constexpr float kShoulderOut = 15.0f, kPalm = 2.0f, kWristBelowTrace = 2.2f, kMeshOriginBelowFeet = 4.0f;
-        std::vector<Vec3> pos;
-        std::vector<Quat4> rot;
-        component_space(out, pos, rot);
-        const Vec3 wrist[2] = {hand_[0] >= 0 ? pos[static_cast<size_t>(hand_[0])] : Vec3(0.0f, 0.0f, 0.0f),
-                               hand_[1] >= 0 ? pos[static_cast<size_t>(hand_[1])] : Vec3(0.0f, 0.0f, 0.0f)};
-        for (int side = 0; side < 2; ++side) {
-            const float weight = side == 0 ? aim.wall_left : aim.wall_right;
-            const float ahead = side == 0 ? aim.wall_ahead_left : aim.wall_ahead_right;
-            if (weight <= 0.0f || ahead < 0.0f || hand_[side] < 0) continue;
-            const Vec3 point = fwd_ * (ahead - kPalm) + right_ * -kShoulderOut + up_ * (aim.wall_height - kWristBelowTrace + kMeshOriginBelowFeet);
-            const Vec3 target = side == 0 ? point : wrist[side] + fwd_ * ((ahead - kPalm) - wrist[side].dot(fwd_));
-            Vec3 shift = (target - wrist[side]) * weight;
-            const float far = shift.length();
-            if (far > 20.0f) shift = shift * (20.0f / far);
-            reach_hand(side, shift, out);
-        }
+    // The rest of the tree's skeletal controls: the aim, the lazy springs, the hands and feet put
+    // on the level.
+    if (controls) {
+        const float look = aim.look_yaw_deg * DEG2RAD;
+        const Vec3 swan = (fwd_ * std::cos(look) + right_ * std::sin(look)) * aim.swan_forward - up_ * aim.swan_down;
+        controls->apply(out, place ? *place : MeshPlace{}, swan);
     }
 }
 

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <memory>
 #include <cstdint>
+#include <functional>
 
 namespace me {
 
@@ -213,6 +214,10 @@ public:
     // view rotation turned by what the animation does to the camera bone. In a level intro, the death
     // fall, or without the tree: the eyes eye_height above the feet, with camera_animation().
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
+    // A line check through the level (no extent), for the first-person mesh's controls that put
+    // her feet on the floor: true with where the line from `from` to `to` meets something.
+    using WorldTrace = std::function<bool(const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal)>;
+    void set_world_trace(WorldTrace trace) { world_trace_ = std::move(trace); }
 
     enum EnemyArchetypeId : uint32_t {
         EnemyArch_SWAT    = 0,
@@ -327,6 +332,7 @@ private:
     // (fp_anim / fp_director / fp_pose). Ticked once per simulation time from evaluate_faith_1p.
     struct FirstPerson;
     mutable std::shared_ptr<FirstPerson> fp_;
+    WorldTrace world_trace_;
     // What of the tree is used this frame: its eye for the world camera, its whole body for the
     // viewmodel, or only its legs under arms that are still posed by hand (a weapon in hand).
     struct FirstPersonUse {
