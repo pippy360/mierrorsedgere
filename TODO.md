@@ -50,6 +50,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 - **Post-roll / diagonal walk acceleration gap (`seg08`):** Walking back-right after a skill roll caps around `350–390 uu/s` in the port whereas retail accelerates to `~610 uu/s` (`MODLOG.md` §13.4).
 - **Gameplay standing eye offset (`12 uu` cutscene hand-over pop):** Retail's standing `1P` pose places the camera at `+158.7 uu` Z and `+8.6 uu` forward from feet, whereas gameplay `kEyeHeightStand` sits at `+166.0 uu` Z / `0.0 uu` forward, causing a 12 uu pop when level intros and cutscenes hand control back (`docs/LEVEL_INTROS.md` §5).
 - **Post-handover turn-in-place (`StandTurn90Left` / `StandTurn90Right`):** Replicate retail's 90° turn-in-place animation and cloth/sneak step notifies when control returns in Flight, Jacknife, Ropeburn, Pirandello Kruger, and The Boat (`docs/LEVEL_INTROS.md` §5).
+- **First-person skeletal controls not yet compared with retail on screen:** Both arms going with the view while she runs unarmed, the weapon's and hand's lazy springs, the hands on a sloped ledge and on a vault, the left hand on a rifle are from the executable's rules only; at retail's flat wall the port's hands sit about 1.5 uu nearer the middle of the picture. Not run: the forearm roll controls with their morph targets, and `CameraNoiseControlRoll` / `Pitch` (`docs/FIRST_PERSON_ANIMATION_RE.md` §10-11).
 - **Zipline entry glide & impact animations:** Port `TdMove_IntoZipLine`'s ~0.3 s entry glide, `ziplinestart` / `ziplinehitwall` animations, and end-of-cable impact camera motion (`MODLOG.md` §10.4).
 
 ---
@@ -72,6 +73,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 
 - **Surface-aware footsteps during level intros & cutscenes:** Trace floor physical materials (`TdPhysicalMaterialFootSteps`) beneath the animated root during cutscenes instead of defaulting to concrete (`docs/LEVEL_INTROS.md` §5).
 - **Room acoustics, occlusion & `SoundGroupEffects` filter presets:** Implement UE3/DICE inside/outside room low-pass filtering, obstruction attenuation, and the 11 global `SoundGroupEffects` presets from `DefaultEngine.ini` (`docs/AUDIO_SYSTEM_RE.md` §2.3).
+- **Layered ambient cues on level emitters (`SoundNodeMixer` under an `AmbientSound`):** The emitter pool plays one branch of a cue. `A_Ambience_Wind.Wind.WindHard` is a looping city bed mixed with three looping layers of random gusts and whistles (one behind a `SoundNodeDelay`); the port loops a single picked wave (a 3 s aeolian pipe in the Training Area). Cues with no `SoundNodeLooping` also loop, where retail plays them once (`docs/AUDIO_SYSTEM_RE.md` §7, `AudioEngine::update` step 5).
 - **Localized elevator announcements (`SeqCond_TdCaseLanguage`):** Select the active locale link on `SeqCond_TdCaseLanguage` instead of firing all output pins simultaneously (`src/game/level_script.cpp`).
 
 ---

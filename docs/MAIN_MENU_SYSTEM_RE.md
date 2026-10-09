@@ -253,6 +253,7 @@ The port no longer imitates this section: it loads `Main_Sequence` and runs it (
   It starts on the start screen and plays through the menu. `TdMainMenu_Audio1` … `_Audio20` hold the unlockable tracks, one per sublevel.
 * **UI sounds** (skin `SoundCues`, all in `Audio/A_HUD.upk`): `NavigateUp/Down/Left/Right`, `ListUp/Down`, `Slider*` → `A_HUD.Menu.D-Pad`; `TabChangeLeft/Right` → `A_HUD.Menu.Tab_Change`; `Accept` → `A_HUD.Menu.A_Pos`; `Cancel` → `A_HUD.Menu.B_Neg`; `Default` → `A_HUD.Menu.Accept`.
   Changing column plays `TabChangeRight` whichever way it goes; moving between buttons plays `NavigateUp`/`NavigateDown`; choosing one plays `Accept`.
+* **Nothing else.** `TdMainMenu.me1` has no `AmbientSound` actor and no Kismet that plays a sound: the city behind the menu is silent. (The port had played the ambient emitters of the level it loads behind the front end, a vehicle pack among them; `docs/AUDIO_SYSTEM_RE.md`, section 7.)
 
 ---
 

@@ -241,3 +241,7 @@ Each `AmbientSound` actor specifies:
 - `Location` (`FVector` in UU)
 - `AudioComponent` → `SoundCue` (`VehiclePack_02`, `VehiclePack_03`, `WindHard`, `AirConditioner`, `Transformer`, `City_Calm`, `ID_Corridor_01`, etc.)
 - `SoundNodeAttenuation` (`MinRadius`, `MaxRadius`, `LPFMinRadius`, `LPFMaxRadius` via `DistributionFloatUniform` subobjects).
+
+**How an emitter repeats** is its cue's own graph. A wave under a `SoundNodeLooping` plays end to end (`WindHard`, the air conditioners). The vehicle packs have a `SoundNodeDelay` between the two: `VehiclePack_02` is `Looping` → `Delay` (7 to 15 s) → `Modulator` → a `SoundNodeRandom` over six groups weighted 7 / 3 / 8 / 8 / 5 / 7 (brakes, buses, cars, horns, motorcycles, trucks; 38 waves). Every round draws the delay again, waits it out, plays one pass once with its own volume and pitch, and the next round starts when that ends: a vehicle every 10 to 20 s, a horn about one time in five. The port's emitter pool does the same (`AudioEngine::next_ambient_voice`); it had looped the cue's first wave end to end.
+
+**With a menu up the emitters are silent.** Retail's front end is a map of its own, `TdMainMenu`, and it has no `AmbientSound` at all: its Kismet cross-fades the menu music and its UI scenes play `A_HUD` cues (`UIAction_PlaySound`), nothing else. The port loads a level behind its front end and listened to it from the world's origin, which in the Training Area is next to a vehicle pack; it no longer plays the level's emitters while the front end or the pause menu is up.

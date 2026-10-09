@@ -191,6 +191,10 @@ private:
         bool positional = false;
         Vec3 position{0.0f, 0.0f, 0.0f};
     };
+    // A level AmbientSound whose cue waits between sounds (a SoundNodeDelay under its
+    // SoundNodeLooping, e.g. the vehicle packs: 7 to 15 s, then one of 38 passes, brakes and
+    // horns): the next sound it will play and how long until then. False for a cue that just loops.
+    bool next_ambient_voice(size_t slot, const AmbientEmitterInfo& em);
     void collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
                             std::vector<CueVoice>& out) const;
     bool play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch);
@@ -243,6 +247,11 @@ private:
     static constexpr size_t kAmbientPoolSize = 4;
     uint32_t ambient_sources_[kAmbientPoolSize] = {0};
     int32_t active_ambient_indices_[kAmbientPoolSize] = {-1, -1, -1, -1};
+    // What each of those sources is doing: looping its cue's wave, waiting out the cue's delay,
+    // or playing the one sound that followed it.
+    enum class AmbientMode : uint8_t { Loop, Waiting, Playing };
+    AmbientMode ambient_mode_[kAmbientPoolSize] = {};
+    CueVoice ambient_voice_[kAmbientPoolSize];
 
     // Stamina-coupled Faith breathing cadence state (A_Character_Female_01.upk)
     float breath_timer_ = 0.0f;

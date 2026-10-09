@@ -745,7 +745,15 @@ void AudioEngine::update(float dt,
     }
 
     // 5. Spatialize nearest 4 3D AmbientSound emitters from *_Aud.me1 sublevels (using MONO 3D buffers!)
-    if (!ambient_emitters_.empty()) {
+    // With a menu up they are silent: retail's front end is a map of its own (TdMainMenu) with no
+    // AmbientSound in it, only its music and the UI's cues, and a paused game's sounds are paused.
+    if (is_menu_music_) {
+        for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
+            if (active_ambient_indices_[slot] == -1 || !ambient_sources_[slot]) continue;
+            active_ambient_indices_[slot] = -1;
+            alSourceStop(ambient_sources_[slot]);
+        }
+    } else if (!ambient_emitters_.empty()) {
         struct Cand { int32_t idx; float dist_sq; };
         std::vector<Cand> cands;
         cands.reserve(ambient_emitters_.size());
@@ -765,25 +773,49 @@ void AudioEngine::update(float dt,
             if (slot < cands.size()) {
                 int32_t eidx = cands[slot].idx;
                 const auto& em = ambient_emitters_[eidx];
+                auto start = [&](const SoundClip* clip, bool loop) {
+                    if (!clip) return false;
+                    uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/true);
+                    if (!buf) return false;
+                    alSourceStop(asrc);
+                    alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
+                    alSourcei(asrc, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
+                    alSourcef(asrc, AL_REFERENCE_DISTANCE, std::max(em.min_radius * 0.01f, 1.0f));
+                    alSourcef(asrc, AL_MAX_DISTANCE, std::max(em.max_radius * 0.01f, 10.0f));
+                    alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
+                    alSourcePlay(asrc);
+                    return true;
+                };
                 if (active_ambient_indices_[slot] != eidx) {
                     active_ambient_indices_[slot] = eidx;
-                    float dummy_v = em.volume, dummy_p = em.pitch;
-                    const SoundClip* clip = resolve_cue_or_clip(
-                        !em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
-                    if (clip) {
-                        uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/true);
-                        if (buf) {
-                            alSourceStop(asrc);
-                            alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
-                            alSourcef(asrc, AL_REFERENCE_DISTANCE, std::max(em.min_radius * 0.01f, 1.0f));
-                            alSourcef(asrc, AL_MAX_DISTANCE, std::max(em.max_radius * 0.01f, 10.0f));
-                            alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
-                            alSourcePlay(asrc);
-                        }
+                    alSourceStop(asrc);
+                    // The cue's own graph says how it repeats: a wave under a SoundNodeLooping
+                    // plays end to end; with a SoundNodeDelay between them each round waits first.
+                    if (!next_ambient_voice(slot, em)) {
+                        float dummy_v = em.volume, dummy_p = em.pitch;
+                        start(resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p), true);
                     }
                 }
-                alSourcef(asrc, AL_GAIN, em.volume * sfx_bus_gain_ * 0.55f);
-                alSourcef(asrc, AL_PITCH, em.pitch * slomo_pitch_scale_);
+                float voice_volume = 1.0f, voice_pitch = 1.0f;
+                if (ambient_mode_[slot] == AmbientMode::Waiting) {
+                    ambient_voice_[slot].delay -= dt;
+                    if (ambient_voice_[slot].delay <= 0.0f) {
+                        auto it = sound_clips_.find(ambient_voice_[slot].clip);
+                        // (A wave that is not loaded is skipped: the next round picks again.)
+                        if (it != sound_clips_.end() && start(&it->second, false)) ambient_mode_[slot] = AmbientMode::Playing;
+                        else next_ambient_voice(slot, em);
+                    }
+                } else if (ambient_mode_[slot] == AmbientMode::Playing) {
+                    ALint state = AL_STOPPED;
+                    alGetSourcei(asrc, AL_SOURCE_STATE, &state);
+                    if (state != AL_PLAYING) next_ambient_voice(slot, em);
+                }
+                if (ambient_mode_[slot] != AmbientMode::Loop) {
+                    voice_volume = ambient_voice_[slot].volume;
+                    voice_pitch = ambient_voice_[slot].pitch;
+                }
+                alSourcef(asrc, AL_GAIN, em.volume * voice_volume * sfx_bus_gain_ * 0.55f);
+                alSourcef(asrc, AL_PITCH, em.pitch * voice_pitch * slomo_pitch_scale_);
             } else if (active_ambient_indices_[slot] != -1) {
                 active_ambient_indices_[slot] = -1;
                 alSourceStop(asrc);
@@ -1208,6 +1240,22 @@ size_t AudioEngine::count_sound_layers(const std::string& name) const {
         if (!voices.empty()) return voices.size();
     }
     return has_sound(name) ? 1 : 0;
+}
+
+// USoundNodeLooping over a USoundNodeDelay: every round the delay is drawn again (and whatever
+// is under it: the modulation, which wave), the sound plays once, and the next round starts when
+// it ends. The first round waits too, as the cue does when the level starts it.
+bool AudioEngine::next_ambient_voice(size_t slot, const AmbientEmitterInfo& em) {
+    ambient_mode_[slot] = AmbientMode::Loop;
+    if (em.cue_name.empty()) return false;
+    auto it = sound_cues_.find(em.cue_name);
+    if (it == sound_cues_.end() || !it->second.looping || it->second.is_concatenator || it->second.nodes.empty()) return false;
+    std::vector<CueVoice> voices;
+    collect_cue_voices(it->second, 0, 0.0f, 1.0f, 1.0f, voices);
+    if (voices.empty() || voices[0].delay <= 0.0f) return false;
+    ambient_voice_[slot] = voices[0];
+    ambient_mode_[slot] = AmbientMode::Waiting;
+    return true;
 }
 
 void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
