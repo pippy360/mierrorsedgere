@@ -249,7 +249,7 @@ private:
     int32_t active_ambient_indices_[kAmbientPoolSize] = {-1, -1, -1, -1};
     // What each of those sources is doing: looping its cue's wave, waiting out the cue's delay,
     // or playing the one sound that followed it.
-    enum class AmbientMode : uint8_t { Loop, Waiting, Playing };
+    enum class AmbientMode : uint8_t { Loop, Waiting, Playing, Silent };
     AmbientMode ambient_mode_[kAmbientPoolSize] = {};
     CueVoice ambient_voice_[kAmbientPoolSize];
 

@@ -981,3 +981,39 @@ User report: in the Training Area, climbing the pipe carried Faith over its top 
   - Capped pipes the old controller dismounted over the top (same bug class), 15 in all: Tutorial_p ×2, Cranes_p ×4, Subway_p ×1, Mall_p ×5, Factory_p ×2, Boat_p ×1. For example, Boat_p `TdLadderVolume_1` (end z 1425) put her at z 1536. All 15 now stop on the pipe at the retail last step.
   - 4 Cranes_p pipes end back at their base in **both** builds. Telemetry shows `respawned=1`: level volumes reset the harness's synthetic spawn, so this is not a climbing fault.
 
+## 20. Audio audit: sounds that repeat, loop or play in the wrong state (agent/audio-audit, 2026-10-10)
+
+Asked for after the menu's vehicle sound (section 16): "search for other possible sound effects that
+might have this issue or a similar issue".
+
+### 20.1 Method
+- Seven read-only auditors, one lens each: how a `SoundCue`'s graph is played; the sound actors placed in
+  retail's levels; how often the game code triggers sounds; what is audible in each app state; sounds
+  started by Kismet and Matinees; music; the life of each OpenAL source. Each finding had to name the
+  port's code path and a retail basis that was actually read (cue graphs and actor properties from the
+  cooked packages, script bytecode from `TdGame.u`, `DefaultEngine.ini`, in places `MirrorsEdge.exe`).
+- 51 distinct findings after merging duplicates. Each was then given to skeptics told to refute it, one
+  half against the port's code and one against retail's data. 49 stood. The other two (breathing asks
+  for the empty `Breath_Hard` cues; the death cue) described code that `agent/fix-user-issues` replaced
+  on main while the audit ran; what is left of them is in `TODO.md`.
+- Not done: a completeness pass over what no auditor read closely (bots' voices, physics impacts,
+  glass, water, tutorial prompts).
+
+### 20.2 Changes
+- `TODO.md`: the 49 findings, grouped, in the Audio section; three of them (zero-length random delays,
+  Matinee keys at Time 0, Kismet in `*_Aud` sublevels) in the scripting section, since they affect more
+  than sound.
+- `src/audio/audio_engine.*`: one finding was in the emitter code of section 16 and is fixed here. A
+  delay cue whose draw yields no voice (`Birds.BirdsChirp` has an empty `SoundNodeRandom` input; 17
+  emitters in New Eden and Kate) fell back to looping one of the cue's waves end to end, a chirp of
+  0.1 to 0.2 s repeated without a gap. Retail (`UAudioComponent::UpdateWaveInstances`) stops the
+  component when nothing in the graph is playing, and the emitter is silent from there on:
+  `AmbientMode::Silent`.
+- `src/anim/anim_system.hpp`: `#include <mutex>`. `std::mutex level_intro_mutex_` (from
+  `agent/fix-user-issues`) compiled on macOS through another header and not with GCC, so main did not
+  build on Windows.
+
+### 20.3 Results
+- `mirrorsedge_windows` builds again; `--verify-all`: ALL SYSTEMS PASS (run from a scratch directory).
+- The audit's full record (every finding with both skeptics' reasons) is local scratch, not in git:
+  `build/re/audio/audio_audit_2026-10-10.json` on the Windows machine.
