@@ -938,4 +938,46 @@ Resolved ten user-reported retail parity gaps across movement, first-person anim
 - `me_anim` bone trajectory verification across `landing_medium`, `landing_hard`, `landing_soft`, and jump-landing transitions: `LeftFoot` stays tucked at `X = 15.3..32.6 uu` beneath Faith (`+86.0 uu` upward leg kick completely eliminated).
 - `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS (`exit code 0`)** across all 16 stages (`Stage 1`–`Stage 16`), including Stage 6 (`Mid-Air Coil & Skill Roll`), Stage 15 (`ZiplineDrop=OK`, `SwingBar=OK`, `LedgeWalk=OK`), and Stage 16 (`Per-Move Camera Constraints`).
 
+---
+
+## 19. Capped Drainpipe Top Stop (`!bCanExitAtTop`) & Roof Fence Glitch Fix (`agent/pipe-climb-top-fence`, 2026-10-10)
+
+User report: in the Training Area, climbing the pipe carried Faith over its top and through the fence above it.
+
+### 19.1 Root Causes
+1. **Top-exit roof probe ran with `bCanExitAtTop = False` (`ParkourController::update_climb`):**
+   - Both Stage 11 drainpipes in `Maps/SP00/Tutorial_p.me1` are `TdLadderVolume`s with `LadderType = LT_Pipe` and `bCanExitAtTop = False`: export `13496` (Pipe 1, `Start (-7890, -3106, 4223)`, `End z 4936`, 19 `PawnLadderLocations`) and `13495` (Pipe 2, `Start (-7663, -3106, 4596)`, `End z 4914`, 6 locations: z 4658, 4690, 4722, 4754, 4786, 4818).
+   - A wire fence (`11741`, `12142`, `S_FenceGenericWire_01m`, y -3128..-3080, z 5024..5345) runs along the roof lip above them.
+   - The port probed for a roof up to 152 uu into the wall whatever `bCanExitAtTop` said, found the z 4992 roof behind the fence, and put her on it. Retail `TdMove_Climb.HandleClimbAction` calls `ExitAtTop` only when `CurrentStep == Ladder.GetLastStep() && Ladder.bCanExitAtTop`.
+2. **The stop was far too high:** a capped pipe let the feet climb to `End.Z - 25`, which put the eye 140 uu above the pipe's end.
+
+### 19.2 Retail Evidence
+- `ATdLadderVolume::GetLastStep` (`MirrorsEdge.exe` 0x12aa0e0): `max(Num - 1, 0)` for `LT_Ladder`, `max(Num - 4, 0)` for `LT_Pipe`.
+- `ATdLadderVolume::GetLadderLocation` (0x12ab3b0): `PawnLadderLocations[clamp(i)] + MoveDirection * ZOffset - WallNormal * XYOffset` (pipe: `ZOffsetPipe -5`, `XYOffsetPipe -62`; ladder: `XYOffsetLadder -50`).
+- Cooked `PawnLadderLocations` of all four Tutorial volumes run 32 uu (`StepHeight`) apart up to `End.Z - 96`.
+- These are pawn locations, i.e. cylinder centres (`CollisionHeight 90`). A pipe's last step is therefore `End.Z - 96 - 3 x 32 - 5 = End.Z - 197` (centre), **feet `End.Z - 287`** (Pipe 1: 4649, Pipe 2: 4627).
+- `TdMove_IntoClimb.CanDoMove`: a pipe is not taken while `Location.Z > GetLadderLocation(Num - 1).Z`, i.e. feet above `End.Z - 191`.
+- `TdMove_IntoClimb.StartMove`: the step taken is `Clamp(GetClosestStep(Location.Z), 0, GetLastStep())`. The pawn is moved onto it with `SetPreciseLocation(..., FMax(VSize2D(Delta), 30) / 0.15)` rather than put there instantly.
+
+### 19.3 Changes
+- `src/physics/parkour_controller.cpp/.hpp`:
+  - `climb_last_step_feet_z()` / `pipe_highest_catch_feet_z()` implement the rules above.
+  - `try_initiate_climb` refuses a pipe above its top location. For a capped volume it keeps the catch height and stores the IntoClimb speed (`m_climb_settle_speed`).
+  - `update_climb` on a capped volume:
+    - lowers a pawn caught above the last step onto it at that speed (no snap, no input meanwhile);
+    - climbs up to the last step and stops (zero velocity, so the director holds the pipe pose);
+    - never runs the top exit.
+  - Ladders and pipes that can be left at the top keep their exit. The roof probe and the fallback exit now also reject a dismount whose path from the pipe crosses blocking geometry at chest height, or that has no room.
+- `src/main.cpp`, Oracle Stage 13B checks four things:
+  - Pipe 1 stops at 4649 and never climbs past it.
+  - Pipe 2 is caught no higher than `End.Z - 191` and settles to 4627 with no single-frame drop of 16 uu or more.
+  - Both pipes stay `MOVE_Climb` in front of the wall.
+  - Jumping east off Pipe 2 reaches the Stage 12 catwalk (`S_Catwalksystem_05_Plateau192`, z 4704).
+
+### 19.4 Verification
+- `--verify-all`: **ALL SYSTEMS PASS**. Stage 13: `Pipe1 Capped=YES [Z=4649 max 4649], Pipe2 Capped=YES [caught Z=4707, settled Z=4627, max drop/frame 10.98], Catwalk Land=(-7364.39,-3140.2,4704) via MOVE_Jump>MOVE_VaultOver>MOVE_Walking, Ladder1 TopExit=YES, Ladder2 TopExit=YES`.
+- Campaign sweep (temporary `--ladder-sweep` harness, not committed): every `TdLadderVolume` in the 11 story maps (120 volumes: 39 exit ladders, 3 capped ladders, 17 exit pipes, 61 capped pipes). Each was climbed from its base with W held, on the pre-change and the new controller.
+  - All 56 exit-at-top volumes: identical outcome and end position in both builds.
+  - Capped pipes the old controller dismounted over the top (same bug class), 15 in all: Tutorial_p ×2, Cranes_p ×4, Subway_p ×1, Mall_p ×5, Factory_p ×2, Boat_p ×1. For example, Boat_p `TdLadderVolume_1` (end z 1425) put her at z 1536. All 15 now stop on the pipe at the retail last step.
+  - 4 Cranes_p pipes end back at their base in **both** builds. Telemetry shows `respawned=1`: level volumes reset the harness's synthetic spawn, so this is not a climbing fault.
 

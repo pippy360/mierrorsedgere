@@ -1074,17 +1074,31 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         const Vec3 bal_end_pos = controller.get_position();
         const bool bal_ok = entered_balance && (min_bal_z >= 4258.0f) && (bal_end_pos.x <= -6848.0f);
 
-        // 13B. Climb Tutorial Stage 11 Pipe 1 (-7890, -3106, 4223..4936), jump to Pipe 2 (-7663, -3106, 4596..4914),
-        //      and mantle onto upper roof (z >= 4914)
+        // 13B. Climb Tutorial Stage 11 Pipe 1 (-7890, -3106, 4223..4936, bCanExitAtTop=False) to its top stop,
+        //      verify it does NOT exit at the top or glitch through the roof fence (Y=-3104),
+        //      jump East to Pipe 2 (-7663, -3106, 4596..4914, bCanExitAtTop=False), verify Pipe 2 also stops
+        //      cleanly below its top cap without glitching through the fence, and jump East onto the Stage 12
+        //      catwalk platform (X=-7472..-7280, Y=-3296..-3104, Z=4704).
+        //      Retail stop (TdLadderVolume.GetLastStep = Num - 4 on a pipe, GetLadderLocation ZOffsetPipe -5):
+        //      cylinder centre End.Z - 197, so feet End.Z - 287 (Pipe 1: 4649, Pipe 2: 4627).
+        constexpr float kPipe1StopZ = 4936.0f - 287.0f;
+        constexpr float kPipe2StopZ = 4914.0f - 287.0f;
         controller.reset(Vec3(-7890.0f, -3165.0f, 4225.0f), 90.0f);
         bool grabbed_pipe1 = false;
-        for (int i = 0; i < 240; ++i) {
+        float pipe1_max_z = -1e9f;
+        for (int i = 0; i < 300; ++i) {
             controller.step(in_walk, kDt, sim_scene);
             if (controller.get_move_state() == EMovement::MOVE_Climb) {
                 grabbed_pipe1 = true;
-                if (controller.get_position().z >= 4560.0f) break;
+                pipe1_max_z = std::max(pipe1_max_z, controller.get_position().z);
             }
         }
+        const Vec3 pipe1_top_pos = controller.get_position();
+        const bool pipe1_capped_ok = grabbed_pipe1 &&
+            (controller.get_move_state() == EMovement::MOVE_Climb) &&
+            (std::abs(pipe1_top_pos.z - kPipe1StopZ) < 1.0f) && (pipe1_max_z <= kPipe1StopZ + 0.5f) &&
+            (pipe1_top_pos.y < -3106.0f);
+
         // Aim toward Pipe 2 (+X / East along the North wall) and jump across
         controller.set_rotation(25.0f, 0.0f, 0.0f);
         InputFrame in_pipe_jump{};
@@ -1093,18 +1107,46 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         controller.step(in_pipe_jump, kDt, sim_scene);
 
         bool caught_pipe2 = false;
-        for (int i = 0; i < 240; ++i) {
+        float pipe2_catch_z = 0.0f;
+        float pipe2_max_step_down = 0.0f;   // largest single-frame drop while on the pipe (no snap)
+        float prev_z = controller.get_position().z;
+        for (int i = 0; i < 180; ++i) {
             controller.step(in_walk, kDt, sim_scene);
+            const float z = controller.get_position().z;
             if (controller.get_move_state() == EMovement::MOVE_Climb &&
                 std::abs(controller.get_position().x - (-7663.0f)) < 60.0f) {
+                if (!caught_pipe2) pipe2_catch_z = z;
+                else pipe2_max_step_down = std::max(pipe2_max_step_down, prev_z - z);
                 caught_pipe2 = true;
             }
-            if (caught_pipe2 && controller.is_grounded() && controller.get_position().z >= 4910.0f) {
+            prev_z = z;
+        }
+        const Vec3 pipe2_top_pos = controller.get_position();
+        const bool pipe2_capped_ok = caught_pipe2 &&
+            (controller.get_move_state() == EMovement::MOVE_Climb) &&
+            (std::abs(pipe2_top_pos.z - kPipe2StopZ) < 1.0f) &&
+            (pipe2_catch_z <= 4914.0f - 191.0f + 0.5f) && (pipe2_max_step_down < 16.0f) &&
+            (pipe2_top_pos.y < -3106.0f);
+
+        // Jump East off Pipe 2 onto the Stage 12 catwalk platform (Z=4704)
+        controller.set_rotation(15.0f, 0.0f, 0.0f);
+        controller.step(in_pipe_jump, kDt, sim_scene);
+        std::string catwalk_route;
+        for (int i = 0; i < 240; ++i) {
+            controller.step(in_walk, kDt, sim_scene);
+            const std::string st = move_state_name(controller.get_move_state());
+            if (catwalk_route.empty() || catwalk_route.rfind(st) != catwalk_route.size() - st.size()) {
+                catwalk_route += (catwalk_route.empty() ? "" : ">") + st;
+            }
+            if (controller.is_grounded() && controller.get_position().x >= -7472.0f &&
+                controller.get_position().z >= 4700.0f) {
                 break;
             }
         }
-        const Vec3 climb_top_pos = controller.get_position();
-        const bool climb_ok = grabbed_pipe1 && caught_pipe2 && controller.is_grounded() && (climb_top_pos.z >= 4910.0f);
+        const Vec3 catwalk_pos = controller.get_position();
+        const bool climb_ok = pipe1_capped_ok && pipe2_capped_ok &&
+            controller.is_grounded() && (catwalk_pos.x >= -7472.0f) &&
+            (catwalk_pos.z >= 4700.0f) && (catwalk_pos.y < -3104.0f);
 
         // 13C. Climb both Tutorial_p TdLadderVolume ladders to the top and verify clean dismount onto top platform:
         //      - Ladder 1 (Billboard catwalk ladder at (-4202, -1369, 3183..4177), WallNormal=(-1,0,0))
@@ -1141,9 +1183,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cout << "  -> Stage 13 Result: " << (s13_pass ? "PASS" : "FAIL")
                   << " (Balance Entered=" << (entered_balance ? "YES" : "NO")
                   << ", Balance End X=" << bal_end_pos.x
-                  << ", Pipe1 Grabbed=" << (grabbed_pipe1 ? "YES" : "NO")
-                  << ", Pipe2 Caught=" << (caught_pipe2 ? "YES" : "NO")
-                  << ", Roof Exit Z=" << climb_top_pos.z
+                  << ", Pipe1 Capped=" << (pipe1_capped_ok ? "YES" : "NO")
+                  << " [Z=" << pipe1_top_pos.z << " max " << pipe1_max_z << "]"
+                  << ", Pipe2 Capped=" << (pipe2_capped_ok ? "YES" : "NO")
+                  << " [caught Z=" << pipe2_catch_z << ", settled Z=" << pipe2_top_pos.z
+                  << ", max drop/frame " << pipe2_max_step_down << "]"
+                  << ", Catwalk Land=(" << catwalk_pos.x << "," << catwalk_pos.y << "," << catwalk_pos.z << ")"
+                  << " via " << catwalk_route
                   << ", Ladder1 TopExit=" << (exited_ladder1 ? "YES" : "NO")
                   << ", Ladder2 TopExit=" << (exited_ladder2 ? "YES" : "NO") << ")" << std::endl;
     }
