@@ -498,6 +498,32 @@ which every stored vertex satisfies too. A mesh takes it only if its component h
 triangle only if it faces the decal (`BackfaceAngle` 0.001, unless `bProjectOnBackfaces`). What is clipped is
 the mesh's collision-tree (kDOP) triangles, facing by their geometric normal.
 
+**What a decal attaches to**, read in the executable (where a step is inferred, it says so):
+
+- A stored receiver is attached as it is (`0x00fc7020`): nothing is asked of its owner. Two of the game's
+  8844 stored receivers are on something that moves: the office's glass stripes
+  (`P_SP01.Decals.MD_OfficeGlassStripes`, `DecalActor_10` and `_15` of `Escape_Off`) run on over the glass door
+  `InterpActor_13`, 41 and 35 triangles.
+- A computed receiver (`ComputeReceivers`, `0x00fc73f0`, each tested by `0x00fc72a0`) has to come out of the
+  collision hash's query of the decal's box, have `bAcceptsDecals` (and `bAcceptsDecalsDuringGameplay` once
+  play has begun), not be hidden, pass the decal's `bProjectOn..` flag for its kind and its filter, and, for a
+  decal placed in a level, have an owner whose `+0x28` equals the decal actor's (its `Outer`, so the same
+  level: the comparison is read, the field's meaning inferred). That the query returns colliding components
+  only is inferred from the data (none of 6771 stored mesh receivers is non-colliding). Whether its owner
+  moves is not asked. In the data no computed decal has a mover to lie on: of 26 pairs of one and a mover whose
+  boxes meet, 25 are in different levels and the last offers only the underside of a barrel.
+- A decal with a `HitComponent`, which a bullet hole is, is offered to that component alone, and on BSP to the
+  one node that was hit (`HitNodeIndex`).
+- A skeletal mesh takes a decal only when the decal has `bProjectOnSkeletalMeshes` (its
+  `GenerateDecalRenderData`, `0x00d21e10`, returns nothing otherwise). `TdWeapon.SpawnImpactDecal` passes
+  false, and `PlayImpactEffects` does not call it for the player at all. So nobody gets a bullet hole, not a
+  bot and not Faith, and nothing behind them gets it either.
+- A static mesh's decal is the mesh's own triangles, clipped in the mesh's space as the decal attaches
+  (`0x00db73c0`) and drawn with the mesh's transform as it is each frame (`0x00db6d80`). Nothing detaches or
+  recomputes it when the mesh moves: a decal on a door or a lift goes with it.
+- A decal made while the game runs takes its `SortOrder` from a running count (`0x00fc4010`): bullet holes are
+  drawn in the order they were made.
+
 **A bullet hole** (`TdWeapon.SpawnImpactDecal`) is a decal made while the game runs. With `N` the surface's
 normal and `D` the bullet's direction, `AngleOfImpact = acos(-N . D)`. The surface's physical material
 (section 13) holds a `TdPhysicalMaterialDecals`: a `CriticalAngle` and, for light weapons, heavy weapons and
@@ -529,15 +555,23 @@ depth buffer at the triangle's depth, slope 1), unculled, casting no shadow, and
 surfaces. The ones with no stored receiver are clipped onto the level's static meshes and BSP at load
 (Heat: 75 of 83 find something to lie on; Jacknife: 21 of 24, 558 triangles). `ME_DECAL_SELFCHECK=1` clips
 the decals that *do* store receivers the same way and compares areas: Jacknife 1.12 of the stored area, 577
-of 621 decals within 0.8..1.25; the Prologue 1.01, 12 of 12. Every bullet tracer that ends on a surface
-leaves its hole, clipped against the triangles in the box of what it hit and drawn with the particles'
-batches under the decals' bias. What it hit is the level, or a part of a lift or a door where that is now
-(`find_impact_surface`): the game gives `SpawnDecal` the hit component, so the hole is that component's and
-goes where it goes. A hole in a mover is clipped and kept in the place the level has the mover in, and its
-triangles are carried to where the mover is each frame they are drawn, a lift's part by its offset and a
-door about its hinge (`dynamic_decal_vertices`). Not as the game: the receivers are found in the box, not by
-the hit component; a bullet hole does not fade, it goes; the decals computed at load lie on static meshes
-and BSP only. Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
+of 621 decals within 0.8..1.25; the Prologue 1.01, 12 of 12. A stored receiver that moves or is drawn apart
+(a lift's part, a door, another `InterpActor`, an actor the level's script shows and hides) has its decals in
+a buffer of its own (`MeshBuffer::decal_receiver`), drawn with the mover's matrix, lit from the receiver's
+place and not while the actor is hidden: the Escape office door's stripes, 76 triangles. A computed decal on
+an actor the script shows and hides goes to that actor's buffer too. Every bullet tracer that ends on a surface leaves its
+hole, clipped against the triangles of what it hit alone, the mesh, the mover's part or the BSP, and drawn
+with the particles' batches under the decals' bias, in the order made. What it hit is the level, or a part of
+a lift or a door where that is now (`find_impact_surface`). A hole in a mover is clipped and kept in the place
+the level has the mover in, and its triangles are carried to where the mover is each frame they are drawn, a
+lift's part by its offset and a door about its hinge (`dynamic_decal_vertices`). Not as the game: on BSP a
+hole lies on all the BSP in its box, not on the one node; a bullet hole does not fade, it goes; a computed
+decal is clipped onto the static meshes and BSP of every loaded package, where the game asks the colliding
+components of the decal's own level only (a model of both rules over the data leaves 167 of the 199 the
+port's rule puts on static meshes with nothing to lie on in the game; no retail picture was held against it,
+so they stay); the door
+with the stripes does not open here, the port playing no Matinee's movement but the lifts' and the barge
+doors'. Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
 ## 13. Particles
 
@@ -656,9 +690,8 @@ What runs is sprite and mesh emitters with the module classes of the table: in t
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
 attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
 the player (the game also asks whether the shooter was drawn lately); a bot is his pawn's cylinder, all of
-it the body's material, where the game traces the bodies of his physics asset, and he takes no bullet hole
-(the game hands `SpawnDecal` the default decal and his mesh; whether the mesh takes it is not checked);
-sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
+it the body's material, where the game traces the bodies of his physics asset (he takes no bullet hole, and
+does not in the game: section 12); sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
 the pane is broken: [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
@@ -721,6 +754,8 @@ Options for looking at things:
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
 | `ME_DECAL_SELFCHECK=1` | Clips the decals that store receivers as the ones that do not are clipped, and compares |
+| `ME_DECAL_DEBUG=1` | Lists the decals of receivers that move or are drawn apart, and what each was bound to |
+| `ME_NO_DYNAMIC_DECALS=1` | A picture without those |
 
 ## 15. Measured against retail
 
@@ -775,10 +810,9 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
   (section 10).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
-- **Bullets:** a bot is a cylinder of one material and takes no bullet hole; a bot's shot is judged by
-  distance alone (section 13).
-- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load are not on movers
-  (section 12).
+- **Bullets:** a bot is a cylinder of one material; a bot's shot is judged by distance alone (section 13).
+- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load lie on more than the
+  game's do; a bullet hole on BSP is not kept to one node (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
 - **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.

@@ -1698,3 +1698,61 @@ Retail leaves the capsule alone between 2.9 and 3.4 uu over the floor; the port 
 Her speed up ramps and stairs changed with this (she is lifted at full horizontal speed where she used to
 slide along the slope and lose some): retail's was not measured. Whether retail's leaf blocks her as it
 opens was not measured. In `TODO.md`.
+
+---
+
+## 36. What a decal attaches to: decals on movers, bullet holes on people and on what was hit (agent/decal-receivers, 2026-10-10)
+
+Section 32 left open whether a bot should take a bullet hole and said the decals computed at load were missing
+from movers. Both were settled by reading the executable and the data (`docs/RENDERING_RE.md` section 12 has
+the rules and the addresses). The attachment rules were re-derived by a second reader; the data scan was not.
+
+### 36.1 What the game does
+- **Nobody gets a bullet hole.** `TdWeapon.SpawnImpactDecal` calls `DecalManager.SpawnDecal(.., HitComponent,
+  false, false, ..)`: the second `false` is `bProjectOnSkeletalMeshes`, and a skeletal mesh's
+  `GenerateDecalRenderData` (`0x00d21e10`) returns nothing without it. A decal with a `HitComponent` is offered
+  to that component alone (`ComputeReceivers`, `0x00fc73f0`), so nothing behind the bot gets it either. For the
+  player `PlayImpactEffects` does not call `SpawnImpactDecal` at all.
+- **A bullet hole is the hit component's**, one static mesh or one BSP node, not everything in its box.
+- **A decal on a mover rides with it.** A static mesh's decal is its own triangles clipped in the mesh's space
+  when the decal attaches (`0x00db73c0`), drawn with the mesh's transform as it is each frame (`0x00db6d80`);
+  no transform update, detach or attach of the receiver touches it.
+- **Decals placed in a level:** a stored receiver is attached whoever owns it (`0x00fc7020`); a computed one
+  must be an accepting component out of the collision hash whose owner is of the decal's own level (the
+  comparison is read; that it is the level, and that the hash holds colliding components only, are inferred).
+  Over all 633 story packages: 4421 placed
+  decals, 440 with no stored receiver, 8844 stored receivers of which 2 are on a mover (the office glass
+  stripes on the glass door `InterpActor_13` of `Escape_Off`); no computed decal has a mover in its own level
+  to lie on (26 box pairs, 25 across levels, one a barrel's underside).
+
+### 36.2 Changes
+- **Stored receivers on what moves** (`src/assets/upk_loader.cpp`, `MeshBuffer::decal_receiver`): a receiver
+  that is a lift's part, a door, another dynamic actor or an actor the script shows and hides is no longer
+  left out. Its decals go into a buffer of their own, lit from the receiver's place, hidden with it, and bound
+  to the lift's part or the door once those are built, so the renderers' existing mover matrix carries them;
+  a computed decal on an actor the script shows and hides goes there too. Such a buffer is no subject of the
+  modulated shadows (`src/renderer/mod_shadow.hpp`).
+- **A bullet hole on what was hit alone** (`src/game/impact_effects.hpp`, `spawn_decal`): only the triangles
+  of the hit actor (or of the BSP, when that was hit) are clipped.
+- **Test aids:** `ME_DECAL_DEBUG=1`, `ME_NO_DYNAMIC_DECALS=1`.
+
+### 36.3 Checked (Windows, Direct3D 11)
+- **Escape:** the load reports `2 receivers move or are drawn apart; 0 left out` (main: 2 left out; 5377
+  decal triangles against 5301), and `decals on Escape_Off:InterpActor_13 (S_SP01_Door_01) at (4214, 7544,
+  12672): 76 triangles, left in place`. Standing at (4475, 7678, 12676) looking along -X
+  (`ME_SHOT_STAND`, `ME_SHOT_LOOK="-12,180"`) the stripes under the door's lettering are there, and gone with
+  `ME_NO_DYNAMIC_DECALS=1`: 558 pixels differ, all on the door's lower panel.
+- **Stormdrain:** the one stored receiver main left out, 2 triangles on a door's closing mechanism
+  (`Stormdrain_StdE-Out_slc` `StaticMeshActor_4`, a part of a barge door here), is bound to its door.
+- **Bullet holes** are still made where they were: five on the Prologue's first door and five more after it
+  swings 15 degrees, five on Escape's first lift's wall.
+- **Oracle:** `--verify-all` passes every stage.
+- **macOS:** the app compiles and links on `macos-15`. Not run.
+
+### 36.4 Not done
+The office door does not open in the port (no Matinee's movement is played but the lifts' and the barge
+doors'), so its stripes are not seen to swing; no lift's part has a stored decal in the data, so that binding
+is exercised by no level, and the one barge door's that is (Stormdrain's, 2 triangles) was not looked at in a
+picture. On BSP a bullet hole still lies on all the BSP in
+its box. The computed decals still lie on more than the game's do (the own-level and collision rules above
+would leave 167 of 199 without a receiver): not changed without a retail picture. In `TODO.md`.

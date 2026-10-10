@@ -3847,11 +3847,16 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         }
         std::map<int32_t, std::map<int32_t, std::vector<Vertex>>> by_order;
         AABB decal_box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
-        size_t placed = 0, triangles = 0, orphaned = 0, computed = 0, computed_triangles = 0;
+        // The decals of a receiver that is drawn apart, by (SortOrder, actor), each with its box.
+        std::map<std::pair<int32_t, size_t>, std::pair<std::map<int32_t, std::vector<Vertex>>, AABB>> on_dynamic;
+        size_t placed = 0, triangles = 0, orphaned = 0, computed = 0, computed_triangles = 0, dynamic_receivers = 0;
         static const bool no_computed = std::getenv("ME_NO_COMPUTED_DECALS") != nullptr;  // to see a picture without them
+        static const bool no_dynamic = std::getenv("ME_NO_DYNAMIC_DECALS") != nullptr;    // nor those on what is drawn apart
         std::vector<Vertex> decal_scratch;
         // What lies in a decal's box, found and clipped: the level's static meshes and BSP.
-        const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box) {
+        // (`apart`: what lies on an actor the script shows and hides goes to that actor's own buffer.)
+        const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box,
+                                         bool apart = false) {
             const Vec3 o = decal.hit_location;
             const float reach = std::sqrt(decal.width * decal.width + decal.height * decal.height) * 0.5f +
                                 std::max(std::abs(decal.far_plane), std::abs(decal.near_plane));
@@ -3886,6 +3891,12 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                         decal_scratch[k + 2].position = p2;
                         decal_scratch[k].normal = decal_scratch[k + 1].normal = decal_scratch[k + 2].normal = n;
                     }
+                    if (apart && a.script_switched && !no_dynamic) {
+                        auto& own = on_dynamic[{decal.sort_order, static_cast<size_t>(&a - actors.data())}];
+                        if (own.first.empty()) own.second = AABB(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+                        made += emitter.project_decal(decal, decal_scratch, nullptr, own.first, own.second);
+                        continue;
+                    }
                     made += emitter.project_decal(decal, decal_scratch, nullptr, bins, box);
                 }
             }
@@ -3913,7 +3924,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             if (decal.compute_receivers) {
                 // No receiver is stored: what lies in its box is found and clipped now.
                 if (no_computed) continue;
-                const size_t made = clip_onto_level(decal, by_order[decal.sort_order], decal_box);
+                const size_t made = clip_onto_level(decal, by_order[decal.sort_order], decal_box, true);
                 computed += made > 0 ? 1 : 0;
                 computed_triangles += made;
                 continue;
@@ -3954,13 +3965,27 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                 const LevelActor* receiver = nullptr;
                 if (!rec.on_bsp) {
                     const auto it = owners.find({decal.package, rec.component});
-                    // Not on what the port hides, moves or lights apart.
-                    if (it == owners.end() || actors[it->second].is_hidden || actors[it->second].elevator >= 0 ||
-                        actors[it->second].barge_door >= 0 || actors[it->second].dynamic_class) {
+                    // Not on what is never drawn.
+                    if (it == owners.end() || (actors[it->second].is_hidden && !actors[it->second].script_switched)) {
                         ++orphaned;
                         continue;
                     }
                     receiver = &actors[it->second];
+                    // On what moves, is lit apart or is shown and hidden by the level's script: a buffer
+                    // of its own, drawn as that receiver is. The engine asks nothing of a stored
+                    // receiver's owner (AttachToStaticReceivers, 0x00fc7020); the triangles are in the
+                    // component's space and are drawn with its transform as it is each frame (the static
+                    // mesh proxy's decal draw, 0x00db6d80), so a door's decals swing with the door.
+                    if (receiver->dynamic_class || receiver->elevator >= 0 || receiver->barge_door >= 0 || receiver->script_switched) {
+                        if (no_dynamic) continue;
+                        auto& apart = on_dynamic[{decal.sort_order, it->second}];
+                        if (apart.first.empty()) apart.second = AABB(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+                        emitter.emit_decal(decal, rec, receiver, apart.first, apart.second);
+                        triangles += rec.indices.size() / 3;
+                        ++dynamic_receivers;
+                        any = true;
+                        continue;
+                    }
                 }
                 emitter.emit_decal(decal, rec, receiver, by_order[decal.sort_order], decal_box);
                 triangles += rec.indices.size() / 3;
@@ -3979,9 +4004,25 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             decal_sections += mb.sections.size();
             out_meshes.push_back(std::move(mb));
         }
+        for (auto& [key, apart] : on_dynamic) {
+            const LevelActor& a = actors[key.second];
+            MeshBuffer mb;
+            mb.name = "UE3_Level_Decals_" + std::to_string(key.first) + "_" + a.source_package + "_" + a.unique_name;
+            mb.is_decal = true;
+            mb.decal_receiver = static_cast<int32_t>(key.second);
+            mb.actor = a.script_switched ? static_cast<int32_t>(key.second) : -1;
+            mb.dynamic_lit = a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0;  // as its receiver's own buffer
+            mb.lighting = a.lighting;
+            MeshEmitter::flush(mb, apart.first);
+            if (mb.vertices.empty()) continue;
+            mb.bounds = valid_box(apart.second) ? apart.second : overall;
+            decal_sections += mb.sections.size();
+            out_meshes.push_back(std::move(mb));
+        }
         std::cout << "[Level] " << placed << " decals drawn: " << triangles << " triangles in " << decal_sections
-                  << " material sections (" << orphaned << " receivers left out: hidden, moving or not loaded); " << computed
-                  << " more clipped here, " << computed_triangles << " triangles" << std::endl;
+                  << " material sections (" << dynamic_receivers << " receivers move or are drawn apart; " << orphaned
+                  << " left out: hidden or not loaded); " << computed << " more clipped here, " << computed_triangles << " triangles"
+                  << std::endl;
         if (selfcheck && check_count > 0) {
             std::cout << "[Level] Decal self-check: clipping the " << check_count << " decals that store their triangles gives "
                       << check_clipped / check_stored << " of the stored area; within 0.8..1.25 for " << check_close << " of them"
@@ -5547,6 +5588,43 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
     build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
+    // The decals of a lift's part or of a door go where that goes (MeshBuffer::decal_receiver), and
+    // every such buffer is lit from its receiver's place, not from the decal's own small box.
+    for (MeshBuffer& mb : out_scene.meshes) {
+        if (mb.decal_receiver < 0 || static_cast<size_t>(mb.decal_receiver) >= out_scene.actors.size()) continue;
+        const LevelActor& a = out_scene.actors[static_cast<size_t>(mb.decal_receiver)];
+        if (a.elevator >= 0 && static_cast<size_t>(a.elevator) < out_scene.elevators.size()) {
+            // The part that is this actor, or, for the copy of a lift cooked into a second package
+            // (assign_elevator_parts keeps one), the part placed where it is.
+            const auto& parts = out_scene.elevators[static_cast<size_t>(a.elevator)].parts;
+            for (int pass = 0; pass < 2 && mb.elevator < 0; ++pass) {
+                for (size_t p = 0; p < parts.size() && mb.elevator < 0; ++p) {
+                    if (parts[p].actor_index < 0 || static_cast<size_t>(parts[p].actor_index) >= out_scene.actors.size()) continue;
+                    const LevelActor& part = out_scene.actors[static_cast<size_t>(parts[p].actor_index)];
+                    const bool same = pass == 0 ? parts[p].actor_index == mb.decal_receiver
+                                                : to_lower(part.mesh_name) == to_lower(a.mesh_name) &&
+                                                      (part.location - a.location).length() < 1.0f;
+                    if (!same) continue;
+                    mb.elevator = a.elevator;
+                    mb.elevator_part = static_cast<int32_t>(p);
+                }
+            }
+            if (mb.elevator < 0) {  // a lift's actor that is no part of it is not drawn: nor are its decals
+                mb.vertices.clear();
+                mb.sections.clear();
+                continue;
+            }
+        } else if (a.barge_door >= 0 && static_cast<size_t>(a.barge_door) < out_scene.barge_doors.size()) {
+            mb.barge_door = a.barge_door;
+        }
+        if (valid_box(a.world_bounds)) mb.bounds = a.world_bounds;
+        if (std::getenv("ME_DECAL_DEBUG")) {
+            std::cout << "[Level]   decals on " << a.source_package << ":" << a.unique_name << " (" << a.mesh_name << ") at ("
+                      << a.location.x << ", " << a.location.y << ", " << a.location.z << "): " << mb.vertices.size() / 3 << " triangles, "
+                      << (mb.elevator >= 0 ? "a lift's part" : mb.barge_door >= 0 ? "a door" : "left in place")
+                      << (mb.actor >= 0 ? ", shown and hidden by the script" : "") << std::endl;
+        }
+    }
     material_uvs.reset();
 
     // WorldInfo.KillZ when the level sets it (otherwise lethal falls are handled by fall height).

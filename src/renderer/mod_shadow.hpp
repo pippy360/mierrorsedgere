@@ -265,7 +265,8 @@ inline void collect_mod_shadows(const LevelScene& scene, SceneLightEnvironments&
     }
     for (size_t i = 0; i < scene.meshes.size(); ++i) {
         const MeshBuffer& mb = scene.meshes[i];
-        if (!mb.dynamic_lit || mb.vertices.empty() || mb.lighting.mode != DynamicLighting::Mode::Environment ||
+        // (A decal casts none: the buffer of a mover's decals is lit as the mover is, and is not a subject.)
+        if (!mb.dynamic_lit || mb.is_decal || mb.vertices.empty() || mb.lighting.mode != DynamicLighting::Mode::Environment ||
             !mb.lighting.cast_shadows) {
             continue;
         }
