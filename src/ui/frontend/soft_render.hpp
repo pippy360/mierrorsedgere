@@ -25,6 +25,8 @@ public:
 
     // Draws `frame` into `rgba` (frame.width x frame.height, top row first).
     void render(const Frame& frame, std::vector<uint8_t>& rgba);
+    // Draws only the 2D `frame.ui` layer into straight-alpha `rgba` over a transparent background.
+    void render_overlay(const Frame& frame, std::vector<uint8_t>& rgba);
 
     // Off: the 2D layer over a flat sky colour (for looking at the UI alone).
     void set_background(bool on) { background_ = on; }

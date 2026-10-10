@@ -185,7 +185,9 @@ struct KeyBinding {
 struct Assets {
     // `viewport_height` picks the font tier. Returns false and sets `error` when the retail
     // install is missing something the front end cannot do without.
-    bool load(const std::string& game_root, int viewport_height, std::string& error);
+    bool load(const std::string& game_root, int viewport_height, std::string& error, bool load_menu_level = true);
+    void ensure_menu_level();
+    [[nodiscard]] bool menu_level_loaded() const { return menu_level_loaded_; }
 
     // A string of Localization/INT/TdGameUI.int, as Latin-1 (the fonts' encoding).
     [[nodiscard]] std::string text(const std::string& section, const std::string& key) const;
@@ -236,6 +238,7 @@ private:
     std::shared_ptr<PackageManager> pm_;
     std::string game_root_;
     int viewport_height_ = 720;
+    bool menu_level_loaded_ = false;
     std::unordered_map<std::string, std::unique_ptr<Font>> fonts_;
     std::unordered_map<std::string, std::unique_ptr<Image>> images_;
     std::unordered_map<std::string, std::string> localized_;  // "file.section.key", lower case -> text

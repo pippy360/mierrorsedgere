@@ -805,6 +805,8 @@ struct OpenGLRenderer::Impl {
     const uint8_t* frontend_rgba = nullptr;
     int frontend_w = 0;
     int frontend_h = 0;
+    bool frontend_overlay = false;
+    float frontend_saturation = 0.0f;
     UITexture frontend_tex;
 
     // Cached GPU Vertex Buffers & Per-Section Material/Shadow Metadata for Scene Meshes
@@ -2089,7 +2091,8 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
     const bool bink_video_active = (cutscene_active && impl->cutscene_player->get_mode() == ECutsceneMode::BinkVideo);
     // While the front end's frame covers the window, the level under it is not drawn. It is still made
     // resident below, so entering the game does not wait for its shaders and textures.
-    const bool scene_hidden = impl->frontend_rgba != nullptr && impl->frontend_w > 0 && impl->frontend_h > 0;
+    const bool frontend_active = impl->frontend_rgba != nullptr && impl->frontend_w > 0 && impl->frontend_h > 0;
+    const bool scene_hidden = frontend_active && !impl->frontend_overlay;
 
     // The frame uniforms as the shaders see them from here on (vertex b1 and fragment b0 share one buffer).
     // The passes push them per mesh; most meshes change nothing (identity model matrix), so only a
@@ -2994,6 +2997,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         const float motion_amount = impl->motion_blur.update(cam_pos, fwd, post_dt, still || opening);
         fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
         apply_hud_damage_uniforms(telemetry, post);
+        post.overlay[3] = impl->frontend_overlay ? impl->frontend_saturation : 0.0f;
         post.fade[0] = telemetry.fade_color.x;
         post.fade[1] = telemetry.fade_color.y;
         post.fade[2] = telemetry.fade_color.z;
@@ -3152,11 +3156,13 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         impl->bind_vertices(buffer, Impl::VertexKind::UiTex);
         impl->draw(static_cast<GLsizei>(verts.size()), 0);
     };
-    // A full-screen picture (a front end frame, a Bink frame) aspect-fitted over a black backdrop.
-    auto draw_fitted_picture = [&](const UITexture& tex, int src_w, int src_h) {
-        std::vector<HUDVertex> black_bg;
-        impl->draw_ui_quad(black_bg, 0.0f, 0.0f, fw, fh, ui_color(0.0f, 0.0f, 0.0f, 1.0f));
-        draw_hud_vertices(black_bg);
+    // A full-screen picture (a front end frame, a Bink frame) aspect-fitted over an optional black backdrop.
+    auto draw_fitted_picture = [&](const UITexture& tex, int src_w, int src_h, bool backdrop = true) {
+        if (backdrop) {
+            std::vector<HUDVertex> black_bg;
+            impl->draw_ui_quad(black_bg, 0.0f, 0.0f, fw, fh, ui_color(0.0f, 0.0f, 0.0f, 1.0f));
+            draw_hud_vertices(black_bg);
+        }
 
         float src_aspect = float(src_w) / float(src_h);
         float scr_aspect = fw / fh;
@@ -3176,7 +3182,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         draw_ui_tex_vertices(tex, {v0, v1, v2, v0, v2, v3});
     };
 
-    if (scene_hidden) {
+    if (frontend_active) {
         // The front end: one CPU-rendered frame over everything, the same way a Bink frame is shown.
         const int src_w = impl->frontend_w;
         const int src_h = impl->frontend_h;
@@ -3187,7 +3193,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         }
         if (impl->frontend_tex) {
             impl->write_dynamic_texture(impl->frontend_tex, impl->frontend_rgba);
-            draw_fitted_picture(impl->frontend_tex, src_w, src_h);
+            draw_fitted_picture(impl->frontend_tex, src_w, src_h, !impl->frontend_overlay);
         }
     } else if (impl->menu_open) {
         std::vector<HUDVertex> bg_verts;
@@ -3392,10 +3398,12 @@ void OpenGLRenderer::set_menu_options_state(int sens_pct, int fov_deg, bool full
 }
 void OpenGLRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
 
-void OpenGLRenderer::set_frontend_frame(const uint8_t* rgba, int width, int height) {
+void OpenGLRenderer::set_frontend_frame(const uint8_t* rgba, int width, int height, bool overlay, float saturation) {
     impl_->frontend_rgba = rgba;
-    impl_->frontend_w = width;
-    impl_->frontend_h = height;
+    impl_->frontend_w = rgba ? width : 0;
+    impl_->frontend_h = rgba ? height : 0;
+    impl_->frontend_overlay = rgba && overlay;
+    impl_->frontend_saturation = (rgba && overlay) ? saturation : 0.0f;
 }
 
 void* OpenGLRenderer::raw_device() const { return impl_->context; }

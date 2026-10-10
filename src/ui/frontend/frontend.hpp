@@ -28,7 +28,7 @@ namespace me::fe {
 
 class SubMenu;
 
-enum class Screen : uint8_t { Start, MainMenu };
+enum class Screen : uint8_t { Start, MainMenu, InGame, Pause };
 // PrevPage and NextPage are the gamepad's shoulders (a tab control's pages); Reset is its X (DEFAULTS).
 enum class Key : uint8_t { Other, Left, Right, Up, Down, Accept, Escape, PrevPage, NextPage, Reset };
 
@@ -60,7 +60,7 @@ class Frontend {
 public:
     Frontend();
     ~Frontend();
-    bool init(const std::string& game_root, int width, int height, std::string& error);
+    bool init(const std::string& game_root, int width, int height, std::string& error, bool load_menu_level = true);
 
     void set_profile(const Profile& p) { profile_ = p; }
     // LeftSideOffset / RightSideOffset are FRand() per boot in retail. Fixing them makes frames repeatable.
@@ -79,6 +79,12 @@ public:
 
     // Jumps straight to the main menu, as if a key had been released on the start screen.
     void open_main_menu();
+    // Opens the retail in-game pause menu (TdSPPause or TdTutorialPause) for `map_file`.
+    void open_pause_menu(const std::string& map_file);
+    void close_pause_menu();
+    [[nodiscard]] bool is_pause_open() const { return screen_ == Screen::Pause && !scenes_.empty(); }
+    // TdHudEffect_Saturation.SaturationAmount (0..1 over 0.5s; 0 on TdVideoSettingsPC where SaturateBackground=SATURATION_ForceOff).
+    [[nodiscard]] float pause_saturation() const;
 
     [[nodiscard]] const Frame& frame();
 
@@ -116,6 +122,9 @@ public:
     //   "ApplySettings"                 an options screen was saved
     //   "PlayMovie <bink>"              PLAY VIDEO on UNLOCKABLES ("PlayMovie Attract_Movie")
     //   "PlayMusic <resource>"          PLAY MUSIC on UNLOCKABLES ("PlayMusic AudioUnlock1")
+    //   "Resume"                        in-game pause menu closed back to the level
+    //   "QuitToMainMenu"                QUIT TO MAIN MENU confirmed from in-game pause menu
+    //   "SkipTutorial"                  SKIP TRAINING confirmed from tutorial pause menu
     //   "Quit"
     std::string take_action();
 
@@ -180,6 +189,8 @@ private:
     float origin_x_ = 0.0f;  // where the 16:9 scene starts in a wider viewport
 
     Screen screen_ = Screen::Start;
+    bool kismet_started_ = false;
+    float pause_saturation_ = 0.0f;
     double time_ = 0.0;
     float time_in_scene_ = 0.0f;  // TdUIScene_Start.TimeElapsedInScene
 

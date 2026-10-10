@@ -82,11 +82,10 @@ public:
     void set_menu_options_state(int sens_pct, int fov_deg, bool fullscreen);
     void set_cutscene_player(const class CutscenePlayer* player);
 
-    // The front end ("Press Any Key" and the main menu) is drawn on the CPU by me::fe::SoftRenderer.
-    // While a frame is set it is shown full screen, aspect-fitted, in place of the HUD and the
-    // chapter-select overlay. `rgba` (width x height, RGBA8, top row first) must stay valid until
-    // render_frame() returns. Pass nullptr to go back to the scene.
-    void set_frontend_frame(const uint8_t* rgba, int width, int height);
+    // The front end ("Press Any Key", the main menu, and the in-game pause menu) is drawn on the
+    // CPU by me::fe::SoftRenderer. When `overlay` is true (pause menu), the 3D scene stays visible
+    // underneath with `saturation` (FX_PostProcess.SaturationFilter) applied.
+    void set_frontend_frame(const uint8_t* rgba, int width, int height, bool overlay = false, float saturation = 0.0f);
 
     // Raw Metal device handles (for external toolchain probes)
     [[nodiscard]] void* raw_device() const;

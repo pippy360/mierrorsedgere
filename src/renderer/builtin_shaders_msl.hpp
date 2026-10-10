@@ -972,7 +972,16 @@ fragment float4 tonemap_fragment(PostVertexOut in [[stage_in]],
     toned = float3(toned.r * P.curve_m[sr].r + P.curve_b[sr].r,
                    toned.g * P.curve_m[sg].g + P.curve_b[sg].g,
                    toned.b * P.curve_m[sb].b + P.curve_b[sb].b);
-    return float4(saturate(toned), 1.0);
+    toned = saturate(toned);
+    // FX_PostProcess.SaturationFilter (MaterialEffect_6, M_FX_FullScreenFX_SaturationFilter_01):
+    // TdHudEffect_Saturation.SaturationAmount in P.overlay.w.
+    if (P.overlay.w > 0.0) {
+        float luma = dot(toned, float3(0.425905, 0.9743, 0.481952));
+        float3 desat = mix(toned, float3(luma), 0.4);
+        float3 washed = saturate(desat * float3(0.3, 0.3, 0.7) + float3(0.65, 0.7, 1.0));
+        toned = mix(toned, washed, saturate(P.overlay.w));
+    }
+    return float4(toned, 1.0);
 }
 
 // The chain's FadeInEffect (FX_PostProcess.FadeInEffect): the picture towards FadeColor as

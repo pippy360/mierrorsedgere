@@ -25,13 +25,23 @@ constexpr float kSelectTiling = 512.0f;                   // "UVTiling 512"
 
 struct Target {
     int w = 0, h = 0;
-    std::vector<float>* rgb = nullptr;  // display space, three per pixel
+    std::vector<float>* rgb = nullptr;    // display space, three per pixel (premultiplied when alpha != nullptr)
+    std::vector<float>* alpha = nullptr;  // optional source-over coverage per pixel
 
     void blend(int x, int y, const float c[3], float a) const {
-        float* d = &(*rgb)[(static_cast<size_t>(y) * w + x) * 3];
-        d[0] += (c[0] - d[0]) * a;
-        d[1] += (c[1] - d[1]) * a;
-        d[2] += (c[2] - d[2]) * a;
+        const size_t idx = static_cast<size_t>(y) * w + x;
+        float* d = &(*rgb)[idx * 3];
+        if (alpha) {
+            float& da = (*alpha)[idx];
+            d[0] = d[0] * (1.0f - a) + c[0] * a;
+            d[1] = d[1] * (1.0f - a) + c[1] * a;
+            d[2] = d[2] * (1.0f - a) + c[2] * a;
+            da = da + a * (1.0f - da);
+        } else {
+            d[0] += (c[0] - d[0]) * a;
+            d[1] += (c[1] - d[1]) * a;
+            d[2] += (c[2] - d[2]) * a;
+        }
     }
 };
 
@@ -157,6 +167,7 @@ struct SoftRenderer::Impl {
     explicit Impl(const City& city) : city(city) {}
     CityRenderer city;
     std::vector<float> color;
+    std::vector<float> alpha;
 };
 
 SoftRenderer::SoftRenderer(const Assets& assets) : impl_(std::make_unique<Impl>(assets.city)), assets_(assets) {}
@@ -186,7 +197,7 @@ void SoftRenderer::render(const Frame& frame, std::vector<uint8_t>& rgba) {
     }
 
     if (ui_) {
-        const Target target{w, h, &color};
+        const Target target{w, h, &color, nullptr};
         for (const DrawOp& op : frame.ui) {
             if (op.kind == DrawOp::Kind::Stick) draw_stick(target, assets_, op, frame.time);
             else draw_quads(target, op, frame.display_gamma);
@@ -200,6 +211,37 @@ void SoftRenderer::render(const Frame& frame, std::vector<uint8_t>& rgba) {
                 rgba[i * 4 + k] = static_cast<uint8_t>(std::clamp(color[i * 3 + k], 0.0f, 1.0f) * 255.0f + 0.5f);
             }
             rgba[i * 4 + 3] = 255;
+        }
+    });
+}
+
+void SoftRenderer::render_overlay(const Frame& frame, std::vector<uint8_t>& rgba) {
+    const int w = frame.width, h = frame.height;
+    std::vector<float>& color = impl_->color;
+    std::vector<float>& alpha = impl_->alpha;
+    color.assign(static_cast<size_t>(w) * h * 3, 0.0f);
+    alpha.assign(static_cast<size_t>(w) * h, 0.0f);
+
+    if (ui_) {
+        const Target target{w, h, &color, &alpha};
+        for (const DrawOp& op : frame.ui) {
+            if (op.kind == DrawOp::Kind::Stick) draw_stick(target, assets_, op, frame.time);
+            else draw_quads(target, op, frame.display_gamma);
+        }
+    }
+
+    rgba.resize(static_cast<size_t>(w) * h * 4);
+    parallel_rows(h, [&](int row0, int row1) {
+        for (size_t i = static_cast<size_t>(row0) * w; i < static_cast<size_t>(row1) * w; ++i) {
+            const float a = std::clamp(alpha[i], 0.0f, 1.0f);
+            if (a > 1.0e-5f) {
+                for (int k = 0; k < 3; ++k) {
+                    rgba[i * 4 + k] = static_cast<uint8_t>(std::clamp(color[i * 3 + k] / a, 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+                rgba[i * 4 + 3] = static_cast<uint8_t>(a * 255.0f + 0.5f);
+            } else {
+                rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rgba[i * 4 + 3] = 0;
+            }
         }
     });
 }

@@ -1277,3 +1277,39 @@ Resolved the user-reported issue where Faith had no on-screen reaction, camera s
    - `./build/mirrorsedge_macos --verify-all`: **ALL 17 VERIFIED STAGES PASS** (`exit code 0`).
    - `./build/me_glsl`: **all shaders compiled** (`exit code 0`).
 
+---
+
+## 27. Retail In-Game Pause Menu (`TdSPPause`, `TdTutorialPause`, `TdPauseOptions`) & Desaturation Post-Process (`agent/escape-pause-menu`, 2026-10-10)
+
+### 27.1 Root Cause & Retail Architecture (`TdGame.u`, `TdUI_InGame.upk`, `TdUI_InGame_Tutorial.upk`, `TdUI_Menu.upk`)
+Pressing `Escape` (or controller `Start`) during gameplay previously opened a custom debug pause overlay drawn via `HUDFont` instead of retail's Unreal UI scenes. Decompiling `TdGame.u` (`TdSPHUD.PauseGame`, `TdHUD.TriggerPauseEffect`, `TdHudEffect_Saturation`, `TdUIScene_Pause`, `TdUIScene_SPPause`, `TdUIScene_TutorialPause`, and `TdUIScene_PauseOptions`) established retail's exact in-game pause pipeline:
+1. **`TdSPHUD.PauseGame()`**:
+   - Inspects the active map and opens `TdUI_InGame.TdSPPause` (`TdUIScene_SPPause`) on story levels (`Edge_p` through `Scraper_p`), or `TdUI_InGame_Tutorial.TdTutorialPause` (`TdUIScene_TutorialPause`) on `Tutorial_p`.
+   - Calls `TriggerPauseEffect(true)`, which activates `TdHudEffect_Saturation` (`FX_PostProcess.SaturationFilter`), fading background saturation from `0.0` (`sRGB` color) to `1.0` at `FadeInTime = 0.2 s` while keeping the 3D viewport visible behind the menu (`bExemptFromAutoClose = true`, no 3D rooftop background).
+2. **`TdUIScene_Pause` (`PauseBaseMenu`)**:
+   - Sets `TitleLabel` to the uppercase localized level title (`GetMapTitle()` -> `TdMapInfo.Titles.<MapName>`, e.g. `THE EDGE` for `Edge_p`, `TRAINING AREA` for `Tutorial_p`) and `SectionLabel` to `<Strings:TdGameUI.TdUIScene_SPPause.SectionText>` (`GAME PAUSED`).
+   - Plays `A_HUD_Menu.Menu.Start` on open (`UI_OpenScene`), pauses game audio (`AudioEngine::set_paused(true)`), and configures the bottom-right `TdUIButtonBar` with `Select` (`Enter` / `A`) and `Back` (`Escape` / `B`).
+3. **`TdUIScene_SPPause` & `TdUIScene_TutorialPause` (`PauseMenu`)**:
+   - `TdSPPause` binds `ResumeGameButton` (`TabIndex = 0`, `"RESUME GAME"`), `OptionsButton` (`TabIndex = 1`, `"OPTIONS"` -> opens `TdUI_InGame.TdPauseOptions`), and `QuitButton` (`TabIndex = 2`, `"QUIT TO MAIN MENU"` -> opens confirmation `TdMessageBox` with `<Strings:TdGameUI.TdMessageBox.QuitToMainMenu_Title>` and `<Strings:TdGameUI.TdMessageBox.QuitToMainMenu_Message>`).
+   - `TdTutorialPause` adds `SkipButton` (`"SKIP TRAINING"` -> opens confirmation `TdMessageBox` with `<Strings:TdGameUI.TdMessageBox.TutorialSkipWarning_Title>` and `<Strings:TdGameUI.TdMessageBox.TutorialSkipWarning_Message>`, transitioning to `Edge_p` on confirm).
+4. **`TdUIScene_PauseOptions` (`PauseOptionsMenu`)**:
+   - Binds `GameButton` (`TdGameSettings`), `ControlsButton` (`TdKeyMappings` on PC / `TdControlsSettings` with controller), `AudioButton` (`TdAudioSettings`), and `VideoButton` (`TdVideoSettingsPC`), setting `TitleLabel` dynamically from the parent button's caption (`OPTIONS`).
+
+### 27.2 Implementation & Component Property Header Fix
+- **Component Property Start Detection (`src/assets/upk_loader.cpp`):**
+  - Discovered why `OptionsButton` (`UILabelButton`) in `TdUI_InGame.TdSPPause` was missing its `StringRenderComponent` caption (`<Strings:TdGameUI.TdUIScene_SPPause.OptionsButtonText>`): `UComponent` exports have a 16-byte pre-property header (`NetIndex` at `+0`, `TemplateOwnerClass` at `+4`, and `TemplateName` at `+8..+15`). On `OptionsButton`'s `UIComp_TdDropShadowString`, `TemplateOwnerClass` at `+4` had export index `189` (`0xbd`), which collided with `FName` index `189` (`"None"`) in `TdUI_InGame.upk`. Because `UPKPackage::find_property_start()` tested `c = 4` first and returned immediately on any `names_[n_idx] == "None"` without checking `n_num == 0` or prioritizing valid `FPropertyTag` headers at `c = 16`, the entire 412-byte component property block was skipped.
+  - Updated `UPKPackage::find_property_start()` to scan all candidate offsets for a valid `FPropertyTag` (`kValidTypes`) first, and only fall back to `"None"` when `n_num == 0`.
+- **UI Scene Layout, Tab Ordering & Forced Navigation (`src/ui/frontend/ui_scene.hpp`, `src/ui/frontend/ui_scene.cpp`, `src/ui/frontend/frontend_menus.hpp`, `src/ui/frontend/frontend_menus.cpp`):**
+  - Defaulted `UiWidget::tab_index` to `10000` and ignored negative `TabIndex` values (`-1` = `INDEX_NONE` on `Default__UIScreenObject`) so `ResumeGameButton` (`TabIndex = 0`) receives initial focus instead of `SafeRegionPanel` (`TabIndex = -1`).
+  - Parsed `TextStyleCustomization.ClipMode` when `bOverrideClipMode = true` into `UiStringComp::wrap` so `TdTutorialPause`'s `TitleLabel` (`CLIP_None`) renders `"TRAINING AREA"` on a single line without wrapping.
+  - Updated `SubMenu::navigate(int face)` to follow `ForcedNavigationTarget` chains across hidden/disabled widgets (such as hidden `CheckpointButton` and `RespawnButton` in `TdSPPause`).
+  - Implemented `PauseBaseMenu`, `PauseOptionsMenu`, `PauseMenu`, and `make_pause_menu()`.
+- **Overlay Alpha-Blending & Saturation Post-Process (`src/ui/frontend/soft_render.*`, `src/ui/frontend/frontend.*`, `src/ui/frontend/frontend_assets.*`, `src/renderer/builtin_shaders_msl.hpp`, `src/renderer/metal_renderer.*`, `src/renderer/opengl_renderer.*`, `src/renderer/d3d11_renderer.*`, `src/main.cpp`, `src/tools/menu_main.cpp`):**
+  - Added `SoftRenderer::render_overlay()` producing straight-alpha RGBA8 pixels over a transparent `(0,0,0,0)` canvas.
+  - Added `FX_PostProcess.SaturationFilter` (`P.overlay.w`) to `tonemap_fragment` in `builtin_shaders_msl.hpp` and wired `set_frontend_frame(rgba, w, h, overlay, saturation)` across Metal, OpenGL, and D3D11 renderers to composite the pause menu UI over the desaturated 3D game viewport.
+  - Deferred loading `Maps/Menu/TdMainMenu.me1` when starting directly in an in-game level (`load_menu_level = false`) until `open_main_menu()` is invoked (`Assets::ensure_menu_level()`).
+  - Added Stage 18 (`Retail In-Game Pause Menu Oracle`) to `--verify-all` and `pause <map>` / `overlay <file.png>` commands to `me_menu`.
+
+### 27.3 Verification (`--verify-all` on macOS Apple Silicon `arm64`)
+- Full headless + Metal GPU oracle suite (`./build/mirrorsedge_macos --verify-all`): **ALL 18 STAGES PASS (`exit code 0`)**, including Stage 18 (`TdSPPause=OK, OverlayAlpha=OK, TdPauseOptions=OK, TdTutorialPause=OK`).
+

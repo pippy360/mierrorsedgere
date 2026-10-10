@@ -80,7 +80,7 @@ public:
 
     // The front end's CPU-rendered frame, shown full screen in place of the HUD while set
     // (see MetalRenderer::set_frontend_frame).
-    void set_frontend_frame(const uint8_t* rgba, int width, int height);
+    void set_frontend_frame(const uint8_t* rgba, int width, int height, bool overlay = false, float saturation = 0.0f);
 
     // The SDL_GLContext (for external probes)
     [[nodiscard]] void* raw_device() const;

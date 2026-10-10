@@ -288,6 +288,8 @@ struct MetalRenderer::Impl {
     const uint8_t* frontend_rgba = nullptr;
     int frontend_w = 0;
     int frontend_h = 0;
+    bool frontend_overlay = false;
+    float frontend_saturation = 0.0f;
     id<MTLTexture> frontend_tex = nil;
 
     // Cached GPU Vertex Buffers & Per-Section Material/Shadow Metadata for Scene Meshes
@@ -2270,6 +2272,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             const float motion_amount = impl_->motion_blur.update(cam_pos, fwd, post_dt, still || opening);
             fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
             apply_hud_damage_uniforms(telemetry, post);
+            post.overlay[3] = impl_->frontend_overlay ? impl_->frontend_saturation : 0.0f;
             post.fade[0] = telemetry.fade_color.x;
             post.fade[1] = telemetry.fade_color.y;
             post.fade[2] = telemetry.fade_color.z;
@@ -2458,12 +2461,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
                 float w = float(impl_->width);
                 float h = float(impl_->height);
-                std::vector<HUDVertex> black_bg;
-                impl_->draw_ui_quad(black_bg, 0.0f, 0.0f, w, h, simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f));
-                [postEnc setRenderPipelineState:impl_->hud_pipeline];
-                bind_vertex_bytes_or_buffer(postEnc, black_bg.data(), black_bg.size() * sizeof(HUDVertex), 0);
-                [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
-                [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:black_bg.size()];
+                if (!impl_->frontend_overlay) {
+                    std::vector<HUDVertex> black_bg;
+                    impl_->draw_ui_quad(black_bg, 0.0f, 0.0f, w, h, simd_make_float4(0.0f, 0.0f, 0.0f, 1.0f));
+                    [postEnc setRenderPipelineState:impl_->hud_pipeline];
+                    bind_vertex_bytes_or_buffer(postEnc, black_bg.data(), black_bg.size() * sizeof(HUDVertex), 0);
+                    [postEnc setVertexBytes:&screen_size length:sizeof(screen_size) atIndex:1];
+                    [postEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:black_bg.size()];
+                }
 
                 float src_aspect = float(fw) / float(fh);
                 float scr_aspect = w / h;
@@ -2800,10 +2805,12 @@ void MetalRenderer::set_menu_options_state(int sens_pct, int fov_deg, bool fulls
 }
 void MetalRenderer::set_cutscene_player(const CutscenePlayer* player) { impl_->cutscene_player = player; }
 
-void MetalRenderer::set_frontend_frame(const uint8_t* rgba, int width, int height) {
+void MetalRenderer::set_frontend_frame(const uint8_t* rgba, int width, int height, bool overlay, float saturation) {
     impl_->frontend_rgba = rgba;
     impl_->frontend_w = rgba ? width : 0;
     impl_->frontend_h = rgba ? height : 0;
+    impl_->frontend_overlay = rgba && overlay;
+    impl_->frontend_saturation = (rgba && overlay) ? saturation : 0.0f;
 }
 
 void* MetalRenderer::raw_device() const { return (__bridge void*)impl_->device; }

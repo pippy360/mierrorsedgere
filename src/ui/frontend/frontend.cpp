@@ -96,13 +96,13 @@ void Frontend::ui_color(float r, float g, float b, float a, float out[4]) const 
 Frontend::Frontend() = default;
 Frontend::~Frontend() = default;
 
-bool Frontend::init(const std::string& game_root, int width, int height, std::string& error) {
+bool Frontend::init(const std::string& game_root, int width, int height, std::string& error, bool load_menu_level) {
     width_ = std::max(width, 16);
     height_ = std::max(height, 16);
     // bForce16x9AspectRatio: the scene keeps its 16:9 shape, centred, at the viewport's height.
     scale_ = static_cast<float>(height_) / kSceneHeight;
     origin_x_ = (static_cast<float>(width_) - kSceneWidth * scale_) * 0.5f;
-    if (!assets_.load(game_root, height_, error)) return false;
+    if (!assets_.load(game_root, height_, error, load_menu_level)) return false;
 
     for (int i = 0; i < kPanelCount; ++i) {
         // FRand() per boot in retail. These are fixed so a frame can be reproduced; a host that
@@ -129,10 +129,17 @@ bool Frontend::init(const std::string& game_root, int width, int height, std::st
     string_lists_["TextureDetail"].index = 3;
     string_lists_["GraphicsQuality"].index = 3;
 
-    // SeqEvent_LevelLoaded and the root's SeqEvent_SequenceActivated: the opening shot, looping,
-    // under a fade from white, and the music's sublevel.
-    kismet_.init(&assets_.kismet);
-    kismet_.begin_play();
+    if (load_menu_level) {
+        // SeqEvent_LevelLoaded and the root's SeqEvent_SequenceActivated: the opening shot, looping,
+        // under a fade from white, and the music's sublevel.
+        kismet_.init(&assets_.kismet);
+        kismet_.begin_play();
+        kismet_started_ = true;
+        screen_ = Screen::Start;
+    } else {
+        kismet_started_ = false;
+        screen_ = Screen::InGame;
+    }
     return true;
 }
 
@@ -173,6 +180,15 @@ void Frontend::build_panels() {
 void Frontend::update(float dt) {
     dt = std::clamp(dt, 0.0f, 0.25f);
     time_ += dt;
+    if (screen_ == Screen::InGame) return;
+    if (screen_ == Screen::Pause) {
+        // TdHudEffect_Saturation.FadeInDuration = 0.5
+        pause_saturation_ = std::min(pause_saturation_ + dt * 2.0f, 1.0f);
+        if (!scenes_.empty()) scenes_.back()->tick(dt);
+        closed_.clear();
+        if (scenes_.empty()) screen_ = Screen::InGame;
+        return;
+    }
     // Level events fired since the last update (a key was handled) run in this one.
     kismet_.update(dt);
     for (const std::string& level : kismet_.take_streamed_levels()) {
@@ -250,6 +266,14 @@ void Frontend::panel_anim_finished(int index) {
 
 void Frontend::open_main_menu() {
     if (screen_ == Screen::MainMenu) return;
+    scenes_.clear();
+    closed_.clear();
+    if (!assets_.menu_level_loaded() || !kismet_started_ || screen_ != Screen::Start) {
+        assets_.ensure_menu_level();
+        kismet_.init(&assets_.kismet);
+        kismet_.begin_play();
+        kismet_started_ = true;
+    }
     // TdUIScene_Start.StartGame -> OpenScene(TdMainMenu)
     screen_ = Screen::MainMenu;
     initial_tick_ = true;
@@ -258,8 +282,28 @@ void Frontend::open_main_menu() {
     build_panels();
 }
 
+void Frontend::open_pause_menu(const std::string& map_file) {
+    scenes_.clear();
+    closed_.clear();
+    screen_ = Screen::Pause;
+    pause_saturation_ = 0.0f;
+    open_scene(make_pause_menu(*this, map_file));
+}
+
+void Frontend::close_pause_menu() {
+    scenes_.clear();
+    closed_.clear();
+    screen_ = Screen::InGame;
+    pause_saturation_ = 0.0f;
+}
+
+float Frontend::pause_saturation() const {
+    if (!is_pause_open() || scene_name() == "TdVideoSettingsPC") return 0.0f;
+    return pause_saturation_;
+}
+
 void Frontend::key_down(Key key, const std::string& name) {
-    if (screen_ == Screen::MainMenu && !scenes_.empty()) {
+    if ((screen_ == Screen::MainMenu || screen_ == Screen::Pause) && !scenes_.empty()) {
         SubMenu* top = scenes_.back().get();
         if (!name.empty() && top->raw_key(name, false)) return;
         top->key_pressed(key);
@@ -290,6 +334,7 @@ void Frontend::key_down(Key key, const std::string& name) {
 }
 
 void Frontend::key_up(Key key, const std::string& name) {
+    if (screen_ == Screen::InGame) return;
     if (screen_ == Screen::Start) {
         // TdUIScene_Start.HandleInputKey: any key released, once the start button is up.
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
@@ -301,7 +346,7 @@ void Frontend::key_up(Key key, const std::string& name) {
         top->key_released(key);
         return;
     }
-    if (current_panel_ < 0) return;
+    if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
     if (key == Key::Escape) {
         quit_clicked();
     } else if (key == Key::Accept) {
@@ -329,6 +374,8 @@ void Frontend::close_scene(SubMenu* menu, const std::function<void()>& then) {
     if (scenes_.size() > depth) return;
     if (!scenes_.empty()) {
         scenes_.back()->reactivated();
+    } else if (screen_ == Screen::Pause) {
+        screen_ = Screen::InGame;
     } else if (current_panel_ >= 0) {
         // TdUIScene_MainMenu.SceneActivated: the column camera again.
         level_event("panel" + std::to_string(current_panel_ + 1));
@@ -446,6 +493,7 @@ void Frontend::mouse_move(float x, float y) {
 }
 
 void Frontend::mouse_click(float x, float y) {
+    if (screen_ == Screen::InGame) return;
     if (screen_ == Screen::Start) {
         if (time_in_scene_ >= assets_.time_till_start_button) open_main_menu();
         return;
@@ -455,7 +503,7 @@ void Frontend::mouse_click(float x, float y) {
         if (!top->raw_key("LeftMouseButton", true)) top->mouse_click(x, y);
         return;
     }
-    if (current_panel_ < 0) return;
+    if (screen_ != Screen::MainMenu || current_panel_ < 0) return;
     const int b = button_at(x, y);
     if (b >= 0) {
         PanelState& p = panels_[static_cast<size_t>(current_panel_)];
@@ -714,13 +762,22 @@ const Frame& Frontend::frame() {
     f.width = width_;
     f.height = height_;
     f.time = time_;
+    f.display_gamma = gamma();
+    f.ui.clear();
+    if (screen_ == Screen::Pause || screen_ == Screen::InGame) {
+        f.white = 0.0f;
+        if (!scenes_.empty()) {
+            size_t first = scenes_.size() - 1;
+            while (first > 0 && scenes_[first]->draws_parent()) --first;
+            for (size_t i = first; i < scenes_.size(); ++i) scenes_[i]->draw(f, scale_, origin_x_, gamma(), i + 1 == scenes_.size());
+        }
+        return f;
+    }
     f.white = kismet_.fade();
     f.district_selected.resize(assets_.city.districts.size());
     for (size_t i = 0; i < assets_.city.districts.size(); ++i) {
         f.district_selected[i] = kismet_.material_param(assets_.city.districts[i], "Selected", 0.0f);
     }
-    f.display_gamma = gamma();
-    f.ui.clear();
     if (const KismetActor* view = kismet_.view()) {
         const float pitch = view->euler.y * kPi / 180.0f, yaw = view->euler.z * kPi / 180.0f;
         f.camera = view->pos;
