@@ -1017,3 +1017,43 @@ might have this issue or a similar issue".
 - `mirrorsedge_windows` builds again; `--verify-all`: ALL SYSTEMS PASS (run from a scratch directory).
 - The audit's full record (every finding with both skeptics' reasons) is local scratch, not in git:
   `build/re/audio/audio_audit_2026-10-10.json` on the Windows machine.
+
+## 21. The training area's opening: the camera pan across the roofs (`agent/tutorial-intro-camera`, 2026-10-10)
+
+**Problem:** `SP00/Tutorial_p` began at Faith's start roof with nothing before it. Retail opens the level with a 15 s camera
+flight over the whole course that comes down onto her roof, fades to white and hands over. `extract_level_intro()` only
+knew the first-person kind of intro (a `SeqVar_TdLocalPawn` group playing an `*intro*` animation), and the training level
+has none: the only body its Matinees animate is Celeste's.
+
+### The cooked data (`ue3_tree.py` dumps)
+- `Tutorial_p.me1 [8840] SeqEvent_LevelLoaded_1` → `[8669] SeqAct_TdDisablePlayerInput_5` → `[8463] SeqAct_ActivateRemoteEvent_30 ('tutorial_pan')`.
+- `Tutorial_Spt.me1 [298] SeqEvent_RemoteEvent_0 ('tutorial_pan')` → `[256] SeqAct_Interp_0` (no `bIsSkippable`: off) → `[94] InterpData_0`, `InterpLength = 15`:
+  - `[117] InterpGroupDirector_0` / `[128] InterpTrackDirector_0`: `CutTrack[0] = {Time 0, TargetCamGroup 'Tutorial_Intro_Pan'}`.
+  - `[106] InterpGroup_0 'Tutorial_Intro_Pan'` ← `[332] SeqVar_Object_0` → `[15] CameraActor_0` at `(-7583.01, 2660.05, 8305.65)`, `Rotation (-4160, 3920928, 0)` = pitch -22.85°, yaw 298.30° (no `FOVAngle`: 90).
+    `[131] InterpTrackMove_0`: `MoveFrame IMF_RelativeToInitial`, `RotMode IMR_LookAtGroup`, `LookAtGroupName 'cam_target'`;
+    `PosTrack` keys `(0,0,0)@0 CurveAuto`, `(6009.56, -2622.3, 1380.15)@7 CurveUser` tangents `(1232.53, 3.9581, 244.703)`, `(10633.4, -2611.64, 2015.63)@15 CurveAuto`; no `InterpMethod` (default: tangents scaled by the key span, `FInterpCurve::Eval` 0x007b5539 takes the unscaled branch only for `InterpMethod == 1`).
+    `[130] InterpTrackFloatProp_0 'FOVAngle'`: no keys. `[129] InterpTrackEvent_0`: `FadeOut @ 14.5`.
+  - `[107] InterpGroup_1 'cam_target'` ← `[333] SeqVar_Object_1` → `[375] Trigger_0` at `(-2720, -4272, 4571)`; `[132] InterpTrackMove_1` relative, `(0,0,0)@0` → `(0.000976562, -3680, 1415)@15`.
+- `SeqAct_Interp_0.FadeOut` → `[265] SeqAct_TdFadeEffect_2` (FadeOut, white) → `Completed` → `[232] SeqAct_ActivateRemoteEvent_31 ('pan_complete')` →
+  `Tutorial_p.me1 [8843] SeqEvent_RemoteEvent_1` → `[8676] SeqAct_TdEnablePlayerInput_1` → `[8734] SeqAct_TdStartMovementChallenge_29 (MovementChallege 'EMC_ButtonTest')` ⇢ `[8998] SeqEvt_TdMovementChallengeStarted_28 ('EMC_ButtonTest')` → `[8689] SeqAct_TdFadeEffect_0` (FadeIn, white, 0.5 s default), `[8795] SeqAct_TdTutorialMessage_60 ('ButtonTestJump')`, `[8469]` remote event `ANIM_initial_standing_waving`.
+- `Tutorial_Aud.me1 [153] SeqEvent_LevelLoaded_1` → `[152] SeqAct_TdPlaySound_2` `A_VO_SP00_Opening_1_1_Merc_Cue` (already played by `audio.play_level_loaded_cues()`).
+- The pawn: `[13432] TdCheckpoint_1 ('start', DefaultCheckpoint)` at `(-4812.86, -7966.21, 5810)`, no rotation.
+
+### Native behaviour read out of `MirrorsEdge.exe`
+- `UInterpTrackMove::GetLocationAtTime` (0x00e41340): `RelTM = FRotationTranslationMatrix(EvalRot, EvalPos)`, `ActorTM = RelTM * RefTM`; `RefTM` for `IMF_RelativeToInitial` is the actor's placed `FRotationTranslationMatrix(Rotation, Location)` (0x004fce80 builds it from the full rotator through `GMath.SinTab`); `IMR_LookAtGroup` (0x00e4163f) then replaces the rotation with `(LookAtActor->Location - OutPos).Rotation()`, roll 0.
+- `UInterpTrackMove::EvalPositionAtTime` (0x00e40ae0) → `FInterpCurveVector::Eval` (0x007b53e0) → `CubicInterp` (0x007b46d0) on `LeaveTangent * Diff`, `ArriveTangent * Diff`.
+- Hand computation for the end: `InitialTM` axes `X = (0.4369, -0.8114, -0.3883)`, `Y = (0.8805, 0.4741, 0)`, `Z = (0.1841, -0.3419, 0.9215)`; `RelPos(15)` → camera `(-4865.75, -7894.91, 6033.65)`, target `(-2720, -7952, 5986)`: 53 uu behind and 58 uu above Faith's standing eye at the start roof, looking along +X down the course.
+
+### Changes
+- `src/assets/level_intro.cpp`: a second kind of intro. `find_director_matinee()` (a `SeqAct_Interp` whose `InterpTrackDirector` cuts to a `CameraActor` group at 0 s), `started_at_level_load()` (a `SeqEvent_LevelLoaded` / checkpoint event behind it through remote events; keeps other director Matinees out), `bake_director_matinee()` (`ActorFrame` = the placed frame, `MovingActor` = `PosTrack`/`EulerTrack`/`MoveFrame`/`RotMode` evaluated as above, 60 Hz, look-at down the line to the other group's moving actor, no roll; sounds, fades, door swings, stop cues as for the pawn kind; the pawn's place from `find_player_start()` = the default `TdCheckpoint`). `extract_level_intro()` falls back to it when no first-person intro exists. `collect_fades()` now takes the packages and follows `SeqAct_ActivateRemoteEvent` → `SeqEvent_RemoteEvent`, passes through the player-input switches, and relays `SeqAct_TdStartMovementChallenge` → `SeqEvt_TdMovementChallengeStarted` of the same challenge (the port does not run that system), which is how the 15.0 s FadeIn is reached; `collect_stop_cues()` factored out.
+- `src/math/types.hpp`: `PlayerTelemetry::intro_camera_only`. `src/cutscene/cutscene_player.cpp` sets it for an intro without an animation (`anim_export_index_1 == 0`) and clears it at the end; `src/anim/anim_system.cpp` `evaluate_faith_1p()` draws no first-person body then (it hung at the camera otherwise); `src/main.cpp` clears it outside cutscenes.
+- `src/main.cpp`: Space/Return on a script-less level intro respects `bIsSkippable` (the pan is not skippable, as in retail); a script-less cutscene a key abandons goes through `abandon_cutscene()`, which also undoes a fade in progress (an Escape at 14.7 s would otherwise leave the screen white). The `--trace` sample carries `"fade"`.
+- `docs/LEVEL_INTROS.md` §1 and §3: the pan's data and how it is played. `src/assets/level_intro.hpp` header.
+
+### Verification
+- Build: `cmake --build build -j`, clean (pre-existing warnings only).
+- Load log: `[Level] Level intro 'Tutorial_Intro_Pan' (15 s camera pan of CameraActor_0, looking at 'cam_target', 901 frames): camera (-7583,2660,8305) -> (-4865,-7894,6033); pawn at its start (-4812,-7966,5810); 0 sounds, 0 of them voice lines, 2 fades, not skippable` — the end matches the hand computation to the unit.
+- `--intro-shots Maps/SP00/Tutorial_p.me1 0.0,3.5,7.0,10.5,14.0,14.75,15.0 /tmp/tut_shots`: 3.5 s a high overview of the course from the north; 14.0 s Faith's start roof (the solar panels, the fence, the course ahead along +X); 14.75 s half white; 15.0 s white.
+- `--level Maps/SP00/Tutorial_p.me1 --max-frames 1150 --trace`: first frame yaw -54.95°, pitch -23.8° (the line from the camera to the target: computed -54.95°, -23.8°); `A_VO_SP00_Opening_1_1_Merc_Cue` at frame 0; fade 0 → 1 over the first second (the restart), 1 → 0 from 14.5 to 15.0 s, hand-over at 15.0 s to (-4813, -7903) eye 5926, yaw 0, fade 0 → 1 over the next 0.5 s; final frame fade 1.00, `MOVE_Walking`.
+- `./build/mirrorsedge_macos --verify-all`: ALL SYSTEMS PASS (16 stages), the ten first-person intros unchanged (`LevelIntro=sp01_intro`).
+- Not measured: retail's pan itself (the training level cannot be booted at a checkpoint by `tools/retail`); the numbers above are the cooked data through the native evaluation.

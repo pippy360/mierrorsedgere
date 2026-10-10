@@ -1809,6 +1809,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         else controller.reset(seq.end_feet_pos + Vec3(0.0f, 0.0f, 2.0f), seq.end_yaw_deg);
         handover_set = false;
     };
+    // A cutscene a key stops in a level without a script to stop it: the player stands at the
+    // level's start, and a fade that had taken the picture out (the training area's pan fades to
+    // white at its end) is undone, as the Kismet it cut short would have done.
+    auto abandon_cutscene = [&]() {
+        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
+        controller.get_telemetry().intro_active = false;
+        controller.get_telemetry().intro_camera_only = false;
+        cutscene_player.stop();
+        if (screen_fade.amount < 1.0f) screen_fade.fade_in(0.5f, screen_fade.color);
+    };
 
     // What the level's Kismet does to the game. docs/GAMEPLAY_SCRIPTING_RE.md.
     auto make_script_host = [&]() {
@@ -2145,7 +2155,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                    << ",\"yaw\":" << t.yaw_deg << ",\"pitch\":" << t.pitch_deg << ",\"roll\":" << t.camera_roll_deg
                    << ",\"fx\":" << t.position.x << ",\"fy\":" << t.position.y << ",\"fz\":" << t.position.z
                    << ",\"move_name\":\"" << move_state_name(t.move_state) << "\""
-                   << ",\"cutscene\":\"" << cutscene << "\"";
+                   << ",\"cutscene\":\"" << cutscene << "\""
+                   << ",\"fade\":" << t.fade_amount;
         if (t.intro_active) {
             trace_file << ",\"intro\":\"" << t.intro_anim_name << "\",\"intro_t\":" << t.intro_anim_time;
             if (cutscene_player.is_level_intro()) {
@@ -2557,9 +2568,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                             std::cout << "[Script] skip asked for (Escape)" << std::endl;
                             script.skip_cutscene();  // SkipCutscene: only if the Matinee allows it
                         } else {
-                            controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
-                            controller.get_telemetry().intro_active = false;
-                            cutscene_player.stop();
+                            abandon_cutscene();
                         }
                     } else {
                         set_menu_active(true);
@@ -2610,10 +2619,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     } else if (cutscene_player.get_mode() == ECutsceneMode::BinkVideo && active_scene.level_intro.valid) {
                         controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
                         cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 3.2f);
+                    } else if (const LevelIntroSequence* seq = cutscene_player.active_sequence(active_scene); seq && !seq->skippable) {
+                        // A level intro with bIsSkippable off (the training area's pan): SkipCutscene
+                        // does nothing to it.
+                        std::cout << "[Cutscene] '" << seq->seq_name << "' is not skippable" << std::endl;
                     } else {
-                        controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
-                        controller.get_telemetry().intro_active = false;
-                        cutscene_player.stop();
+                        abandon_cutscene();
                     }
                 } else if (key == SDLK_o || (key == SDLK_c && cutscene_player.is_playing())) {
                     controller.reset(active_scene.player_spawn_pos, active_scene.player_spawn_yaw);
@@ -2840,6 +2851,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 const bool cinematic_lock = cutscene_player.is_playing() || into_cutscene_pending ||
                                             script.cinematic_mode() || script.input_move_disabled();
                 controller.get_telemetry().intro_active = cinematic_lock;
+                controller.get_telemetry().intro_camera_only = false;  // only a playing cutscene is seen through a camera
                 if (into_cutscene_pending) {
                     // TdMove_IntoCutscene: the pawn glides onto its mark over 0.4 s and faces it.
                     into_cutscene_timer += dt;
