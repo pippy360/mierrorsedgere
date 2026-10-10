@@ -1604,3 +1604,51 @@ User request: every agent rebuilds the binary on `main` when it merges back. The
   points to it.
 - Check: only `AGENTS.md` and `MODLOG.md` changed. `main` at `2f48a83` builds and passes `--verify-all` (every
   stage) on macOS `arm64` in the worktree.
+
+---
+
+## 34. The camera at a cutscene's hand-over, and the capsule's hover (agent/handover-eye, 2026-10-10)
+
+`TODO.md` still listed a 12 uu pop when a level intro hands control back. On `main` that pop was already
+gone (the gameplay camera is the first-person tree's eye since the first-person work), but the hand-over was
+not right: measured headless on New Eden, The Boat, The Shard and Heat, the view fell 2 uu in each of the
+first two frames, ended 3 to 5 uu under retail's, and for one frame was thrown sideways by up to 16 uu.
+`docs/LEVEL_INTROS.md` section 5 has what retail does.
+
+### 34.1 What retail does (the intro traces of nine chapters, `build/re/cam/handover_table.py`)
+- The pawn, let go by the stand-in, settles onto its hover: capsule centre 93.15 uu over the floor (it stays
+  put between 92.9 and 93.4). The port's feet are on the floor, so everything it drew on a floor was 3.15 uu
+  low. Standing still in play, retail's eye is 64.15 to 65.42 over the capsule's centre and 8.06 to 9.23
+  ahead (two recordings, 1,900 samples each): the port's tree gives the same over a centre 90 above its feet.
+- As the pawn's own `Stand` begins, the eye is 6.5 uu over its standing place and comes down in five frames
+  at 79 uu/s (6.41 to 6.56 uu in all nine chapters).
+
+### 34.2 Changes
+- `ParkourController::hand_over` (new; the game loop's hand-over and the oracle use it): on the floor under
+  the stand-in's root at once, and the lift of 6.5 uu let down at 79 uu/s.
+- `kFloorHover` 3.15 uu, added to `PlayerTelemetry::camera_mesh_offset.z` (the eye and the first-person
+  mesh) while a floor carries her and in the air after it, taken off while she hangs from a ledge, a bar, a
+  cable or a pipe. `PlayerTelemetry::mesh_smooth_z` keeps `TdPawn.SmoothOffset` alone for the feet's
+  placement, which must not read the hover as a step.
+- `ParkourController::reset` sets the body's yaw: it used to lag a frame, and the eye (8 uu ahead of the
+  pawn) was drawn round the old yaw for that frame.
+- `--handover-check <map>` prints the camera around the hand-over; the interactive `--trace` records the
+  camera (`cx cy cz`); oracle stage 22.
+
+### 34.3 Results
+- **Headless**, first frame of play / rest, against the intro's last eye, port and retail: New Eden +5.65 /
+  -0.75 and +5.85 / -0.70; The Boat +3.65 / -2.75 and +3.79 / -2.63; The Shard +3.40 / -2.99 and +3.61 /
+  -2.87; Heat +6.20 / -0.23 and +6.17 / -0.36. No sideways move; down in five frames of 1.3 uu.
+- **The game itself**, windowed, New Eden, from its trace: the intro's last camera z 2622.22 (retail's
+  2622.22), the first frame of play 2627.88 (2628.07), then 2621.51 (2621.53).
+- **Oracle stage 22** (The Boat, New Eden): PASS. `--verify-all`: ALL SYSTEMS PASS, 20 stages; the tracked
+  screenshots are regenerated (the view is 3.15 uu higher wherever she stands on a floor).
+- **Against retail's pictures** over the ten level intros: 30.0, every chapter unchanged (an intro's own camera is
+  not touched).
+- **macOS:** the app compiles and links on `macos-15` and both Metal shader sources compile. Not run.
+
+### 34.4 Not done
+The hover is drawn, not simulated: the controller's feet are still on the floor, 3.15 uu under retail's
+capsule bottom, so jump reach and the heights measured from the feet are that much under retail's. The
+blend from the reference pose is imitated by the lift, not by the tree; the view's pitch does not glide
+from 0 to 0.11 degrees with it. In `TODO.md`.

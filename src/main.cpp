@@ -105,6 +105,123 @@ static std::string platform_upper() {
 // Deterministic Headless Oracle & Multi-Stage Parkour Verification Suite
 // -----------------------------------------------------------------------------
 // -----------------------------------------------------------------------------
+// --handover-check <map>: the level's intro played headless to its end and handed over to the
+// controller as the game loop does it, with the camera (Renderer::player_camera, what is drawn from)
+// written out around the hand-over: where it is in the pawn's frame, and how far it moves a frame.
+// The view should not jump when control comes back (docs/LEVEL_INTROS.md).
+// -----------------------------------------------------------------------------
+struct HandoverResult {
+    bool valid = false;
+    float jump = 0.0f;           // the camera's move in the hand-over's frame (uu)
+    float settle = 0.0f;         // its largest move in a frame in the second after it
+    float drift = 0.0f;          // how far it ends from where the intro left it
+    float turn_deg = 0.0f;       // the view's turn in the hand-over's frame
+    float first_up = 0.0f;       // the eye in the first frame of play, over the intro's last eye
+    float first_side = 0.0f;     // and how far from it level with the floor
+    float rest_up = 0.0f;        // the eye a tenth of a second on, when the lift has been let down
+    int glide_frames = 0;        // frames from the hand-over until the eye moves less than 0.2 uu
+    me::Vec3 intro_eye{0.0f, 0.0f, 0.0f};  // the intro's last eye, ahead / right / above the feet it ends on
+    me::Vec3 play_eye{0.0f, 0.0f, 0.0f};   // the standing eye a second later, the same way
+};
+
+static HandoverResult measure_intro_handover(me::Renderer& renderer, const std::string& game_root, const std::string& map_rel, bool print) {
+    using namespace me;
+    HandoverResult result;
+    LevelScene scene;
+    if (!load_level_scene(game_root, map_rel, scene) || !scene.level_intro.valid) return result;
+    stream_level_to_checkpoint(game_root, scene, 0);
+    MovementConfig move_cfg;
+    load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+    ParkourController controller(move_cfg);
+    controller.reset(scene.player_spawn_pos, scene.player_spawn_yaw);
+    const LevelIntroSequence& seq = scene.level_intro;
+    const Rotator end_frame = Rotator::from_degrees(0.0f, seq.end_yaw_deg, 0.0f);
+    const auto in_pawn_frame = [&](const Vec3& p) {
+        const Vec3 d = p - seq.end_feet_pos;
+        return Vec3(d.dot(end_frame.forward()), d.dot(end_frame.right()), d.z);
+    };
+    struct Sample {
+        float t;
+        Vec3 cam;
+        Rotator rot;
+        bool intro;
+        EMovement move;
+        float feet_z;
+    };
+    std::vector<Sample> samples;
+    const float dt = 1.0f / 60.0f;
+    float now = 0.0f;
+    const auto record = [&](bool intro) {
+        Vec3 cam;
+        Rotator rot;
+        renderer.player_camera(controller.get_telemetry(), cam, rot);
+        samples.push_back(Sample{now, cam, rot, intro, controller.get_telemetry().move_state, controller.get_telemetry().position.z});
+    };
+    CutscenePlayer cutscene;
+    cutscene.play_in_engine_intro(scene, controller.get_telemetry(), 4.5f);
+    for (int guard = 0; guard < 60 * 240 && cutscene.is_playing(); ++guard) {
+        cutscene.update(dt, scene, controller.get_telemetry());
+        now += dt;
+        if (cutscene.is_playing()) record(true);
+    }
+    if (samples.empty()) return result;
+    const size_t last_intro = samples.size() - 1;
+    // The Matinee ran out: the player stands where its animation left her (the game loop's hand_over).
+    controller.hand_over(seq.end_feet_pos, seq.end_yaw_deg, scene);
+    controller.get_telemetry().intro_active = false;
+    controller.get_telemetry().intro_camera_only = false;
+    record(false);
+    InputFrame idle{};
+    for (int i = 0; i < 300; ++i) {
+        controller.step(idle, dt, scene);
+        now += dt;
+        record(false);
+    }
+    result.valid = true;
+    result.jump = (samples[last_intro + 1].cam - samples[last_intro].cam).length();
+    {
+        const Vec3 a = samples[last_intro].rot.forward(), b = samples[last_intro + 1].rot.forward();
+        result.turn_deg = std::acos(std::clamp(a.dot(b), -1.0f, 1.0f)) * 57.29578f;
+    }
+    for (size_t i = last_intro + 2; i < samples.size() && i <= last_intro + 61; ++i) {
+        result.settle = std::max(result.settle, (samples[i].cam - samples[i - 1].cam).length());
+    }
+    result.drift = (samples.back().cam - samples[last_intro].cam).length();
+    {
+        const Vec3 first = samples[last_intro + 1].cam - samples[last_intro].cam;
+        result.first_up = first.z;
+        result.first_side = Vec3(first.x, first.y, 0.0f).length();
+        size_t i = last_intro + 2;
+        while (i + 1 < samples.size() && (samples[i].cam - samples[i - 1].cam).length() > 0.2f) ++i;
+        result.glide_frames = static_cast<int>(i - (last_intro + 2));
+        result.rest_up = samples[i].cam.z - samples[last_intro].cam.z;
+    }
+    result.intro_eye = in_pawn_frame(samples[last_intro].cam);
+    result.play_eye = in_pawn_frame(samples.back().cam);
+    if (print) {
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "[Handover] " << map_rel << ": the intro ends at " << samples[last_intro].t << " s on feet (" << seq.end_feet_pos.x << ", "
+                  << seq.end_feet_pos.y << ", " << seq.end_feet_pos.z << "), yaw " << seq.end_yaw_deg << std::endl;
+        const size_t from = last_intro >= 6 ? last_intro - 6 : 0;
+        for (size_t i = from; i < samples.size(); ++i) {
+            if (i > last_intro + 8 && (i - last_intro) % 20 != 0) continue;
+            const Vec3 e = in_pawn_frame(samples[i].cam);
+            const Vec3 r = samples[i].rot.to_degrees();
+            std::cout << "[Handover]   " << (samples[i].intro ? "intro" : "play ") << " t " << samples[i].t << "  eye ahead " << e.x << " right "
+                      << e.y << " up " << e.z << "  pitch " << r.x << " yaw " << r.y << " roll " << r.z << "  " << move_state_name(samples[i].move)
+                      << " feet " << samples[i].feet_z - seq.end_feet_pos.z;
+            if (i > from) std::cout << "  moved " << (samples[i].cam - samples[i - 1].cam).length();
+            std::cout << std::endl;
+        }
+        std::cout << "[Handover] " << map_rel << ": the eye goes up " << result.first_up << " uu (and " << result.first_side
+                  << " sideways) in the first frame of play, turns " << result.turn_deg << " deg, comes down in " << result.glide_frames
+                  << " frames (largest step " << result.settle << " uu) and rests " << result.rest_up << " uu from the intro's last eye"
+                  << std::defaultfloat << std::endl;
+    }
+    return result;
+}
+
+// -----------------------------------------------------------------------------
 // The level's script acting on the scene (game/script_effects.hpp), checked on a real level: Flight's
 // Kismet is run against a pane of glass (SeqEvent_TakeDamage -> SeqAct_ActorFactory,
 // SeqAct_ToggleHidden, SeqAct_ChangeCollision, SeqAct_Destroy) with real bullets and with a barge, and
@@ -2165,9 +2282,39 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << "[Oracle Stage 21] Testing the Level Script's Effects (breakable glass, emitter factories, toggles)..." << std::endl;
     const bool s21_pass = oracle_script_effects(game_root);
 
+    // Stage 22: the hand-over at the end of a level intro (measure_intro_handover above), against what
+    // retail's intro traces show (docs/LEVEL_INTROS.md section 5): as the pawn's own animation comes back
+    // the eye is 6.5 uu over its standing place and comes down in five frames, and it rests where the
+    // intro's stand-in left it less the pawn's settling onto its hover over the floor. The Boat is the
+    // chapter that ends facing backwards along the world's axis (yaw 178): a body yaw that lags a frame
+    // would throw the eye 16 uu.
+    std::cout << "[Oracle Stage 22] Testing the Camera at a Level Intro's Hand-Over (retail's lift and rest)..." << std::endl;
+    bool s22_pass = true;
+    {
+        struct Case {
+            const char* map;
+            float retail_up;    // retail's eye in the first frame, over the intro's last
+            float retail_rest;  // and where it rests
+        };
+        // tools/retail/intro_capture traces, 2026-10-08 (build/re/cam/handover_table.py).
+        const Case cases[] = {{"Maps/SP07/Boat_p.me1", 3.79f, -2.63f}, {"Maps/SP05/Mall_p.me1", 5.85f, -0.70f}};
+        for (const Case& c : cases) {
+            const HandoverResult r = measure_intro_handover(renderer, game_root, c.map, false);
+            const bool ok = r.valid && r.first_side < 0.5f && std::abs(r.first_up - c.retail_up) < 0.6f &&
+                            std::abs(r.rest_up - c.retail_rest) < 0.6f && r.settle < 1.6f && r.glide_frames >= 4 && r.glide_frames <= 6 &&
+                            r.turn_deg < 1.5f;
+            s22_pass = s22_pass && ok;
+            std::cout << std::fixed << std::setprecision(2) << "  [" << c.map << "] " << (ok ? "OK" : "FAIL") << ": first frame up " << r.first_up
+                      << " (retail " << c.retail_up << "), sideways " << r.first_side << ", rests " << r.rest_up << " (retail " << c.retail_rest
+                      << "), down in " << r.glide_frames << " frames, largest step " << r.settle << ", turn " << r.turn_deg << " deg"
+                      << std::defaultfloat << std::endl;
+        }
+        std::cout << "  -> Stage 22 Result: " << (s22_pass ? "PASS" : "FAIL") << std::endl;
+    }
+
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2627,8 +2774,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     float handover_yaw = 0.0f;
     bool handover_set = false;
     auto hand_over = [&](const LevelIntroSequence& seq) {
-        if (handover_set) controller.reset(handover_pos, handover_yaw);
-        else controller.reset(seq.end_feet_pos + Vec3(0.0f, 0.0f, 2.0f), seq.end_yaw_deg);
+        if (handover_set) controller.hand_over(handover_pos - Vec3(0.0f, 0.0f, 2.0f), handover_yaw, active_scene);
+        else controller.hand_over(seq.end_feet_pos, seq.end_yaw_deg, active_scene);
         handover_set = false;
     };
     // A cutscene a key stops in a level without a script to stop it: the player stands at the
@@ -3019,6 +3166,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 const Vec3 root = cutscene_player.intro_root_pos();
                 trace_file << ",\"rx\":" << root.x << ",\"ry\":" << root.y << ",\"rz\":" << root.z;
             }
+        }
+        {
+            // The camera the frame is drawn from (the first-person tree's eye in play).
+            Vec3 cam;
+            Rotator cam_rot;
+            renderer.player_camera(t, cam, cam_rot);
+            trace_file << ",\"cx\":" << cam.x << ",\"cy\":" << cam.y << ",\"cz\":" << cam.z;
         }
         if (in_frontend) trace_file << ",\"frontend\":true";
         if (renderer.is_menu_open() || (frontend && frontend->is_pause_open())) trace_file << ",\"menu\":true";
@@ -4177,6 +4331,7 @@ int main(int argc, char* argv[]) {
     bool verify_all = false;
     bool verify_script = false;  // the level script's stage of the oracle, alone
     std::string shots_map, shots_times, shots_dir;
+    std::string handover_map;  // --handover-check <map>
     std::string script_json = "";
     int initial_chapter = 0;
     std::string custom_level = "";
@@ -4186,7 +4341,9 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--intro-shots") {
+        if (arg == "--handover-check") {
+            if (i + 1 < argc) handover_map = argv[++i];
+        } else if (arg == "--intro-shots") {
             if (i + 3 < argc) {
                 shots_map = argv[++i];
                 shots_times = argv[++i];
@@ -4237,6 +4394,7 @@ int main(int argc, char* argv[]) {
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
+                      << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
@@ -4259,6 +4417,12 @@ int main(int argc, char* argv[]) {
 
     if (!shots_map.empty()) {
         return run_intro_shots(game_root, shots_map, shots_times, shots_dir);
+    }
+    if (!handover_map.empty()) {
+        me::Renderer renderer;
+        renderer.set_game_root(game_root);
+        if (!renderer.init_headless(1280, 720)) return 1;
+        return measure_intro_handover(renderer, game_root, handover_map, true).valid ? 0 : 1;
     }
     if (verify_script) {
         // ME_SCRIPT_SHOTS=<dir>: with pictures of the pane it breaks.

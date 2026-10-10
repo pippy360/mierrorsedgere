@@ -1590,7 +1590,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         frame.ledge_wall_normal = telemetry.ledge_wall_normal;
         frame.ledge_top_normal = telemetry.ledge_top_normal;
         frame.floor_sloped = telemetry.floor_sloped;
-        frame.smooth_offset = telemetry.camera_mesh_offset.z;
+        frame.smooth_offset = telemetry.mesh_smooth_z;
         frame.climbing_pipe = telemetry.climbing_pipe;
         frame.climb_top = telemetry.climb_top;
         frame.climb_bottom = telemetry.climb_bottom;

@@ -179,10 +179,29 @@ came from a cadence timer and no voice line played.
 
 ## 5. What still differs
 
-- **The hand-over pops 12 uu.** When the intro ends the port's camera jumps 8.6 uu back and 8.2 uu up. This is
-  not the intro's doing: the animation ends in the standing pose with the eye 158.7 uu above the feet and 8.6
-  ahead of them, which is where retail's camera stays, and the port's gameplay camera stands at feet + 166 on
-  the pawn's axis (`kEyeHeightStand`). Left alone here because it is the gameplay camera, used by everything.
+- **The hand-over** is now retail's, to 0.2 uu. Retail's view is not still when control comes back. In the
+  intro traces of nine chapters (Ropeburn's has no pawn data):
+  - During the intro the pawn rides the stand-in with its mesh's origin on the stand-in's root, its capsule
+    centre 94 uu over it. Let go, it settles onto its hover over the floor: the centre comes to rest 93.15 uu
+    over the floor the port stands on (New Eden, The Shard, The Boat), or stays where it is when it is between
+    92.9 and 93.4 (Heat). That is `physWalking`'s band of 1.9 to 2.4 uu over the floor, moved to its middle,
+    and one unit more; the drop is 0 to 2.85 uu.
+  - In the next frame the pawn's own `Stand` begins and the eye is 6.5 uu above its standing place; it comes
+    down in five frames at 79 uu/s, the view's pitch going from 0 to the stand's 0.11 degrees with it (the
+    tree blending in from its reference pose). So the eye first goes up (5.85 uu in New Eden, 3.79 on The
+    Boat, 6.17 in Heat) and rests a little under where the intro left it (-0.70, -2.63, -0.36).
+  - Standing, the eye is 64.2 to 65.4 uu over the capsule's centre and 8.1 to 9.2 ahead of it, breathing.
+
+  The port does the same (`ParkourController::hand_over`): she is put on the floor under the stand-in's root,
+  the view starts 6.5 uu up and is let down at 79 uu/s, and what is drawn rides at the height retail's capsule
+  hovers (`kFloorHover`, 3.15 uu: the port's feet are on the floor, so its eye and first-person mesh were
+  that much under retail's wherever a floor carries her). Measured (`--handover-check <map>`, oracle stage
+  22), first frame / rest against the intro's last eye, port and retail: New Eden +5.65 / -0.75 and +5.85 /
+  -0.70; The Boat +3.65 / -2.75 and +3.79 / -2.63; The Shard +3.40 / -2.99 and +3.61 / -2.87; Heat +6.20 /
+  -0.23 and +6.17 / -0.36. Before, the camera stood at feet + 166 on the pawn's axis and popped 12 uu; with
+  the first-person tree's eye it ended 3 to 5 uu under retail's, fell 2 uu in the first two frames, and for
+  one frame was thrown sideways by a body yaw that lagged the reset (16 uu on The Boat, which ends facing
+  178 degrees). The hover is drawn, not simulated: see `TODO.md`.
 - **The turn after the hand-over.** In five chapters (Flight, Jacknife, Ropeburn, Pirandello Kruger, The Boat)
   retail's pawn plays `StandTurn90Left` or `Right` as control returns, heard as one `Cloth.Walk` at the
   Matinee's end and two `FootStepSneak` in the half second after. The port has no turn in place. Which chapters
