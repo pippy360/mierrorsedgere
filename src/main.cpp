@@ -1699,9 +1699,109 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                   << ", Exclusion=" << real_excl_vols << "])" << std::endl;
     }
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
+    // Stage 20: Ledge pull-up after a jump (TdMove_GrabPullUp). The heave's root motion carries the
+    // pawn, and the first-person camera on the EyeJoint rides it, as in retail. At the Escape_p ledge
+    // of the 2026-09-20 18:59 recording (hang capsule (17584, -6869, 12139.2), lip 12232): fall onto
+    // it, hang, pull up holding W. Retail's numbers are the mean of its five recorded HangHeaveUp
+    // pull-ups (spread under 2 uu), capsule rise and eye over the hanging capsule's centre against
+    // the time in the heave; the recorded camera is 10 uu ahead along the view and a frame older than
+    // the pawn (tools/retail/README.md), both taken out. Before root motion the eye was 22 uu low.
+    std::cout << "[Oracle Stage 20] Testing Ledge Pull-Up Root Motion & Camera (TdMove_GrabPullUp)..." << std::endl;
+    bool s20_pass = false;
+    {
+        LevelScene esc_scene;
+        const bool esc_ok = load_level_scene(game_root, "Maps/SP01/Escape_p.me1", esc_scene);
+        struct Ref { float t, cap, eye; };
+        constexpr Ref kRetailHeave[] = {{0.2f, 34.2f, 114.5f}, {0.4f, 68.6f, 152.3f}, {0.6f, 103.8f, 175.4f},
+                                        {0.8f, 142.0f, 189.5f}, {1.0f, 177.2f, 202.8f}, {1.2f, 188.4f, 227.6f}};
+        constexpr float kHangHeaveUpLength = 1.533333f;
+        struct Sample { float t, cap, eye; };
+        std::vector<Sample> heave_samples;
+        bool grabbed = false, pulled = false, walked = false, shot = false;
+        std::string heave_anim;
+        float worst_cap = 0.0f, worst_eye = 0.0f, max_cam_step = 0.0f, last_heave_t = 0.0f, end_rise = 0.0f;
+        std::ostringstream eye_report;
+        if (esc_ok) {
+            controller.anchor(Vec3(17584.0f, -6880.0f, 12080.0f), Vec3(0.0f, 0.0f, -150.0f), 90.0f, 25.0f, false,
+                              ParkourController::AnchorState{});
+            Vec3 cam_pos;
+            Rotator cam_rot;
+            InputFrame in20_idle{};
+            for (int i = 0; i < 120 && !grabbed; ++i) {
+                controller.step(in20_idle, kDt, esc_scene);
+                renderer.player_camera(controller.get_telemetry(), cam_pos, cam_rot);
+                grabbed = controller.get_move_state() == EMovement::MOVE_Grabbing;
+            }
+            for (int i = 0; grabbed && i < 72; ++i) {  // hang 1.2 s
+                controller.step(in20_idle, kDt, esc_scene);
+                renderer.player_camera(controller.get_telemetry(), cam_pos, cam_rot);
+            }
+            const Vec3 hang = controller.get_position();
+            const float hang_centre_z = hang.z + 90.0f;
+            InputFrame in20_up{};
+            in20_up.forward = 1.0f;
+            Vec3 prev_cam(0.0f, 0.0f, 0.0f);
+            int frames_after = 0;
+            for (int i = 0; grabbed && i < 180 && frames_after < 24; ++i) {
+                controller.step(in20_up, kDt, esc_scene);
+                renderer.player_camera(controller.get_telemetry(), cam_pos, cam_rot);
+                const EMovement st = controller.get_move_state();
+                if (st == EMovement::MOVE_GrabPullUp) {
+                    if (!pulled) heave_anim = controller.get_telemetry().move_anim;
+                    pulled = true;
+                    last_heave_t = controller.get_telemetry().combat_anim_time;
+                    heave_samples.push_back({last_heave_t, controller.get_position().z + 90.0f - hang_centre_z, cam_pos.z - hang_centre_z});
+                    if (!shot && last_heave_t >= 0.5f) {
+                        // Half a second in: up past the lip, looking down onto the roof.
+                        shot = true;
+                        renderer.render_frame(esc_scene, controller.get_telemetry());
+                        save_and_publish_png("oracle_20_ledge_pullup.png");
+                    }
+                } else if (pulled) {
+                    walked = walked || st == EMovement::MOVE_Walking;
+                    ++frames_after;
+                }
+                if (pulled && i > 0) max_cam_step = std::max(max_cam_step, cam_pos.distance(prev_cam));
+                prev_cam = cam_pos;
+            }
+            end_rise = controller.get_position().z - hang.z;
+            // The heave's samples at retail's times (frames interpolated on the move's own clock).
+            for (const Ref& ref : kRetailHeave) {
+                for (size_t k = 1; k < heave_samples.size(); ++k) {
+                    const Sample& a = heave_samples[k - 1];
+                    const Sample& b = heave_samples[k];
+                    if (b.t < ref.t || a.t > ref.t) continue;
+                    const float w = b.t > a.t ? (ref.t - a.t) / (b.t - a.t) : 0.0f;
+                    const float cap = a.cap + (b.cap - a.cap) * w;
+                    const float eye = a.eye + (b.eye - a.eye) * w;
+                    if (std::abs(cap - ref.cap) > std::abs(worst_cap)) worst_cap = cap - ref.cap;
+                    if (std::abs(eye - ref.eye) > std::abs(worst_eye)) worst_eye = eye - ref.eye;
+                    eye_report << " " << ref.t << "s:" << static_cast<int>(std::lround(eye)) << "/" << static_cast<int>(std::lround(ref.eye));
+                    break;
+                }
+            }
+        }
+        const bool s20_heave = pulled && heave_anim == "HangHeaveUp" && heave_samples.size() >= 80;
+        // The camera follows retail's to 5 uu, the pawn the root motion to 1.5 uu.
+        const bool s20_track = s20_heave && eye_report.str().size() > 0 && std::abs(worst_cap) <= 1.5f && std::abs(worst_eye) <= 5.0f;
+        // The move lasts the animation (OnCustomAnimEnd) and ends on the roof, walking, with no jump of
+        // the camera on the way (the old end shoved her 76 uu forward in one frame).
+        const bool s20_end = walked && last_heave_t > kHangHeaveUpLength - kDt - 1e-3f && last_heave_t < kHangHeaveUpLength &&
+                             std::abs(end_rise - 182.8f) <= 1.5f && max_cam_step < 12.0f;
+        s20_pass = esc_ok && grabbed && s20_heave && s20_track && s20_end;
+        std::cout << "  -> Stage 20 Result: " << (s20_pass ? "PASS" : "FAIL")
+                  << " (Escape_p=" << (esc_ok ? "OK" : "NO") << ", Grab=" << (grabbed ? "OK" : "NO")
+                  << ", Heave=" << (heave_anim.empty() ? "none" : heave_anim)
+                  << ", RootMotion=" << (std::abs(worst_cap) <= 1.5f ? "OK" : "FAIL") << " [worst " << worst_cap << " uu]"
+                  << ", Camera=" << (std::abs(worst_eye) <= 5.0f && !eye_report.str().empty() ? "OK" : "FAIL")
+                  << " [eye over hang centre port/retail" << eye_report.str() << "; worst " << worst_eye << " uu]"
+                  << ", End=" << (s20_end ? "OK" : "FAIL") << " [" << last_heave_t << " s, rise " << end_rise
+                  << " uu, largest camera step " << max_cam_step << " uu])" << std::endl;
+    }
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, electric fence stage 19, and ledge pull-up stage 20
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;

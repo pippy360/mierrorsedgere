@@ -252,6 +252,8 @@ private:
     void update_wallclimb(const InputFrame& input, float dt, const LevelScene& scene);
     void update_slide(const InputFrame& input, float dt, LevelScene& scene);
     void update_ledge_grab(const InputFrame& input, float dt, const LevelScene& scene);
+    // TdMove_GrabPullUp.StartMove: picks the heave (standing or crouched on top, hanging free or not).
+    void start_pull_up(const LevelScene& scene);
     void start_grab_transfer(const RailTransfer& rail);
     void update_grab_transfer(float dt);
     void update_vault(const InputFrame& input, float dt, const LevelScene& scene);
@@ -341,7 +343,10 @@ private:
 
     // Movement Timers & Accumulators
     float m_state_timer = 0.0f;
-    Vec3 m_pullup_start{0.0f, 0.0f, 0.0f};
+    Vec3 m_pullup_start{0.0f, 0.0f, 0.0f};  // TdMove_GrabPullUp: the feet where the heave began
+    Vec3 m_pullup_dir{1.0f, 0.0f, 0.0f};    // ...the pawn's facing, which the root motion moves along
+    int m_pullup_heave = 0;                 // ...which heave plays (kHeaveRootMotion in the .cpp)
+    float m_pullup_lift = 0.0f;             // ...how far collision, once back on, has lifted her out of the level
     float m_wallrun_cooldown = 0.0f;
     float m_wallrun_begin_speed = 0.0f;
     float m_slide_timer = 0.0f;
@@ -474,6 +479,7 @@ private:
     float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
     float m_smooth_last_z = 0.0f;
     bool m_smooth_was_walking = false;
+    bool m_smooth_was_heave = false;        // ...the frame before was a pull-up's (its end drops her onto the floor)
     int m_against_wall = 0;                 // TdPlayerPawn.AgainstWallState
     float m_against_wall_yaw = 0.0f;        // the way into that wall
     float m_against_wall_off = 0.0f;        // how long the check has found no wall (StopAgainstWall)
