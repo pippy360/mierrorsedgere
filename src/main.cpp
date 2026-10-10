@@ -768,7 +768,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     const float s1_fov = controller.get_telemetry().fov_deg;
     const float s1_z = controller.get_position().z;
     bool s1_pass = (s1_speed >= 400.0f) && (s1_fov > 90.0f) && controller.is_grounded() &&
-                   std::abs(s1_z - sp00_scene.player_spawn_pos.z) < 1.0f;
+                   std::abs(s1_z - (sp00_scene.player_spawn_pos.z + kPawnFloorHover)) < 1.0f;  // on the roof, at her hover over it
     std::cout << "  -> Stage 1 Result: " << (s1_pass ? "PASS" : "FAIL")
               << " (Speed=" << s1_speed << " u/s, FOV=" << s1_fov << "°, Roof Z=" << s1_z << ")" << std::endl;
 
@@ -856,7 +856,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     controller.step(in_run_jump, kDt, sim_scene);
     step_until(in_run, 180, sim_scene, [&] { return controller.is_grounded(); });
     const Vec3 s3_land = controller.get_position();
-    bool s3_cleared_gap = controller.is_grounded() && s3_land.x < -1150.0f && std::abs(s3_land.z - 4224.0f) < 2.0f;
+    bool s3_cleared_gap = controller.is_grounded() && s3_land.x < -1150.0f && std::abs(s3_land.z - (4224.0f + kPawnFloorHover)) < 2.0f;
     bool s3_pass = s3_wallrun && (s3_max_roll >= 10.0f) && s3_cleared_gap;
     std::cout << "  -> Stage 3 Result: " << (s3_pass ? "PASS" : "FAIL")
               << " (State=" << move_state_name(s3_state)
@@ -1156,7 +1156,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                 }
             }
             cab_top_z = controller.get_position().z;
-            s8_elev_top = (std::abs(cab_top_z - lift_top_z) < 2.0f) &&
+            s8_elev_top = (std::abs(cab_top_z - (lift_top_z + kPawnFloorHover)) < 2.0f) &&
                           (esc_scene.elevators[lift].state == ElevatorState::IdleEnd) &&
                           esc_scene.elevators[lift].streaming_triggered;
 
@@ -1167,7 +1167,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
             }
             walkout_pos = controller.get_position();
             s8_walkout = controller.is_grounded() && walkout_pos.x < lift_floor.x - lift_half.x - 30.0f &&
-                         std::abs(walkout_pos.z - lift_top_z) < 2.0f;
+                         std::abs(walkout_pos.z - (lift_top_z + kPawnFloorHover)) < 2.0f;
         }
         s8_pass = s8_elev_top && s8_walkout && real_elev_ok;
         std::cout << "  -> Stage 8 Result: " << (s8_pass ? "PASS" : "FAIL")
@@ -2262,10 +2262,11 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         const bool s20_heave = pulled && heave_anim == "HangHeaveUp" && heave_samples.size() >= 80;
         // The camera follows retail's to 5 uu, the pawn the root motion to 1.5 uu.
         const bool s20_track = s20_heave && eye_report.str().size() > 0 && std::abs(worst_cap) <= 1.5f && std::abs(worst_eye) <= 5.0f;
-        // The move lasts the animation (OnCustomAnimEnd) and ends on the roof, walking, with no jump of
+        // The move lasts the animation (OnCustomAnimEnd) and ends on the roof (the lip is 182.8 over the
+        // hanging feet, and she hovers over it), walking, with no jump of
         // the camera on the way (the old end shoved her 76 uu forward in one frame).
         const bool s20_end = walked && last_heave_t > kHangHeaveUpLength - kDt - 1e-3f && last_heave_t < kHangHeaveUpLength &&
-                             std::abs(end_rise - 182.8f) <= 1.5f && max_cam_step < 12.0f;
+                             std::abs(end_rise - (182.8f + kPawnFloorHover)) <= 1.5f && max_cam_step < 12.0f;
         s20_pass = esc_ok && grabbed && s20_heave && s20_track && s20_end;
         std::cout << "  -> Stage 20 Result: " << (s20_pass ? "PASS" : "FAIL")
                   << " (Escape_p=" << (esc_ok ? "OK" : "NO") << ", Grab=" << (grabbed ? "OK" : "NO")

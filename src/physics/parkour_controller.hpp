@@ -24,6 +24,15 @@ struct LinearCurve {
 // GetWalkAcceleration / CalcVelocity) describe it, with swept collision against the real UE3 level
 // collision (LevelScene::collision + the moving elevator parts), weapons, combat disarm, and AI.
 // =============================================================================
+// Retail's capsule does not stand on the floor. Let go at the end of each level intro, its centre
+// comes to rest 93.15 above the floor its sweep meets (New Eden, The Shard, The Boat), or stays
+// where it is when it is between 92.9 and 93.4 (Heat): physWalking's band of 1.9 to 2.4 over the
+// floor (MINFLOORDIST, MAXFLOORDIST), moved to its middle, and one unit more. With CollisionHeight
+// 90 that puts the capsule's bottom, the controller's feet, 3.15 over the floor that carries
+// her. (The band is not kept: she is always put at its middle.) A recording's capsule centre is
+// 90 over these feet on a floor and off it (tools/retail/trace.py).
+inline constexpr float kPawnFloorHover = 3.15f;
+
 class ParkourController {
 public:
     explicit ParkourController(const MovementConfig& config = MovementConfig());
@@ -32,7 +41,7 @@ public:
     // Reset player position and orientation
     void reset(const Vec3& spawn_pos, float spawn_yaw = 0.0f);
     // A cutscene ends and the player is let go where its animation left the mesh's root (the
-    // stand-in's place, on the floor or near it): she stands on the floor under it, facing `yaw`,
+    // stand-in's place, on the floor or near it): she hovers over the floor under it, facing `yaw`,
     // and the view is let down onto her own standing pose as retail's is (parkour_controller.cpp,
     // kHandoverLift).
     void hand_over(const Vec3& root_end, float yaw, const LevelScene& scene);
@@ -486,7 +495,6 @@ private:
     float m_balance_time = 0.0f;            // since she stepped on to the beam
     float m_balance_sway = 0.0f;            // the lean's own wander, as shown
     float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
-    float m_hover_z = 0.0f;                 // how far over these feet retail's capsule bottom is (kFloorHover on a floor)
     float m_handover_lift = 0.0f;           // what is left of a hand-over's lift (kHandoverLift)
     float m_smooth_last_z = 0.0f;
     bool m_smooth_was_walking = false;

@@ -1398,9 +1398,8 @@ struct PlayerTelemetry {
     bool move_left = false;         // a dodge jump going left
     bool hanging_free = false;      // hanging with no wall for the legs
     // The first-person mesh, and the eye in it, away from where the pawn's place puts them: kept off
-    // a wall (TdPawn.OffsetMeshXY), and in z held back over a step (TdPawn.SmoothOffset), carried at
-    // the height retail's capsule hovers over a floor, and let down as the pawn's own animation
-    // comes back after a cutscene (physics/parkour_controller.cpp).
+    // a wall (TdPawn.OffsetMeshXY), and in z held back over a step (TdPawn.SmoothOffset) and let
+    // down as the pawn's own animation comes back after a cutscene (physics/parkour_controller.cpp).
     Vec3 camera_mesh_offset{0.0f, 0.0f, 0.0f};
     float mesh_smooth_z = 0.0f;     // TdPawn.SmoothOffset alone: what the feet's placement reads
     bool ledge_sloped = false;      // TdMove_Grab.bSlopedLedge: the ledge's top is not level

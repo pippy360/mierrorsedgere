@@ -24,16 +24,17 @@ import math
 
 TICK_MS = 16
 # Retail's pawn Location is the capsule centre. CollisionHeight is 90 (a
-# half-height, units.py) and the pawn floats a few uu above the floor: at the
-# escape_p spawn the centre reads 12069.15 over a roof whose top converts to
-# 11976, so 93. The anchor is lifted a little on top and settled onto OUR
-# floor, so a unit either way costs nothing.
-CENTRE_ABOVE_FEET = 93.0
+# half-height, units.py), so the capsule's bottom is 90 under it. The pawn
+# hovers over the floor (at the escape_p spawn the centre reads 12069.15 over
+# a roof whose top converts to 11976: 93.15), and so does the port's since
+# its controller keeps the feet kPawnFloorHover (3.15) over the floor: its
+# feet are the capsule's bottom, on a floor and off it.
+CENTRE_ABOVE_FEET = 90.0
 # ...except on the SHORT capsule: a move with bUseCustomCollision runs on a
 # 122 uu capsule with the feet fixed (TdMove.ShrinkCollision), so its centre
 # stands 29 uu lower - every recorded slide steps pz down exactly 29.00. Read
-# with 93, a slide's feet came out 29 uu under the floor, and a re-anchor
-# dropped inside one started the port in the ground.
+# with the full capsule's height, a slide's feet came out 29 uu under the
+# floor, and a re-anchor dropped inside one started the port in the ground.
 SHORT_CAPSULE_MOVES = frozenset(("MOVE_Slide", "MOVE_Crouch", "MOVE_180TurnInAir",
                                  "MOVE_LayOnGround", "MOVE_Coil", "MOVE_AirBarge",
                                  "MOVE_MeleeCrouch", "MOVE_MeleeSlide"))
@@ -47,7 +48,7 @@ def centre_above_feet(sample):
     return CENTRE_ABOVE_FEET
 
 
-ANCHOR_LIFT_UU = 3.0
+ANCHOR_LIFT_UU = 0.0        # the anchor is the capsule's bottom as it is: nothing to settle
 DIVERGE_UU = 50.0           # the gap that counts as "parted"
 FELL_UU = 300.0             # port below retail by this much = fell through
 
