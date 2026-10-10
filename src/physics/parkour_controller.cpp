@@ -4449,7 +4449,10 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         if (facing_forward().dot(-wall_out) < -0.30f) continue;
 
         const Vec3 climb_xy = Vec3(base.x, base.y, 0.0f) + wall_out * 64.0f;
-        const float clamped_z = std::clamp(m_telemetry.position.z, base.z, std::max(base.z, top.z - 35.0f));
+        const float max_climb_z = act.can_exit_at_top
+            ? std::max(base.z, top.z - 35.0f)
+            : std::max(base.z, top.z - kPawnHeight);
+        const float clamped_z = std::clamp(m_telemetry.position.z, base.z, max_climb_z);
 
         m_telemetry.position = Vec3(climb_xy.x, climb_xy.y, clamped_z);
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
@@ -4479,8 +4482,13 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
 
     const Vec3 into = -m_climb_normal;
     const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 64.0f;
+    // In UE3 TdLadderVolume, GetLastStep() stops one full pawn height below End.Z when !bCanExitAtTop
+    // (GetLastStep = LadderSteps.Num() - 4 on pipes), so Faith's head/eyes never rise above a capped pipe.
+    const float max_climb_z = m_climb_can_exit_top
+        ? std::max(m_climb_base.z, m_climb_top.z - 65.0f)
+        : std::max(m_climb_base.z, m_climb_top.z - kPawnHeight);
     // How far the ladder goes on, for the animation: a pipe's last rung is climbed differently.
-    m_telemetry.climb_top = std::max(0.0f, (m_climb_can_exit_top ? m_climb_top.z - 65.0f : m_climb_top.z - 25.0f) - m_telemetry.position.z);
+    m_telemetry.climb_top = std::max(0.0f, max_climb_z - m_telemetry.position.z);
     m_telemetry.climb_bottom = std::max(0.0f, m_telemetry.position.z - m_climb_base.z);
     m_telemetry.position.x = climb_xy.x;
     m_telemetry.position.y = climb_xy.y;
@@ -4515,14 +4523,29 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
     }
 
     if (input.forward > 0.2f) {
+        if (!m_climb_can_exit_top && m_telemetry.position.z >= max_climb_z) {
+            m_telemetry.position.z = max_climb_z;
+            m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+            return;
+        }
         constexpr float kClimbUpSpeed = 190.0f;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, kClimbUpSpeed);
         m_telemetry.position.z += kClimbUpSpeed * dt;
 
+        // When bCanExitAtTop is false (e.g. Tutorial Stage 11 drainpipes capped beneath a roof fence),
+        // TdMove_Climb.HandleClimbAction stops at GetLastStep() and never triggers ExitAtTop.
+        if (!m_climb_can_exit_top) {
+            if (m_telemetry.position.z >= max_climb_z) {
+                m_telemetry.position.z = max_climb_z;
+                m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+            }
+            return;
+        }
+
         // Reaching top of pipe/ladder (TdMove_Climb.ExitAtTop):
         // In UE3 TdLadderVolume, GetLastStep().Z = End.Z - 96.0 (side rails extend ~96 UU above the platform),
         // so the top catwalk/roof surface can lie down to m_climb_top.z - 160.0f.
-        const float exit_check_z = m_climb_can_exit_top ? (m_climb_top.z - 65.0f) : (m_climb_top.z - 25.0f);
+        const float exit_check_z = m_climb_top.z - 65.0f;
         if (m_telemetry.position.z >= exit_check_z) {
             for (float dist_in : {36.0f, 52.0f, 68.0f, 84.0f, 104.0f, 128.0f, 152.0f}) {
                 const Vec3 probe_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + into * dist_in;
@@ -4540,6 +4563,12 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
                 }
                 if (roof.hit && roof.normal.z >= kWalkableFloorZ) {
                     const Vec3 stand_pos(probe_xy.x, probe_xy.y, roof.point.z + 2.0f);
+                    const TraceHit path_block = trace_ray(
+                        Vec3(m_climb_base.x, m_climb_base.y, stand_pos.z + 120.0f) + into * 16.0f,
+                        Vec3(stand_pos.x, stand_pos.y, stand_pos.z + 120.0f),
+                        scene
+                    );
+                    if (path_block.hit) continue;
                     if (has_room_at(stand_pos, kPawnHeight, scene) ||
                         has_room_at(stand_pos + Vec3(0.0f, 0.0f, 12.0f), kEyeHeightCrouch, scene)) {
                         m_telemetry.position = stand_pos;
@@ -4553,8 +4582,15 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
                 }
             }
             if (m_telemetry.position.z >= m_climb_top.z - 25.0f) {
-                if (m_climb_can_exit_top) {
-                    const Vec3 exit_pos = Vec3(m_climb_base.x, m_climb_base.y, m_climb_top.z - 64.0f) + into * 64.0f;
+                const Vec3 exit_pos = Vec3(m_climb_base.x, m_climb_base.y, m_climb_top.z - 64.0f) + into * 64.0f;
+                const TraceHit path_block = trace_ray(
+                    Vec3(m_climb_base.x, m_climb_base.y, exit_pos.z + 120.0f) + into * 16.0f,
+                    Vec3(exit_pos.x, exit_pos.y, exit_pos.z + 120.0f),
+                    scene
+                );
+                if (!path_block.hit &&
+                    (has_room_at(exit_pos, kPawnHeight, scene) ||
+                     has_room_at(exit_pos + Vec3(0.0f, 0.0f, 12.0f), kEyeHeightCrouch, scene))) {
                     m_telemetry.position = exit_pos;
                     m_telemetry.velocity = into * 300.0f;
                     m_telemetry.move_state = EMovement::MOVE_Walking;

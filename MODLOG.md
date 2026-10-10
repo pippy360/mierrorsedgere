@@ -938,4 +938,29 @@ Resolved ten user-reported retail parity gaps across movement, first-person anim
 - `me_anim` bone trajectory verification across `landing_medium`, `landing_hard`, `landing_soft`, and jump-landing transitions: `LeftFoot` stays tucked at `X = 15.3..32.6 uu` beneath Faith (`+86.0 uu` upward leg kick completely eliminated).
 - `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS (`exit code 0`)** across all 16 stages (`Stage 1`–`Stage 16`), including Stage 6 (`Mid-Air Coil & Skill Roll`), Stage 15 (`ZiplineDrop=OK`, `SwingBar=OK`, `LedgeWalk=OK`), and Stage 16 (`Per-Move Camera Constraints`).
 
+---
+
+## 19. Capped Drainpipe Top Stop (`!bCanExitAtTop`) & Roof Fence Glitch Fix (`agent/pipe-climb-top-fence`, 2026-10-10)
+
+### 19.1 Root Causes
+1. **Unconditional top-exit roof probe when `bCanExitAtTop = False` (`ParkourController::update_climb`):**
+   - In `Maps/SP00/Tutorial_p.me1`, both Stage 11 vertical drainpipes on the North wall (`Y = -3106`) are `TdLadderVolume` actors with `LadderType = LT_Pipe` and **`bCanExitAtTop = False`**:
+     - Export `13496` (West Pipe 1): `Start = (-7890, -3106, 4223)`, `End = (-7890, -3106, 4936)`, `bCanExitAtTop = False`.
+     - Export `13495` (East Pipe 2): `Start = (-7663, -3106, 4596)`, `End = (-7663, -3106, 4914)`, `bCanExitAtTop = False`.
+   - Along the roof lip directly above both pipes at `Y = -3104, Z = 5024..5345` stands a wire fence (`11741` and `12142`, `S_FenceGenericWire_01m`).
+   - Previously, `ParkourController::update_climb` executed the top-exit roof-probe loop (`dist_in = 36..152 UU` along `into = -m_climb_normal`) unconditionally even when `m_climb_can_exit_top == false`, finding walkable roof triangles at `Z = 4992` behind the fence (`Y = -3038..-2954`) and teleporting Faith straight through the wire fence onto the upper roof.
+   - In retail `TdMove_Climb.HandleClimbAction` (`TdGame.u`), `ExitAtTop` is gated by `CurrentStep == Ladder.GetLastStep() && Ladder.bCanExitAtTop`.
+2. **Pipe top stop height (`m_climb_top.z - kPawnHeight` vs `m_climb_top.z - 25.0f`):**
+   - In `MirrorsEdge.exe`, `ATdLadderVolume::GetLastStep` (`0x12aa0e0`) returns `LadderSteps.Num() - 4` (`Pawn.Z = End.Z - 197.0`) for `LT_Pipe` and `LadderSteps.Num() - 1` (`Pawn.Z = End.Z - 96.0`) for `LT_Ladder`. Because `m_telemetry.position.z` in `ParkourController` represents **Feet Z** (`kPawnHeight = 180.0f`), allowing `m_telemetry.position.z` to climb up to `m_climb_top.z - 25.0f` on a capped pipe raised Faith's head and camera `140+ UU` above the top cap of the pipe (`End.Z`) in front of the wire fence.
+
+### 19.2 Changes
+- [`src/physics/parkour_controller.cpp`](file:///Users/tomnom/git/mierrorsedgere/src/physics/parkour_controller.cpp):
+  - In `ParkourController::try_initiate_climb` and `ParkourController::update_climb`, computed `max_climb_z = m_climb_can_exit_top ? std::max(m_climb_base.z, m_climb_top.z - 65.0f) : std::max(m_climb_base.z, m_climb_top.z - kPawnHeight)`.
+  - When `!m_climb_can_exit_top`, clamped upward climbing at `max_climb_z` (`4756.0f` on Pipe 1, `4734.0f` on Pipe 2) with zero vertical velocity so `Director::tick_climb` stops stepping and holds the pipe idle pose without ever invoking the top-exit roof probe.
+  - Added a horizontal line-of-sight blocking trace (`path_block`) on `m_climb_can_exit_top` top exits to ensure top dismounts never teleport across a blocking wall or fence.
+- [`src/main.cpp`](file:///Users/tomnom/git/mierrorsedgere/src/main.cpp):
+  - Updated Oracle Stage 13B to verify that holding climb up (`W`) on Tutorial Pipe 1 (`13496`) and Pipe 2 (`13495`) stops cleanly at their capped top rungs (`Z = 4756` and `Z = 4734` in `MOVE_Climb`, `Y < -3106`) without glitching through the wire fence onto the roof, and that jumping East (`+X`) off Pipe 2 lands cleanly on the Stage 12 catwalk platform (`12161 S_Catwalksystem_05_Plateau192` at `Z = 4704`).
+
+### 19.3 Verification
+- `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS** (`Stage 13 Result: PASS (Balance Entered=YES, Balance End X=-6850.69, Pipe1 Capped=YES [Z=4756], Pipe2 Capped=YES [Z=4734], Catwalk Land=(-7368.16,-3226.01,4704), Ladder1 TopExit=YES, Ladder2 TopExit=YES)`).
 
