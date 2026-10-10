@@ -2393,24 +2393,52 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
         }
 
         auto nprops = parse_exp_props(obj_idx);
-        if (ncls.find("Attenuation") != std::string::npos) {
-            // Extract MinRadius / MaxRadius from DistributionFloatUniform subobjects if present
-            if (auto it = nprops.find("MinRadius"); it != nprops.end() && it->second.obj_ref_index > 0) {
-                auto dprops = parse_exp_props(it->second.obj_ref_index);
-                if (auto dit = dprops.find("Min"); dit != dprops.end()) cue.min_radius = dit->second.float_val;
-            }
-            if (auto it = nprops.find("MaxRadius"); it != nprops.end() && it->second.obj_ref_index > 0) {
-                auto dprops = parse_exp_props(it->second.obj_ref_index);
-                if (auto dit = dprops.find("Max"); dit != dprops.end()) cue.max_radius = dit->second.float_val;
-            }
-        }
 
-        // The node itself: USoundNodeMixer / Random / Delay / Modulator (the rest pass through).
+        // The node itself: USoundNodeMixer / Random / Delay / Modulator / Attenuation / Ambient
+        // (the rest pass through).
         const int node_index = static_cast<int>(cue.nodes.size());
+        int32_t ambient_wave = 0;
         {
             SoundCueNode node;
             UPropertyList uprops;
             parse_export_properties(*this, obj_idx, uprops);
+            // The node's radii and flags, over its class's defaults. A node reached by two branches
+            // is one entry of cue.attenuations.
+            auto attenuation_index = [&](SoundAttenuation a) {
+                a.export_index = obj_idx;
+                for (size_t k = 0; k < cue.attenuations.size(); ++k) {
+                    if (cue.attenuations[k].export_index == obj_idx) return static_cast<int>(k);
+                }
+                const auto pair = [&](const char* name, float* io) {
+                    const auto [first, second] = distribution_range(uprops, name, io[0], io[1]);
+                    io[0] = first;
+                    io[1] = second;
+                };
+                pair("MinRadius", a.min_radius);
+                pair("MaxRadius", a.max_radius);
+                pair("LPFMinRadius", a.lpf_min_radius);
+                pair("LPFMaxRadius", a.lpf_max_radius);
+                // DistanceModel is a byte property: the enum value's name as cooked here (429 of
+                // the game's 1,834 nodes store one), its number where a package saves it that way.
+                if (const UProperty* dm = find_prop(uprops, "DistanceModel")) {
+                    static const char* const kModels[] = {"ATTENUATION_Linear", "ATTENUATION_Logarithmic", "ATTENUATION_Inverse",
+                                                          "ATTENUATION_LogReverse", "ATTENUATION_NaturalSound"};
+                    a.model = static_cast<uint8_t>(dm->i);
+                    for (size_t k = 0; k < std::size(kModels); ++k) {
+                        if (dm->s == kModels[k]) a.model = static_cast<uint8_t>(k);
+                    }
+                }
+                a.db_at_max = prop_float(uprops, "dBAttenuationAtMax", a.db_at_max);
+                a.attenuate = prop_bool(uprops, "bAttenuate", a.attenuate);
+                a.spatialize = prop_bool(uprops, "bSpatialize", a.spatialize);
+                a.lowpass = prop_bool(uprops, "bAttenuateWithLowPassFilter", a.lowpass);
+                if (a.td) {
+                    a.delay = prop_bool(uprops, "bDelay", a.delay);
+                    pair("SpeedOfSound", a.speed_of_sound);
+                }
+                cue.attenuations.push_back(a);
+                return static_cast<int>(cue.attenuations.size()) - 1;
+            };
             auto float_array = [&uprops](const char* name) {
                 std::vector<float> values;
                 if (const UProperty* a = find_prop(uprops, name)) {
@@ -2443,8 +2471,40 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
                 node.max_value = vhi;
                 node.min_pitch = plo;
                 node.max_pitch = phi;
+            } else if (ncls == "SoundNodeAttenuation" || ncls == "TdSoundNodeAttenuation") {
+                // Default__SoundNodeAttenuation: Linear, 400 / 5000, low pass 1500 / 5000, -60 dB,
+                // the three flags set. TdSoundNodeAttenuation adds bDelay (off) and SpeedOfSound
+                // (33100 .. 33101 uu/s) and inherits the rest.
+                node.kind = SoundCueNode::Kind::Attenuation;
+                SoundAttenuation a;
+                a.td = (ncls == "TdSoundNodeAttenuation");
+                node.attenuation = attenuation_index(a);
+            } else if (ncls == "SoundNodeAmbient") {
+                // What an AmbientSoundSimple actor's cue is: the radii, a volume and a pitch
+                // modulation and the wave in one node. Default__SoundNodeAmbient: 400 / 5000, low
+                // pass 1500 / 2500 and off, both modulations 1 .. 1.
+                node.kind = SoundCueNode::Kind::Ambient;
+                SoundAttenuation a;
+                a.linear_only = true;
+                a.lowpass = false;
+                a.lpf_max_radius[0] = a.lpf_max_radius[1] = 2500.0f;
+                node.attenuation = attenuation_index(a);
+                const auto [vlo, vhi] = distribution_range(uprops, "VolumeModulation", 1.0f, 1.0f);
+                const auto [plo, phi] = distribution_range(uprops, "PitchModulation", 1.0f, 1.0f);
+                node.min_value = vlo;
+                node.max_value = vhi;
+                node.min_pitch = plo;
+                node.max_pitch = phi;
+                ambient_wave = prop_object(uprops, "Wave");
             }
             cue.nodes.push_back(std::move(node));
+        }
+
+        // A USoundNodeAmbient plays its Wave property; it has no ChildNodes.
+        if (ambient_wave != 0) {
+            const int child = self(self, ambient_wave, cue, depth + 1);
+            cue.nodes[static_cast<size_t>(node_index)].children.push_back(child);
+            return node_index;
         }
 
         // Follow ChildNodes array
@@ -2484,6 +2544,9 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
         if (auto it = props.find("PitchMultiplier"); it != props.end()) {
             cue.pitch_multiplier = it->second.float_val;
         }
+        if (auto it = props.find("Duration"); it != props.end()) {
+            cue.duration = it->second.float_val;
+        }
         if (auto it = props.find("FirstNode"); it != props.end() && it->second.obj_ref_index != 0) {
             walk_sound_node(walk_sound_node, it->second.obj_ref_index, cue, 0);
         }
@@ -2517,8 +2580,6 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
                 if (auto map_it = cue_exp_to_idx.find(cue_obj); map_it != cue_exp_to_idx.end()) {
                     const auto& cdef = out_cues[map_it->second];
                     em.cue_name = cdef.name;
-                    em.min_radius = cdef.min_radius;
-                    em.max_radius = cdef.max_radius;
                     if (!cdef.wave_names.empty()) {
                         em.wave_name = cdef.wave_names.front();
                     }

@@ -581,6 +581,459 @@ static bool oracle_script_effects(const std::string& game_root, me::Renderer* re
     return pass;
 }
 
+// -----------------------------------------------------------------------------
+// Oracle stage 23: how loud a sound at a place is (docs/AUDIO_SYSTEM_RE.md section 3.2).
+// The curve itself against values worked by hand from the executable's formulas, then the audio
+// engine, without a device, playing cues at measured distances from the listener: what each wave
+// would be set to must be its attenuation nodes' curve, follow the listener, be the product of two
+// nodes on one branch, leave a wave with no node above it alone, and not start at all where retail
+// refuses to; and of a level's emitters none may hold a source it is not heard on.
+// --verify-sound runs it alone; ME_AUDIO_DEBUG=1 prints every gain as it is set.
+// -----------------------------------------------------------------------------
+static bool oracle_sound_attenuation(const std::string& game_root) {
+    using namespace me;
+    const auto near = [](float a, float b, float tolerance = 1.0e-3f) { return std::abs(a - b) <= tolerance; };
+
+    // 1. USoundNodeAttenuation::ParseNodes' five models (0x00B7DD60). The wanted values are the
+    // formulas evaluated by hand to four places; the research's emulation of the function's own
+    // bytes gave the same ones.
+    struct Worked {
+        uint8_t model;
+        float distance, min_radius, max_radius, db, want;
+    };
+    static const Worked kWorked[] = {
+        {0, 480.0f, 10.0f, 2000.0f, -60.0f, 0.7638f},    // a concrete bullet impact
+        {0, 1000.0f, 10.0f, 2000.0f, -60.0f, 0.5025f},
+        {0, 1900.0f, 10.0f, 2000.0f, -60.0f, 0.0503f},
+        {0, 2000.0f, 10.0f, 2000.0f, -60.0f, 0.0f},      // at MaxRadius: silent
+        {0, 480.0f, 400.0f, 600.0f, -60.0f, 0.6f},       // Flesh.9mm_Flesh_Impact
+        {0, 299.0f, 300.0f, 300.0f, -60.0f, 1.0f},       // Faith.9mm_Faith_Impact: equal radii
+        {0, 300.0f, 300.0f, 300.0f, -60.0f, 0.0f},
+        {1, 1000.0f, 500.0f, 2000.0f, -60.0f, 0.5f},     // Glass_BP.9mm_Glass_BP_Impact
+        {1, 480.0f, 10.0f, 2000.0f, -60.0f, 0.2694f},    // Glass_Prop, Taser_NotBody
+        {1, 1000.0f, 10.0f, 2000.0f, -60.0f, 0.1308f},
+        {2, 1000.0f, 100.0f, 2000.0f, -60.0f, 0.8f},
+        {2, 1999.0f, 100.0f, 2000.0f, -60.0f, 0.4002f},  // still 0.02 * Max / Min just inside MaxRadius
+        {2, 2000.0f, 100.0f, 2000.0f, -60.0f, 0.0f},
+        {3, 2700.0f, 400.0f, 5000.0f, -60.0f, 0.6926f},
+        {3, 400.01f, 400.0f, 5000.0f, -60.0f, 0.9670f},  // the step down just outside MinRadius
+        {4, 2700.0f, 400.0f, 5000.0f, -60.0f, 0.0316f},  // half way: -30 dB
+        {5, 2700.0f, 400.0f, 5000.0f, -60.0f, 1.0f},     // no such model: untouched
+        {3, 4000.0f, 1.0f, 18000.0f, -60.0f, 0.9744f},   // the two nodes of a gun's Fire3P,
+        {3, 4000.0f, 10.0f, 8000.0f, -60.0f, 0.8963f},   // see 5 below
+    };
+    bool curve_ok = true;
+    float curve_worst = 0.0f;
+    for (const Worked& w : kWorked) {
+        const float got = attenuation_gain(w.model, w.distance, w.min_radius, w.max_radius, w.db);
+        curve_worst = std::max(curve_worst, std::abs(got - w.want));
+        if (!near(got, w.want, 1.0e-4f)) {
+            curve_ok = false;
+            std::cout << "  [curve] model " << static_cast<int>(w.model) << " " << w.min_radius << "/" << w.max_radius << " at " << w.distance
+                      << ": " << got << ", wanted " << w.want << std::endl;
+        }
+    }
+    // A radius is drawn between its pair whichever way round the pair is stored.
+    const float backwards[2] = {5000.0f, 800.0f};
+    curve_ok = curve_ok && near(draw_radius(backwards, 0.0f), 5000.0f) && near(draw_radius(backwards, 1.0f), 800.0f) &&
+               near(draw_radius(backwards, 0.25f), 3950.0f);
+    std::cout << "  [curve] " << std::size(kWorked) << " worked values: " << (curve_ok ? "OK" : "FAIL") << ", worst difference "
+              << curve_worst << std::endl;
+
+    // 2. The engine, with no device: the stock banks and the training area's audio sublevel.
+    AudioEngine audio;
+    audio.init(true);
+    audio.load_stock_audio(game_root);
+    audio.load_level_audio(game_root, "Maps/SP00/Tutorial_p.me1");
+    audio.load_cue_bank(game_root, "A_WP_SLAPBACK");
+    const Vec3 ahead(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    // Far from the level, so that none of its emitters is in the way of the counts below.
+    const Vec3 home(400000.0f, 400000.0f, 0.0f);
+    const auto tick = [&](const Vec3& listener, float dt = 0.0f) { audio.update(dt, listener, ahead, up, 0.0f, false); };
+    const auto voices_of = [&](const std::string& name) {
+        std::vector<AudioEngine::PositionalVoice> found;
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+            if (!v.emitter && v.name == name) found.push_back(v);
+        }
+        return found;
+    };
+    const auto one_gain = [&](const std::string& name) {
+        const auto found = voices_of(name);
+        return found.size() == 1 ? found[0].distance_gain : -1.0f;
+    };
+
+    // 3. A bullet impact on concrete (Linear 10 / 2000, 1.35 s) at 480, 1000 and 2100 uu: the curve's
+    // gain at each, the last one playing at 0 (it lasts more than a second, so it is started).
+    const char* const kConcrete = "Concrete.9mm_Concrete_Impact";
+    bool impact_ok = audio.find_cue(kConcrete) != nullptr;
+    float impact_gain[3] = {-1.0f, -1.0f, -1.0f};
+    {
+        const float distances[3] = {480.0f, 1000.0f, 2100.0f};
+        const float wanted[3] = {0.7638f, 0.5025f, 0.0f};
+        tick(home);
+        for (int i = 0; i < 3; ++i) {
+            audio.stop_all();
+            audio.play_sound_3d(kConcrete, home + Vec3(distances[i], 0.0f, 0.0f));
+            impact_ok = impact_ok && voices_of(kConcrete).empty();  // not before the update that knows the listener
+            tick(home);
+            const auto found = voices_of(kConcrete);
+            if (found.size() == 1) impact_gain[i] = found[0].distance_gain;
+            // (The cue's VolumeMultiplier is 1: the source's gain is the distance's.)
+            impact_ok = impact_ok && found.size() == 1 && near(found[0].distance_gain, wanted[i], 1.0e-4f) &&
+                        near(found[0].gain, wanted[i], 1.0e-4f) && near(found[0].distance, distances[i], 0.01f) && found[0].spatialized &&
+                        found[0].attenuation_nodes == 1;
+        }
+    }
+    // The gain follows the listener while the sound plays, down to nothing and back.
+    bool follow_ok = true;
+    float follow_gain[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+    {
+        audio.stop_all();
+        const Vec3 at = home + Vec3(0.0f, 480.0f, 0.0f);
+        audio.play_sound_3d(kConcrete, at);
+        const float distances[4] = {480.0f, 1900.0f, 2500.0f, 1000.0f};
+        const float wanted[4] = {0.7638f, 0.0503f, 0.0f, 0.5025f};
+        for (int i = 0; i < 4; ++i) {
+            tick(at - Vec3(0.0f, distances[i], 0.0f));
+            follow_gain[i] = one_gain(kConcrete);
+            follow_ok = follow_ok && near(follow_gain[i], wanted[i], 1.0e-4f);
+        }
+    }
+    // A sound played on the player (2D) is not one of these: nothing gives it a distance.
+    bool flat_ok = true;
+    {
+        audio.stop_all();
+        tick(home);
+        const size_t before = audio.positional_voices().size();
+        audio.play_sound(kConcrete);
+        audio.play_cue("Doors.Door_Barge");
+        tick(home, 0.5f);
+        tick(home + Vec3(5000.0f, 0.0f, 0.0f));
+        flat_ok = audio.positional_voices().size() == before;
+    }
+
+    // 4. The test for starting at all (UAudioDevice::CreateComponent): a cue of at most a second is
+    // refused where the listener is not within its MaxAudibleDistance. Fabric's impact lasts 0.72 s.
+    const char* const kFabric = "Fabric.9mm_Fabric_Impact";
+    bool gate_ok = audio.find_cue(kFabric) != nullptr && near(audio.cue_max_audible_distance(kFabric), 2000.0f) &&
+                   near(audio.cue_max_audible_distance(kConcrete), 2000.0f) &&
+                   audio.cue_max_audible_distance("Fire.Fire1P") >= kSoundWorldMax;  // no attenuation node: anywhere
+    size_t gate_far = 99, gate_near = 99;
+    {
+        audio.stop_all();
+        audio.play_sound_3d(kFabric, home + Vec3(2100.0f, 0.0f, 0.0f));
+        tick(home);
+        gate_far = voices_of(kFabric).size();
+        audio.play_sound_3d(kFabric, home + Vec3(1900.0f, 0.0f, 0.0f));
+        tick(home);
+        gate_near = voices_of(kFabric).size();
+        gate_ok = gate_ok && gate_far == 0 && gate_near == 1 && near(one_gain(kFabric), 0.0503f, 1.0e-4f);
+    }
+
+    // 5. Two attenuation nodes on one branch multiply. A pistol's Fire3P is a mixer of two layers
+    // under a LogReverse 1 / 18000 node, one of them under a second node, LogReverse 10 / 8000.
+    bool chain_ok = false;
+    float chain_one = -1.0f, chain_two = -1.0f;
+    {
+        audio.stop_all();
+        audio.play_sound_3d("Fire.Fire3P", home + Vec3(0.0f, 0.0f, 4000.0f));
+        tick(home);
+        for (const AudioEngine::PositionalVoice& v : voices_of("Fire.Fire3P")) {
+            if (v.attenuation_nodes == 1) chain_one = v.distance_gain;
+            if (v.attenuation_nodes == 2) chain_two = v.distance_gain;
+        }
+        chain_ok = near(chain_one, 0.9744f, 2.0e-4f) && near(chain_two, 0.9744f * 0.8963f, 2.0e-4f);
+    }
+
+    // 6. A wave with no attenuation node above it plays as it is, at the listener, beside its
+    // attenuated sisters: the soft hand step on metal has such a layer under its mixer (Linear
+    // 100 / 800 on the other). Past 800 uu the cue (0.38 s) does not start.
+    const char* const kHandStep = "Metal._21_Female_HandStepSoft";
+    bool bare_ok = false;
+    float bare_layer = -1.0f, placed_layer = -1.0f;
+    {
+        audio.stop_all();
+        audio.play_sound_3d(kHandStep, home + Vec3(400.0f, 0.0f, 0.0f));
+        tick(home);
+        bool flags_ok = true;
+        for (const AudioEngine::PositionalVoice& v : voices_of(kHandStep)) {
+            if (v.attenuation_nodes == 0) {
+                bare_layer = v.distance_gain;
+                flags_ok = flags_ok && !v.spatialized;
+            } else {
+                placed_layer = v.distance_gain;
+                flags_ok = flags_ok && v.spatialized;
+            }
+        }
+        audio.stop_all();
+        audio.play_sound_3d(kHandStep, home + Vec3(900.0f, 0.0f, 0.0f));
+        tick(home);
+        bare_ok = flags_ok && near(bare_layer, 1.0f) && near(placed_layer, 1.0f - 300.0f / 700.0f) && voices_of(kHandStep).empty();
+    }
+
+    // 7. bSpatialize off, bAttenuate on (the 300 radio lines): the distance's gain, but at the
+    // listener, not placed. The training area's opening line is Linear 400 / 5000.
+    const char* const kRadio = "A_VO_SP00_Opening_1_1_Merc_Cue";
+    bool radio_ok = false;
+    float radio_gain = -1.0f;
+    {
+        audio.stop_all();
+        audio.play_sound_3d(kRadio, home + Vec3(2700.0f, 0.0f, 0.0f));
+        tick(home);
+        const auto found = voices_of(kRadio);
+        if (found.size() == 1) radio_gain = found[0].distance_gain;
+        radio_ok = found.size() == 1 && near(radio_gain, 0.5f, 1.0e-4f) && !found[0].spatialized && found[0].attenuation_nodes == 1;
+    }
+
+    // 8. DICE's TdSoundNodeAttenuation (the guns' slap-back echo): held back by the first distance
+    // over the speed of sound, and attenuated twice, once on that first distance for good. The cue's
+    // first node is Linear 100 / 11000 with bDelay at 33100 uu/s over a mixer of a click (a 40 ms
+    // wave) and a reverb tail that has a second such node above it, Linear 800 / 15000 at 53100 uu/s.
+    // At 5000 uu the click comes 0.151 s late at 0.5505 squared, the tail 0.094 s after it at that
+    // times 0.7042 squared.
+    const char* const kSlap = "Slap_Back.Slap_Back";
+    bool td_ok = false;
+    size_t td_early = 99;
+    float td_click = -1.0f, td_tail = -1.0f, td_moved = -1.0f;
+    if (audio.find_cue(kSlap)) {
+        audio.stop_all();
+        const Vec3 at = home + Vec3(5000.0f, 0.0f, 0.0f);
+        audio.play_sound_3d(kSlap, at);
+        tick(home);
+        tick(home, 0.14f);
+        td_early = voices_of(kSlap).size();
+        tick(home, 0.012f);
+        for (const AudioEngine::PositionalVoice& v : voices_of(kSlap)) {
+            if (v.attenuation_nodes == 1) td_click = v.distance_gain;
+        }
+        tick(home, 0.1f);
+        for (const AudioEngine::PositionalVoice& v : voices_of(kSlap)) {
+            if (v.attenuation_nodes == 2) td_tail = v.distance_gain;
+        }
+        tick(home + Vec3(2500.0f, 0.0f, 0.0f));  // half way there: the first factors stay, the second ones follow
+        for (const AudioEngine::PositionalVoice& v : voices_of(kSlap)) {
+            if (v.attenuation_nodes == 2) td_moved = v.distance_gain;
+        }
+        const float outer = 1.0f - 4900.0f / 10900.0f, inner = 1.0f - 4200.0f / 14200.0f;
+        td_ok = td_early == 0 && near(td_click, outer * outer) && near(td_tail, outer * outer * inner * inner) &&
+                near(td_moved, outer * (1.0f - 2400.0f / 10900.0f) * inner * (1.0f - 1700.0f / 14200.0f));
+    }
+
+    // 9. The level's emitters, heard from a thousand units above each in turn: whichever of them
+    // have a source play at their cue's curve for the distance (the radii drawn once per emitter,
+    // so a ranged MaxRadius gives a gain between the two ends), and none is past its reach.
+    bool emitter_ok = true;
+    int emitters_heard = 0, emitters_checked = 0;
+    float emitter_worst = 0.0f, emitter_sample_distance = 0.0f, emitter_sample_gain = -1.0f;
+    std::string emitter_sample;
+    {
+        audio.stop_all();
+        const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
+        for (size_t e = 0; e < emitters.size(); ++e) {
+            const Vec3 listener = emitters[e].location + Vec3(0.0f, 0.0f, 1000.0f);
+            // (The vehicle packs wait 7 to 15 s before each pass.)
+            for (int step = 0; step < (e == 0 ? 20 : 1); ++step) tick(listener, e == 0 ? 1.0f : 0.0f);
+            for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+                if (!v.emitter) continue;
+                ++emitters_heard;
+                const SoundCueDef* cue = audio.find_cue(v.name);
+                if (!cue || cue->attenuations.size() != 1 || v.attenuation_nodes != 1) continue;
+                const SoundAttenuation& a = cue->attenuations[0];
+                const float lo = attenuation_gain(a.model, v.distance, std::max(a.min_radius[0], a.min_radius[1]),
+                                                  std::min(a.max_radius[0], a.max_radius[1]), a.db_at_max);
+                const float hi = attenuation_gain(a.model, v.distance, std::min(a.min_radius[0], a.min_radius[1]),
+                                                  std::max(a.max_radius[0], a.max_radius[1]), a.db_at_max);
+                ++emitters_checked;
+                const float off = std::max(0.0f, std::max(lo - v.distance_gain, v.distance_gain - hi));
+                emitter_worst = std::max(emitter_worst, off);
+                emitter_ok = emitter_ok && off < 1.0e-4f && v.distance < std::max(a.max_radius[0], a.max_radius[1]);
+                if (emitter_sample.empty() && lo == hi && v.distance > 900.0f && v.distance_gain > 0.0f && v.distance_gain < 1.0f) {
+                    emitter_sample = v.name;
+                    emitter_sample_distance = v.distance;
+                    emitter_sample_gain = v.distance_gain;
+                }
+            }
+        }
+        emitter_ok = emitter_ok && emitters_checked >= 20;
+        // And from far away from all of them, none has a source.
+        tick(home);
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) emitter_ok = emitter_ok && !v.emitter;
+    }
+
+    // 10. An emitter has one source, which plays one wave. Of a cue that mixes layers with different
+    // radii (114 of the factory's 153 emitters: an air vent's hiss, Logarithmic 2 / 1500, with its
+    // hum, Logarithmic 150 / 3000) it plays the layer that carries farthest, and it is given one of
+    // the four sources only while it would be heard. From 150 and from 2000 uu above each of the
+    // factory's emitters in turn: no source is at volume 0, and every such cue is on the curve of its
+    // farthest layer (the cues whose radii are all single values are held against it).
+    bool layered_ok = true;
+    int layered_heard = 0, layered_silent = 0, layered_checked = 0;
+    float layered_worst = 0.0f, layered_sample_gain = -1.0f;
+    std::string layered_sample;
+    {
+        audio.stop_all();
+        audio.load_level_audio(game_root, "Maps/SP06/Factory_p.me1");
+        const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
+        for (const float height : {150.0f, 2000.0f}) {
+            for (size_t e = 0; e < emitters.size(); ++e) {
+                tick(emitters[e].location + Vec3(0.0f, 0.0f, height));
+                for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+                    if (!v.emitter) continue;
+                    ++layered_heard;
+                    if (v.distance_gain <= 0.0f) ++layered_silent;
+                    const SoundCueDef* cue = audio.find_cue(v.name);
+                    if (!cue || cue->attenuations.size() < 2 || v.attenuation_nodes != 1) continue;
+                    bool single_values = true;
+                    float farthest = 0.0f;
+                    for (const SoundAttenuation& a : cue->attenuations) {
+                        single_values = single_values && a.attenuate && a.min_radius[0] == a.min_radius[1] && a.max_radius[0] == a.max_radius[1];
+                        farthest = std::max(farthest, a.max_radius[0]);
+                    }
+                    if (!single_values) continue;
+                    float off = 1.0f;
+                    for (const SoundAttenuation& a : cue->attenuations) {
+                        if (a.max_radius[0] != farthest) continue;
+                        off = std::min(off, std::abs(v.distance_gain - attenuation_gain(a.model, v.distance, a.min_radius[0], a.max_radius[0], a.db_at_max)));
+                    }
+                    ++layered_checked;
+                    layered_worst = std::max(layered_worst, off);
+                    // (The emitter straight below, between its two layers' reach.)
+                    if (layered_sample.empty() && height == 2000.0f && near(v.distance, height, 0.01f)) {
+                        layered_sample = v.name;
+                        layered_sample_gain = v.distance_gain;
+                    }
+                }
+            }
+        }
+        layered_ok = layered_silent == 0 && layered_checked >= 20 && layered_worst < 1.0e-4f;
+    }
+
+    const bool pass = curve_ok && impact_ok && follow_ok && flat_ok && gate_ok && chain_ok && bare_ok && radio_ok && td_ok && emitter_ok &&
+                      layered_ok;
+    std::cout << std::fixed << std::setprecision(4) << "  -> Stage 23 Result: " << (pass ? "PASS" : "FAIL") << " (Curve=" << (curve_ok ? "OK" : "FAIL")
+              << ", Impact=" << (impact_ok ? "OK" : "FAIL") << " [concrete at 480 / 1000 / 2100 uu: " << impact_gain[0] << " / " << impact_gain[1]
+              << " / " << impact_gain[2] << "], Follow=" << (follow_ok ? "OK" : "FAIL") << " [listener at 480 / 1900 / 2500 / 1000 uu: "
+              << follow_gain[0] << " / " << follow_gain[1] << " / " << follow_gain[2] << " / " << follow_gain[3] << "], 2D="
+              << (flat_ok ? "OK" : "FAIL") << ", Gate=" << (gate_ok ? "OK" : "FAIL") << " [0.72 s cue at 2100 uu: " << gate_far
+              << " started, at 1900: " << gate_near << "], Chain=" << (chain_ok ? "OK" : "FAIL") << " [Fire3P at 4000 uu: one node "
+              << chain_one << ", two " << chain_two << "], BareLayer=" << (bare_ok ? "OK" : "FAIL") << " [at 400 uu: " << bare_layer
+              << " beside " << placed_layer << "], Radio=" << (radio_ok ? "OK" : "FAIL") << " [not spatialised, at 2700 uu: " << radio_gain
+              << "], TdAttenuation=" << (td_ok ? "OK" : "FAIL") << " [at 5000 uu: " << td_early << " waves before 0.15 s, then the click at "
+              << td_click << " and the tail at " << td_tail << ", " << td_moved << " heard from 2500 uu], Emitters=" << (emitter_ok ? "OK" : "FAIL") << " [" << emitters_heard << " heard, "
+              << emitters_checked << " held against their curve, worst " << emitter_worst << "; " << emitter_sample << " at "
+              << std::setprecision(1) << emitter_sample_distance << std::setprecision(4) << " uu: " << emitter_sample_gain
+              << "], LayeredEmitters=" << (layered_ok ? "OK" : "FAIL") << " [the factory: " << layered_heard << " heard, " << layered_silent
+              << " at volume 0, " << layered_checked << " held against their farthest layer's curve, worst " << layered_worst << "; "
+              << layered_sample << " at 2000 uu: " << layered_sample_gain << "])"
+              << std::defaultfloat << std::setprecision(6) << std::endl;
+    return pass;
+}
+
+// -----------------------------------------------------------------------------
+// --dump-sound-cues <file>: every SoundCue of every package under CookedPC as the loader reads it,
+// one JSON object a line: the cue's attenuation nodes (class, model, the stored radius pairs, flags,
+// where each sits in the graph) and how many of its waves have none, one or two of them above. For
+// holding the loader against a scan of the cooked data (tools/retail/attenuation_check.py).
+// -----------------------------------------------------------------------------
+static int run_dump_sound_cues(const std::string& game_root, const std::string& out_path) {
+    using namespace me;
+    const fs::path cooked = fs::path(game_root) / "TdGame" / "CookedPC";
+    std::vector<fs::path> files;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(cooked, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        const std::string ext = lower(it->path().extension().string());
+        if (ext == ".upk" || ext == ".me1") files.push_back(it->path());
+    }
+    std::sort(files.begin(), files.end());
+    std::ofstream out(out_path, std::ios::binary);
+    if (!out.is_open()) {
+        std::cerr << "[Cues] cannot write " << out_path << std::endl;
+        return 1;
+    }
+    out << std::setprecision(9);
+    const auto text = [](const std::string& s) {
+        std::string quoted = "\"";
+        for (char c : s) {
+            if (c == '"' || c == '\\') quoted += '\\';
+            quoted += c;
+        }
+        return quoted + "\"";
+    };
+    size_t packages = 0, cue_count = 0, node_count = 0, emitter_count = 0;
+    for (const fs::path& file : files) {
+        const UPKPackage pkg(file.string());
+        if (!pkg.is_valid()) {
+            std::cerr << "[Cues] not read: " << file.string() << std::endl;
+            continue;
+        }
+        ++packages;
+        std::vector<SoundCueDef> cues;
+        std::vector<AmbientEmitterInfo> emitters;
+        pkg.extract_sound_cues_and_ambients(cues, emitters);
+        const std::string rel = fs::relative(file, cooked, ec).generic_string();
+        for (const SoundCueDef& cue : cues) {
+            // Where each attenuation node is first met going down the graph (its depth and the
+            // attenuation nodes above it there), and the waves by how many are above them.
+            std::vector<int> depth(cue.attenuations.size(), -1);
+            std::vector<std::vector<int>> above(cue.attenuations.size());
+            int waves[3] = {0, 0, 0};
+            std::vector<int> path;
+            const auto walk = [&](const auto& self, int node, int level) -> void {
+                if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size()) return;
+                const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
+                if (n.kind == SoundCueNode::Kind::Wave) {
+                    ++waves[std::min<size_t>(path.size(), 2)];
+                    return;
+                }
+                const bool attenuates = n.attenuation >= 0 && static_cast<size_t>(n.attenuation) < cue.attenuations.size();
+                if (attenuates && depth[static_cast<size_t>(n.attenuation)] < 0) {
+                    depth[static_cast<size_t>(n.attenuation)] = level;
+                    above[static_cast<size_t>(n.attenuation)] = path;
+                }
+                if (attenuates) path.push_back(n.attenuation);
+                for (int child : n.children) self(self, child, level + 1);
+                if (attenuates) path.pop_back();
+            };
+            if (!cue.nodes.empty()) walk(walk, 0, 0);
+            out << "{\"pkg\":" << text(rel) << ",\"path\":" << text(cue.full_path) << ",\"group\":" << text(cue.sound_group)
+                << ",\"vol\":" << cue.volume_multiplier << ",\"dur\":" << cue.duration << ",\"looping\":" << (cue.looping ? "true" : "false")
+                << ",\"mixer\":" << (cue.has_mixer ? "true" : "false") << ",\"waves\":[" << waves[0] << "," << waves[1] << "," << waves[2]
+                << "],\"att\":[";
+            for (size_t k = 0; k < cue.attenuations.size(); ++k) {
+                const SoundAttenuation& a = cue.attenuations[k];
+                const auto pair = [&](const char* name, const float* v) { out << ",\"" << name << "\":[" << v[0] << "," << v[1] << "]"; };
+                out << (k ? "," : "") << "{\"n\":" << a.export_index << ",\"c\":\""
+                    << (a.td ? "TdSoundNodeAttenuation" : a.linear_only ? "SoundNodeAmbient" : "SoundNodeAttenuation")
+                    << "\",\"model\":" << static_cast<int>(a.model);
+                pair("min", a.min_radius);
+                pair("max", a.max_radius);
+                pair("lpfmin", a.lpf_min_radius);
+                pair("lpfmax", a.lpf_max_radius);
+                pair("speed", a.speed_of_sound);
+                out << ",\"db\":" << a.db_at_max << ",\"attenuate\":" << (a.attenuate ? "true" : "false") << ",\"spatialize\":"
+                    << (a.spatialize ? "true" : "false") << ",\"lowpass\":" << (a.lowpass ? "true" : "false") << ",\"delay\":"
+                    << (a.delay ? "true" : "false") << ",\"depth\":" << depth[k] << ",\"above\":[";
+                for (size_t j = 0; j < above[k].size(); ++j) {
+                    out << (j ? "," : "") << cue.attenuations[static_cast<size_t>(above[k][j])].export_index;
+                }
+                out << "]}";
+                ++node_count;
+            }
+            out << "]}\n";
+            ++cue_count;
+        }
+        for (const AmbientEmitterInfo& em : emitters) {
+            out << "{\"pkg\":" << text(rel) << ",\"emitter\":" << text(em.cue_name) << ",\"wave\":" << text(em.wave_name) << ",\"at\":["
+                << em.location.x << "," << em.location.y << "," << em.location.z << "],\"vol\":" << em.volume << "}\n";
+            ++emitter_count;
+        }
+    }
+    std::cout << "[Cues] " << packages << " packages of " << files.size() << ": " << cue_count << " sound cues, " << node_count
+              << " attenuation nodes, " << emitter_count << " ambient sound actors -> " << out_path << std::endl;
+    return 0;
+}
+
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
@@ -2313,9 +2766,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
         std::cout << "  -> Stage 22 Result: " << (s22_pass ? "PASS" : "FAIL") << std::endl;
     }
 
+    // Stage 23: the loudness of sounds at a place (oracle_sound_attenuation above).
+    std::cout << "[Oracle Stage 23] Testing Sound Attenuation with Distance (the cues' own curves, per wave)..." << std::endl;
+    const bool s23_pass = oracle_sound_attenuation(game_root);
+
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2463,6 +2920,18 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     // effect and the sound of a body.
     const char* body_spec = std::getenv("ME_SHOT_BODY");
     const float body_at = body_spec ? static_cast<float>(std::atof(body_spec)) : 0.0f;
+    // ME_AUDIO_DEBUG=1: the shots' impact sounds and the level's emitters go through the audio
+    // engine (with no device), heard from the view, and it prints the gain each of them gets.
+    std::unique_ptr<AudioEngine> audio;
+    if (std::getenv("ME_AUDIO_DEBUG")) {
+        audio = std::make_unique<AudioEngine>();
+        audio->init(true);
+        audio->load_stock_audio(game_root);
+        audio->load_level_audio(game_root, map_rel);
+        for (const PhysicalMaterialInfo& pm : scene.physical_materials) {
+            if (!pm.impact_sound.empty() && !audio->has_cue(pm.impact_sound)) audio->load_cue_bank(game_root, pm.impact_sound_package);
+        }
+    }
     if (movers) {
         for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
             const BargeDoorInstance& door = scene.barge_doors[d];
@@ -2520,6 +2989,15 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
                       << " impact effects, " << scene.dynamic_decals.size() - holes << " bullet holes, " << heard.size() << " impact sounds"
                       << std::endl;
             scene.active_tracers.clear();
+            if (audio) {
+                for (const SimSoundEvent& ev : heard) audio->play_sound_3d(ev.cue, ev.location);
+            }
+        }
+        if (audio) {
+            Vec3 ear;
+            Rotator ear_rot;
+            renderer.player_camera(tel, ear, ear_rot);
+            audio->update(dt, ear, ear_rot.forward(), ear_rot.up(), 0.0f, false);
         }
         update_impact_effects(scene, dt, tel.position);
         now += dt;
@@ -3186,6 +3664,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         trace_file << std::defaultfloat << std::setprecision(6);
     };
 
+    // The audio engine's frame. The listener is the pawn's location plus her eye height, facing as
+    // the view does, in play and behind a menu alike: the update starts the sounds the frame asked
+    // for at a place and sets the ones already playing by their distance from it.
+    auto update_audio = [&](float dt, float player_speed, bool reaction_active) {
+        const PlayerTelemetry& t = controller.get_telemetry();
+        const Rotator ear_rot = Rotator::from_degrees(t.pitch_deg, t.yaw_deg, t.camera_roll_deg);
+        audio.update(dt, t.position + Vec3(0.0f, 0.0f, t.eye_height), ear_rot.forward(), ear_rot.up(), player_speed, reaction_active);
+    };
+
     EMovement prev_state = EMovement::MOVE_Walking;
     int prev_checkpoint = 0;
     int intro_handover_frames = 0;  // frames since a cutscene handed the player over
@@ -3406,7 +3893,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 frontend_renderer->render_overlay(frontend->frame(), frontend_rgba);
                 renderer.set_frontend_frame(frontend_rgba.data(), kFrontendW, kFrontendH, /*overlay=*/true, frontend->pause_saturation());
             }
-            audio.update(dt, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), 0.0f, false);
+            // (The level may have begun play above, from the menu, with its script asking for sounds at a
+            // place: they start here, heard from where she stands. A menu has no running speed.)
+            update_audio(dt, 0.0f, false);
             renderer.render_frame(active_scene, controller.get_telemetry());
             write_trace(controller.get_telemetry(), /*in_frontend=*/frontend_active);
 
@@ -4266,11 +4755,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         // Update 3D listener and dynamic audio stems
         audio.set_menu_music(renderer.is_menu_open());
-        Vec3 ear = tel.position + Vec3(0, 0, tel.eye_height);
-        Rotator ear_rot = Rotator::from_degrees(tel.pitch_deg, tel.yaw_deg, tel.camera_roll_deg);
         // A cutscene's motion is not the player's running: no speed-driven wind or breathing for it.
-        audio.update(dt, ear, ear_rot.forward(), ear_rot.up(),
-                     (cutscene_player.is_playing() || into_cutscene_pending) ? 0.0f : tel.speed_2d,
+        update_audio(dt, (cutscene_player.is_playing() || into_cutscene_pending) ? 0.0f : tel.speed_2d,
                      tel.reaction_active && !cutscene_player.is_playing());
 
         // The screen fade (TdHUD): in from white when the player starts or restarts, and whatever
@@ -4331,8 +4817,10 @@ int main(int argc, char* argv[]) {
     std::string game_root = me::default_game_root();
     bool verify_all = false;
     bool verify_script = false;  // the level script's stage of the oracle, alone
+    bool verify_sound = false;   // and the sound attenuation stage
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
+    std::string cue_dump;      // --dump-sound-cues <file>
     std::string script_json = "";
     int initial_chapter = 0;
     std::string custom_level = "";
@@ -4359,8 +4847,12 @@ int main(int argc, char* argv[]) {
             std::ofstream(dir + "/material_check.metal", std::ios::binary) << me::material_check_msl();
             std::cout << "Wrote builtin.metal and material_check.metal to " << dir << std::endl;
             return 0;
+        } else if (arg == "--dump-sound-cues") {
+            if (i + 1 < argc) cue_dump = argv[++i];
         } else if (arg == "--verify-script") {
             verify_script = true;
+        } else if (arg == "--verify-sound") {
+            verify_sound = true;
         } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
@@ -4395,9 +4887,11 @@ int main(int argc, char* argv[]) {
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
+                      << "  --verify-sound           Run only its sound attenuation stage (gain with distance, per cue)\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
+                      << "  --dump-sound-cues <file> Write every sound cue's attenuation nodes as the loader reads them, headless\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
                       << "  --test-replay <trace>    Replay physics trace headless\n"
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
@@ -4418,6 +4912,13 @@ int main(int argc, char* argv[]) {
 
     if (!shots_map.empty()) {
         return run_intro_shots(game_root, shots_map, shots_times, shots_dir);
+    }
+    if (!cue_dump.empty()) {
+        return run_dump_sound_cues(game_root, cue_dump);
+    }
+    if (verify_sound) {
+        std::cout << "[Oracle Stage 23] Testing Sound Attenuation with Distance (the cues' own curves, per wave)..." << std::endl;
+        return oracle_sound_attenuation(game_root) ? 0 : 1;
     }
     if (!handover_map.empty()) {
         me::Renderer renderer;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../math/types.hpp"
+#include "attenuation.hpp"
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,6 +91,11 @@ public:
 
     // Playback APIs (supports both direct wave names and UE3 SoundCue names/paths)
     void play_sound(const std::string& name, float volume = 1.0f, float pitch = 1.0f);
+    // A sound at a place in the world. The next update() starts it, when it knows where the
+    // listener is: each wave the cue plays gets the fall-off with distance of the attenuation
+    // nodes above it in the cue's graph, followed while it plays, and is placed in the world only
+    // if one of them spatialises it. A cue that lasts at most a second is not started at all when
+    // the listener is not within its MaxAudibleDistance, as UAudioDevice::CreateComponent refuses it.
     void play_sound_3d(const std::string& name, const Vec3& world_pos, float volume = 1.0f, float pitch = 1.0f);
     void play_vo(const std::string& name, float volume = 1.0f);
     void play_level_loaded_cues();
@@ -128,9 +135,30 @@ public:
     bool load_cue_bank(const std::string& game_root, const std::string& package);
     // Stops every source that is playing that cue.
     void stop_cue(const std::string& group_and_name);
+    // USoundCue::MaxAudibleDistance of a cue (uu): the largest MaxRadius of its attenuation nodes,
+    // kSoundWorldMax when it has none or is not loaded. What APlayerController::HearSound holds
+    // an Actor.PlaySound against, whatever the cue's length.
+    [[nodiscard]] float cue_max_audible_distance(const std::string& group_and_name) const;
+
+    // What the sounds at a place are doing now: one entry per wave playing from the pool, and one
+    // per level emitter that has a source. It is the same with and without an audio device, so the
+    // oracle can hold the gains against the curves; ME_AUDIO_DEBUG=1 prints them as they change.
+    struct PositionalVoice {
+        std::string name;            // the cue (or wave) asked for
+        std::string clip;            // the wave playing
+        Vec3 position{0.0f, 0.0f, 0.0f};
+        float distance = 0.0f;       // from the listener of the last update (uu)
+        float distance_gain = 1.0f;  // the product of its attenuation nodes' factors
+        float gain = 0.0f;           // what the source is set to
+        bool spatialized = false;    // placed in the world; false: source-relative, at the listener
+        size_t attenuation_nodes = 0;
+        bool emitter = false;        // a level AmbientSound
+    };
+    [[nodiscard]] std::vector<PositionalVoice> positional_voices() const;
 
     // A log of every sound asked to play (the cue or wave name it resolved from), for --trace.
-    // It records the request, so it is the same with and without an audio device.
+    // It records the request, so it is the same with and without an audio device. A sound at a
+    // place is entered by the update() that starts it, and not at all if it is refused there.
     struct PlayEvent {
         std::string name;
         const char* kind = "sound";  // "sound", "sound3d" or "vo"
@@ -152,6 +180,12 @@ public:
     [[nodiscard]] size_t get_clip_count() const { return sound_clips_.size(); }
     [[nodiscard]] size_t get_cue_count() const { return sound_cues_.size(); }
     [[nodiscard]] size_t get_ambient_emitter_count() const { return ambient_emitters_.size(); }
+    [[nodiscard]] const std::vector<AmbientEmitterInfo>& get_ambient_emitters() const { return ambient_emitters_; }
+    // The cue a name ("Group.Name" or bare) is loaded as, null if none.
+    [[nodiscard]] const SoundCueDef* find_cue(const std::string& name) const {
+        const auto it = sound_cues_.find(name);
+        return it != sound_cues_.end() ? &it->second : nullptr;
+    }
 
     // Synthesize procedural fallback clips for 100% offline/fallback reliability
     void synthesize_fallback_clips();
@@ -159,6 +193,11 @@ public:
 private:
     bool init_openal();
     void cleanup_openal();
+    // True when sounds reach an OpenAL device (false headless, and in a build without OpenAL).
+    [[nodiscard]] bool has_device() const;
+    // The pool slot a new sound gets: the first that is not playing, else the next in turn, whose
+    // sound is cut. What the slot was playing is forgotten.
+    size_t acquire_slot();
     uint32_t acquire_source();
     uint32_t get_or_create_buffer(const SoundClip& clip, bool force_mono_for_3d = false);
     void invalidate_cached_buffer(const std::string& key);
@@ -179,7 +218,9 @@ private:
     // Doors.Door_Hit plays A_CXP_Plaza.Door_RAW.Door_Hit). UE3 loads the import's package with
     // the cue; this loads just the referenced waves that are not loaded yet.
     void load_imported_waves(const std::string& game_root);
-    const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const;
+    // `out_cue`, when given, is set to the cue the name resolved through (null for a bare wave).
+    const SoundClip* resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch,
+                                         const SoundCueDef** out_cue = nullptr) const;
     const SoundClip* pick_first_available_clip(std::initializer_list<const char*> candidates) const;
 
     // Layered cues (a SoundNodeMixer in the graph, e.g. Doors.Door_Barge = impact + a delayed
@@ -189,20 +230,67 @@ private:
         float delay = 0.0f;
         float volume = 1.0f;
         float pitch = 1.0f;
+        std::vector<int> attenuations;  // the attenuation nodes above the wave (SoundCueDef::attenuations), root first
     };
     struct PendingVoice {
         CueVoice voice;
         bool positional = false;
         Vec3 position{0.0f, 0.0f, 0.0f};
+        VoiceAttenuation attenuation;  // positional: what `voice.attenuations` came to for this play
+        std::string name;              // the cue asked for
     };
+    // A sound asked for at a place, waiting for the update that knows where the listener is.
+    struct PositionalRequest {
+        std::string name;
+        Vec3 position{0.0f, 0.0f, 0.0f};
+        float volume = 1.0f;
+        float pitch = 1.0f;
+    };
+    // What a pool source is playing, when it is a sound at a place: update() gives it the gain its
+    // distance from the listener asks for, every time, as retail's node graph does.
+    struct SourceVoice {
+        bool positional = false;
+        Vec3 position{0.0f, 0.0f, 0.0f};
+        float volume = 1.0f;           // before the distance: the cue's, its nodes' and the bus's
+        VoiceAttenuation attenuation;
+        float remaining = 0.0f;        // without a device: the seconds it would still play
+        float logged_gain = -1.0f;     // ME_AUDIO_DEBUG: the gain last printed
+        PositionalVoice info;
+    };
+    // A MinRadius and a MaxRadius drawn for one play (and a TdSoundNodeAttenuation's SpeedOfSound).
+    struct DrawnRadii {
+        float min_radius = 0.0f;
+        float max_radius = 0.0f;
+        float speed_of_sound = 0.0f;
+    };
+    // One play's draw for every attenuation node of the cue, in the order of SoundCueDef::attenuations.
+    [[nodiscard]] std::vector<DrawnRadii> draw_cue_radii(const SoundCueDef& cue) const;
+    // What the attenuation nodes `path` (root first) do to a wave played at `world_pos` with those
+    // radii. A TdSoundNodeAttenuation's hold-back, its first distance over the speed of sound, is
+    // added to `io_delay`.
+    [[nodiscard]] VoiceAttenuation make_voice_attenuation(const SoundCueDef& cue, const std::vector<int>& path,
+                                                          const std::vector<DrawnRadii>& radii, const Vec3& world_pos,
+                                                          float* io_delay) const;
+    // The attenuation nodes above the wave `wave` in the cue's graph, root first, where the graph
+    // first reaches it; above the graph's first wave when it has no wave of that name (a
+    // concatenator's stitched clip carries the cue's name).
+    [[nodiscard]] std::vector<int> wave_attenuations(const SoundCueDef& cue, const std::string& wave) const;
+    // UAudioDevice::CreateComponent's test (through USoundCue::IsAudibleSimple) for a cue at a place.
+    [[nodiscard]] bool location_is_audible(const SoundCueDef& cue, const Vec3& at) const;
+    void start_positional(const PositionalRequest& request);
+    void update_voice_gains(float dt);
+    void update_ambient_emitters(float dt);
     // A level AmbientSound whose cue waits between sounds (a SoundNodeDelay under its
     // SoundNodeLooping, e.g. the vehicle packs: 7 to 15 s, then one of 38 passes, brakes and
     // horns): the next sound it will play and how long until then. False for a cue that just loops.
     bool next_ambient_voice(size_t slot, const AmbientEmitterInfo& em);
+    // `path` is the walk's own list of the attenuation nodes above `node`; pass it empty.
     void collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
-                            std::vector<CueVoice>& out) const;
+                            std::vector<CueVoice>& out, std::vector<int>& path) const;
     bool play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch);
-    void start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch);
+    // Starts a wave on a pool source: in 2D, or at `world_pos` with `attenuation`.
+    void start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch,
+                     const VoiceAttenuation* attenuation = nullptr, const std::string& name = std::string());
 
     bool decode_ogg_to_pcm(const uint8_t* ogg_data, size_t ogg_size,
                            std::vector<int16_t>& out_pcm, int& out_rate, int& out_channels);
@@ -225,6 +313,10 @@ private:
     static constexpr size_t kSourcePoolSize = 32;
     uint32_t sources_[kSourcePoolSize] = {0};
     size_t next_source_ = 0;
+    SourceVoice source_voices_[kSourcePoolSize];              // what each is playing, when it is a sound at a place
+    std::vector<PositionalRequest> positional_requests_;      // play_sound_3d calls since the last update
+    Vec3 listener_pos_{0.0f, 0.0f, 0.0f};                     // the listener of the last update (uu)
+    bool debug_log_ = false;                                  // ME_AUDIO_DEBUG
 
     // 4 Dynamic Solar Fields music stem sources:
     // 0: Ambient (ambience_01 / Menu), 1: Tension/Puzzle (ambience_011 / Puzzle_01),
@@ -257,6 +349,29 @@ private:
     enum class AmbientMode : uint8_t { Loop, Waiting, Playing, Silent };
     AmbientMode ambient_mode_[kAmbientPoolSize] = {};
     CueVoice ambient_voice_[kAmbientPoolSize];
+    VoiceAttenuation ambient_attenuation_[kAmbientPoolSize];  // of the wave each is playing
+    bool ambient_sounding_[kAmbientPoolSize] = {};            // a wave was started on it
+    float ambient_remaining_[kAmbientPoolSize] = {};          // without a device: the seconds a one-shot would still play
+    float ambient_logged_gain_[kAmbientPoolSize] = {};        // ME_AUDIO_DEBUG: the gain last printed
+    PositionalVoice ambient_info_[kAmbientPoolSize];
+    // An emitter's cue is one play that starts with the level and lasts as long as it does: the
+    // radii of its attenuation nodes are drawn once, the first time the emitter is looked at, and
+    // not again when it comes back into the pool. Retail plays every layer of the cue. An emitter
+    // here has one source, which plays one wave, so of a cue that mixes layers under different
+    // attenuation nodes (767 of the 1,650 emitters of the *_Aud files; in 701 the layers' MaxRadius
+    // differ: a vent's hiss to 1500 uu with its hum to 3000) it plays the layer that carries
+    // farthest, the one heard wherever retail's emitter is. `waves` are that layer's and
+    // `attenuation` the nodes above it with the radii drawn: the emitter is in the running for a
+    // source while they leave it any volume at all.
+    struct EmitterPlay {
+        bool drawn = false;
+        bool has_cue = false;
+        std::vector<DrawnRadii> radii;
+        std::vector<std::string> waves;                       // sound_clips_ keys; none: whatever its name resolves to
+        VoiceAttenuation attenuation;
+    };
+    std::vector<EmitterPlay> ambient_plays_;                  // by ambient_emitters_ index
+    const EmitterPlay& emitter_play(size_t emitter);
 
     // Stamina-coupled Faith breathing cadence state (A_Character_Female_01.upk)
     float breath_timer_ = 0.0f;

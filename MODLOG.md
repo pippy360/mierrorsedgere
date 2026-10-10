@@ -1756,3 +1756,207 @@ is exercised by no level, and the one barge door's that is (Stormdrain's, 2 tria
 picture. On BSP a bullet hole still lies on all the BSP in
 its box. The computed decals still lie on more than the game's do (the own-level and collision rules above
 would leave 167 of 199 without a receiver): not changed without a retail picture. In `TODO.md`.
+
+---
+
+## 37. Sounds at a place fall off with distance by their cue's own nodes (agent/sound-attenuation, 2026-10-10)
+
+Section 20's audit left the "Distance" item: no attenuation radius was ever read, every cue and emitter
+had 200 / 3000 uu, and a sound at a place used OpenAL's inverse model with a fixed 2.5 m / 35 m that never
+reaches silence. Section 32 left a bullet's impact sound with that fall-off. `docs/AUDIO_SYSTEM_RE.md`
+section 3.2 has the rules.
+
+### 37.1 What the game does (the executable's code, every cooked package)
+- The audio device's init calls `alDistanceModel(AL_NONE)` (0x010D97EC) and sets no reference distance,
+  maximum distance or roll-off on any source: OpenAL only pans. The gain is the sound nodes' arithmetic,
+  redone on every audio update.
+- `USoundNodeAttenuation::ParseNodes` (0x00B7DD60): the radii are drawn from their distributions once per
+  play; the distance is from the listener to the sound's current location; with `bAttenuate`, at or
+  beyond the `MaxRadius` drawn the volume is 0, at or inside `MinRadius` it is unchanged, between them one
+  of five models multiplies it (Linear, Logarithmic, Inverse, LogReverse, NaturalSound with
+  `dBAttenuationAtMax`; constants 0.25, 0.02, 0.05, 10.0). `bSpatialize` decides whether the wave is
+  placed in the world at all; a wave with no such node above it plays source-relative at the listener.
+- 1,828 `SoundNodeAttenuation` and 6 `TdSoundNodeAttenuation` nodes in 2,030 cues: 1,588 cues have one,
+  338 none, 104 several, on the inputs of a mixer with different radii. In 17 cues two are on one branch
+  (their factors multiply) and 7 keep a layer with none above it. 62 `MinRadius` and 101 `MaxRadius` are
+  ranges; three tables are stored higher value first.
+- `UTdSoundNodeAttenuation::ParseNodes` (0x0122AE80) holds its branch back by the first distance over
+  `SpeedOfSound` (`bDelay`) and multiplies by the linear factor of that first distance on top of its
+  parent's model. `USoundNodeAmbient::ParseNodes` (0x00B7E6B0, the two `AmbientSoundSimple` actors) is
+  linear only.
+- A cue's `MaxAudibleDistance` is the largest `MaxRadius` of its nodes (0x00B76C80). `CreateComponent`
+  (0x00B6B550) makes no component for a cue of at most 1 s at a place no listener is strictly within it of;
+  `Actor.PlaySound` is dropped by `HearSound` (0x00EF4480) beyond it whatever the cue's length.
+
+### 37.2 Changes
+- **Data** (`src/math/types.hpp`): `SoundAttenuation` (model, the radius pairs in stored order,
+  `dBAttenuationAtMax`, the three flags, the low-pass radii, `bDelay`, `SpeedOfSound`);
+  `SoundCueNode::Kind::Attenuation` and `Ambient` with an index into `SoundCueDef::attenuations` (a node two
+  branches share is one entry); `SoundCueDef::duration` and `max_audible_distance`. The cue's and the
+  emitter's `min_radius` / `max_radius` (always 200 / 3000) are gone.
+- **Loader** (`src/assets/upk_loader.cpp`): `walk_sound_node` reads `SoundNodeAttenuation`,
+  `TdSoundNodeAttenuation` and `SoundNodeAmbient` (whose wave is its `Wave` property, not a child node) over
+  their class defaults, and the cue's `Duration`. The old read tested a struct property for an object
+  reference and never ran.
+- **The curve** (`src/audio/attenuation.hpp`, new): `attenuation_gain`, the executable's arithmetic and
+  constants (the linear and inverse models in single precision as the game's SSE code has them, the three
+  x87 ones in double, rounded once); `draw_radius`; `VoiceAttenuation`, the nodes above one wave and their
+  product.
+- **Playing** (`src/audio/audio_engine.*`): `alDistanceModel(AL_NONE)`, and no reference or maximum
+  distance on any source. `play_sound_3d` queues the sound and the frame's `update()` starts it once the
+  listener is known (`start_positional`): `CreateComponent`'s test, one draw of the cue's radii, and for
+  each wave the nodes on its own way down the graph (`collect_cue_voices` carries the path; a single-wave
+  cue looks its wave's path up, `wave_attenuations`). A pool source keeps what it plays (`SourceVoice`) and
+  `update_voice_gains` sets it to its volume times the nodes' product for the listener's distance, every
+  update. A wave that is attenuated but not spatialised plays source-relative at that gain; one with no
+  node above it plays as a 2D sound does. `TdSoundNodeAttenuation`'s hold-back and first-distance factor are
+  in the same record. `play_sound`, `play_vo`, `play_cue`, the footsteps, the music and the wind are as they
+  were. All of it runs without an audio device too, so that it can be checked.
+- **Emitters** (`update_ambient_emitters`, was step 5 of `update()`): an emitter's radii are drawn once, it
+  is a candidate while the listener is inside the largest of them (was: within 3674 uu, whatever the cue),
+  and its source's gain is multiplied by its wave's nodes' product. The two `AmbientSoundSimple` actors now
+  have a wave to play.
+- **Checks** (`src/main.cpp`, `tools/retail/attenuation_check.py`): oracle stage 23, alone as
+  `--verify-sound`; `--dump-sound-cues <file>`, every cue of every package as the loader reads it, and the
+  script that compares it with a scan of the cooked data; `ME_AUDIO_DEBUG=1`, which with `--intro-shots`
+  also puts the shots' impact sounds and the level's emitters through the audio engine.
+
+### 37.3 Checked (Windows, no audio device)
+- **The loader against the research scan** (`v_raw.json`, an independent walk of the tagged properties of
+  2,406 packages): 19,363 of 19,363 cue records agree in every compared value, 19,316 of 19,316 nodes
+  (class, model, the four radius pairs in stored order, dB, three flags, `bDelay`, depth, the nodes above),
+  2,030 of 2,030 different cues in all their copies; the same 17 cues have two nodes on a branch and the
+  same 7 a bare layer. Changed by hand, a radius off by 0.01, a flipped flag, a dropped node and a
+  `Duration` off by 0.001 are each reported. Against the first scan's `attenuation_table.json` (2,042 keys,
+  15 of them without their package and 12 cues under two keys, as the review of that research found): the
+  keys reach all 2,030 cues and 2,042 of 2,042 agree. Counted from the port's own dump: Linear 1,399,
+  NaturalSound 189, Logarithmic 117, Inverse 91, LogReverse 32; 74 nodes with `bAttenuate` off, 379 with
+  `bSpatialize` off; 23 radius values stored higher first.
+- **The curve** (stage 23): 19 values worked by hand from the formulas, which the research's emulation of
+  the function's bytes also gave, to 0.00005: Linear 10 / 2000 at 480, 1000, 1900 and 2000 uu 0.7638,
+  0.5025, 0.0503, 0; Logarithmic 500 / 2000 at 1000 uu 0.5; Inverse 100 / 2000 at 1000 and 1999 uu 0.8 and
+  0.4002, then 0; LogReverse 400 / 5000 at 2700 uu 0.6926; NaturalSound -60 dB at 2700 uu 0.0316; equal
+  radii (300 / 300) 1 at 299 uu and 0 at 300.
+- **The engine** (stage 23, sounds played at measured distances and the gain each source would be set to
+  read back): a concrete impact at 480 / 1000 / 2100 uu 0.7638 / 0.5025 / 0 (started, silent); the same
+  sound as the listener moves to 1900, 2500 and back to 1000 uu 0.0503, 0, 0.5025; a 0.72 s cue at 2100 uu
+  not started, at 1900 started; a pistol's `Fire3P` at 4000 uu 0.9744 on the layer under one node and
+  0.8733 (0.9744 x 0.8963) under two; the soft hand step's bare layer 1.0 and not placed beside 0.5714; a
+  radio line at 2700 uu 0.5 and not placed; the slap-back echo at 5000 uu silent for 0.15 s, then its click
+  at 0.3030 (0.5505 squared) and its tail at 0.1503, 0.2661 heard from 2500 uu; 61 emitter gains of the
+  training area on their cue's curve (`WindHard` at 1000 uu 0.5025). Playing the same cue with `play_sound`
+  adds nothing to the list of followed sounds. The stage also passed twelve runs with the C random
+  generator seeded differently (through a switch that was taken out again: which wave a cue picks is random).
+- **Through the game's own path** (`--intro-shots` with `ME_SHOT_FIRE=0`, `ME_AUDIO_DEBUG=1`, the Prologue,
+  `ME_SHOT_STAND="-6632,-2210,5640"`): shots at a door 138 uu off 0.936, at walls 636, 673, 1199, 1208
+  and 1517 uu off 0.685, 0.667, 0.403, 0.398 and 0.243, each `1 - (D - 10) / 1990`; four on a wall 2200 uu
+  off are not played (the impact code's own test). The fans beside her (Logarithmic, 600 to a `MaxRadius`
+  drawn at 2318 and 2438) at 735 and 801 uu 0.850 and 0.794. In Escape, 725 uu from the
+  `AmbientSoundSimple` siren: Linear 400 / 5000, 0.929.
+- **`--verify-all`**: ALL SYSTEMS PASS, 21 stages. The 17 screenshots it writes are byte for byte the tracked
+  ones.
+
+### 37.4 Not done
+The low pass with distance is read and kept but not applied (whether retail's PC device uses it is not
+known). Occlusion, the sound groups' `MaxUpdateDistance` and `TdSoundNodeRelativePosition` are not done; the
+listener is the pawn's location plus eye height. `HearSound`'s test is applied to bullet impacts only. The
+emitter pool still plays one wave of a layered cue. Nothing was listened to: every figure above is a gain
+read back with no audio device, and nothing was held against a retail recording. macOS was not compiled:
+the check needs a pushed branch, which this task was not to make. In `TODO.md`.
+
+---
+
+## 38. Sounds at a place, after review: the listener behind a menu, emitters with layers (agent/sound-attenuation, 2026-10-10)
+
+Three reviews of section 37's work found nine things, which come to four: a menu's frame gave the audio
+engine a listener at the world's origin, a level emitter could hold one of the four emitter sources while
+silent, two documents said more than had been read, and a build without OpenAL had a new warning. All nine
+held and are fixed here. `docs/AUDIO_SYSTEM_RE.md` section 3.2 has the rules.
+
+### 38.1 What the game does (Engine.u's bytecode, the cooked `*_Aud` files)
+- `PlayerController.ClientHearSound` (Engine.u, read with `tools/uscript_bytecode.py`) makes the component
+  of a sound `HearSound` let through: at `SourceLocation` when the sound has no actor; with no place and
+  `bAllowSpatialization = false` when its actor is the view target or the controller; else on the actor (at
+  `SourceLocation` when one is given that is not the actor's own). `USoundNodeAttenuation::ParseNodes` does
+  nothing for a component with that flag clear (0x00B7DD68), and `Default__AudioComponent` has it on. An
+  occluded sound gets `VolumeMultiplier *= 0.5`. Section 37's document had stated the flag's part without a
+  source.
+- `PlayerController.Kismet_ClientPlaySound` makes its component with
+  `SourceActor.CreateAudioComponent(ASound, false, true)`, no location, and clears the same flag when passed
+  `bSuppressSpatialization`. `Actor.PlaySound` and `Actor.CreateAudioComponent` are natives.
+- Still not read: that `Actor.PlaySound` is what calls `HearSound` (0x00EF4480 sits in three vtables,
+  nothing calls it directly), and that the float `IsAudibleSimple` compares with 1.0 is the cue's duration
+  (the cue's virtual at vtable offset 0x114, named by its place in stock Unreal Engine 3).
+- The emitters' cues: of the 1,650 `AmbientSound` actors in the `*_Aud` files 767 have a cue with two
+  attenuation nodes, each over its own input of a mixer under the loop, and the other 883 one node above
+  all their waves. None of the 767 has a delay node, two nodes on one branch or `bAttenuate` off, and every
+  wave of every emitter's cue is loaded. In 701 the two `MaxRadius` differ: `A_Prop_AirPipe_Indoor` (207
+  emitters) Logarithmic 150 / 3000 with Logarithmic 2 / 1500, `A_Prop_AirVent_Indoor` (111) and
+  `A_Prop_AirVent_Low_Indoor` (83) Logarithmic 2 / 1500 with Logarithmic 150 / 3000, `A_Prop_ACAiry_Indoor`
+  (78) Logarithmic 1 / 2000 with Linear 150 / 4000. In 59 of the 767 the two ranges overlap, so the draw
+  decides which layer carries farther; 64 tie exactly (61 `A_Prop_WaterPipeBright_Indoor`: LogReverse
+  50 / 1000 with NaturalSound 50 / 1000). Retail plays both layers, each at its own node's volume.
+
+### 38.2 Changes
+- **The listener** (`src/main.cpp`): the loop's front-end and pause branch called `audio.update` with the
+  listener at (0, 0, 0). Since section 37 that update starts the sounds asked for at a place and sets the
+  playing ones by their distance, so a sound the level's script asked for as play began from a menu
+  (`begin_level_play` runs inside that branch on Continue, and on New Game or a chapter with no loading
+  movie) was tested and started from the origin, and under the pause menu every sound at a place was set by
+  its distance from the origin. Both branches now go through one `update_audio`, which takes the pawn's
+  location plus her eye height and the view's direction from the telemetry.
+- **Emitters** (`src/audio/audio_engine.*`): `EmitterRadii` is `EmitterPlay`: the radii drawn for the
+  emitter, the waves of the layer it plays and the nodes above them. A layer is the cue's loaded waves
+  under one set of nodes; `emitter_play` takes the one that carries farthest with the radii drawn (the
+  smallest `MaxRadius` of the attenuating nodes above it), the first in the graph on a tie. An emitter that
+  loops a wave picks it among that layer's (it was any wave of the cue, so about half the vents played the
+  layer that is silent past 1500 uu). It is a candidate for a source while that layer's product is above 0 at the
+  listener's distance (it was: while inside the largest `MaxRadius` of any node of the cue, which also kept
+  a LogReverse emitter in the running between `Max - Min` and `Max`, where its volume is 0).
+- **Without OpenAL**: `voice_pitch` in `update_ambient_emitters` is marked used in the block's `#else`.
+- **Oracle** (`src/main.cpp`): stage 23 has a tenth part, the factory's emitters heard from 150 and from
+  2000 uu above each in turn: no source at volume 0, every two-layer cue with single-valued radii on the
+  curve of its farthest layer.
+- **Documents**: `docs/AUDIO_SYSTEM_RE.md` section 3.2 names where `bAllowSpatialization` is cleared, marks
+  what was not read (the `PlaySound` to `HearSound` call, the duration behind `IsAudibleSimple`, the uniform
+  draw of a radius) and describes the emitters' layer; `docs/RENDERING_RE.md` section 13 no longer says the
+  impact sound's start test is an unread stock rule of the audio device.
+
+### 38.3 Checked (Windows, no audio device)
+- **The listener**, in the engine alone, the player at (-6632, -2210, 5640): with a menu frame's update at
+  the origin a concrete impact playing 300 uu from her reads 8762.9 uu and gain 0, and a 0.72 s cue asked
+  for 300 uu away on that frame is never started; with her own position it stays at 0.8543 and the cue
+  starts at 0.8543. The loop itself was not run (it needs the window): the change there is by reading.
+- **Emitters, every level**: heard from 100, 150, 1000 and 2000 uu above each emitter of the eleven maps in
+  turn (6,600 places), the sources that sound at distance gain 0 were 1,922 of 17,940 before and are 0 of
+  17,894. One reviewer's count, 150 uu above each emitter, of places where all four sources sound and one is
+  at 0 while an emitter at 0.1 or more has none: the Prologue 4, the factory 17, the convoy 19, now 0 in all
+  six maps walked. Another's, 100 uu above, by the source's gain being at most 0.001: the Prologue 10, the
+  mall 12, the cranes 4, now 2, 0 and 1; the three left are above 0 (two at a distance gain of 0.0016, 1997
+  uu into a `MaxRadius` of 2000, one in the last decibels of a NaturalSound curve).
+- **Stage 23**, the new part: 937 emitter sources heard, 0 at volume 0, 884 held against their farthest
+  layer's curve, worst difference 0.0000; `A_Prop_AirVent_Indoor` straight below at 2000 uu 0.1353
+  (`ln(2000 / 3000) / ln(150 / 3000)`). With section 37's engine under the same stage it fails: 210 of 935
+  at volume 0, worst difference 0.6851. The rest of the stage is as in section 37.
+- **Through the game's own path** (`--intro-shots`, `ME_AUDIO_DEBUG=1`, the Prologue): from
+  `ME_SHOT_STAND="-8784,-5296,7400"` two `A_Prop_AirVent_Indoor` 2168 and 2396 uu off play a wave of the hum
+  on Logarithmic 150 / 3000 at 0.1084 and 0.0750. From section 37's stand the shots at 673, 1199, 1207,
+  1208 and 1517 uu are at 0.667, 0.403, 0.398, 0.398 and 0.243 and the fans at 735 and 801 uu at 0.850 and
+  0.794, as before.
+- **The loader** is untouched: its dump of every cue is byte for byte section 37's, and agrees with the
+  scan on 19,363 of 19,363 cue records, 19,316 of 19,316 nodes and 2,030 of 2,030 cues (2,042 of 2,042
+  keys of the first scan's table).
+- **Warnings**: `g++ -std=c++20 -Wall -Wextra -Wno-unused-parameter -DME_NO_OPENAL -fsyntax-only` on
+  `audio_engine.cpp` gave `variable 'voice_pitch' set but not used` at section 37 and gives nothing now
+  beyond the three pragma lines it gives on `main`; with OpenAL, and for `main.cpp`, nothing.
+- **`--verify-all`**: ALL SYSTEMS PASS, every stage from 1 to 23. The 17 screenshots it writes are byte for
+  byte the tracked ones.
+
+### 38.4 Not done
+The game's loop was not run, so the menu's listener is checked in the engine and by reading only. The four
+emitter sources still go to the nearest emitters that are heard, not the loudest: over the walk above, 90 of
+17,894 sources are at a distance gain of at most 0.002. A layered emitter is its farthest layer alone at
+every distance, and the layer nearer by is never heard; a cue that plays in rounds takes its first layer
+(none of the game's emitters has such a cue with layers). Under the pause menu the level's emitters and its
+sounds at a place now play on, heard from where she stands; retail pauses them. Nothing was listened to.
+macOS and clang were not compiled: there is no clang on this machine. In `TODO.md`.

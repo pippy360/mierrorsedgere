@@ -94,6 +94,58 @@ std::vector<uint8_t> float_stereo_to_pcm16(const std::vector<float>& left, const
     return bytes;
 }
 
+// A wave asked for at a place by its own name has no cue graph above it: it is given what a
+// USoundNodeAttenuation does when nothing is set on it (Default__SoundNodeAttenuation).
+VoiceAttenuation default_voice_attenuation() {
+    const SoundAttenuation def;
+    VoiceAttenuation att;
+    DrawnAttenuation d;
+    d.model = def.model;
+    d.attenuate = def.attenuate;
+    d.min_radius = def.min_radius[0];
+    d.max_radius = def.max_radius[0];
+    d.db_at_max = def.db_at_max;
+    att.nodes.push_back(d);
+    att.spatialize = def.spatialize;
+    return att;
+}
+
+// How far a wave carries: at the MaxRadius of any attenuating node above it the volume is set to 0
+// (kSoundWorldMax for a wave nothing attenuates).
+float carrying_distance(const VoiceAttenuation& att) {
+    float reach = kSoundWorldMax;
+    for (const DrawnAttenuation& n : att.nodes) {
+        if (n.attenuate) reach = std::min(reach, n.max_radius);
+    }
+    return reach;
+}
+
+// "Linear 10/2000", "LogReverse 1/18000 x LogReverse 10/8000", for ME_AUDIO_DEBUG.
+std::string describe_attenuation(const VoiceAttenuation& att) {
+    static const char* const kModels[] = {"Linear", "Logarithmic", "Inverse", "LogReverse", "NaturalSound"};
+    if (att.nodes.empty()) return "no attenuation node";
+    std::string out;
+    char text[96];
+    for (const DrawnAttenuation& n : att.nodes) {
+        if (!out.empty()) out += " x ";
+        if (!n.attenuate) {
+            out += "(bAttenuate off)";
+            continue;
+        }
+        std::snprintf(text, sizeof(text), "%s %g/%g", n.model < 5 ? kModels[n.model] : "?", n.min_radius, n.max_radius);
+        out += text;
+        if (n.model == 4) {
+            std::snprintf(text, sizeof(text), " %g dB", n.db_at_max);
+            out += text;
+        }
+        if (n.first_distance_gain != 1.0f) {
+            std::snprintf(text, sizeof(text), " (first distance %g)", n.first_distance_gain);
+            out += text;
+        }
+    }
+    return out;
+}
+
 static const char* surface_prefix(ESurfaceMaterial surf) {
     switch (surf) {
         case ESurfaceMaterial::Concrete:     return "Concrete";
@@ -120,6 +172,7 @@ AudioEngine::~AudioEngine() {
 bool AudioEngine::init(bool headless) {
     headless_ = headless;
     initialized_ = true;
+    debug_log_ = std::getenv("ME_AUDIO_DEBUG") != nullptr;
 
     // Synthesize procedural fallback clips and 4 dynamic Solar Fields stems
     synthesize_fallback_clips();
@@ -137,9 +190,21 @@ void AudioEngine::shutdown() {
     sound_clips_.clear();
     sound_cues_.clear();
     ambient_emitters_.clear();
+    ambient_plays_.clear();
+    positional_requests_.clear();
+    pending_voices_.clear();
+    for (SourceVoice& v : source_voices_) v = SourceVoice{};
     al_buffers_.clear();
     playback_started_ = false;
     initialized_ = false;
+}
+
+bool AudioEngine::has_device() const {
+#ifndef ME_NO_OPENAL
+    return !headless_ && alc_context_ != nullptr;
+#else
+    return false;
+#endif
 }
 
 bool AudioEngine::init_openal() {
@@ -161,8 +226,10 @@ bool AudioEngine::init_openal() {
     alc_context_ = ctx;
     alcMakeContextCurrent(ctx);
 
-    // Match UE3 ALAudioDevice distance attenuation model
-    alDistanceModel(AL_INVERSE_DISTANCE_CLAMPED);
+    // Retail's device leaves the distance to the sound nodes: its init calls alDistanceModel(AL_NONE)
+    // (MirrorsEdge.exe 0x010D97EC) and never sets a reference or maximum distance or a roll-off on a
+    // source. Every source plays at the gain the engine hands it (update_voice_gains).
+    alDistanceModel(AL_NONE);
 
     // Create 32 spatial sources
     for (size_t i = 0; i < kSourcePoolSize; ++i) {
@@ -284,25 +351,41 @@ void AudioEngine::cleanup_openal() {
 #endif
 }
 
-uint32_t AudioEngine::acquire_source() {
+size_t AudioEngine::acquire_slot() {
+    size_t slot = kSourcePoolSize;
 #ifndef ME_NO_OPENAL
-    if (headless_ || !alc_context_) return 0;
-    // Check if any source is stopped
-    for (size_t i = 0; i < kSourcePoolSize; ++i) {
-        ALint state = 0;
-        alGetSourcei(sources_[i], AL_SOURCE_STATE, &state);
-        if (state != AL_PLAYING && state != AL_PAUSED) {
-            return sources_[i];
+    if (has_device()) {
+        // Check if any source is stopped
+        for (size_t i = 0; i < kSourcePoolSize && slot == kSourcePoolSize; ++i) {
+            ALint state = 0;
+            alGetSourcei(sources_[i], AL_SOURCE_STATE, &state);
+            if (state != AL_PLAYING && state != AL_PAUSED) slot = i;
         }
+        // Round-robin steal
+        if (slot == kSourcePoolSize) {
+            slot = next_source_;
+            next_source_ = (next_source_ + 1) % kSourcePoolSize;
+            alSourceStop(sources_[slot]);
+        }
+        source_voices_[slot] = SourceVoice{};
+        return slot;
     }
-    // Round-robin steal
-    uint32_t s = sources_[next_source_];
-    next_source_ = (next_source_ + 1) % kSourcePoolSize;
-    alSourceStop(s);
-    return s;
-#else
-    return 0;
 #endif
+    // Without a device only the sounds at a place are kept, for as long as they would play.
+    for (size_t i = 0; i < kSourcePoolSize && slot == kSourcePoolSize; ++i) {
+        if (!source_voices_[i].positional) slot = i;
+    }
+    if (slot == kSourcePoolSize) {
+        slot = next_source_;
+        next_source_ = (next_source_ + 1) % kSourcePoolSize;
+    }
+    source_voices_[slot] = SourceVoice{};
+    return slot;
+}
+
+uint32_t AudioEngine::acquire_source() {
+    if (!has_device()) return 0;
+    return sources_[acquire_slot()];
 }
 
 void AudioEngine::invalidate_cached_buffer(const std::string& key) {
@@ -336,6 +419,7 @@ void AudioEngine::invalidate_cached_buffer(const std::string& key) {
                             alSourceStop(ambient_sources_[i]);
                             alSourcei(ambient_sources_[i], AL_BUFFER, 0);
                             active_ambient_indices_[i] = -1;
+                            ambient_sounding_[i] = false;
                         }
                     }
                 }
@@ -585,6 +669,8 @@ void AudioEngine::update(float dt,
                          const Vec3& listener_up,
                          float player_speed,
                          bool reaction_active) {
+    listener_pos_ = listener_pos;
+
     // Layered cue waves whose SoundNodeDelay has run out.
     if (!pending_voices_.empty()) {
         const float step = std::max(0.0f, dt);
@@ -601,9 +687,16 @@ void AudioEngine::update(float dt,
         for (const PendingVoice& p : due) {
             auto cit = sound_clips_.find(p.voice.clip);
             if (cit != sound_clips_.end()) {
-                start_voice(cit->second, p.positional ? &p.position : nullptr, p.voice.volume, p.voice.pitch);
+                start_voice(cit->second, p.positional ? &p.position : nullptr, p.voice.volume, p.voice.pitch,
+                            p.positional ? &p.attenuation : nullptr, p.name);
             }
         }
+    }
+
+    // The sounds asked for at a place since the last update, now that the listener is known.
+    if (!positional_requests_.empty()) {
+        const std::vector<PositionalRequest> requests = std::exchange(positional_requests_, {});
+        for (const PositionalRequest& r : requests) start_positional(r);
     }
 
     // Advance active voice-over playback timer and synchronized subtitle lines
@@ -702,9 +795,16 @@ void AudioEngine::update(float dt,
         slomo_pitch_scale_ += (target_slomo_pitch - slomo_pitch_scale_) * lerp_factor;
     }
 
-#ifndef ME_NO_OPENAL
-    if (headless_ || !alc_context_) return;
+    if (!has_device()) {
+        // No device: the sounds at a place and the level's emitters are followed all the same, so
+        // that what they would be set to can be read (positional_voices).
+        update_voice_gains(dt);
+        update_ambient_emitters(dt);
+        (void)listener_forward; (void)listener_up; (void)player_speed;
+        return;
+    }
 
+#ifndef ME_NO_OPENAL
     if (!playback_started_) {
         playback_started_ = true;
         rebind_music_stem_buffers();
@@ -718,6 +818,9 @@ void AudioEngine::update(float dt,
     Vec3 u = listener_up.normalized();
     ALfloat ori[6] = {f.x, f.y, f.z, u.x, u.y, u.z};
     alListenerfv(AL_ORIENTATION, ori);
+
+    // The gain of every sound at a place, for where the listener is now.
+    update_voice_gains(dt);
 
     // 2. Evaluate target Solar Fields stem volumes based on gameplay speed & state
     if (is_menu_music_) {
@@ -816,87 +919,230 @@ void AudioEngine::update(float dt,
         breath_timer_ = 0.25f;
     }
 
-    // 5. Spatialize nearest 4 3D AmbientSound emitters from *_Aud.me1 sublevels (using MONO 3D buffers!)
-    // With a menu up they are silent: retail's front end is a map of its own (TdMainMenu) with no
-    // AmbientSound in it, only its music and the UI's cues, and a paused game's sounds are paused.
+    // 5. The level's AmbientSound emitters
+    update_ambient_emitters(dt);
+#endif
+}
+
+// What an emitter's cue plays with: its radii, drawn the first time the emitter is looked at, and
+// with them the layer of the cue that carries farthest (EmitterPlay).
+const AudioEngine::EmitterPlay& AudioEngine::emitter_play(size_t emitter) {
+    if (ambient_plays_.size() < ambient_emitters_.size()) ambient_plays_.resize(ambient_emitters_.size());
+    EmitterPlay& r = ambient_plays_[emitter];
+    const AmbientEmitterInfo& em = ambient_emitters_[emitter];
+    const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
+    const bool has_cue = cue_it != sound_cues_.end();
+    if (r.drawn && r.has_cue == has_cue && r.radii.size() == (has_cue ? cue_it->second.attenuations.size() : 0)) return r;
+    r = EmitterPlay{};
+    r.drawn = true;
+    r.has_cue = has_cue;
+    if (!has_cue) {
+        // A wave with no cue of its own: the class's defaults.
+        r.attenuation = default_voice_attenuation();
+        return r;
+    }
+    const SoundCueDef& cue = cue_it->second;
+    r.radii = draw_cue_radii(cue);
+    // A layer is the cue's loaded waves under one set of nodes. The one that carries farthest is the
+    // emitter's, the first the graph reaches when two carry equally far. (A concatenator's waves are
+    // not layers but one stitched clip under the cue's name. A cue that plays in rounds,
+    // next_ambient_voice, takes each round's first wave whatever is chosen here: none of the game's
+    // emitters has such a cue with layers that carry different distances.)
+    std::vector<int> layer;
+    float carries = -1.0f;
+    if (!cue.is_concatenator) {
+        for (const std::string& wave : cue.wave_names) {
+            const auto clip = sound_clips_.find(wave);
+            if (clip == sound_clips_.end() || clip->second.pcm_data.empty()) continue;
+            std::vector<int> path = wave_attenuations(cue, wave);
+            if (!r.waves.empty() && path == layer) {
+                r.waves.push_back(wave);
+                continue;
+            }
+            VoiceAttenuation attenuation = make_voice_attenuation(cue, path, r.radii, em.location, nullptr);
+            const float reach = carrying_distance(attenuation);
+            if (reach <= carries) continue;
+            carries = reach;
+            layer = std::move(path);
+            r.attenuation = std::move(attenuation);
+            r.waves.assign(1, wave);
+        }
+    }
+    if (r.waves.empty()) r.attenuation = make_voice_attenuation(cue, wave_attenuations(cue, std::string()), r.radii, em.location, nullptr);
+    return r;
+}
+
+// The nearest 4 AmbientSound emitters of the *_Aud.me1 sublevels that can be heard. Each plays at
+// the gain its cue's attenuation nodes give it at the listener's distance (USoundNodeAttenuation,
+// or USoundNodeAmbient for an AmbientSoundSimple), and is in the running only while that gain is
+// above nothing: retail's emitter plays on at volume 0 out of range, here it would keep one of the
+// four sources from an emitter that is heard.
+// With a menu up they are silent: retail's front end is a map of its own (TdMainMenu) with no
+// AmbientSound in it, only its music and the UI's cues, and a paused game's sounds are paused.
+void AudioEngine::update_ambient_emitters(float dt) {
+    const bool device = has_device();
+    const auto stop_source = [&](size_t slot) {
+        ambient_sounding_[slot] = false;
+        ambient_info_[slot] = PositionalVoice{};
+#ifndef ME_NO_OPENAL
+        if (device && ambient_sources_[slot]) alSourceStop(ambient_sources_[slot]);
+#endif
+    };
     if (is_menu_music_) {
         for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
-            if (active_ambient_indices_[slot] == -1 || !ambient_sources_[slot]) continue;
+            if (active_ambient_indices_[slot] == -1) continue;
             active_ambient_indices_[slot] = -1;
-            alSourceStop(ambient_sources_[slot]);
+            stop_source(slot);
         }
-    } else if (!ambient_emitters_.empty()) {
-        struct Cand { int32_t idx; float dist_sq; };
-        std::vector<Cand> cands;
-        cands.reserve(ambient_emitters_.size());
-        for (size_t i = 0; i < ambient_emitters_.size(); ++i) {
-            Vec3 d = ambient_emitters_[i].location - listener_pos;
-            float d2 = d.dot(d);
-            float max_r = std::max(ambient_emitters_[i].max_radius, 500.0f);
-            if (d2 <= max_r * max_r * 1.5f) {
-                cands.push_back({static_cast<int32_t>(i), d2});
+        return;
+    }
+    if (ambient_emitters_.empty()) return;
+
+    struct Cand { int32_t idx; float dist_sq; };
+    std::vector<Cand> cands;
+    cands.reserve(ambient_emitters_.size());
+    for (size_t i = 0; i < ambient_emitters_.size(); ++i) {
+        Vec3 d = ambient_emitters_[i].location - listener_pos_;
+        float d2 = d.dot(d);
+        if (emitter_play(i).attenuation.gain(std::sqrt(d2)) > 0.0f) {
+            cands.push_back({static_cast<int32_t>(i), d2});
+        }
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist_sq < b.dist_sq; });
+
+    for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
+#ifndef ME_NO_OPENAL
+        const ALuint asrc = ambient_sources_[slot];
+        if (device && !asrc) continue;
+#endif
+        if (slot >= cands.size()) {
+            if (active_ambient_indices_[slot] != -1) {
+                active_ambient_indices_[slot] = -1;
+                stop_source(slot);
+            }
+            continue;
+        }
+        const int32_t eidx = cands[slot].idx;
+        const auto& em = ambient_emitters_[eidx];
+        const float distance = std::sqrt(cands[slot].dist_sq);
+        const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
+        // The attenuation of a round's wave: the nodes above it in the emitter's cue, with the
+        // emitter's radii.
+        const auto round_attenuation = [&](const std::vector<int>& path) {
+            if (cue_it == sound_cues_.end()) return default_voice_attenuation();
+            return make_voice_attenuation(cue_it->second, path, emitter_play(static_cast<size_t>(eidx)).radii, em.location, nullptr);
+        };
+        auto start = [&](const SoundClip* clip, bool loop, VoiceAttenuation att, float pitch) {
+            if (!clip) return false;
+#ifndef ME_NO_OPENAL
+            if (device) {
+                // (OpenAL places only mono buffers; a wave that is not spatialised keeps its channels.)
+                uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/att.spatialize);
+                if (!buf) return false;
+                alSourceStop(asrc);
+                alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
+                alSourcei(asrc, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
+                if (att.spatialize) {
+                    alSourcei(asrc, AL_SOURCE_RELATIVE, AL_FALSE);
+                    alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
+                } else {
+                    alSourcei(asrc, AL_SOURCE_RELATIVE, AL_TRUE);
+                    alSource3f(asrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
+                }
+                alSourcePlay(asrc);
+            }
+#endif
+            ambient_remaining_[slot] = clip->duration / std::max(pitch, 0.01f);
+            ambient_sounding_[slot] = true;
+            ambient_logged_gain_[slot] = -1.0f;
+            ambient_info_[slot] = PositionalVoice{};
+            ambient_info_[slot].name = !em.cue_name.empty() ? em.cue_name : em.wave_name;
+            ambient_info_[slot].clip = clip->name;
+            ambient_info_[slot].position = em.location;
+            ambient_info_[slot].spatialized = att.spatialize;
+            ambient_info_[slot].attenuation_nodes = att.nodes.size();
+            ambient_info_[slot].emitter = true;
+            ambient_attenuation_[slot] = std::move(att);
+            return true;
+        };
+        if (active_ambient_indices_[slot] != eidx) {
+            active_ambient_indices_[slot] = eidx;
+            stop_source(slot);
+            // The cue's own graph says how it repeats: a wave under a SoundNodeLooping
+            // plays end to end; with a SoundNodeDelay between them each round waits first.
+            if (!next_ambient_voice(slot, em)) {
+                // One of the waves of the layer the emitter plays (EmitterPlay), or what its name
+                // resolves to when it has no layer to choose from.
+                const EmitterPlay& play = emitter_play(static_cast<size_t>(eidx));
+                const SoundClip* clip = nullptr;
+                if (!play.waves.empty()) {
+                    const auto it = sound_clips_.find(play.waves[static_cast<size_t>(std::rand()) % play.waves.size()]);
+                    if (it != sound_clips_.end()) clip = &it->second;
+                } else {
+                    float dummy_v = em.volume, dummy_p = em.pitch;
+                    clip = resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
+                }
+                if (clip) start(clip, true, play.attenuation, em.pitch);
             }
         }
-        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist_sq < b.dist_sq; });
-
-        for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
-            ALuint asrc = ambient_sources_[slot];
-            if (!asrc) continue;
-            if (slot < cands.size()) {
-                int32_t eidx = cands[slot].idx;
-                const auto& em = ambient_emitters_[eidx];
-                auto start = [&](const SoundClip* clip, bool loop) {
-                    if (!clip) return false;
-                    uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/true);
-                    if (!buf) return false;
-                    alSourceStop(asrc);
-                    alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
-                    alSourcei(asrc, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
-                    alSourcef(asrc, AL_REFERENCE_DISTANCE, std::max(em.min_radius * 0.01f, 1.0f));
-                    alSourcef(asrc, AL_MAX_DISTANCE, std::max(em.max_radius * 0.01f, 10.0f));
-                    alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
-                    alSourcePlay(asrc);
-                    return true;
-                };
-                if (active_ambient_indices_[slot] != eidx) {
-                    active_ambient_indices_[slot] = eidx;
-                    alSourceStop(asrc);
-                    // The cue's own graph says how it repeats: a wave under a SoundNodeLooping
-                    // plays end to end; with a SoundNodeDelay between them each round waits first.
-                    if (!next_ambient_voice(slot, em)) {
-                        float dummy_v = em.volume, dummy_p = em.pitch;
-                        start(resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p), true);
-                    }
+        float voice_volume = 1.0f, voice_pitch = 1.0f;
+        if (ambient_mode_[slot] == AmbientMode::Waiting) {
+            ambient_voice_[slot].delay -= dt;
+            if (ambient_voice_[slot].delay <= 0.0f) {
+                auto it = sound_clips_.find(ambient_voice_[slot].clip);
+                // (A wave that is not loaded is skipped: the next round picks again.)
+                if (it != sound_clips_.end() &&
+                    start(&it->second, false, round_attenuation(ambient_voice_[slot].attenuations), em.pitch * ambient_voice_[slot].pitch)) {
+                    ambient_mode_[slot] = AmbientMode::Playing;
+                } else {
+                    next_ambient_voice(slot, em);
                 }
-                float voice_volume = 1.0f, voice_pitch = 1.0f;
-                if (ambient_mode_[slot] == AmbientMode::Waiting) {
-                    ambient_voice_[slot].delay -= dt;
-                    if (ambient_voice_[slot].delay <= 0.0f) {
-                        auto it = sound_clips_.find(ambient_voice_[slot].clip);
-                        // (A wave that is not loaded is skipped: the next round picks again.)
-                        if (it != sound_clips_.end() && start(&it->second, false)) ambient_mode_[slot] = AmbientMode::Playing;
-                        else next_ambient_voice(slot, em);
-                    }
-                } else if (ambient_mode_[slot] == AmbientMode::Playing) {
-                    ALint state = AL_STOPPED;
-                    alGetSourcei(asrc, AL_SOURCE_STATE, &state);
-                    if (state != AL_PLAYING) next_ambient_voice(slot, em);
-                }
-                if (ambient_mode_[slot] != AmbientMode::Loop) {
-                    voice_volume = ambient_voice_[slot].volume;
-                    voice_pitch = ambient_voice_[slot].pitch;
-                }
-                alSourcef(asrc, AL_GAIN, em.volume * voice_volume * sfx_bus_gain_ * 0.55f);
-                alSourcef(asrc, AL_PITCH, em.pitch * voice_pitch * slomo_pitch_scale_);
-            } else if (active_ambient_indices_[slot] != -1) {
-                active_ambient_indices_[slot] = -1;
-                alSourceStop(asrc);
+            }
+        } else if (ambient_mode_[slot] == AmbientMode::Playing) {
+            bool playing = false;
+#ifndef ME_NO_OPENAL
+            if (device) {
+                ALint state = AL_STOPPED;
+                alGetSourcei(asrc, AL_SOURCE_STATE, &state);
+                playing = (state == AL_PLAYING);
+            }
+#endif
+            if (!device) {
+                ambient_remaining_[slot] -= dt;
+                playing = ambient_remaining_[slot] > 0.0f;
+            }
+            if (!playing) {
+                ambient_sounding_[slot] = false;
+                next_ambient_voice(slot, em);
+            }
+        }
+        if (ambient_mode_[slot] != AmbientMode::Loop) {
+            voice_volume = ambient_voice_[slot].volume;
+            voice_pitch = ambient_voice_[slot].pitch;
+        }
+        const float distance_gain = ambient_sounding_[slot] ? ambient_attenuation_[slot].gain(distance) : 0.0f;
+        const float gain = em.volume * voice_volume * sfx_bus_gain_ * 0.55f * distance_gain;
+#ifndef ME_NO_OPENAL
+        if (device) {
+            alSourcef(asrc, AL_GAIN, gain);
+            alSourcef(asrc, AL_PITCH, em.pitch * voice_pitch * slomo_pitch_scale_);
+        }
+#else
+        (void)voice_pitch;
+#endif
+        if (ambient_sounding_[slot]) {
+            ambient_info_[slot].distance = distance;
+            ambient_info_[slot].distance_gain = distance_gain;
+            ambient_info_[slot].gain = gain;
+            if (debug_log_ && std::abs(gain - ambient_logged_gain_[slot]) > 0.01f) {
+                ambient_logged_gain_[slot] = gain;
+                std::cout << "[Audio] emitter " << eidx << " '" << ambient_info_[slot].name << "' wave " << ambient_info_[slot].clip
+                          << " at " << distance << " uu from the listener: " << describe_attenuation(ambient_attenuation_[slot])
+                          << " -> distance gain " << distance_gain << ", source gain " << gain
+                          << (ambient_attenuation_[slot].spatialize ? ", placed in the world" : ", not spatialised") << std::endl;
             }
         }
     }
-#else
-    (void)listener_pos; (void)listener_forward; (void)listener_up; (void)player_speed;
-#endif
 }
 
 bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
@@ -922,6 +1168,16 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
     std::vector<AmbientEmitterInfo> ambients;
     pkg.extract_sound_cues_and_ambients(cues, ambients);
     for (auto& cue : cues) {
+        // USoundCue::CalculateMaxAudibleDistance (0x00B76C80): every node is asked in turn
+        // (USoundNodeAttenuation::MaxAudibleDistance, 0x00B79860, and USoundNodeAmbient's, 0x00B788C0:
+        // max(so far, MaxRadius.GetValue()), with no look at bAttenuate), and a cue left at 0 is
+        // audible anywhere. The game works it out once per cue, on first use, so a radius with a
+        // range is one draw for as long as the cue is loaded.
+        cue.max_audible_distance = 0.0f;
+        for (const SoundAttenuation& a : cue.attenuations) {
+            cue.max_audible_distance = std::max(cue.max_audible_distance, draw_radius(a.max_radius, rand_normalized()));
+        }
+        if (cue.max_audible_distance == 0.0f) cue.max_audible_distance = kSoundWorldMax;
         sound_cues_[cue.name] = cue;
         if (!cue.full_path.empty()) {
             sound_cues_[cue.full_path] = cue;
@@ -1126,6 +1382,7 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
 bool AudioEngine::load_level_audio(const std::string& game_root, const std::string& map_file) {
     namespace fs = std::filesystem;
     ambient_emitters_.clear();
+    ambient_plays_.clear();
     level_loaded_cues_.clear();
     vo_elapsed_ = 0.0f;
     vo_duration_ = 0.0f;
@@ -1133,6 +1390,7 @@ bool AudioEngine::load_level_audio(const std::string& game_root, const std::stri
     active_vo_subtitle_.clear();
     for (size_t i = 0; i < kAmbientPoolSize; ++i) {
         active_ambient_indices_[i] = -1;
+        ambient_sounding_[i] = false;
     }
 
     // Purge any previous chapter's Solar Fields music clips so unqualified wave names
@@ -1254,11 +1512,14 @@ const SoundClip* AudioEngine::pick_first_available_clip(std::initializer_list<co
     return nullptr;
 }
 
-const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch) const {
+const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float& io_vol, float& io_pitch,
+                                                  const SoundCueDef** out_cue) const {
+    if (out_cue) *out_cue = nullptr;
     // 1. Check UE3 SoundCue graph first (supports SoundNodeConcatenator, SoundNodeRandom + SoundNodeModulator)
     auto cue_it = sound_cues_.find(name);
     if (cue_it != sound_cues_.end() && !cue_it->second.wave_names.empty()) {
         const auto& cue = cue_it->second;
+        if (out_cue) *out_cue = &cue;
         io_vol *= cue.volume_multiplier;
         if (cue.has_modulator && !cue.is_concatenator && cue.sound_group.find("Dialogue") == std::string::npos) {
             io_pitch *= cue.pitch_multiplier * (0.96f + 0.08f * rand_normalized());
@@ -1288,6 +1549,7 @@ const SoundClip* AudioEngine::resolve_cue_or_clip(const std::string& name, float
                 return &ait->second;
             }
         }
+        if (out_cue) *out_cue = nullptr;
     }
 
     // 2. Direct SoundClip lookup
@@ -1310,7 +1572,8 @@ size_t AudioEngine::count_sound_layers(const std::string& name) const {
     if (cue_it != sound_cues_.end() && cue_it->second.has_mixer && !cue_it->second.is_concatenator &&
         !cue_it->second.looping && !cue_it->second.nodes.empty()) {
         std::vector<CueVoice> voices;
-        collect_cue_voices(cue_it->second, 0, 0.0f, 1.0f, 1.0f, voices);
+        std::vector<int> path;
+        collect_cue_voices(cue_it->second, 0, 0.0f, 1.0f, 1.0f, voices, path);
         if (!voices.empty()) return voices.size();
     }
     return has_sound(name) ? 1 : 0;
@@ -1325,7 +1588,8 @@ bool AudioEngine::next_ambient_voice(size_t slot, const AmbientEmitterInfo& em) 
     auto it = sound_cues_.find(em.cue_name);
     if (it == sound_cues_.end() || !it->second.looping || it->second.is_concatenator || it->second.nodes.empty()) return false;
     std::vector<CueVoice> voices;
-    collect_cue_voices(it->second, 0, 0.0f, 1.0f, 1.0f, voices);
+    std::vector<int> path;
+    collect_cue_voices(it->second, 0, 0.0f, 1.0f, 1.0f, voices, path);
     if (voices.empty()) {
         // A round that draws nothing: a SoundNodeRandom input left empty (Birds.BirdsChirp has
         // one) or a wave that is not loaded. In retail nothing in the graph is then playing, the
@@ -1344,7 +1608,7 @@ bool AudioEngine::next_ambient_voice(size_t slot, const AmbientEmitterInfo& em) 
 }
 
 void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
-                                     std::vector<CueVoice>& out) const {
+                                     std::vector<CueVoice>& out, std::vector<int>& path) const {
     if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || out.size() >= 8) return;
     const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
     auto in_range = [](float lo, float hi) { return lo + (hi - lo) * rand_normalized(); };
@@ -1352,7 +1616,7 @@ void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float del
         case SoundCueNode::Kind::Wave: {
             auto it = sound_clips_.find(n.wave);
             if (it != sound_clips_.end() && !it->second.pcm_data.empty()) {
-                out.push_back({n.wave, delay, volume, pitch});
+                out.push_back({n.wave, delay, volume, pitch, path});
             }
             return;
         }
@@ -1360,7 +1624,7 @@ void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float del
             // USoundNodeMixer: every input, scaled by its InputVolume.
             for (size_t i = 0; i < n.children.size(); ++i) {
                 const float input = (i < n.weights.size()) ? n.weights[i] : 1.0f;
-                collect_cue_voices(cue, n.children[i], delay, volume * input, pitch, out);
+                collect_cue_voices(cue, n.children[i], delay, volume * input, pitch, out, path);
             }
             return;
         case SoundCueNode::Kind::Random: {
@@ -1378,25 +1642,134 @@ void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float del
                 }
                 pick -= weight(i);
             }
-            collect_cue_voices(cue, n.children[chosen], delay, volume, pitch, out);
+            collect_cue_voices(cue, n.children[chosen], delay, volume, pitch, out, path);
             return;
         }
         case SoundCueNode::Kind::Delay:
             if (!n.children.empty()) {
-                collect_cue_voices(cue, n.children[0], delay + in_range(n.min_value, n.max_value), volume, pitch, out);
+                collect_cue_voices(cue, n.children[0], delay + in_range(n.min_value, n.max_value), volume, pitch, out, path);
             }
             return;
         case SoundCueNode::Kind::Modulator:
             if (!n.children.empty()) {
                 collect_cue_voices(cue, n.children[0], delay, volume * in_range(n.min_value, n.max_value),
-                                   pitch * in_range(n.min_pitch, n.max_pitch), out);
+                                   pitch * in_range(n.min_pitch, n.max_pitch), out, path);
+            }
+            return;
+        case SoundCueNode::Kind::Attenuation:
+            // USoundNodeAttenuation: what is below it falls off with distance by this node's rule
+            // (worked out when the wave is played at a place: make_voice_attenuation).
+            if (!n.children.empty()) {
+                if (n.attenuation >= 0) path.push_back(n.attenuation);
+                collect_cue_voices(cue, n.children[0], delay, volume, pitch, out, path);
+                if (n.attenuation >= 0) path.pop_back();
+            }
+            return;
+        case SoundCueNode::Kind::Ambient:
+            // USoundNodeAmbient: its own radii, then its volume and pitch modulation, then its wave.
+            if (!n.children.empty()) {
+                if (n.attenuation >= 0) path.push_back(n.attenuation);
+                collect_cue_voices(cue, n.children[0], delay, volume * in_range(n.min_value, n.max_value),
+                                   pitch * in_range(n.min_pitch, n.max_pitch), out, path);
+                if (n.attenuation >= 0) path.pop_back();
             }
             return;
         case SoundCueNode::Kind::Passthrough:
         default:
-            if (!n.children.empty()) collect_cue_voices(cue, n.children[0], delay, volume, pitch, out);
+            if (!n.children.empty()) collect_cue_voices(cue, n.children[0], delay, volume, pitch, out, path);
             return;
     }
+}
+
+std::vector<int> AudioEngine::wave_attenuations(const SoundCueDef& cue, const std::string& wave) const {
+    std::vector<int> path;
+    // Depth first, as the graph is parsed: true when `node` or something below it is the wave.
+    const auto find = [&](const auto& self, int node, const std::string& wanted) -> bool {
+        if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size()) return false;
+        const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
+        if (n.kind == SoundCueNode::Kind::Wave) return wanted.empty() || n.wave == wanted;
+        const bool attenuates = n.attenuation >= 0 &&
+                                (n.kind == SoundCueNode::Kind::Attenuation || n.kind == SoundCueNode::Kind::Ambient);
+        if (attenuates) path.push_back(n.attenuation);
+        for (int child : n.children) {
+            if (self(self, child, wanted)) return true;
+        }
+        if (attenuates) path.pop_back();
+        return false;
+    };
+    if (cue.nodes.empty()) return path;
+    if (!find(find, 0, wave)) {
+        path.clear();
+        find(find, 0, std::string());
+    }
+    return path;
+}
+
+std::vector<AudioEngine::DrawnRadii> AudioEngine::draw_cue_radii(const SoundCueDef& cue) const {
+    // USoundNodeAttenuation::ParseNodes draws them the first time it parses the node for a play
+    // (the payload's RequiresInit, 0x00B7DE0B): MinRadius, then MaxRadius.
+    std::vector<DrawnRadii> radii;
+    radii.reserve(cue.attenuations.size());
+    for (const SoundAttenuation& a : cue.attenuations) {
+        DrawnRadii d;
+        d.min_radius = draw_radius(a.min_radius, rand_normalized());
+        d.max_radius = draw_radius(a.max_radius, rand_normalized());
+        if (a.td) d.speed_of_sound = draw_radius(a.speed_of_sound, rand_normalized());
+        radii.push_back(d);
+    }
+    return radii;
+}
+
+VoiceAttenuation AudioEngine::make_voice_attenuation(const SoundCueDef& cue, const std::vector<int>& path,
+                                                     const std::vector<DrawnRadii>& radii, const Vec3& world_pos,
+                                                     float* io_delay) const {
+    VoiceAttenuation out;
+    for (int index : path) {
+        if (index < 0 || static_cast<size_t>(index) >= cue.attenuations.size() || static_cast<size_t>(index) >= radii.size()) continue;
+        const SoundAttenuation& a = cue.attenuations[static_cast<size_t>(index)];
+        const DrawnRadii& r = radii[static_cast<size_t>(index)];
+        DrawnAttenuation d;
+        d.model = a.linear_only ? uint8_t{0} : a.model;
+        d.attenuate = a.attenuate;
+        d.min_radius = r.min_radius;
+        d.max_radius = r.max_radius;
+        d.db_at_max = a.db_at_max;
+        if (a.td && (a.attenuate || a.delay)) {
+            // UTdSoundNodeAttenuation::ParseNodes (0x0122AE80), its first parse: the distance then,
+            // the hold-back it asks for with bDelay (none for a sound that starts out of range),
+            // and the linear factor on that distance that it keeps applying. (The port takes the
+            // distance when the cue starts, not after the delays of the nodes above this one.)
+            const float first_distance = (listener_pos_ - world_pos).length();
+            float hold = (a.delay && r.speed_of_sound > 0.0f) ? first_distance / r.speed_of_sound : 0.0f;
+            if (a.attenuate) {
+                if (first_distance >= r.max_radius) hold = 0.0f;
+                d.first_distance_gain = attenuation_gain(0, first_distance, r.min_radius, r.max_radius, a.db_at_max);
+            }
+            if (io_delay) *io_delay += hold;
+        }
+        out.nodes.push_back(d);
+        out.spatialize = out.spatialize || a.spatialize;
+    }
+    return out;
+}
+
+bool AudioEngine::location_is_audible(const SoundCueDef& cue, const Vec3& at) const {
+    // USoundCue::IsAudibleSimple (0x00B76F10): a cue longer than a second is never refused.
+    if (cue.duration > 1.0f) return true;
+    // UAudioDevice::LocationIsAudible (0x00B653D0): anywhere at WORLD_MAX, else strictly nearer.
+    if (cue.max_audible_distance >= kSoundWorldMax) return true;
+    const Vec3 d = listener_pos_ - at;
+    return cue.max_audible_distance * cue.max_audible_distance > d.dot(d);
+}
+
+float AudioEngine::cue_max_audible_distance(const std::string& group_and_name) const {
+    const size_t dot = group_and_name.rfind('.');
+    const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    for (const std::string& name : {group_and_name, bare}) {
+        const auto it = sound_cues_.find(name);
+        if (it != sound_cues_.end() && it->second.max_audible_distance > 0.0f) return it->second.max_audible_distance;
+    }
+    return kSoundWorldMax;
 }
 
 bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch) {
@@ -1405,8 +1778,16 @@ bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_po
     const SoundCueDef& cue = cue_it->second;
     if (!cue.has_mixer || cue.is_concatenator || cue.looping || cue.nodes.empty()) return false;
     std::vector<CueVoice> voices;
-    collect_cue_voices(cue, 0, 0.0f, volume * cue.volume_multiplier, pitch * cue.pitch_multiplier, voices);
+    std::vector<int> path;
+    collect_cue_voices(cue, 0, 0.0f, volume * cue.volume_multiplier, pitch * cue.pitch_multiplier, voices, path);
     if (voices.empty()) return false;
+    // At a place, every layer gets the attenuation nodes above it: one draw of the radii for the
+    // play, shared by the layers under one node (the helicopter's five layers each have their own).
+    std::vector<VoiceAttenuation> attenuations;
+    if (world_pos) {
+        const std::vector<DrawnRadii> radii = draw_cue_radii(cue);
+        for (CueVoice& v : voices) attenuations.push_back(make_voice_attenuation(cue, v.attenuations, radii, *world_pos, &v.delay));
+    }
     if (play_log_on_) {
         // As long as its longest layer, delay included.
         float duration = 0.0f;
@@ -1416,47 +1797,187 @@ bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_po
         }
         play_log_.push_back({name, world_pos ? "sound3d" : "sound", duration});
     }
-    if (headless_ || !alc_context_) return true;
-    for (CueVoice& v : voices) {
+    // (Without a device only the sounds at a place are followed.)
+    if (!has_device() && !world_pos) return true;
+    for (size_t i = 0; i < voices.size(); ++i) {
+        CueVoice& v = voices[i];
         if (v.delay <= 0.0f) {
             auto it = sound_clips_.find(v.clip);
-            if (it != sound_clips_.end()) start_voice(it->second, world_pos, v.volume, v.pitch);
+            if (it != sound_clips_.end()) start_voice(it->second, world_pos, v.volume, v.pitch, world_pos ? &attenuations[i] : nullptr, name);
         } else {
             PendingVoice p;
             p.voice = std::move(v);
             p.positional = (world_pos != nullptr);
-            if (world_pos) p.position = *world_pos;
+            if (world_pos) {
+                p.position = *world_pos;
+                p.attenuation = std::move(attenuations[i]);
+            }
+            p.name = name;
             pending_voices_.push_back(std::move(p));
         }
     }
     return true;
 }
 
-void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch) {
-#ifndef ME_NO_OPENAL
-    if (headless_ || !alc_context_) return;
-    uint32_t src = acquire_source();
-    if (!src) return;
-
-    uint32_t buf = get_or_create_buffer(clip, /*force_mono_for_3d=*/world_pos != nullptr);
-    if (!buf) return;
-
-    alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
-    alSourcef(src, AL_GAIN, std::clamp(volume * sfx_bus_gain_, 0.0f, 1.5f));
-    alSourcef(src, AL_PITCH, std::clamp(pitch * slomo_pitch_scale_, 0.25f, 2.0f));
+// A wave on a pool source. In 2D it is at the listener at its own volume. At a place it plays at
+// the volume its distance gives it, which update() then follows (update_voice_gains), and it is
+// placed in the world only when a node above it spatialises it: the device positions a wave
+// instance whose CurrentUseSpatialization is set and makes any other source-relative, at the
+// listener (0x010DB137, 0x010D732E). OpenAL only places mono buffers, so a placed wave is mixed down.
+void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch,
+                              const VoiceAttenuation* attenuation, const std::string& name) {
+    const bool device = has_device();
+    if (!device && !world_pos) return;
+    const size_t slot = acquire_slot();
+    float gain = volume * sfx_bus_gain_;
+    const float play_pitch = std::clamp(pitch * slomo_pitch_scale_, 0.25f, 2.0f);
+    bool placed = false;
     if (world_pos) {
-        alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
-        alSourcef(src, AL_REFERENCE_DISTANCE, 2.5f);
-        alSourcef(src, AL_MAX_DISTANCE, 35.0f);
-        alSource3f(src, AL_POSITION, world_pos->x * 0.01f, world_pos->y * 0.01f, world_pos->z * 0.01f);
-    } else {
-        alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
-        alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
+        SourceVoice& v = source_voices_[slot];
+        v.positional = true;
+        v.position = *world_pos;
+        v.volume = gain;
+        if (attenuation) v.attenuation = *attenuation;
+        v.remaining = clip.duration / play_pitch;
+        placed = v.attenuation.spatialize;
+        const float distance = (listener_pos_ - *world_pos).length();
+        const float distance_gain = v.attenuation.gain(distance);
+        gain *= distance_gain;
+        v.info.name = name.empty() ? clip.name : name;
+        v.info.clip = clip.name;
+        v.info.position = *world_pos;
+        v.info.distance = distance;
+        v.info.distance_gain = distance_gain;
+        v.info.gain = std::clamp(gain, 0.0f, 1.5f);
+        v.info.spatialized = placed;
+        v.info.attenuation_nodes = v.attenuation.nodes.size();
+        v.logged_gain = v.info.gain;
+        if (debug_log_) {
+            std::cout << "[Audio] '" << v.info.name << "' wave " << clip.name << " at (" << world_pos->x << ", " << world_pos->y << ", "
+                      << world_pos->z << "), " << distance << " uu from the listener: " << describe_attenuation(v.attenuation)
+                      << " -> distance gain " << distance_gain << ", source gain " << v.info.gain
+                      << (placed ? ", placed in the world" : ", not spatialised") << std::endl;
+        }
     }
-    alSourcePlay(src);
-#else
-    (void)clip; (void)world_pos; (void)volume; (void)pitch;
+#ifndef ME_NO_OPENAL
+    if (device) {
+        const uint32_t src = sources_[slot];
+        uint32_t buf = get_or_create_buffer(clip, /*force_mono_for_3d=*/placed);
+        if (!src || !buf) {
+            source_voices_[slot] = SourceVoice{};
+            return;
+        }
+
+        alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
+        alSourcef(src, AL_GAIN, std::clamp(gain, 0.0f, 1.5f));
+        alSourcef(src, AL_PITCH, play_pitch);
+        if (placed) {
+            alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
+            alSource3f(src, AL_POSITION, world_pos->x * 0.01f, world_pos->y * 0.01f, world_pos->z * 0.01f);
+        } else {
+            alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
+            alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
+        }
+        alSourcePlay(src);
+    }
 #endif
+}
+
+// What update() does with a play_sound_3d: the test for starting at all, then the cue's waves.
+void AudioEngine::start_positional(const PositionalRequest& request) {
+    // UAudioDevice::CreateComponent (0x00B6B550) returns no component for a cue that
+    // USoundCue::IsAudibleSimple turns down: one that lasts at most a second, at a place no
+    // listener is within its MaxAudibleDistance of. A longer cue is started wherever it is and
+    // plays at volume 0 until the listener comes into range.
+    const auto cue_it = sound_cues_.find(request.name);
+    if (cue_it != sound_cues_.end() && !location_is_audible(cue_it->second, request.position)) {
+        if (debug_log_) {
+            std::cout << "[Audio] '" << request.name << "' not started: " << (listener_pos_ - request.position).length()
+                      << " uu from the listener, past its MaxAudibleDistance " << cue_it->second.max_audible_distance << " (it lasts "
+                      << cue_it->second.duration << " s)" << std::endl;
+        }
+        return;
+    }
+    if (play_layered_cue(request.name, &request.position, request.volume, request.pitch)) return;
+
+    float volume = request.volume;
+    float pitch = request.pitch;
+    const SoundCueDef* cue = nullptr;
+    const SoundClip* clip = resolve_cue_or_clip(request.name, volume, pitch, &cue);
+    if (!clip) return;
+    // The attenuation nodes above the wave that was picked. A wave asked for by its own name has
+    // no graph: it gets the class's defaults.
+    float delay = 0.0f;
+    const VoiceAttenuation attenuation =
+        cue ? make_voice_attenuation(*cue, wave_attenuations(*cue, clip->name), draw_cue_radii(*cue), request.position, &delay)
+            : default_voice_attenuation();
+    if (play_log_on_) play_log_.push_back({request.name, "sound3d", delay + clip->duration});
+    if (delay <= 0.0f) {
+        start_voice(*clip, &request.position, volume, pitch, &attenuation, request.name);
+    } else {
+        PendingVoice p;
+        p.voice.clip = clip->name;
+        p.voice.delay = delay;
+        p.voice.volume = volume;
+        p.voice.pitch = pitch;
+        p.positional = true;
+        p.position = request.position;
+        p.attenuation = attenuation;
+        p.name = request.name;
+        pending_voices_.push_back(std::move(p));
+    }
+}
+
+// USoundNodeAttenuation::ParseNodes runs on every audio update for every playing sound: the radii
+// stay as drawn, the distance to the listener is taken again and the volume follows it. A sound
+// that is past its MaxRadius plays on at volume 0 (no culling happens in the node).
+void AudioEngine::update_voice_gains(float dt) {
+    const bool device = has_device();
+    for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
+        SourceVoice& v = source_voices_[slot];
+        if (!v.positional) continue;
+        bool playing = false;
+#ifndef ME_NO_OPENAL
+        if (device) {
+            ALint state = 0;
+            alGetSourcei(sources_[slot], AL_SOURCE_STATE, &state);
+            playing = (state == AL_PLAYING || state == AL_PAUSED);
+        }
+#endif
+        if (!device) {
+            playing = v.remaining > 0.0f;
+            v.remaining -= std::max(0.0f, dt);
+        }
+        if (!playing) {
+            v = SourceVoice{};
+            continue;
+        }
+        const float distance = (listener_pos_ - v.position).length();
+        const float distance_gain = v.attenuation.gain(distance);
+        const float gain = std::clamp(v.volume * distance_gain, 0.0f, 1.5f);
+#ifndef ME_NO_OPENAL
+        if (device) alSourcef(sources_[slot], AL_GAIN, gain);
+#endif
+        v.info.distance = distance;
+        v.info.distance_gain = distance_gain;
+        v.info.gain = gain;
+        if (debug_log_ && std::abs(gain - v.logged_gain) > 0.01f) {
+            v.logged_gain = gain;
+            std::cout << "[Audio] '" << v.info.name << "' wave " << v.info.clip << " now " << distance << " uu from the listener: distance gain "
+                      << distance_gain << ", source gain " << gain << std::endl;
+        }
+    }
+}
+
+std::vector<AudioEngine::PositionalVoice> AudioEngine::positional_voices() const {
+    std::vector<PositionalVoice> out;
+    for (const SourceVoice& v : source_voices_) {
+        if (v.positional) out.push_back(v.info);
+    }
+    for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
+        if (active_ambient_indices_[slot] != -1 && ambient_sounding_[slot]) out.push_back(ambient_info_[slot]);
+    }
+    return out;
 }
 
 void AudioEngine::play_sound(const std::string& name, float volume, float pitch) {
@@ -1527,32 +2048,10 @@ void AudioEngine::play_level_loaded_cues() {
 }
 
 void AudioEngine::play_sound_3d(const std::string& name, const Vec3& world_pos, float volume, float pitch) {
-    if (play_layered_cue(name, &world_pos, volume, pitch)) return;
-    float final_vol = volume * sfx_bus_gain_;
-    float final_pitch = pitch * slomo_pitch_scale_;
-    const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
-    if (!clip) return;
-    if (play_log_on_) play_log_.push_back({name, "sound3d", clip->duration});
-
-#ifndef ME_NO_OPENAL
-    if (headless_ || !alc_context_) return;
-    uint32_t src = acquire_source();
-    if (!src) return;
-
-    uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/true);
-    if (!buf) return;
-
-    alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
-    alSourcef(src, AL_GAIN, std::clamp(final_vol, 0.0f, 1.5f));
-    alSourcef(src, AL_PITCH, std::clamp(final_pitch, 0.25f, 2.0f));
-    alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
-    alSourcef(src, AL_REFERENCE_DISTANCE, 2.5f);
-    alSourcef(src, AL_MAX_DISTANCE, 35.0f);
-    alSource3f(src, AL_POSITION, world_pos.x * 0.01f, world_pos.y * 0.01f, world_pos.z * 0.01f);
-    alSourcePlay(src);
-#else
-    (void)world_pos; (void)final_vol; (void)final_pitch;
-#endif
+    // Whether it starts and how loud depend on where the listener is, which this frame's update()
+    // is about to say: it starts there (start_positional), as retail's sounds get their volume from
+    // the audio device's update at the end of the tick that played them.
+    positional_requests_.push_back({name, world_pos, volume, pitch});
 }
 
 void AudioEngine::play_footstep(ESurfaceMaterial surface, float speed, bool crouch, float volume) {
@@ -1660,10 +2159,12 @@ bool AudioEngine::load_cue_bank(const std::string& game_root, const std::string&
 }
 
 void AudioEngine::stop_cue(const std::string& group_and_name) {
-#ifndef ME_NO_OPENAL
-    if (headless_ || !alc_context_) return;
     const size_t dot = group_and_name.rfind('.');
     const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
+    // One asked for at a place this frame has not started yet.
+    std::erase_if(positional_requests_, [&](const PositionalRequest& r) { return r.name == group_and_name || r.name == bare; });
+#ifndef ME_NO_OPENAL
+    if (headless_ || !alc_context_) return;
     for (const std::string& name : {group_and_name, bare}) {
         float v = 1.0f, p = 1.0f;
         const SoundClip* clip = resolve_cue_or_clip(name, v, p);
@@ -1863,6 +2364,8 @@ void AudioEngine::set_menu_music(bool active) {
 
 void AudioEngine::stop_all() {
     pending_voices_.clear();
+    positional_requests_.clear();
+    for (SourceVoice& v : source_voices_) v = SourceVoice{};
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
     for (size_t i = 0; i < kSourcePoolSize; ++i) {

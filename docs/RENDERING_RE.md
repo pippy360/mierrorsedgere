@@ -664,9 +664,13 @@ afresh. Two things make systems while the game runs:
   cue, the one every weapon plays (`GetWeaponSpecificImpactSound`), else its parents', else the default
   material's, played at the hit (`PlaySound(.., HitLocation)`). The cues are `A_Effects_Bullet_Impacts`'s, 26
   of them (`Concrete.9mm_Concrete_Impact`, `Metal_Thin.9mm_Metal_Thin_Impact`, ...). Past the `MaxRadius` of
-  the cue's attenuation node a sound is not started at all (stock Unreal Engine 3: the audio device asks
-  `USoundCue::IsAudible`; not read out of the executable): 2000 uu for concrete, 300 for
-  `Faith.9mm_Faith_Impact`, the bodies' cue, so a bot hit further off than three metres is silent.
+  the cue's attenuation node a sound played this way is not started at all, whatever its length:
+  `APlayerController::HearSound` (0x00EF4480) asks `USoundCue::IsAudible` (0x00B76D90) with the view
+  target's location, and nearer than that the node sets the volume by the distance
+  (`docs/AUDIO_SYSTEM_RE.md` section 3.2; that `PlaySound` goes through `HearSound` is stock Unreal Engine 3,
+  the call itself was not read; the audio device's own test, in `CreateComponent`, refuses only cues of at
+  most a second). That is 2000 uu for concrete and 300 for `Faith.9mm_Faith_Impact`, the bodies' cue, so a
+  bot hit further off than three metres is silent.
 - The script (`SeqAct_ActorFactory` with an `ActorFactoryEmitter`, 1080 of them): the factory's particle
   system at each of the action's spawn points. 1024 are the cracking and breaking of glass panes; the rest
   feathers, sparks, falling dust.
@@ -753,6 +757,7 @@ Options for looking at things:
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
+| `ME_AUDIO_DEBUG=1` | Every sound at a place: its cue's attenuation nodes, its distance from the listener and the gain that gives it, when it starts and as the gain changes; the level's emitters likewise. With `--intro-shots` the shots' impact sounds and the level's emitters go through the audio engine, with no device, heard from the view ([`AUDIO_SYSTEM_RE.md`](AUDIO_SYSTEM_RE.md) section 3.2) |
 | `ME_DECAL_SELFCHECK=1` | Clips the decals that store receivers as the ones that do not are clipped, and compares |
 | `ME_DECAL_DEBUG=1` | Lists the decals of receivers that move or are drawn apart, and what each was bound to |
 | `ME_NO_DYNAMIC_DECALS=1` | A picture without those |
