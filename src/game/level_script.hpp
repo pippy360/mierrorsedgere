@@ -209,6 +209,8 @@ struct ScriptHost {
     std::function<void(bool on)> slomo;
     // SeqAct_ShowLoading / SeqAct_HideLoading
     std::function<void(bool shown)> loading_indicator;
+    // SeqAct_ChangeCollision / SeqAct_Toggle on collision/volume actors
+    std::function<void(const ScriptActor& actor, bool collide_actors, bool block_actors)> change_collision;
     // Line checks for SeqEvent_LOS (bCheckForObstructions): true when the way is clear
     std::function<bool(const Vec3& from, const Vec3& to)> line_clear;
     // Logging

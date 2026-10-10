@@ -540,6 +540,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_env_blur.reset();
     m_env_melee.reset();
     m_env_fall.reset();
+    m_hazard_shock_cooldown = 0.0f;
     m_air_fall_start_z = spawn_pos.z;
     m_fall_peak_z = spawn_pos.z;
     m_melee_cooldown = 0.0f;
@@ -800,6 +801,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         m_ledge_walk_cooldown = std::max(0.0f, m_ledge_walk_cooldown - step_dt);
         m_swing_cooldown = std::max(0.0f, m_swing_cooldown - step_dt);
         m_ignore_move_input = std::max(0.0f, m_ignore_move_input - step_dt);
+        m_hazard_shock_cooldown = std::max(0.0f, m_hazard_shock_cooldown - step_dt);
         if (m_illegal_wall_timer > 0.0f) {
             m_illegal_wall_timer = std::max(0.0f, m_illegal_wall_timer - step_dt);
             if (m_illegal_wall_timer <= 0.0f) m_last_wallrun_normal = Vec3(0.0f, 0.0f, 0.0f);
@@ -1046,6 +1048,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             m_base_actor = -1;
         }
 
+        check_hazard_volumes(step_dt, scene);
         m_jump_buffer = std::max(0.0f, m_jump_buffer - step_dt);
     }
 
@@ -1980,6 +1983,7 @@ ParkourController::WallFace ParkourController::probe_wall(const Vec3& dir_in, fl
     out.normal = n;
     out.point = hit.point - n * support;  // a point on the face plane
     out.distance = std::max(0.0f, (out.point - centre).dot(-n));
+    out.actor_index = hit.actor_index;
     return out;
 }
 
@@ -2014,12 +2018,14 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
             Vec3 column = wall.point + into * extra;
             float top_z = 0.0f;
             bool got_top = false;
+            int32_t top_actor = -1;
             Vec3 top_normal(0.0f, 0.0f, 1.0f);
             const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start),
                                            Vec3(column.x, column.y, z_end), scene);
             if (top.hit && top.normal.z >= kWalkableFloorZ) {
                 top_z = top.point.z;
                 top_normal = top.normal;
+                top_actor = top.actor_index;
                 got_top = true;
             } else {
                 const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start),
@@ -2027,20 +2033,27 @@ ParkourController::Ledge ParkourController::find_ledge(const Vec3& dir_in, float
                                                    Vec3(0.0f, 0.0f, z_end - z_start), scene);
                 if (box_top.hit && !box_top.start_penetrating && box_top.normal.z >= kWalkableFloorZ) {
                     top_z = box_top.point.z - kTopProbeExtent.z;
+                    top_actor = box_top.actor_index;
                     got_top = true;
                 }
             }
             if (!got_top) continue;
             const float rise = top_z - feet.z;
             if (rise < min_rise || rise > max_rise) continue;
+            const Vec3 top_pt(column.x, column.y, top_z);
+            if (is_hand_move_excluded(top_pt, top_actor, scene) ||
+                is_hand_move_excluded(wall.point, -1, scene)) {
+                continue;
+            }
             const Vec3 hands(column.x, column.y, top_z + 1.0f + 0.5f * kHandPlantHeight);
             if (!box_free(hands, Vec3(kHandPlantWidth, kHandPlantWidth, 0.5f * kHandPlantHeight), scene)) continue;
             out.found = true;
             out.normal = wall.normal;
             out.top_z = top_z;
             out.wall_distance = wall.distance;
-            out.top_point = Vec3(column.x, column.y, top_z);
+            out.top_point = top_pt;
             out.top_normal = top_normal;
+            out.actor_index = top_actor;
             return out;
         }
     }
@@ -2084,22 +2097,26 @@ ParkourController::RailTransfer ParkourController::find_rail_transfer(const Vec3
     const float z_start = ledge_z + kAllowedZTransferDistance + 10.0f;
     const float z_end = ledge_z + 1.0f;
     float rail_top = 0.0f;
+    int32_t top_actor = -1;
     bool got_top = false;
     const TraceHit top = trace_ray(Vec3(column.x, column.y, z_start), Vec3(column.x, column.y, z_end), scene);
     if (top.hit && !top.start_penetrating && top.normal.z >= kWalkableFloorZ) {
         rail_top = top.point.z;
+        top_actor = top.actor_index;
         got_top = true;
     } else {
         const TraceHit box_top = sweep_box(Vec3(column.x, column.y, z_start), kTopProbeExtent,
                                            Vec3(0.0f, 0.0f, z_end - z_start), scene);
         if (box_top.hit && !box_top.start_penetrating && box_top.normal.z >= kWalkableFloorZ) {
             rail_top = box_top.point.z - kTopProbeExtent.z;
+            top_actor = box_top.actor_index;
             got_top = true;
         }
     }
     if (!got_top) return out;
     const float rise = rail_top - ledge_z;
     if (rise < kMaxStepHeight || rise > kAllowedZTransferDistance) return out;
+    if (is_hand_move_excluded(Vec3(column.x, column.y, rail_top), top_actor, scene)) return out;
     if (!box_free(Vec3(column.x, column.y, rail_top + 41.0f), Vec3(10.0f, 10.0f, 40.0f), scene)) return out;
 
     // Thin enough to vault: the top has to end within kRailMaxWidth. The far face is then found
@@ -2297,10 +2314,12 @@ bool ParkourController::find_ledge_top(const Vec3& wall_normal, float max_rise, 
     for (float extra : {2.0f, 8.0f, 20.0f, 36.0f}) {
         const Vec3 column = p + into * (wall_dist + extra);
         float top_z = 0.0f;
+        int32_t top_actor = -1;
         bool got_top = false;
         const TraceHit h = trace_ray(column + Vec3(0.0f, 0.0f, max_rise + 10.0f), column + Vec3(0.0f, 0.0f, 5.0f), scene);
         if (h.hit && h.normal.z >= kWalkableFloorZ && h.point.z <= p.z + max_rise) {
             top_z = h.point.z;
+            top_actor = h.actor_index;
             got_top = true;
         } else {
             const float z_start = p.z + max_rise + 10.0f;
@@ -2311,11 +2330,13 @@ bool ParkourController::find_ledge_top(const Vec3& wall_normal, float max_rise, 
                 const float tz = bh.point.z - kTopProbeExtent.z;
                 if (tz <= p.z + max_rise) {
                     top_z = tz;
+                    top_actor = bh.actor_index;
                     got_top = true;
                 }
             }
         }
         if (!got_top) continue;
+        if (is_hand_move_excluded(Vec3(column.x, column.y, top_z), top_actor, scene)) continue;
         if (!has_room_at(Vec3(column.x, column.y, top_z + 0.5f), kPawnHeight, scene)) continue;
         ledge_z = top_z;
         return true;
@@ -2658,6 +2679,96 @@ bool ParkourController::has_soft_landing_below(const LevelScene& scene) const {
         }
     }
     return false;
+}
+
+bool ParkourController::is_hand_move_excluded(const Vec3& pt, int32_t actor_index, const LevelScene& scene) const {
+    if (actor_index >= 0 && static_cast<size_t>(actor_index) < scene.actors.size()) {
+        if (scene.actors[static_cast<size_t>(actor_index)].exclude_hand_moves) return true;
+    }
+    for (const auto& act : scene.actors) {
+        if (!act.exclude_hand_moves) continue;
+        if (!act.is_movement_exclusion_volume && !act.is_electric_volume && !act.is_barbed_wire_volume) continue;
+        if (act.world_bounds.min_pt.x > act.world_bounds.max_pt.x) continue;
+        const float pad_xy = (act.is_electric_volume || act.is_barbed_wire_volume) ? 28.0f : 8.0f;
+        const float pad_z  = (act.is_electric_volume || act.is_barbed_wire_volume) ? 40.0f : 12.0f;
+        if (pt.x >= act.world_bounds.min_pt.x - pad_xy && pt.x <= act.world_bounds.max_pt.x + pad_xy &&
+            pt.y >= act.world_bounds.min_pt.y - pad_xy && pt.y <= act.world_bounds.max_pt.y + pad_xy &&
+            pt.z >= act.world_bounds.min_pt.z - pad_z  && pt.z <= act.world_bounds.max_pt.z + pad_z) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ParkourController::is_foot_move_excluded(const Vec3& pt, int32_t actor_index, const LevelScene& scene) const {
+    if (actor_index >= 0 && static_cast<size_t>(actor_index) < scene.actors.size()) {
+        if (scene.actors[static_cast<size_t>(actor_index)].exclude_foot_moves) return true;
+    }
+    for (const auto& act : scene.actors) {
+        if (!act.exclude_foot_moves) continue;
+        if (!act.is_movement_exclusion_volume && !act.is_electric_volume && !act.is_barbed_wire_volume) continue;
+        if (act.world_bounds.min_pt.x > act.world_bounds.max_pt.x) continue;
+        const float pad_xy = (act.is_electric_volume || act.is_barbed_wire_volume) ? 28.0f : 8.0f;
+        const float pad_z  = (act.is_electric_volume || act.is_barbed_wire_volume) ? 40.0f : 12.0f;
+        if (pt.x >= act.world_bounds.min_pt.x - pad_xy && pt.x <= act.world_bounds.max_pt.x + pad_xy &&
+            pt.y >= act.world_bounds.min_pt.y - pad_xy && pt.y <= act.world_bounds.max_pt.y + pad_xy &&
+            pt.z >= act.world_bounds.min_pt.z - pad_z  && pt.z <= act.world_bounds.max_pt.z + pad_z) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// TdPawn.UpdateSpecialDamage (TdDmgType_ElectricShock: DamageImpulse = 300, DamageZDirection = 0.2)
+// and TdBarbedWireVolume.Touch: touching an active electric fence PhysicsVolume or barbed-wire volume
+// aborts any parkour move into MOVE_Falling, shocks Faith, and knocks her away from the fence.
+void ParkourController::check_hazard_volumes(float /*dt*/, const LevelScene& scene) {
+    if (m_telemetry.intro_active || m_telemetry.falling_to_death || m_telemetry.health <= 0.0f) return;
+    if (m_hazard_shock_cooldown > 0.0f) return;
+
+    const EMovement st = m_telemetry.move_state;
+    const bool low = (st == EMovement::MOVE_Crouch || st == EMovement::MOVE_Slide ||
+                      st == EMovement::MOVE_MeleeSlide || st == EMovement::MOVE_SkillRoll ||
+                      st == EMovement::MOVE_Coil);
+    const float h = low ? kCrouchHeight : kPawnHeight;
+    const AABB pawn_box(
+        m_telemetry.position - Vec3(kPawnRadius + 6.0f, kPawnRadius + 6.0f, 0.0f),
+        m_telemetry.position + Vec3(kPawnRadius + 6.0f, kPawnRadius + 6.0f, h));
+
+    for (const auto& vol : scene.actors) {
+        if (!vol.is_electric_volume && !vol.is_barbed_wire_volume) continue;
+        if (vol.world_bounds.min_pt.x > vol.world_bounds.max_pt.x) continue;
+        if (!pawn_box.intersects(vol.world_bounds)) continue;
+
+        m_hazard_shock_cooldown = 0.65f;
+        const float dmg = std::max(15.0f, vol.damage_per_sec);
+        m_telemetry.health = std::max(0.0f, m_telemetry.health - dmg);
+        m_telemetry.damage_flash_timer = 0.35f;
+        m_damage_cooldown = m_config.health_regen_delay;
+
+        const Vec3 vol_center = (vol.world_bounds.min_pt + vol.world_bounds.max_pt) * 0.5f;
+        const Vec3 vol_ext = (vol.world_bounds.max_pt - vol.world_bounds.min_pt) * 0.5f;
+        Vec3 push_dir;
+        if (vol_ext.x < vol_ext.y * 0.5f) {
+            push_dir = Vec3((m_telemetry.position.x >= vol_center.x) ? 1.0f : -1.0f, 0.0f, 0.0f);
+        } else if (vol_ext.y < vol_ext.x * 0.5f) {
+            push_dir = Vec3(0.0f, (m_telemetry.position.y >= vol_center.y) ? 1.0f : -1.0f, 0.0f);
+        } else {
+            push_dir = horiz(m_telemetry.position - vol_center);
+            if (push_dir.length_sq() < 1e-4f) push_dir = -facing_forward();
+            else push_dir = push_dir.normalized();
+        }
+
+        constexpr float kShockImpulse = 300.0f;
+        m_telemetry.velocity = push_dir * kShockImpulse + Vec3(0.0f, 0.0f, 160.0f);
+        m_sprint_energy = 0.0f;
+        m_ignore_move_input = std::max(m_ignore_move_input, 0.35f);
+        m_telemetry.camera_roll_deg = 0.0f;
+        leave_ground(EMovement::MOVE_Falling);
+        set_stance(kEyeHeightStand);
+        move_swept(push_dir * 8.0f, kPawnHeight, 0.0f, scene);
+        break;
+    }
 }
 
 void ParkourController::update_fall_height_volumes(const LevelScene& scene) {
@@ -3083,6 +3194,7 @@ bool ParkourController::try_initiate_wallrun(const InputFrame& input, const Leve
     }
     if (!hit.found) return false;
     if (h.dot(hit.normal) >= 0.0f) return false;  // must be moving into the wall
+    if (is_foot_move_excluded(hit.point, hit.actor_index, scene)) return false;
 
     const Vec3 n = hit.normal;
     const Vec3 along = along_of(n);
@@ -3325,6 +3437,7 @@ bool ParkourController::try_initiate_wallclimb(const InputFrame& input, const Le
     const Vec3 fwd = facing_forward();
     const WallFace wall = probe_wall(fwd, c.wallclimb_max_distance, kPawnHeight * 0.5f, scene);
     if (!wall.found || wall.distance > c.wallclimb_max_distance) return false;
+    if (is_foot_move_excluded(wall.point, wall.actor_index, scene)) return false;
     if (fwd.dot(-wall.normal) < std::cos(c.wallclimb_max_angle_deg * DEG2RAD)) return false;
     if (m_last_wallrun_normal.length_sq() > 0.5f && wall.normal.dot(m_last_wallrun_normal) > 0.9f) return false;
     const WallFace tall = probe_wall(fwd, c.wallclimb_max_distance, c.wallclimb_min_wall_height - 2.0f, scene);
@@ -3957,6 +4070,7 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
     const Ledge step = find_ledge(dir, reach, c.springboard_step_height - c.springboard_step_tolerance,
                                   c.springboard_step_height + c.springboard_step_tolerance, scene);
     if (!step.found) return false;
+    if (is_foot_move_excluded(step.top_point, step.actor_index, scene)) return false;
     if (step.wall_distance < kPawnRadius + 20.0f) return false;
     if (dir.dot(-step.normal) < 0.7f) return false;
 
@@ -3972,9 +4086,14 @@ bool ParkourController::try_initiate_springboard(const InputFrame& input, const 
                                        Vec3(column.x, column.y, step.top_z + 10.0f), scene);
         if (!top.hit || top.normal.z < kWalkableFloorZ) continue;
         if (top.point.z < obstacle_z_min || top.point.z > obstacle_z_max) continue;
+        const Vec3 cand_top(column.x, column.y, top.point.z);
+        if (is_hand_move_excluded(cand_top, top.actor_index, scene) ||
+            is_foot_move_excluded(cand_top, top.actor_index, scene)) {
+            continue;
+        }
         if (!has_room_at(Vec3(column.x, column.y, top.point.z + 0.5f), kCrouchHeight, scene)) continue;
         found_obstacle = true;
-        obstacle_top = Vec3(column.x, column.y, top.point.z);
+        obstacle_top = cand_top;
     }
     if (!found_obstacle) return false;
 
@@ -4137,6 +4256,10 @@ bool ParkourController::try_initiate_vault(const InputFrame& input, const LevelS
         const Vec3 end = face + into * (kPawnRadius + 6.0f + end_dist * 0.5f);
         m_path_p2 = Vec3(end.x, end.y, top_z);
         m_path_end_move = EMovement::MOVE_Walking;
+    }
+    if (is_hand_move_excluded(m_path_p1, -1, scene) ||
+        is_hand_move_excluded(m_path_p1 + Vec3(0.0f, 0.0f, 40.0f), -1, scene)) {
+        return false;
     }
     if (!grounded) {
         consume_jump();

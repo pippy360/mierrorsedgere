@@ -171,6 +171,7 @@ private:
         Vec3 normal{0.0f, 0.0f, 0.0f};
         Vec3 point{0.0f, 0.0f, 0.0f};
         float distance = 0.0f;
+        int32_t actor_index = -1;
     };
 
     // A ledge (walkable top of a wall ahead): where to hang / vault / climb.
@@ -181,6 +182,7 @@ private:
         float wall_distance = 0.0f;     // pawn centre -> wall face, along -normal
         Vec3 top_point{0.0f, 0.0f, 0.0f};
         Vec3 top_normal{0.0f, 0.0f, 1.0f};  // of the surface the hands go on (TdPawn.MoveLedgeNormal)
+        int32_t actor_index = -1;
     };
 
     // TdMove_GrabTransfer: an obstacle standing on a grabbed lip (a rail) that leaves no room to
@@ -278,6 +280,9 @@ private:
     void land(const FloorHit& floor, const LevelScene& scene);
     [[nodiscard]] bool is_soft_landing_surface(const FloorHit& floor, const LevelScene& scene) const;
     [[nodiscard]] bool has_soft_landing_below(const LevelScene& scene) const;
+    [[nodiscard]] bool is_hand_move_excluded(const Vec3& pt, int32_t actor_index, const LevelScene& scene) const;
+    [[nodiscard]] bool is_foot_move_excluded(const Vec3& pt, int32_t actor_index, const LevelScene& scene) const;
+    void check_hazard_volumes(float dt, const LevelScene& scene);
     void update_fall_height_volumes(const LevelScene& scene);
     void leave_ground(EMovement air_move);
     void set_stance(float eye_height);
@@ -354,6 +359,7 @@ private:
     HudEffectEnvelope m_env_blur;
     HudEffectEnvelope m_env_melee;
     HudEffectEnvelope m_env_fall;
+    float m_hazard_shock_cooldown = 0.0f;
     float m_air_fall_start_z = 0.0f;
     float m_fall_peak_z = 0.0f;
     float m_melee_cooldown = 0.0f;

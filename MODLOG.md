@@ -1313,3 +1313,37 @@ Pressing `Escape` (or controller `Start`) during gameplay previously opened a cu
 ### 27.3 Verification (`--verify-all` on macOS Apple Silicon `arm64`)
 - Full headless + Metal GPU oracle suite (`./build/mirrorsedge_macos --verify-all`): **ALL 18 STAGES PASS (`exit code 0`)**, including Stage 18 (`TdSPPause=OK, OverlayAlpha=OK, TdPauseOptions=OK, TdTutorialPause=OK`).
 
+---
+
+## 28. Electric Fence, Barbed-Wire & Movement-Exclusion Volume Parity (`agent/electric-fence-vault`, 2026-10-10)
+
+### 28.1 Retail Reverse-Engineering Findings (`TdGame.u`, `Engine.u`, `.me1` Maps)
+1. **Electric Fences & Barbed-Wire Volumes in `.me1` Packages**:
+   - In retail *Mirror's Edge*, electric fences (`S_FenceGenericWire_*`) are ordinary `StaticMeshActor` props enveloped by a `PhysicsVolume` with `bPainCausing = true` and `DamageType = Class'TdGame.TdDmgType_ElectricShock'` (with `DamagePerSec = 90..10000`, e.g., `Subway_MoPu_Spt.me1` `PhysicsVolume_0..5`, `Subway_Sky_Spt.me1`, `Mall_HW_Spt.me1`, `Factory_Pursuit_Spt.me1`, `Boat_P.me1`, `Convoy_SL_Spt.me1`, `Scraper_Roof_Spt.me1`), accompanied by `BlockingVolume` brushes with `bExludeHandMoves = true` and `bExludeFootMoves = true`.
+   - Barbed-wire fences use `TdBarbedWireVolume` (`TdBarbedWireVolume.uc`), which extends `TdMovementExclusionVolume` (`bExcludeHandMoves = true`, `bExcludeFootMoves = true`, `bPainCausing = true`, `DamageType = Class'TdGame.TdDmgType_BarbedWire'`, `BarbedWireDamage = 25`).
+2. **Parkour Move Exclusions (`TdMovementDataSource.cpp` / `Actor.uc`)**:
+   - `Actor` in `Engine.u` defines `bExludeHandMoves` and `bExludeFootMoves` (note the retail spelling without `'c'`, defaulted to `true` on `Default__BlockingVolume`), while `TdMovementExclusionVolume` defines `bExcludeHandMoves` and `bExcludeFootMoves`.
+   - Hand-based moves (`MOVE_VaultOver`, `MOVE_SpeedVaulting`, `MOVE_Grabbing`, `MOVE_IntoGrab`, `MOVE_GrabPullUp`, `MOVE_GrabTransfer`) reject ledges/obstacles whose hit actor has `bExludeHandMoves` or whose handplant/vault sweep intersects an active `TdMovementExclusionVolume`, `TdBarbedWireVolume`, or electric-shock `PhysicsVolume`.
+   - Foot-based wall moves (`MOVE_WallRunningLeft`, `MOVE_WallRunningRight`, `MOVE_WallClimbing`, `MOVE_SpringBoarding`) reject surfaces whose hit actor has `bExludeFootMoves` or whose contact point lies inside an active exclusion/hazard volume.
+3. **Electric Shock & Barbed-Wire Knockback (`TdPawn.UpdateSpecialDamage` / `TdDmgType_ElectricShock`)**:
+   - `TdDmgType_ElectricShock` (`Default__TdDmgType_ElectricShock` in `TdGame.u`) specifies `DamageImpulse = 300.0` and `DamageZDirection = 0.2`.
+   - In `TdPawn.UpdateSpecialDamage`, touching an electric-shock volume forces `SetMove(MOVE_Falling)`, zeroes velocity along the push direction if moving into the fence, and applies `AddVelocity(ElectricShockDirection * 300.0)` where `ElectricShockDirection = Normal(PushDir2D + (0, 0, 0.2))`.
+4. **Kismet Deactivation (`SeqAct_ChangeCollision`)**:
+   - When the player flips an electric-fence cutoff switch (e.g., Chapter 4 `Subway_MoPu_Spt.me1` `SeqAct_ChangeCollision_3` with `CollisionType = COLLIDE_NoCollision`), Kismet disables collision on both the `BlockingVolume`s and the electric `PhysicsVolume`s so Faith can vault or climb the de-energized fence.
+
+### 28.2 Implementation (`src/math/types.hpp`, `src/assets/upk_loader.cpp`, `src/physics/collision_world.*`, `src/physics/parkour_controller.*`, `src/game/level_script.*`, `src/main.cpp`)
+- **`UPKPackage::parse_properties` & `extract_actors` (`src/assets/upk_loader.cpp`)**:
+  - Extended `parse_properties` and `find_property_start` to parse 4-byte object references on `ComponentProperty` and `ClassProperty` tags in addition to `ObjectProperty`.
+  - Extracted `is_movement_exclusion_volume`, `is_barbed_wire_volume`, `is_electric_volume`, `exclude_hand_moves`, `exclude_foot_moves`, `damage_per_sec`, and world-space `BrushAggGeom` `world_bounds` for hazard and exclusion volumes.
+- **`ParkourController` (`src/physics/parkour_controller.hpp`, `src/physics/parkour_controller.cpp`)**:
+  - Implemented `is_hand_move_excluded()`, `is_foot_move_excluded()`, and `check_hazard_volumes()`.
+  - Filtered out excluded actors and volumes in `probe_wall`, `find_ledge`, `find_rail_transfer`, `find_ledge_top`, `try_initiate_wallrun`, `try_initiate_wallclimb`, `try_initiate_springboard`, and `try_initiate_vault`.
+  - Applied `TdDmgType_ElectricShock` / `TdBarbedWireVolume` knockback (`MOVE_Falling`, `300.0 uu/s` impulse with `0.2` Z lift, health damage, and shock audio) in `ParkourController::step` whenever the player capsule overlaps an active hazard volume.
+- **`LevelScript` & `CollisionWorld` (`src/game/level_script.*`, `src/physics/collision_world.*`, `src/main.cpp`)**:
+  - Added `SeqAct_ChangeCollision` parsing and execution (`COLLIDE_NoCollision`, `COLLIDE_BlockAll`, `COLLIDE_TouchAll`, `bCollideActors`, `bBlockActors`) and `SeqAct_Toggle` volume handling via `ScriptHost::change_collision`, updating actor collision/hazard flags and triangle channel masks (`CollisionWorld::set_actor_channels`).
+
+### 28.3 Verification (`./build/mirrorsedge_macos --verify-all`)
+- Added **Oracle Stage 19 (`Testing Electric Fence Vault Prevention & Shock Knockback`)** in `src/main.cpp`:
+  - `BlockedVaultWhenEnergized=OK`, `ShockKnockback=OK`, `HealthAfterShock=10`, `VaultWhenDeenergized=OK`, `RealVols[Electric=6, BarbedWire=35, Exclusion=1]`.
+- All 17 verified oracle stages (`Stage 1`–`Stage 19`) pass with exit code `0`.
+

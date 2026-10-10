@@ -1607,9 +1607,100 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", TdPauseOptions=" << (s18_opt_ok ? "OK" : "FAIL")
               << ", TdTutorialPause=" << (s18_tut_ok ? "OK" : "FAIL") << ")" << std::endl;
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, and pause menu stage 18
+    // Stage 19: Electric Fence & Movement Exclusion Volume (TdDmgType_ElectricShock / TdBarbedWireVolume /
+    // TdMovementExclusionVolume / SeqAct_ChangeCollision): an energized electric fence blocks vaulting and
+    // ledge-grabbing and shocks Faith back into MOVE_Falling with DamageImpulse=300, DamageZDirection=0.2;
+    // once de-energized (e.g. SeqAct_ChangeCollision), the same obstacle can be vaulted cleanly.
+    std::cout << "[Oracle Stage 19] Testing Electric Fence Vault Prevention & Shock Knockback..." << std::endl;
+    bool s19_pass = false;
+    {
+        // Place an electric fence volume over the Stage 2 airduct obstacle (east face x ~ -2621, z = 4224..4380)
+        LevelActor elec_vol{};
+        elec_vol.class_name = "PhysicsVolume";
+        elec_vol.object_name = "PhysicsVolume_ElectricTest";
+        elec_vol.unique_name = "PhysicsVolume_ElectricTest";
+        elec_vol.is_electric_volume = true;
+        elec_vol.exclude_hand_moves = true;
+        elec_vol.exclude_foot_moves = true;
+        elec_vol.damage_per_sec = 90.0f;
+        elec_vol.world_bounds.min_pt = Vec3(-2700.0f, -6600.0f, 4220.0f);
+        elec_vol.world_bounds.max_pt = Vec3(-2500.0f, -6400.0f, 4420.0f);
+        elec_vol.location = (elec_vol.world_bounds.min_pt + elec_vol.world_bounds.max_pt) * 0.5f;
+        sim_scene.actors.push_back(elec_vol);
+
+        // 19A: Attempt the exact Stage 2 speed-vault approach while the electric fence volume is active.
+        // Vaulting / grabbing must be rejected, and running into the volume must shock Faith back (+X velocity,
+        // MOVE_Falling, health reduced).
+        controller.reset(Vec3(-1655.2f, -6505.2f, 4224.0f), 180.0f);
+        bool saw_illegal_vault = false;
+        bool saw_shock_knockback = false;
+        float min_health = 100.0f;
+        for (int i = 0; i < 180; ++i) {
+            const bool jump_frame = (std::abs(controller.get_position().x - (-2513.0f)) < 25.0f);
+            controller.step(jump_frame ? in_run_jump : in_run, kDt, sim_scene);
+            const EMovement st = controller.get_move_state();
+            if (st == EMovement::MOVE_VaultOver || st == EMovement::MOVE_SpeedVaulting ||
+                st == EMovement::MOVE_Grabbing || st == EMovement::MOVE_IntoGrab ||
+                st == EMovement::MOVE_GrabPullUp || st == EMovement::MOVE_WallClimbing) {
+                saw_illegal_vault = true;
+            }
+            min_health = std::min(min_health, controller.get_telemetry().health);
+            if (controller.get_telemetry().health < 100.0f && controller.get_velocity().x > 100.0f &&
+                st == EMovement::MOVE_Falling) {
+                saw_shock_knockback = true;
+                break;
+            }
+        }
+
+        // 19B: De-energize the electric fence volume (as SeqAct_ChangeCollision does when flipping the switch)
+        // and verify the obstacle can now be vaulted normally.
+        sim_scene.actors.back().is_electric_volume = false;
+        controller.reset(Vec3(-1655.2f, -6505.2f, 4224.0f), 180.0f);
+        step_until(in_run, 240, sim_scene, [&] { return controller.get_position().x <= -2513.0f; });
+        controller.step(in_run_jump, kDt, sim_scene);
+        const bool deenergized_vault_ok = (controller.get_move_state() == EMovement::MOVE_VaultOver);
+        sim_scene.actors.pop_back();
+
+        // 19C: Verify real UPK extraction of electric-shock PhysicsVolumes (Subway_MoPu_Spt.me1),
+        // TdBarbedWireVolumes (Tutorial_p.me1 / Edge_p.me1), and TdMovementExclusionVolumes
+        // (Escape_Plaza_Spt.me1) with valid world-space BrushAggGeom bounds.
+        int real_elec_vols = 0;
+        int real_wire_vols = 0;
+        int real_excl_vols = 0;
+        auto count_vols = [&](const std::vector<LevelActor>& acts) {
+            for (const auto& a : acts) {
+                const bool valid_bounds = (a.world_bounds.max_pt.x > a.world_bounds.min_pt.x &&
+                                           a.world_bounds.max_pt.z > a.world_bounds.min_pt.z);
+                if (a.is_electric_volume && valid_bounds) ++real_elec_vols;
+                if (a.is_barbed_wire_volume && valid_bounds) ++real_wire_vols;
+                if (a.is_movement_exclusion_volume && valid_bounds) ++real_excl_vols;
+            }
+        };
+        count_vols(sp00_scene.actors);
+        count_vols(sp01_scene.actors);
+        for (const char* rel : {"/TdGame/CookedPC/Maps/SP04/Subway_MoPu_Spt.me1",
+                                "/TdGame/CookedPC/Maps/SP01/Escape_Plaza_Spt.me1"}) {
+            UPKPackage pkg(game_root + rel);
+            if (pkg.is_valid()) {
+                count_vols(pkg.extract_actors());
+            }
+        }
+
+        s19_pass = !saw_illegal_vault && saw_shock_knockback && (min_health < 100.0f) &&
+                   deenergized_vault_ok && (real_elec_vols >= 6) && (real_wire_vols > 0) && (real_excl_vols > 0);
+        std::cout << "  -> Stage 19 Result: " << (s19_pass ? "PASS" : "FAIL")
+                  << " (BlockedVaultWhenEnergized=" << (!saw_illegal_vault ? "OK" : "FAIL")
+                  << ", ShockKnockback=" << (saw_shock_knockback ? "OK" : "FAIL")
+                  << ", HealthAfterShock=" << min_health
+                  << ", VaultWhenDeenergized=" << (deenergized_vault_ok ? "OK" : "FAIL")
+                  << ", RealVols[Electric=" << real_elec_vols
+                  << ", BarbedWire=" << real_wire_vols
+                  << ", Exclusion=" << real_excl_vols << "])" << std::endl;
+    }
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2114,6 +2205,26 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         host.line_clear = [&](const Vec3& from, const Vec3& to) {
             Vec3 hit, normal;
             return !controller.leg_line_check(from, to, active_scene, hit, normal);
+        };
+        host.change_collision = [&](const ScriptActor& sa, bool collide_actors, bool block_actors) {
+            for (size_t ai = 0; ai < active_scene.actors.size(); ++ai) {
+                LevelActor& a = active_scene.actors[ai];
+                if (lower(a.source_package) == lower(sa.package) && a.unique_name == sa.name) {
+                    a.is_collidable = collide_actors && block_actors;
+                    a.blocks_traces = collide_actors && block_actors;
+                    if (!collide_actors) {
+                        a.is_electric_volume = false;
+                        a.is_barbed_wire_volume = false;
+                        a.is_movement_exclusion_volume = false;
+                    }
+                    if (active_scene.collision) {
+                        uint8_t ch = 0;
+                        if (a.is_collidable) ch |= COLL_BlockNonZeroExtent;
+                        if (a.blocks_traces) ch |= COLL_BlockZeroExtent;
+                        active_scene.collision->set_actor_channels(static_cast<int32_t>(ai), ch);
+                    }
+                }
+            }
         };
         return host;
     };
