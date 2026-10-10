@@ -388,6 +388,8 @@ private:
     Vec3 m_climb_normal{0.0f, 0.0f, 0.0f};
     float m_climb_cooldown = 0.0f;
     bool m_climb_can_exit_top = true;
+    bool m_climb_is_pipe = false;
+    float m_climb_settle_speed = 0.0f;     // TdMove_IntoClimb: SetPreciseLocation speed onto the step taken
     Vec3 m_balance_start{0.0f, 0.0f, 0.0f};
     Vec3 m_balance_end{0.0f, 0.0f, 0.0f};
     float m_balance_lean = 0.0f;

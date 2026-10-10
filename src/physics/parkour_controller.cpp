@@ -60,6 +60,25 @@ constexpr float kGrabMaxRise = 215.0f;
 constexpr float kMantleMaxRise = 125.0f;
 // Camera roll while wallrunning (TdMove_WallRun camera modifier).
 constexpr float kWallrunCameraRoll = 15.0f;
+// TdLadderVolume (MirrorsEdge.exe GetLastStep 0x12aa0e0, GetLadderLocation 0x12ab3b0): the cooked
+// PawnLadderLocations run StepHeight (32) apart up to End.Z - 96 (every Tutorial_p volume). A ladder
+// is climbed to its top location, a pipe only to the fourth from the top (LadderSteps.Num() - 4),
+// and a pipe's pawn location is ZOffsetPipe (-5) lower. They are cylinder centres, so the feet are
+// CollisionHeight (90) under them.
+constexpr float kLadderTopStepBelowEnd = 96.0f;
+constexpr float kLadderStepHeight = 32.0f;
+constexpr float kPipeZOffset = -5.0f;
+// The feet on the last step the move climbs to (TdMove_Climb.HandleClimbAction stops there).
+float climb_last_step_feet_z(const Vec3& base, const Vec3& top, bool pipe) {
+    const float top_step = top.z - kLadderTopStepBelowEnd;
+    const float centre = pipe ? top_step - 3.0f * kLadderStepHeight + kPipeZOffset : top_step;
+    return std::max(base.z, centre - 0.5f * kPawnHeight);
+}
+// TdMove_IntoClimb.CanDoMove: a pipe is not taken by a pawn whose centre is above the pipe's top
+// location (GetLadderLocation(Num - 1)) - her hands would be over the end of it.
+float pipe_highest_catch_feet_z(const Vec3& top) {
+    return top.z - kLadderTopStepBelowEnd + kPipeZOffset - 0.5f * kPawnHeight;
+}
 // TdMove_Barge defaults (Default__TdMove_Barge): BargeAddOnSpeed, BargeMaxSpeed,
 // BargeKickThresholdSpeed, BargeMinTraceDistance, BargeTraceTime, BargeAnimTime.
 constexpr float kBargeAddOnSpeed = 200.0f;
@@ -546,6 +565,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_climb_normal = Vec3(0.0f, 0.0f, 0.0f);
     m_climb_cooldown = 0.0f;
     m_climb_can_exit_top = true;
+    m_climb_is_pipe = false;
+    m_climb_settle_speed = 0.0f;
     m_balance_start = Vec3(0.0f, 0.0f, 0.0f);
     m_balance_end = Vec3(0.0f, 0.0f, 0.0f);
     m_balance_lean = 0.0f;
@@ -4413,6 +4434,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         if (m_climb_cooldown > 0.0f && horiz(m_climb_base - base).length() < 80.0f) continue;
 
         if (!(m_telemetry.position.z >= base.z - 95.0f && m_telemetry.position.z <= top.z - 20.0f)) continue;
+        if (act.is_pipe && m_telemetry.position.z > pipe_highest_catch_feet_z(top)) continue;
         const float h_dist = horiz(m_telemetry.position - base).length();
         if (!(h_dist <= max_horiz)) continue;
 
@@ -4449,12 +4471,15 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         if (facing_forward().dot(-wall_out) < -0.30f) continue;
 
         const Vec3 climb_xy = Vec3(base.x, base.y, 0.0f) + wall_out * 64.0f;
-        const float max_climb_z = act.can_exit_at_top
-            ? std::max(base.z, top.z - 35.0f)
-            : std::max(base.z, top.z - kPawnHeight);
-        const float clamped_z = std::clamp(m_telemetry.position.z, base.z, max_climb_z);
+        // TdMove_IntoClimb.StartMove takes the closest step clamped to GetLastStep() and moves the
+        // pawn onto it (SetPreciseLocation at FMax(VSize2D(Delta), 30) / 0.15 uu/s). With no way off
+        // at the top, a pawn caught above the last step is left there for update_climb to lower.
+        const float entry_z = act.can_exit_at_top
+            ? std::clamp(m_telemetry.position.z, base.z, std::max(base.z, top.z - 35.0f))
+            : std::max(m_telemetry.position.z, base.z);
+        m_climb_settle_speed = std::max(horiz(m_telemetry.position - climb_xy).length(), 30.0f) / 0.15f;
 
-        m_telemetry.position = Vec3(climb_xy.x, climb_xy.y, clamped_z);
+        m_telemetry.position = Vec3(climb_xy.x, climb_xy.y, entry_z);
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
         m_telemetry.move_state = EMovement::MOVE_Climb;
         m_telemetry.grounded = false;
@@ -4463,6 +4488,7 @@ bool ParkourController::try_initiate_climb(const InputFrame& input, const LevelS
         m_climb_top = top;
         m_climb_normal = wall_out;
         m_climb_can_exit_top = act.can_exit_at_top;
+        m_climb_is_pipe = act.is_pipe;
         m_telemetry.climbing_pipe = act.is_pipe;
         m_telemetry.wall_normal = wall_out;
         m_state_timer = 0.0f;
@@ -4482,16 +4508,24 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
 
     const Vec3 into = -m_climb_normal;
     const Vec3 climb_xy = Vec3(m_climb_base.x, m_climb_base.y, 0.0f) + m_climb_normal * 64.0f;
-    // In UE3 TdLadderVolume, GetLastStep() stops one full pawn height below End.Z when !bCanExitAtTop
-    // (GetLastStep = LadderSteps.Num() - 4 on pipes), so Faith's head/eyes never rise above a capped pipe.
+    // With no way off at the top (bCanExitAtTop false), TdMove_Climb.HandleClimbAction stops on
+    // GetLastStep() and never calls ExitAtTop: on a pipe that keeps her hands under its end.
     const float max_climb_z = m_climb_can_exit_top
         ? std::max(m_climb_base.z, m_climb_top.z - 65.0f)
-        : std::max(m_climb_base.z, m_climb_top.z - kPawnHeight);
+        : climb_last_step_feet_z(m_climb_base, m_climb_top, m_climb_is_pipe);
     // How far the ladder goes on, for the animation: a pipe's last rung is climbed differently.
     m_telemetry.climb_top = std::max(0.0f, max_climb_z - m_telemetry.position.z);
     m_telemetry.climb_bottom = std::max(0.0f, m_telemetry.position.z - m_climb_base.z);
     m_telemetry.position.x = climb_xy.x;
     m_telemetry.position.y = climb_xy.y;
+
+    // Caught above the last step (a jump onto a capped pipe): IntoClimb's precise move lowers her
+    // onto it, and nothing else is taken until she is there (ClimbState 2 / bUsePreciseLocation).
+    if (!m_climb_can_exit_top && m_telemetry.position.z > max_climb_z) {
+        m_telemetry.position.z = std::max(max_climb_z, m_telemetry.position.z - m_climb_settle_speed * dt);
+        m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        return;
+    }
 
     // Jump off pipe/ladder (TdMove_Climb.HandleMoveAction(MA_Jump)):
     // Aiming away from the wall or holding A/D jumps toward adjacent pipes/ledges (e.g. Tutorial Stage 11 pipes);
@@ -4523,24 +4557,18 @@ void ParkourController::update_climb(const InputFrame& input, float dt, const Le
     }
 
     if (input.forward > 0.2f) {
-        if (!m_climb_can_exit_top && m_telemetry.position.z >= max_climb_z) {
-            m_telemetry.position.z = max_climb_z;
-            m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
+        constexpr float kClimbUpSpeed = 190.0f;
+        if (!m_climb_can_exit_top) {
+            // Up to the last step and no further (e.g. the Tutorial Stage 11 drainpipes, which end
+            // under the roof's wire fence).
+            m_telemetry.position.z = std::min(max_climb_z, m_telemetry.position.z + kClimbUpSpeed * dt);
+            m_telemetry.velocity = (m_telemetry.position.z < max_climb_z)
+                ? Vec3(0.0f, 0.0f, kClimbUpSpeed)
+                : Vec3(0.0f, 0.0f, 0.0f);
             return;
         }
-        constexpr float kClimbUpSpeed = 190.0f;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, kClimbUpSpeed);
         m_telemetry.position.z += kClimbUpSpeed * dt;
-
-        // When bCanExitAtTop is false (e.g. Tutorial Stage 11 drainpipes capped beneath a roof fence),
-        // TdMove_Climb.HandleClimbAction stops at GetLastStep() and never triggers ExitAtTop.
-        if (!m_climb_can_exit_top) {
-            if (m_telemetry.position.z >= max_climb_z) {
-                m_telemetry.position.z = max_climb_z;
-                m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
-            }
-            return;
-        }
 
         // Reaching top of pipe/ladder (TdMove_Climb.ExitAtTop):
         // In UE3 TdLadderVolume, GetLastStep().Z = End.Z - 96.0 (side rails extend ~96 UU above the platform),
