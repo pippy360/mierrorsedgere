@@ -11,7 +11,6 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 
 <!-- Add new bug reports or feature requests right below this comment: -->
 - Respawning often respawns the player to a position where they fall and die or inside geometry.
-- The falling effect is wrong (it's just a transparent black border now).
 
 ---
 
@@ -52,14 +51,16 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 ---
 
 ## Rendering, Lighting & Post-Processing
-*(Refs: `docs/RENDERING_RE.md` §10, `MODLOG.md` §9.4 & §14.3, `src/renderer/*`, `src/assets/level_lightmaps.*`, `src/assets/level_postprocess.*`)*
+*(Refs: `docs/RENDERING_RE.md` §15, `MODLOG.md` §9.4, §14 & §23, `src/renderer/*`, `src/assets/level_*`; research notes in the main checkout's ignored `build/re/notes/`)*
 
-- **Dynamic light environments (`DynamicLightEnvironmentComponent`):** Replace the legacy forward sun + hemisphere stand-in on movers (doors, lifts), NPCs, dropped weapons, and Faith's first-person mesh with retail's spherical harmonic + dominant directional light environment (`docs/AMBIENT_LIGHTING_RE.md` §3.3, `docs/RENDERING_RE.md` §10).
-- **Modulated dynamic shadows, decals, and particle emitters:** Render UE3 modulated character/mover shadows (`ModShadowColor`), placed/dynamic `DecalComponent`s, and `ParticleSystemComponent` emitters (steam, sparks, glass shards, helicopter searchlight dust).
-- **Sun & lamp lens flares (`LensFlareSource`):** Implement `LensFlareVertexFactory` rendering for sun and light lens flares (e.g., Pirandello Kruger and Prologue rooftops).
-- **`TdMotionBlurPostProcess` pass:** Read native speed-to-`MotionPacked` parameter mapping from `MirrorsEdge.exe` and add the radial 8-tap peripheral motion blur pass to the post-process chain (`docs/RENDERING_RE.md` §10).
-- **Post-process `MaterialEffect` shaders:** Replace the hand-tuned health, melee impact, and reaction-time tint approximations in `tonemap_fragment` with retail's compiled post-process material expressions.
-- **Height fog on translucent surfaces:** Apply height fog / haze to translucent geometry (glass, water, alpha-blended props), which currently draws after the fog pass without fogging.
+- **Particle emitters (`ParticleSystemComponent`):** nothing is drawn. 1783 emitters are placed in the ten chapters, 1299 running from the start: rooftop vent smoke (sprites with a 4 x 4 sub-UV flipbook), far smoke columns and flying paper (mesh emitters), warning-light flares, water drips, birds. The cooked layout, the module semantics, the sprite vertex maths and a 13-module subset that covers 57% of the placements are worked out in `build/re/notes/particles.md`.
+- **The player's dynamic shadow is cast by the first-person body:** it has no head. Retail casts it from the third-person body (`TdPawnMesh3p`, `bOwnerNoSeeWithShadow`), which the port does not have (`docs/RENDERING_RE.md` §10).
+- **Dynamic shadows not done:** the shadows inside the first-person depth groups (the arms' on the legs), `LightShadow_ModulateBetter` while hanging from a ledge, pre-shadows.
+- **Light environments, remaining differences:** the whole first-person mesh takes the arms' environment (`MyLightEnvironment1P`), where retail gives the legs the pawn's; an actor whose environment is switched off is lit by the sky colours and its one brightest light, where retail adds a pass for every light on its channels; `SkeletalMeshActor`s, dropped weapons and pickups get none (`docs/RENDERING_RE.md` §9).
+- **Lens flares switched by Kismet or riding a mover:** the 70 `LensFlareSource`s with `bAutoActivate=False` (`SeqAct_Toggle`, Matinee toggle tracks) never switch on, and the 89 on a base (police cars, trains) stay where the level placed them. A flare's coverage comes from sight lines against meshes that have collision, not from an occlusion query, so a mesh with no collision does not hide it (`docs/RENDERING_RE.md` §11).
+- **Decals with no stored receiver, and dynamic decals:** 440 placed decals carry no triangles (retail may compute their receivers when the level loads: e.g. `SP00/Tutorial_p` `DecalActor_0`, a drain); bullet holes (`TdWeapon.SpawnImpactDecal`) and footprints are not made; a decal's own `FLightMap1D` (10 receivers) is not used (`docs/RENDERING_RE.md` §12).
+- **Material effects not driven:** taser, explosion, flashbang, laser and scope effects of the chain, and the slideshow.
+- **OpenGL on Intel's Windows driver:** `me_glsl.exe --builtin-only` compiles the built-in shaders there, but `mirrorsedge_opengl.exe` and the materials were run on NVIDIA's driver only (`docs/LINUX_PORT.md`).
 - **Honour `CastShadow=False` and Kismet-toggled lights/volumes:** Skip shadow-map rendering for static mesh components with `CastShadow=False` (`MODLOG.md` §9.4) and support Kismet actions that toggle lights, material scalar/vector parameters, and post-process volumes at runtime.
 
 ---

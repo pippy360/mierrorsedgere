@@ -1116,3 +1116,76 @@ failed in any run.
   theme, chapter track, menu theme. This branch: menu theme, chapter track (19 ms after the switch), menu theme
   (20 ms), chapter track (23 ms), Stormdrain's stems (bound at once, 2 s after their stop); no failed deletes.
 - `./build/mirrorsedge_macos --verify-all`: ALL SYSTEMS PASS (16 stages).
+
+## 23. Retail's rendering, second part: light and shadow for dynamic objects, lens flares, decals, motion blur, the material effects (agent/retail-rendering-2, 2026-10-10)
+
+Section 14 left a list of what was still a stand-in or missing. This is that list, done from the game's
+executable, its shipped shader sources and the level data, except the particles. `docs/RENDERING_RE.md`
+sections 8 to 12 have what retail does, with the addresses.
+
+### 23.1 Changes
+- **Light environments** (`src/assets/level_lights.*`, `src/renderer/light_environment.hpp`,
+  `scene_shading_msl.hpp`, all new): the level's lights are kept in the scene; every dynamic object drawn
+  (lift parts, doors, the `InterpActor`s and `KActor`s left in place, enemies, the first-person body) has a
+  `DynamicLightEnvironmentComponent` as retail runs it: the lights that share a channel are gathered at the
+  centre of its bounds with one line check each into spherical harmonics, DICE's bounce is added, the brightest
+  direction is taken out as a point light and the rest lights the object as harmonics. Per actor the level's
+  own settings are read (the environment is off by class default for movers; then the lights reach the mesh
+  directly). Lights on the world's dynamic list (a lift's own lamps) light what shares their channel. The
+  sun-and-hemisphere stand-in is gone from everything that has an environment.
+- **Dynamic shadows** (`src/renderer/mod_shadow.hpp`, new; `mod_shadow_fragment`): retail's modulated shadows.
+  Each casting environment makes a shadow light from its shadow environment and a colour
+  `min(1, Rest / (Rest + Dominant))`; a depth map a caster (cells of a third slice of the shadow map array),
+  one pass that multiplies the scene before fog. Casters: the player, enemies, movers whose environment casts.
+- **Lens flares** (`src/assets/level_lensflares.*`, `src/renderer/lens_flare.hpp`, new): `LensFlareSource`s
+  and their templates from the level packages, the raw-distribution lookup tables, the quads' placement along
+  the line through the screen's centre, the cone, the coverage, the three material inputs (with the swap the
+  shipped vertex factory makes), drawn with their own translated materials.
+- **Decals** (`src/assets/level_decals.*`, new): the placed decals' stored, already clipped triangles, read
+  from the native tail of each `DecalComponent`; drawn with a depth bias, before the other translucency.
+- **`TdMotionBlur`** (`MotionBlurState`, `finish_fragment`): the amount as the executable makes it from the
+  eye's speed, the shader's radial blur as the last pass.
+- **The chain's material effects** (`src/game/screen_effects.hpp`, new; `extract_post_chain`): the effects of
+  `FX_PostProcess` are translated like any material and drawn over the picture, before or after tone mapping
+  as the chain orders them, driven as `TdHudEffectManager` drives them: health, reaction time, a blow, a hard
+  landing, the long fall, death. The hand-made tints in `tonemap_fragment` and the dark border of the long
+  fall are gone. The fade is eased as the game eases it.
+- **Fog on translucency:** translucent and additive materials take the height fog in their own shaders
+  (`BasePassPixelShader.usf`), through a scene block every material shader is given.
+- **A shadow-cast collision channel** (`COLL_ShadowCast`): a light's line of sight, and a flare's, is tested
+  against meshes' own triangles and not their simplified hulls, as the game's `TRACE_ShadowCast` is.
+- **The OpenGL renderer builds and runs on Windows** (`mirrorsedge_opengl.exe`, `me_glsl.exe`), which is how
+  it was checked here. The GLSL translator's names changed for NVIDIA's and Intel's Windows compilers
+  (`docs/LINUX_PORT.md`).
+- **All three renderers** (`d3d11_renderer.cpp`, `opengl_renderer.cpp`, `metal_renderer.mm`) run the same
+  passes.
+- **Tools:** `ME_SCREEN_EFFECT`, `ME_SHOT_LOOK`, `ME_LIGHT_ENV_DEBUG`, `ME_LENS_FLARE_DEBUG`,
+  `ME_NO_LENS_FLARES`, `ME_NO_DYNAMIC_SHADOWS`.
+
+### 23.2 Results
+- **Against retail's pictures** (the ten level intros, same cameras): the grid difference is 30.0 over all
+  ten (31.9 before). Per chapter: The Shard 12.8, Ropeburn 16.4 (was 20.6), The Boat 16.6 (was 27.3),
+  Heat 19.1, New Eden 29.9, Pirandello Kruger 30.7, Flight 33.5, Jacknife 37.4, Prologue 43.2, Kate 60.3 (one
+  frame, inside its opening fade). The branch was rebased over other work on the intros before this was
+  measured, so not all of the change is this work's. The intros hold little of what this work adds (in the
+  Prologue's and New Eden's matched frames the sun is off screen, and the player's shadow shows in few), so
+  the new parts were checked picture by picture instead:
+  - New Eden's opening door, in shade: dark grey under the stand-in, light as retail's with its environment.
+  - The lift of Flight: its cab is lit by its own movable lamps (it came out black until lights on the
+    dynamic list were kept).
+  - The Prologue, looking at the sun from the roof (`ME_SHOT_LOOK`): the glare, its rays and a reflection,
+    under the first-person body; behind the tower the flare is hidden.
+  - Jacknife's alley: 621 decals (30,291 triangles) read, none unread; dirt under the drainpipe and along the
+    walls where retail has it.
+  - The Prologue's roof, looking down: the body's shadow on the sunlit floor, blue.
+- **Direct3D against OpenGL** on the same machine: the pictures differ by a mean of 0.04 to 0.4 of 255.
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS. The tracked `screenshots/oracle_*.png` and
+  `tutorial_*.png` are regenerated.
+- **macOS:** the app compiles and links on `macos-15`, and both Metal shader sources compile with Apple's
+  `metal` compiler (`--dump-shaders`). It was not run: no Mac was at hand.
+
+### 23.3 Still missing
+Particles (surveyed and specified in the ignored `build/re/notes/particles.md`, not drawn), and the smaller
+differences listed in `docs/RENDERING_RE.md` section 15 and in `TODO.md`: the player's shadow comes from the
+first-person body, Kismet-switched and moving lens flares, decals with no stored receiver and dynamic decals,
+the material effects nothing drives yet.

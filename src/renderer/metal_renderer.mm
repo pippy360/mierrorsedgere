@@ -1,6 +1,9 @@
 #include "metal_renderer.hpp"
 #include "builtin_shaders_msl.hpp"
 #include "hud_font.hpp"
+#include "lens_flare.hpp"
+#include "light_environment.hpp"
+#include "mod_shadow.hpp"
 #include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
@@ -27,6 +30,7 @@
 #include <chrono>
 #include <climits>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
@@ -134,6 +138,7 @@ struct MetalRenderer::Impl {
     id<MTLRenderPipelineState> viewmodel_pipeline = nil;
     // The post-process chain (builtin_shaders_msl.hpp, section 4)
     id<MTLRenderPipelineState> fog_pipeline = nil;
+    id<MTLRenderPipelineState> mod_shadow_pipeline = nil;  // dest * src
     id<MTLRenderPipelineState> haze_pipeline = nil;
     id<MTLRenderPipelineState> bloom_gather_pipeline = nil;
     id<MTLRenderPipelineState> filter_pipeline = nil;
@@ -141,6 +146,7 @@ struct MetalRenderer::Impl {
     id<MTLRenderPipelineState> meter_pipeline = nil;
     id<MTLRenderPipelineState> exposure_pipeline = nil;
     id<MTLRenderPipelineState> tonemap_pipeline = nil;
+    id<MTLRenderPipelineState> finish_pipeline = nil;
     id<MTLRenderPipelineState> hud_pipeline = nil;
     id<MTLRenderPipelineState> ui_tex_pipeline = nil;
 
@@ -162,7 +168,17 @@ struct MetalRenderer::Impl {
     id<MTLTexture> filter_b_tex = nil;
     id<MTLTexture> meter_tex[kMeterSteps] = {};    // the exposure's metering: 512 .. 1 across, 16-bit fixed point
     id<MTLTexture> exposure_tex[2] = {};           // 1 x 1: exposure squared over 64, this frame's and the last's
+    id<MTLTexture> picture_tex[2] = {};            // the tone-mapped picture (RGBA8), for the passes that work on it in turn
+    id<MTLTexture> scene_effect_tex = nil;         // the scene after a material effect that stands before the tone mapper
     PostSettingsBlend post_settings;               // the post-process settings in force at the view
+    MotionBlurState motion_blur;                   // TdMotionBlur: the camera's velocity, smoothed
+    SceneUniformsGPU scene_uniforms{};             // fragment buffer 2 of the material shaders, this frame's
+    SceneLightEnvironments light_envs;             // of the dynamic objects, kept between frames
+    std::vector<LensFlareQuad> flare_quads;        // this frame's
+    std::vector<ModShadow> mod_shadows;            // this frame's dynamic shadows (mod_shadow.hpp)
+    std::vector<uint8_t> mod_enemy_ready;
+    bool viewmodel_built = false;                  // the first-person body is already posed for this frame
+    std::vector<Vertex> flare_vertices;
     int exposure_current = 0;
     float exposure_sim_time = -1.0f;               // telemetry.sim_time the exposure was last moved at
     std::string exposure_map;                      // the level it adapted in
@@ -290,6 +306,11 @@ struct MetalRenderer::Impl {
     std::vector<id<MTLTexture>> mat_textures;                // per SceneTexture (nil = missing -> default)
     std::vector<id<MTLTexture>> lm_textures;                 // SceneMaterialLibrary::lightmap_textures (nil = unreadable)
     std::vector<id<MTLRenderPipelineState>> mat_pipelines;   // per MaterialShader (nil = failed -> legacy)
+    // The chain's material effects draw a material into a target that is not the scene's: the
+    // library each shader's function is in, and the pipelines made from them for those targets.
+    std::vector<id<MTLLibrary>> mat_shader_libs;
+    std::string mat_vertex_function;
+    std::unordered_map<uint64_t, id<MTLRenderPipelineState>> effect_pipelines;  // shader * 2 + (1: RGBA16F, 0: RGBA8)
     id<MTLTexture> tex_default_white = nil;
     id<MTLTexture> tex_default_flat_normal = nil;
     id<MTLTexture> tex_default_black = nil;
@@ -635,12 +656,45 @@ struct MetalRenderer::Impl {
             mat_pipelines[i] = pipelines[i];
             if (pipelines[i]) ok++;
         }
+        mat_shader_libs = shader_lib;
+        mat_vertex_function = lib.vertex_function;
+        effect_pipelines.clear();
         std::cout << "[MetalRenderer] Material shaders: " << ok << "/" << n << " compiled" << std::endl;
         for (size_t e = 0; e < errors.size() && e < 4; ++e) {
             std::string msg = errors[e];
             if (msg.size() > 900) msg = msg.substr(0, 900) + " ...";
             std::cerr << "[MetalRenderer]   shader error: " << msg << std::endl;
         }
+    }
+
+    // A material shader's pipeline for a full-screen effect: one colour target of `format`, no depth,
+    // no blending. Made when first asked for.
+    id<MTLRenderPipelineState> effect_pipeline(int shader, MTLPixelFormat format) {
+        if (!mat_lib || shader < 0 || static_cast<size_t>(shader) >= mat_shader_libs.size()) return nil;
+        const uint64_t key = static_cast<uint64_t>(shader) * 2 + (format == MTLPixelFormatRGBA16Float ? 1 : 0);
+        const auto it = effect_pipelines.find(key);
+        if (it != effect_pipelines.end()) return it->second;
+        id<MTLRenderPipelineState> ps = nil;
+        id<MTLLibrary> L = mat_shader_libs[static_cast<size_t>(shader)];
+        if (L) {
+            const MaterialShader& sh = mat_lib->shaders[static_cast<size_t>(shader)];
+            id<MTLFunction> vf = [L newFunctionWithName:[NSString stringWithUTF8String:mat_vertex_function.c_str()]];
+            id<MTLFunction> ff = [L newFunctionWithName:[NSString stringWithUTF8String:sh.function_name.c_str()]];
+            if (vf && ff) {
+                MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
+                d.vertexFunction = vf;
+                d.fragmentFunction = ff;
+                d.colorAttachments[0].pixelFormat = format;
+                NSError* err = nil;
+                ps = [device newRenderPipelineStateWithDescriptor:d error:&err];
+                if (!ps) {
+                    std::cerr << "[MetalRenderer] effect pipeline " << sh.function_name << " (" << sh.base_material << "): "
+                              << (err ? [[err localizedDescription] UTF8String] : "unknown error") << std::endl;
+                }
+            }
+        }
+        effect_pipelines[key] = ps;
+        return ps;
     }
 
     // Makes `lib` the resident material library (uploads textures, compiles shaders) if it changed.
@@ -718,6 +772,7 @@ struct MetalRenderer::Impl {
 
     // Binds a material instance's textures, samplers and parameter uniforms.
     void bind_material(id<MTLRenderCommandEncoder> enc, const SceneMaterial& m, const MaterialShader& sh) {
+        [enc setFragmentBytes:&scene_uniforms length:sizeof(scene_uniforms) atIndex:matbind::kSceneBuffer];
         for (int k = 0; k < sh.num_tex2d; ++k) {
             const int ti = (static_cast<size_t>(k) < m.tex2d.size()) ? m.tex2d[static_cast<size_t>(k)] : -1;
             id<MTLTexture> t = (ti >= 0 && static_cast<size_t>(ti) < mat_textures.size()) ? mat_textures[static_cast<size_t>(ti)] : nil;
@@ -827,12 +882,22 @@ struct MetalRenderer::Impl {
 
         // 4. The post-process chain: a full-screen triangle per pass, each into its own target.
         id<MTLFunction> postVert = [shader_library newFunctionWithName:@"post_vertex"];
-        auto post_pipeline_for = [&](NSString* fragment, MTLPixelFormat format, bool fog_blend) -> id<MTLRenderPipelineState> {
+        // `fog_blend`: 0 no blending, 1 the fog's, 2 a multiplication.
+        auto post_pipeline_for = [&](NSString* fragment, MTLPixelFormat format, int fog_blend) -> id<MTLRenderPipelineState> {
             MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
             desc.vertexFunction = postVert;
             desc.fragmentFunction = [shader_library newFunctionWithName:fragment];
             desc.colorAttachments[0].pixelFormat = format;
-            if (fog_blend) {
+            if (fog_blend == 2) {
+                // DestColor, Zero: scene * what the shader returns. The scene's alpha is left as it is.
+                desc.colorAttachments[0].blendingEnabled = YES;
+                desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+                desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorDestinationColor;
+                desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorZero;
+                desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+                desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+            } else if (fog_blend) {
                 // One, SrcAlpha: scene * scattering + fog. The scene's alpha is left as it is.
                 desc.colorAttachments[0].blendingEnabled = YES;
                 desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
@@ -850,7 +915,8 @@ struct MetalRenderer::Impl {
             }
             return state;
         };
-        fog_pipeline = post_pipeline_for(@"fog_fragment", MTLPixelFormatRGBA16Float, true);
+        fog_pipeline = post_pipeline_for(@"fog_fragment", MTLPixelFormatRGBA16Float, 1);
+        mod_shadow_pipeline = post_pipeline_for(@"mod_shadow_fragment", MTLPixelFormatRGBA16Float, 2);
         haze_pipeline = post_pipeline_for(@"haze_fragment", MTLPixelFormatRGBA16Float, false);
         bloom_gather_pipeline = post_pipeline_for(@"bloom_gather_fragment", MTLPixelFormatRGBA16Float, false);
         filter_pipeline = post_pipeline_for(@"filter_fragment", MTLPixelFormatRGBA16Float, false);
@@ -858,8 +924,9 @@ struct MetalRenderer::Impl {
         meter_pipeline = post_pipeline_for(@"meter_fragment", MTLPixelFormatRGBA16Unorm, false);
         exposure_pipeline = post_pipeline_for(@"exposure_fragment", MTLPixelFormatR32Float, false);
         tonemap_pipeline = post_pipeline_for(@"tonemap_fragment", MTLPixelFormatRGBA8Unorm, false);
+        finish_pipeline = post_pipeline_for(@"finish_fragment", MTLPixelFormatRGBA8Unorm, false);
         if (!fog_pipeline || !haze_pipeline || !bloom_gather_pipeline || !filter_pipeline || !meter_scene_pipeline ||
-            !meter_pipeline || !exposure_pipeline || !tonemap_pipeline) {
+            !meter_pipeline || !exposure_pipeline || !tonemap_pipeline || !finish_pipeline) {
             return false;
         }
 
@@ -979,6 +1046,8 @@ struct MetalRenderer::Impl {
         filter_b_tex = post_target(MTLPixelFormatRGBA16Float, width / kFilterDownsample, height / kFilterDownsample);
         for (int i = 0; i < kMeterSteps; ++i) meter_tex[i] = post_target(MTLPixelFormatRGBA16Unorm, kMeterSizes[i], kMeterSizes[i]);
         for (auto& e : exposure_tex) e = post_target(MTLPixelFormatR32Float, 1, 1);
+        for (auto& p : picture_tex) p = post_target(MTLPixelFormatRGBA8Unorm, width, height);
+        scene_effect_tex = post_target(MTLPixelFormatRGBA16Float, width, height);
         exposure_sim_time = -1.0f;
 
         MTLTextureDescriptor* depthDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
@@ -995,7 +1064,7 @@ struct MetalRenderer::Impl {
                                                                                              height:kSunShadowMapSize
                                                                                           mipmapped:NO];
             shDesc.textureType = MTLTextureType2DArray;
-            shDesc.arrayLength = 2;  // kSunShadowNearSlice, kSunShadowFarSlice
+            shDesc.arrayLength = 3;  // kSunShadowNearSlice, kSunShadowFarSlice, kModShadowSlice
             shDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
             shDesc.storageMode = MTLStorageModePrivate;
             shadow_depth_tex = [device newTextureWithDescriptor:shDesc];
@@ -1279,6 +1348,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
         // The post-process settings in force where the view is (the world's, or a volume's).
         const PostProcessSettings& view_post = impl_->post_settings.update(active_scene, cam_pos, telemetry.sim_time);
+        // What a material's fragment shader is given beside the frame's constants: the height fog a
+        // translucent surface takes.
+        impl_->scene_uniforms = SceneUniformsGPU{};
+        fill_fog_uniforms(active_scene, cam_pos, impl_->scene_uniforms.fog);
+        impl_->light_envs.begin_frame(active_scene);
 
         Vec3 fwd = rot.forward();
         Vec3 right = rot.right();
@@ -1579,6 +1653,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     const auto& mesh = active_scene.meshes[i];
                     if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
                     if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
+                    if (mesh.is_decal) continue;
                     bool moved = apply_scene_mesh_model(i);
                     if (moved || sh_prev_moved) [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                     sh_prev_moved = moved;
@@ -1632,6 +1707,93 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                                   /*dynamic_casters=*/true);
         }
 
+        // Pass 0b: the dynamic objects' own shadows (mod_shadow.hpp): a depth map each, from its light
+        // environment's shadow light, in cells of the shadow map array's third slice.
+        impl_->mod_shadows.clear();
+        impl_->viewmodel_built = false;
+        if (impl_->shadow_depth_tex && impl_->shadow_pipeline && impl_->mod_shadow_pipeline && !in_main_menu && !impl_->menu_open) {
+            ModShadowView shadow_view;
+            shadow_view.position = cam_pos;
+            shadow_view.forward = fwd;
+            shadow_view.proj_x = proj.m[0];
+            shadow_view.proj_y = proj.m[5];
+            shadow_view.width = static_cast<float>(impl_->width);
+            shadow_view.height = static_cast<float>(impl_->height);
+            impl_->mod_enemy_ready.assign(active_scene.enemies.size(), 0);
+            for (size_t ei = 0; need_enemies && ei < active_scene.enemies.size() && ei < impl_->frame_enemy_draws.size(); ++ei) {
+                impl_->mod_enemy_ready[ei] = (impl_->frame_enemy_draws[ei].in_view || impl_->frame_enemy_draws[ei].in_shadow) ? 1 : 0;
+            }
+            const bool film = impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing() &&
+                              impl_->cutscene_player->get_mode() == ECutsceneMode::BinkVideo;
+            const bool body_casts = !film && impl_->anim_system.is_loaded();
+            collect_mod_shadows(active_scene, impl_->light_envs, shadow_view, body_casts ? &telemetry.position : nullptr,
+                                telemetry.yaw_deg, impl_->mod_enemy_ready, telemetry.sim_time, impl_->mod_shadows);
+            if (!impl_->mod_shadows.empty()) {
+                MTLRenderPassDescriptor* cellPass = [MTLRenderPassDescriptor renderPassDescriptor];
+                cellPass.depthAttachment.texture = impl_->shadow_depth_tex;
+                cellPass.depthAttachment.slice = kModShadowSlice;
+                cellPass.depthAttachment.loadAction = MTLLoadActionClear;
+                cellPass.depthAttachment.storeAction = MTLStoreActionStore;
+                cellPass.depthAttachment.clearDepth = 1.0;
+                const simd_float4x4 sun_vp_saved = uniforms.sun_view_proj;
+                id<MTLRenderCommandEncoder> cellEnc = [cmd_buffer renderCommandEncoderWithDescriptor:cellPass];
+                [cellEnc setRenderPipelineState:impl_->shadow_pipeline];
+                [cellEnc setDepthStencilState:impl_->depth_write_state];
+                [cellEnc setCullMode:MTLCullModeNone];
+                for (const ModShadow& s : impl_->mod_shadows) {
+                    [cellEnc setViewport:(MTLViewport){(double)s.cell_x, (double)s.cell_y, (double)s.resolution, (double)s.resolution, 0.0, 1.0}];
+                    std::memcpy(&uniforms.sun_view_proj, s.subject_matrix.m, sizeof(float) * 16);  // shadow_vertex projects with it
+                    if (s.kind == ModShadow::Kind::Enemy) {
+                        const auto& bot = active_scene.enemies[s.index];
+                        Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+                        std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
+                        [cellEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        draw_enemy_mesh(cellEnc, s.index);
+                    } else if (s.kind == ModShadow::Kind::Mesh) {
+                        const auto& mesh = active_scene.meshes[s.index];
+                        if (!impl_->cached_mesh_buffers[s.index]) continue;
+                        apply_scene_mesh_model(s.index);
+                        [cellEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        [cellEnc setVertexBuffer:impl_->cached_mesh_buffers[s.index] offset:0 atIndex:0];
+                        if (mesh.sections.empty()) {
+                            [cellEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:mesh.vertices.size()];
+                            continue;
+                        }
+                        const auto& sflags = impl_->cached_section_flags[s.index];
+                        for (size_t si = 0; si < mesh.sections.size(); ++si) {
+                            const auto& sec = mesh.sections[si];
+                            if (!section_in_range(mesh, sec) || (sflags[si] & MetalRenderer::Impl::kSecShadowCaster) == 0) continue;
+                            [cellEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:sec.first_vertex vertexCount:sec.vertex_count];
+                        }
+                    } else {
+                        // The first-person body, which is posed in the view's own frame (x to the left,
+                        // y ahead, z up).
+                        impl_->build_faith_viewmodel(telemetry);
+                        impl_->viewmodel_built = true;
+                        if (impl_->faith_viewmodel_mesh.empty()) continue;
+                        Mat4 body;
+                        const Vec3 axes[3] = {right * -1.0f, fwd, up};
+                        for (int c = 0; c < 3; ++c) {
+                            body.m[c * 4 + 0] = axes[c].x;
+                            body.m[c * 4 + 1] = axes[c].y;
+                            body.m[c * 4 + 2] = axes[c].z;
+                        }
+                        body.m[12] = cam_pos.x;
+                        body.m[13] = cam_pos.y;
+                        body.m[14] = cam_pos.z;
+                        std::memcpy(&uniforms.model, body.m, sizeof(float) * 16);
+                        [cellEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        bind_vertex_bytes_or_buffer(cellEnc, impl_->faith_viewmodel_mesh.data(),
+                                                    impl_->faith_viewmodel_mesh.size() * sizeof(Vertex), 0);
+                        [cellEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->faith_viewmodel_mesh.size()];
+                    }
+                }
+                [cellEnc endEncoding];
+                uniforms.sun_view_proj = sun_vp_saved;
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            }
+        }
+
         // ---------------------------------------------------------------------
         // Pass 1: 3D Scene Geometry & Sky -> HDR Texture
         // ---------------------------------------------------------------------
@@ -1649,6 +1811,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         id<MTLRenderCommandEncoder> enc = [cmd_buffer renderCommandEncoderWithDescriptor:scenePass];
         [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 1.0}];
         [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+        [enc setFragmentBytes:&impl_->scene_uniforms length:sizeof(impl_->scene_uniforms) atIndex:matbind::kSceneBuffer];
+        // The light environment of what is drawn next; none for the level's own geometry.
+        auto set_light_env = [&](const LightEnvLighting* lighting, const Vec3& relative_to) {
+            if (!light_env_uniforms(lighting, relative_to, impl_->scene_uniforms.env)) return;
+            [enc setFragmentBytes:&impl_->scene_uniforms length:sizeof(impl_->scene_uniforms) atIndex:matbind::kSceneBuffer];
+        };
 
         // A. Draw Sky Dome (TdDirHaze + Distant City Skyline)
         [enc setRenderPipelineState:impl_->sky_pipeline];
@@ -1692,6 +1860,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         auto bind_scene_mesh = [&](size_t i) {
             uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
             apply_scene_mesh_model(i);
+            if (active_scene.meshes[i].dynamic_lit && !in_main_menu) {
+                const LightEnvLighting lighting = impl_->light_envs.mesh(active_scene, i, telemetry.sim_time);
+                set_light_env(&lighting, Vec3(0.0f, 0.0f, 0.0f));
+            } else {
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+            }
             [enc setVertexBuffer:impl_->cached_mesh_buffers[i] offset:0 atIndex:0];
             [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
@@ -1707,6 +1881,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                // The level's decals lie in their receivers' surfaces (render_common.hpp).
+                [enc setDepthBias:(mesh.is_decal ? static_cast<float>(kDecalDepthBias) : 0.0f)
+                       slopeScale:(mesh.is_decal ? kDecalSlopeBias : 0.0f)
+                            clamp:0.0f];
                 bind_scene_mesh(i);
                 if (mesh.sections.empty()) {
                     [enc setRenderPipelineState:impl_->world_pipeline];
@@ -1724,7 +1902,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     if (ps && mat_blend_is_translucent(sh->blend)) continue;
                     if (ps) {
                         [enc setRenderPipelineState:ps];
-                        [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided && !in_main_menu) ? MTLCullModeBack : MTLCullModeNone];
+                        [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided && !in_main_menu && !mesh.is_decal) ? MTLCullModeBack : MTLCullModeNone];
                         impl_->bind_material(enc, *m, *sh);
                         impl_->bind_lightmap(enc, s.lightmap);
                         if (in_main_menu && sh->num_uniforms > 0 && !active_mi_tag.empty()) {
@@ -1748,6 +1926,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 }
             }
             [enc setCullMode:MTLCullModeNone];
+            [enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
             uniforms.is_runner_vision = 0.0f;
         }
@@ -1769,8 +1948,10 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
                 [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                set_light_env(&impl_->light_envs.enemy(active_scene, ei, telemetry.sim_time), Vec3(0.0f, 0.0f, 0.0f));
                 draw_enemy_mesh(enc, ei);
             }
+            set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
 
@@ -1810,9 +1991,30 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // Height fog over the opaque scene, before anything translucent is drawn on it
         // (HeightFogPixelShader.usf): scene * scattering + fog, read off the depth buffer, which
         // for that cannot be the pass's own. The scene pass is taken up again afterwards.
+        // The dynamic objects' shadows multiply the lit scene, before fog and translucency
+        // (mod_shadow.hpp). Like the fog, the pass reads the depth buffer, so the scene pass stops for it.
+        const bool mod_pass = !impl_->mod_shadows.empty();
+        if (mod_pass) {
+            [enc endEncoding];
+            ModShadowUniformsGPU shadow_constants;
+            fill_mod_shadow_uniforms(impl_->mod_shadows, shadow_constants);
+            MTLRenderPassDescriptor* modPass = [MTLRenderPassDescriptor renderPassDescriptor];
+            modPass.colorAttachments[0].texture = impl_->scene_hdr_tex;
+            modPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            modPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> modEnc = [cmd_buffer renderCommandEncoderWithDescriptor:modPass];
+            [modEnc setRenderPipelineState:impl_->mod_shadow_pipeline];
+            [modEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
+            [modEnc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+            [modEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+            [modEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [modEnc setFragmentBytes:&shadow_constants length:sizeof(shadow_constants) atIndex:1];
+            [modEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [modEnc endEncoding];
+        }
         const bool fog_pass = !active_scene.height_fog.empty();
         if (fog_pass) {
-            [enc endEncoding];
+            if (!mod_pass) [enc endEncoding];
             PostUniformsGPU fog_constants{};
             fill_post_uniforms(active_scene, view_post, cam_pos, 0.0f, false, fog_constants);
             MTLRenderPassDescriptor* fogPass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1833,8 +2035,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         // all opaque geometry, depth-tested without depth writes. Materials that read the scene
         // (SceneTexture, DestColor, DepthBiasedAlpha) sample copies of the opaque scene.
         const bool copy_scene = has_translucent && needs_scene_copies;
-        if (fog_pass || copy_scene) {
-            if (!fog_pass) [enc endEncoding];
+        if (mod_pass || fog_pass || copy_scene) {
+            if (!fog_pass && !mod_pass) [enc endEncoding];
             if (copy_scene) {
                 id<MTLBlitCommandEncoder> blit = [cmd_buffer blitCommandEncoder];
                 [blit copyFromTexture:impl_->scene_hdr_tex toTexture:impl_->scene_color_copy];
@@ -1851,13 +2053,20 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             enc = [cmd_buffer renderCommandEncoderWithDescriptor:resumePass];
             [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.05, 1.0}];
             [enc setFragmentTexture:impl_->shadow_depth_tex atIndex:matbind::kShadowMapTexture];
+            [enc setFragmentBytes:&impl_->scene_uniforms length:sizeof(impl_->scene_uniforms) atIndex:matbind::kSceneBuffer];
         }
         if (has_translucent) {
             [enc setDepthStencilState:impl_->depth_test_only_state];
             [enc setFrontFacingWinding:impl_->mat_front_winding];
+            // The decals first: they belong to the opaque surfaces they lie on.
+            for (int decals = 1; decals >= 0; --decals)
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || mesh.sections.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                if (mesh.is_decal != (decals == 1)) continue;
+                [enc setDepthBias:(mesh.is_decal ? static_cast<float>(kDecalDepthBias) : 0.0f)
+                       slopeScale:(mesh.is_decal ? kDecalSlopeBias : 0.0f)
+                            clamp:0.0f];
                 bool mesh_bound = false;
                 for (const auto& s : mesh.sections) {
                     if (!section_in_range(mesh, s)) continue;
@@ -1870,21 +2079,68 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         mesh_bound = true;
                     }
                     [enc setRenderPipelineState:ps];
-                    [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided) ? MTLCullModeBack : MTLCullModeNone];
+                    [enc setCullMode:(impl_->mat_cull_enabled && !sh->two_sided && !mesh.is_decal) ? MTLCullModeBack : MTLCullModeNone];
                     impl_->bind_material(enc, *m, *sh);
                     impl_->bind_lightmap(enc, s.lightmap);
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:s.first_vertex vertexCount:s.vertex_count];
                 }
             }
             [enc setCullMode:MTLCullModeNone];
+            [enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
         }
 
-        // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
         const bool cutscene_active = (impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing());
         const bool bink_video_active = (cutscene_active && impl_->cutscene_player->get_mode() == ECutsceneMode::BinkVideo);
+
+        // B4. Lens flares (lens_flare.hpp): additive quads over the world, under the first-person mesh.
+        if (!in_main_menu && !bink_video_active && !active_scene.lens_flares.empty()) {
+            LensFlareView flare_view;
+            flare_view.position = cam_pos;
+            flare_view.forward = fwd;
+            flare_view.right = right;
+            flare_view.up = up;
+            flare_view.proj_x = proj.m[0];
+            flare_view.proj_y = proj.m[5];
+            flare_view.width = static_cast<float>(impl_->width);
+            flare_view.height = static_cast<float>(impl_->height);
+            flare_view.near_plane = near_plane;
+            build_lens_flare_quads(active_scene, flare_view, impl_->flare_quads);
+            if (!impl_->flare_quads.empty()) {
+                const auto kept = uniforms;
+                std::memcpy(&uniforms.view_proj, identity.m, sizeof(float) * 16);
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+                [enc setDepthStencilState:impl_->depth_test_only_state];
+                [enc setCullMode:MTLCullModeNone];
+                for (const LensFlareQuad& q : impl_->flare_quads) {
+                    MeshSection section;
+                    section.material = q.material;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    id<MTLRenderPipelineState> ps = impl_->section_pipeline(section, &sh, &m);
+                    if (!ps) continue;
+                    [enc setRenderPipelineState:ps];
+                    std::memcpy(impl_->scene_uniforms.flare_color, q.color, sizeof(q.color));
+                    const float inputs[4] = {q.radial_distance, q.source_distance, q.occlusion, q.intensity};
+                    std::memcpy(impl_->scene_uniforms.flare_inputs, inputs, sizeof(inputs));
+                    impl_->scene_uniforms.flare_ray[0] = q.ray_distance;
+                    impl_->bind_material(enc, *m, *sh);  // binds the scene block as it now stands
+                    lens_flare_vertices(q, impl_->flare_vertices);
+                    bind_vertex_bytes_or_buffer(enc, impl_->flare_vertices.data(), impl_->flare_vertices.size() * sizeof(Vertex), 0);
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->flare_vertices.size()];
+                }
+                uniforms = kept;
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            }
+        }
+
+        // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
         if (!impl_->menu_open && !bink_video_active) {
-            impl_->build_faith_viewmodel(telemetry);
+            if (!impl_->viewmodel_built) impl_->build_faith_viewmodel(telemetry);
             if (!impl_->faith_viewmodel_mesh.empty()) {
                 [enc setViewport:(MTLViewport){0.0, 0.0, (double)impl_->width, (double)impl_->height, 0.0, 0.05}];
                 [enc setRenderPipelineState:impl_->viewmodel_pipeline];
@@ -1892,6 +2148,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 std::memcpy(&uniforms.view_proj, vm_vp.m, sizeof(float) * 16);
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
                 uniforms.camera_pos = simd_make_float3(0.0f, 0.0f, 0.0f);
+                // Its lights are given around the eye, as the mesh is.
+                set_light_env(&impl_->light_envs.first_person(active_scene, telemetry.position, telemetry.sim_time), cam_pos);
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = simd_make_float3(1.0f, 1.0f, 1.0f);
 
@@ -1964,11 +2222,14 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             const bool view_jumped = (cam_pos - impl_->exposure_view_pos).length_sq() > 300.0f * 300.0f;
             const bool still = !opening && (new_level || fresh || post_dt == 0.0f || post_dt >= 0.5f || view_jumped);
             impl_->exposure_view_pos = cam_pos;
+            // TdMotionBlur's amount, from how the camera itself moved since the last frame.
+            const float motion_amount = impl_->motion_blur.update(cam_pos, fwd, post_dt, still || opening);
             fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
             post.fade[0] = telemetry.fade_color.x;
             post.fade[1] = telemetry.fade_color.y;
             post.fade[2] = telemetry.fade_color.z;
             post.fade[3] = telemetry.fade_amount;
+            post.motion[0] = motion_amount;
             impl_->exposure_sim_time = telemetry.sim_time;
             impl_->exposure_map = active_scene.map_name;
         }
@@ -2017,6 +2278,97 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         post_pass(impl_->exposure_pipeline, impl_->exposure_tex[impl_->exposure_current], impl_->meter_tex[kMeterSteps - 1],
                   impl_->exposure_tex[exposure_previous], nil);
 
+        // A material effect of the chain: its material over the whole target, through the material
+        // vertex stage with nothing to transform, reading `source` as the scene colour.
+        auto effect_pass = [&](const PostEffectInfo& fx, const ScreenEffect* state, id<MTLTexture> source,
+                               id<MTLTexture> target) -> bool {
+            if (!impl_->mat_lib || fx.material < 0 || static_cast<size_t>(fx.material) >= impl_->mat_lib->materials.size()) {
+                return false;
+            }
+            const SceneMaterial& m = impl_->mat_lib->materials[static_cast<size_t>(fx.material)];
+            if (m.shader < 0 || static_cast<size_t>(m.shader) >= impl_->mat_lib->shaders.size()) return false;
+            const MaterialShader& sh = impl_->mat_lib->shaders[static_cast<size_t>(m.shader)];
+            id<MTLRenderPipelineState> ps = impl_->effect_pipeline(m.shader, target.pixelFormat);
+            if (!ps) return false;
+            MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.colorAttachments[0].texture = target;
+            pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cmd_buffer renderCommandEncoderWithDescriptor:pass];
+            [e setRenderPipelineState:ps];
+            [e setCullMode:MTLCullModeNone];
+            impl_->bind_material(e, m, sh);
+            impl_->bind_lightmap(e, -1);
+            [e setFragmentTexture:source atIndex:matbind::kSceneColorTexture];
+            [e setFragmentTexture:impl_->offscreen_depth_tex atIndex:matbind::kSceneDepthTexture];
+            [e setFragmentSamplerState:impl_->scene_copy_sampler atIndex:matbind::kSceneSampler];
+            if (sh.num_uniforms > 0 && state && !state->params.empty()) {
+                std::vector<std::array<float, 4>> values = m.uniforms;
+                values.resize(static_cast<size_t>(sh.num_uniforms), {0.0f, 0.0f, 0.0f, 0.0f});
+                for (const auto& [name, value] : state->params) {
+                    const int at = m.uniform_index(name);
+                    if (at >= 0 && static_cast<size_t>(at) < values.size()) values[static_cast<size_t>(at)] = value;
+                }
+                [e setFragmentBytes:values.data() length:values.size() * 16 atIndex:matbind::kMaterialBuffer];
+            }
+            const auto kept = uniforms;
+            std::memcpy(&uniforms.view_proj, identity.m, sizeof(float) * 16);
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            const std::vector<Vertex>& quad = screen_quad_vertices();
+            [e setVertexBytes:quad.data() length:quad.size() * sizeof(Vertex) atIndex:0];
+            [e setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+            [e setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:quad.size()];
+            [e endEncoding];
+            uniforms = kept;
+            return true;
+        };
+        const auto effect_state = [&](const PostEffectInfo& fx) -> const ScreenEffect* {
+            for (const ScreenEffect& e : telemetry.screen_effects) {
+                if (e.name == fx.name) return &e;
+            }
+            return nullptr;
+        };
+
+        // The effects that stand before the tone mapper work on the scene itself.
+        id<MTLTexture> scene_for_tone = impl_->scene_hazed_tex;
+        for (const PostEffectInfo& fx : active_scene.post_effects) {
+            if (fx.after_tone_mapping) continue;
+            const ScreenEffect* state = effect_state(fx);
+            if (!state) continue;
+            // one such effect at a time is all the game ever shows; a second would need a third buffer
+            if (scene_for_tone != impl_->scene_hazed_tex) break;
+            if (effect_pass(fx, state, scene_for_tone, impl_->scene_effect_tex)) scene_for_tone = impl_->scene_effect_tex;
+        }
+
+        // The tone-mapped picture, then the passes that work on it in turn; the last writes the frame.
+        {
+            MTLRenderPassDescriptor* tonePass = [MTLRenderPassDescriptor renderPassDescriptor];
+            tonePass.colorAttachments[0].texture = impl_->picture_tex[0];
+            tonePass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            tonePass.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> toneEnc = [cmd_buffer renderCommandEncoderWithDescriptor:tonePass];
+            [toneEnc setRenderPipelineState:impl_->tonemap_pipeline];
+            [toneEnc setFragmentTexture:scene_for_tone atIndex:0];
+            [toneEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
+            [toneEnc setFragmentTexture:impl_->filter_a_tex atIndex:2];
+            [toneEnc setFragmentTexture:impl_->exposure_tex[impl_->exposure_current] atIndex:3];
+            [toneEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
+            [toneEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [toneEnc setFragmentBytes:&post length:sizeof(post) atIndex:1];
+            [toneEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [toneEnc endEncoding];
+        }
+        int picture_now = 0;
+        for (const PostEffectInfo& fx : active_scene.post_effects) {
+            if (!fx.after_tone_mapping) continue;
+            const ScreenEffect* state = effect_state(fx);
+            if (!state) continue;
+            if (effect_pass(fx, state, impl_->picture_tex[picture_now], impl_->picture_tex[1 - picture_now])) {
+                picture_now = 1 - picture_now;
+            }
+        }
+
         MTLRenderPassDescriptor* postPass = [MTLRenderPassDescriptor renderPassDescriptor];
         postPass.colorAttachments[0].texture = final_target;
         postPass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -2024,11 +2376,8 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         postPass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
         id<MTLRenderCommandEncoder> postEnc = [cmd_buffer renderCommandEncoderWithDescriptor:postPass];
-        [postEnc setRenderPipelineState:impl_->tonemap_pipeline];
-        [postEnc setFragmentTexture:impl_->scene_hazed_tex atIndex:0];
-        [postEnc setFragmentTexture:impl_->offscreen_depth_tex atIndex:1];
-        [postEnc setFragmentTexture:impl_->filter_a_tex atIndex:2];
-        [postEnc setFragmentTexture:impl_->exposure_tex[impl_->exposure_current] atIndex:3];
+        [postEnc setRenderPipelineState:impl_->finish_pipeline];
+        [postEnc setFragmentTexture:impl_->picture_tex[picture_now] atIndex:0];
         [postEnc setFragmentSamplerState:impl_->linear_sampler atIndex:0];
         [postEnc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [postEnc setFragmentBytes:&post length:sizeof(post) atIndex:1];

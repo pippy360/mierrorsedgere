@@ -495,16 +495,8 @@
             if (blackout > 0.0f) {
                 draw_ui_quad(verts, 0.0f, 0.0f, w, h, ui_color(0.0f, 0.0f, 0.0f, blackout));
             }
-        } else if (telemetry.falling_to_death) {
-            float rush = std::clamp((-telemetry.velocity.z - 1200.0f) / 1400.0f, 0.25f, 0.85f);
-            float edge_w = w * 0.14f;
-            float edge_h = h * 0.16f;
-            UIColor vig = ui_color(0.02f, 0.02f, 0.04f, rush * 0.55f);
-            draw_ui_quad(verts, 0.0f, 0.0f, w, edge_h, vig);
-            draw_ui_quad(verts, 0.0f, h - edge_h, w, edge_h, vig);
-            draw_ui_quad(verts, 0.0f, edge_h, edge_w, h - 2.0f * edge_h, vig);
-            draw_ui_quad(verts, w - edge_w, edge_h, edge_w, h - 2.0f * edge_h, vig);
         }
+        // (A long fall's own picture is the chain's UncontrolledFallingEffect, drawn by the renderer.)
 
         if (telemetry.hit_marker_timer > 0.0f) {
             float alpha = std::clamp(telemetry.hit_marker_timer / 0.22f, 0.0f, 1.0f);

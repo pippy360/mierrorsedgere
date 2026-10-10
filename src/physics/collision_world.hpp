@@ -30,6 +30,10 @@ enum CollisionChannel : uint8_t {
     COLL_BlockNonZeroExtent = 1u << 0,  // blocks swept extent checks (player / AI movement)
     COLL_BlockZeroExtent = 1u << 1,     // blocks zero-extent line checks (traces, bullets)
     COLL_BlockAll = COLL_BlockNonZeroExtent | COLL_BlockZeroExtent,
+    // What a light's line of sight is tested against (TRACE_ShadowCast): a mesh's own triangles,
+    // never its simplified hull, whatever its UseSimple*Collision flags say. A triangle that has
+    // only this bit takes no part in movement or in traces.
+    COLL_ShadowCast = 1u << 2,
 };
 
 struct CollisionHit {

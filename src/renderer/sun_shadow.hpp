@@ -37,6 +37,7 @@
 //    depends on screen pixels.
 // -----------------------------------------------------------------------------
 
+#include "scene_shading_msl.hpp"
 #include "math/types.hpp"
 
 #include <cmath>
@@ -176,7 +177,7 @@ inline float sun_shadow_visibility(depth2d_array<float> maps, float4x4 near_vp, 
     }
     return mix(vis_far, vis_near, near_w);
 }
-)msl";
+)msl" + kSceneShadingMSL;
     return source;
 }
 

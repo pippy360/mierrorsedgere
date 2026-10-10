@@ -1,23 +1,25 @@
 # Rendering: what retail draws and how the port draws it
 
 How Mirror's Edge lights and finishes a frame, worked out from the game's own files, and what the port
-does with that. It covers the baked lighting, the fog, and the post-process chain (haze, bloom, exposure,
-tone mapping, the screen fade). Materials themselves are in [`MATERIAL_SYSTEM.md`](MATERIAL_SYSTEM.md).
+does with that. It covers the baked lighting, the fog, the post-process chain (haze, bloom, exposure, tone
+mapping, the material effects, the screen fade, the motion blur), the light and the shadows of what is not
+level geometry, lens flares and decals. Materials themselves are in
+[`MATERIAL_SYSTEM.md`](MATERIAL_SYSTEM.md).
 
-The work was measured against retail pictures taken from the same camera (section 9). Over the ten level
-intros the difference between the two games' pictures fell from 68.5 to 31.9 on the scale described there,
-and what is left is mostly things other than lighting and tone: the first-person body, motion blur, objects
-the port does not draw.
+The work was measured against retail pictures taken from the same camera (section 14). Over the ten level
+intros the difference between the two games' pictures fell from 68.5 to 30.0 on the scale described there,
+and what is left is mostly things other than lighting and tone: the first-person body where retail's is out
+of view, objects the port does not draw, particles.
 
 ## 1. Where the knowledge comes from
 
 | Source | What it gives |
 |---|---|
-| `Engine/Shaders/*.usf` in the retail install (113 files, shipped as source) | The exact arithmetic of every pass: `BasePassPixelShader.usf`, `HeightFogCommon.usf`, `TdDirHazePixelShader.usf`, `DOFAndBloomGatherPixelShader.usf`, `DOFAndBloomBlendPixelShader.usf`, `FilterPixelShader.usf`, `TdToneMapExposurePixelShader.usf`, `TdToneMappingPixelShader.usf`, `TdMotionBlurShader.usf` |
+| `Engine/Shaders/*.usf` in the retail install (113 files, shipped as source) | The exact arithmetic of every pass: `BasePassPixelShader.usf`, `HeightFogCommon.usf`, `TdDirHazePixelShader.usf`, `DOFAndBloomGatherPixelShader.usf`, `DOFAndBloomBlendPixelShader.usf`, `FilterPixelShader.usf`, `TdToneMapExposurePixelShader.usf`, `TdToneMappingPixelShader.usf`, `TdMotionBlurShader.usf`, `PointLightPixelShader.usf`, `SphericalHarmonicLightPixelShader.usf`, `ModShadowProjectionPixelShader.usf`, `LensFlareVertexFactory.usf` |
 | `TdGame/CookedPC/Effects/FX_PostProcess.upk` | The chain: which effects run, in what order, with what values |
-| `Engine.u`, `TdGame.u` | The defaults of `PostProcessSettings`, and the scripts that drive the fade (`TdHUD`, `SeqAct_TdFadeEffect`) |
-| The level packages | Light maps, lights, `WorldInfo.DefaultPostProcessSettings`, `PostProcessVolume`s, `HeightFog` actors |
-| `MirrorsEdge.exe` | What the shaders are handed: the fog constants, the exposure's metering. Addresses are given where a fact was read there |
+| `Engine.u`, `TdGame.u` | The defaults of `PostProcessSettings` and of the light environments, and the scripts that drive the fade and the material effects (`TdHUD`, `TdHudEffectManager`, `SeqAct_TdFadeEffect`) |
+| The level packages | Light maps, lights, `WorldInfo.DefaultPostProcessSettings`, `PostProcessVolume`s, `HeightFog` actors, each mover's light environment, lens-flare sources and their templates, decals with their clipped triangles |
+| `MirrorsEdge.exe` | What the shaders are handed: the fog constants, the exposure's metering, the motion blur's amount, a light environment's lights and its shadow, where a lens flare's quads go. Addresses are given where a fact was read there |
 | Retail recordings | A back buffer a second through every level intro (`tools/retail/intro_capture.py --frames`), to check all of the above |
 
 The user's `TdEngine.ini [SystemSettings]` on the machine the recordings were made on: `DirectionalLightmaps=True`,
@@ -29,10 +31,13 @@ The user's `TdEngine.ini [SystemSettings]` on the machine the recordings were ma
 
 1. **Base pass.** Every opaque surface writes linear, unbounded scene colour into a 16-bit float buffer:
    its light map through the material's diffuse and specular, plus what it emits. There is no forward sun,
-   no ambient term and no shadow map for level geometry: the light is all in the light maps.
-2. **Height fog**, a full-screen pass that reads the depth buffer.
-3. **Translucency**, then the first-person body in its own depth range.
-4. **The post-process chain** of `FX_PostProcess.FX_PostProcess`, in this order (effects marked off are
+   no ambient term and no shadow map for level geometry: the light is all in the light maps. What is not
+   level geometry takes the lights its light environment makes for it (section 9).
+2. **The dynamic objects' shadows**, multiplied into scene colour (section 10).
+3. **Height fog**, a full-screen pass that reads the depth buffer.
+4. **Decals** (section 12), **translucency** with the lens flares in it (section 11), then the first-person
+   body in its own depth range. Translucent surfaces take the fog in their own shaders.
+5. **The post-process chain** of `FX_PostProcess.FX_PostProcess`, in this order (effects marked off are
    `bShowInGame=False` until script turns them on):
 
    | # | Effect | Notes |
@@ -41,11 +46,11 @@ The user's `TdEngine.ini [SystemSettings]` on the machine the recordings were ma
    | 2 | `DOFAndBloomEffect` | its own values, not the world's: `BloomScale` 0.15, blur kernel 16, both blur clamps 0 (no depth of field) |
    | 3 | `DeathEffect`, `Slideshow`, `MotionBlurEffect`, `ReactionTimeEffect` | off |
    | 4 | `TdToneMappingPostProcess` | world settings: exposure, shadows / midtones / highlights, desaturation, curves |
-   | 5 | `HealthEffect`, `MeleeEffect` on; taser, fall, explosion, flashbang, falling, laser, scope off | material effects, on the tone-mapped picture |
+   | 5 | `HealthEffect`, `MeleeEffect` on; taser, fall, explosion, flashbang, falling, laser, scope off | material effects, on the tone-mapped picture; section 8 |
    | 6 | `FadeInEffect` | off until `TdHUD` fades; section 7 |
    | 7 | `SaturationFilter` | off |
    | 8 | `TdCalibrationPostProcess` | draws only its calibration squares |
-   | 9 | `TdMotionBlurPostProcess` | amount 0.6, from 400 uu/s |
+   | 9 | `TdMotionBlurPostProcess` | amount 0.6, from 400 uu/s; section 8 |
 
    There is no ambient occlusion effect in the chain, though the shader ships.
 
@@ -268,28 +273,248 @@ Around a level intro the levels use it the same way. What starts the intro's Mat
 in (4 s in the Prologue and Flight, 0.5 s elsewhere), and an event key near the Matinee's end fades out to
 white in 0.2 s, its `Completed` fading back in over 0.2 s: the flash that covers the hand-over to the player.
 
-The step of `FadeAmount` itself is native; the port takes it as a straight line over the time.
+`FadeAmount` moves in a straight line over the time, in steps of at most 0.066 s a frame, and what the
+material is given is eased: `FadeInAmount = 3 F^2 - 2 F^3` (`TdHudEffectManager`).
 
-## 8. In the port
+## 8. The material effects and the motion blur
+
+### 8.1 Material effects
+
+The chain's effects 3 and 5 to 7 (section 2) are materials of `FX_PostProcess.upk` drawn over the whole
+picture, each reading the picture so far as its scene colour. `TdHudEffectManager` (`TdGame.u`) switches them
+on and feeds their parameters:
+
+| Effect | Shown | Parameters |
+|---|---|---|
+| `HealthEffect` | health under 100 | `Health` = health / 100 (0 while dead) |
+| `ReactionTimeEffect` (before tone mapping) | while time is slowed | `FXFScreen_ReactionTime` = `saturate(1 - TimeDilation)` (0.75 at full); dilation goes in over 0.8 s and out over 1.6 s. `FXFScreen_ReactionTimeCharged` pulses 0.5 in / 0.5 hold / 0.5 out when the energy reaches 100 |
+| `MeleeEffect` | a blow lands | `FXFScreen_MeleeDamage` = damage / 100 through an envelope 0.06 / 0.06 / 0.4 s; `FXFScreen_MeleeHitDirection` in turns |
+| `FallDamageEffect` | a hard landing | `FXFScreen_FallDamage`, envelope 0.03 / 0.12 / 0.75 s (a hard landing counts 15) |
+| `UncontrolledFallingEffect` | `Velocity.Z < -2000` | `FXFScreen_UncontrolledFalling` from 0 at 0.5 a second up to 0.99; off at once |
+| `DeathEffect` (before tone mapping) | dead | `DeathAmount` 0.25, then 0.25 a second more |
+| `FadeInEffect` | section 7 | |
+
+An envelope eases in from the value it has to `min(1, value + strength)`, holds, and eases out (smoothstep
+both ways). A bullet hit drives no material effect.
+
+### 8.2 `TdMotionBlurPostProcess`
+
+The last effect of the chain is a radial blur of the finished picture that grows towards the screen's edges
+(`TdMotionBlurShader.usf`): eight taps along the line from the screen's centre, of reach
+`clamp(pow(distance, 0.1) - 0.95, 0, 0.07) * MotionPacked.r`. Only `MotionPacked.r` matters, and the
+executable makes it so (the proxy's render function, `0x012d42a0`):
+
+```
+V      = (eye - last eye) / dt, each component clamped to +-720
+t      = clamp((|V| - 400) / 320, 0, 1)
+smooth = 0.2 t + 0.8 smooth                    a frame, at about 62 frames a second
+r      = 0.6 * dot(V / |V|, view direction) * smooth
+```
+
+The blur's centre is always the middle of the view, and the shader adds its step (`direction.x`) to both
+texture coordinates, a slip the port keeps: the smear runs diagonally.
+
+## 9. Light for what is not level geometry
+
+Movers, characters, the first-person body, held and dropped weapons have no light map. Retail lights them
+through a `DynamicLightEnvironmentComponent` (`FDynamicLightEnvironmentState`, constructor `0x00ff3120`;
+`UpdateStaticEnvironment` `0x00ff4b60`; `CreateRepresentativeLight` `0x00ff3e50`).
+
+**Gathering.** At the centre of its owner's bounds the environment sums the level's lights into nine
+spherical-harmonic coefficients a colour:
+
+- Only lights on the world's *static* list count: enabled, the owner not movable, not `bForceDynamicLight`;
+  a `SkyLightToggleable` never (`ULightComponent::HasStaticLighting`, `0x00ed9210`).
+- A light counts when it shares a lighting channel with the owner. The light's own `Dynamic` bit is ignored
+  and its `CompositeDynamic` bit counts as `Dynamic` (`DoesLightAffectOwner`, `0x00ff1490`), so an owner on
+  `Dynamic` takes the lights that were authored for the "composite" of dynamic objects.
+- One line check a light, from the light to the centre of the bounds (`IsLightVisible`, `0x00ff11e0`); a
+  directional light's from 100,000 uu out. A light that does not cast static shadows, and a sky light, is
+  not checked. The check is a shadow-cast trace: against a mesh's own triangles, not its collision hull.
+- A light adds `SHBasis(direction to it) * colour there`: `pow(LightColor, 2.2) * Brightness`, for a point
+  light times `pow(max(1 - (d / Radius)^2, 0), FalloffExponent)`, for a spot light times the square of its
+  cone ramp. A sky light adds its upper and lower colours through the two sky functions.
+- DICE's bounce: `E += BouncedLightingIntensity * mirror(E * (1 - D) + luminance(E) * D)`, `D =
+  BouncedLightingDesaturation` (-1 by default), the directional bands mirrored. `AmbientGlow * 4 * 0.282095`
+  is added to the constant band.
+- It is gathered again at most every 0.3 s and only when the owner has moved; the lights in use move to the
+  new ones in a straight line meanwhile.
+
+**The lights it becomes** (`CreateEnvironmentLightList`, `0x00ff4690`). The brightest direction
+`(-L[3], -L[1], L[2])` of the coefficients' luminance is taken out as a **point light** standing
+`LightDistance` bounds-radii from the centre, of radius `(LightDistance + ShadowDistance + 2)` radii and
+falloff exponent 2, its colour the environment's light in that direction divided by the falloff at the centre
+and put through eight bits a channel. What is left lights the object as **spherical harmonics**, diffuse only
+(`SphericalHarmonicLightPixelShader.usf`: band factors `2 pi / (1 + p)`, `2 pi / (2 + p)`,
+`p 2 pi / (3 + 4 p + p^2)` for `DiffusePower` p). With `bSynthesizeSHLight` off the remainder becomes a sky
+light's two colours instead.
+
+**Who has one.**
+
+| Owner | Environment | `LightDistance` / `ShadowDistance` / bounce |
+|---|---|---|
+| `TdPawn`, `TdBotPawn`: the third-person body, the first-person legs | `MyLightEnvironment` | 8 / 1 / 0.2 |
+| `TdPlayerPawn`: the first-person arms and the held weapon | `MyLightEnvironment1P` | 8 / 2.5 / 0.1 |
+| `InterpActor`, `KActor`, `SkeletalMeshActor` | `MyLightEnvironment`, **off by class default**; a level switches it on per actor | 1.5 / 1 / 0.1 |
+
+An actor whose environment is off is lit straight by the lights that share a channel with its mesh (the sky
+through the base pass's hemisphere term, every other light as a pass of its own), with no line check; a mesh
+with `bAcceptsLights=False` shows only what it emits. In Jacknife's 60 packages 119 `InterpActor`s have the
+environment on and 100 off.
+
+**In the port** (`src/assets/level_lights.*`, `src/renderer/light_environment.hpp`,
+`scene_shading_msl.hpp`): the level's static-list lights are kept in the scene; every dynamic object drawn
+(lift parts, doors, the `InterpActor`s and `KActor`s the port leaves in place, enemies, the first-person
+body) has an environment that is gathered and split as above, and its point light and harmonics are handed
+to the shaders with the object's draw. Differences: the whole first-person mesh takes the arms' environment;
+an actor with its environment off is lit by the sky colours and the one brightest light, not by every light;
+pawn bounds are a fixed sphere. `ME_LIGHT_ENV_DEBUG=1` prints what the first-person environment gathers,
+light by light, and what hides a light.
+
+## 10. Dynamic shadows
+
+Every dynamic shadow of the game is the shadow of a light environment, and none is a shadow of a level
+light. An environment with `bCastShadows` also sums a **shadow environment**: the same lights, but only those
+with `bCastCompositeShadow` (the sun and the sky by class, lamps where the level says), no bounce, plus
+`AmbientShadowColor` (0.15) from `AmbientShadowSourceDirection` (up; for the player
+`Normal(vect(0,0,10) - vector(Rotation))`, so the faint shadow she has in shade falls a little in front of
+her). From it (`CreateRepresentativeLight(S, 0, 1)`):
+
+```
+Dir            = brightest direction of S          none: no shadow
+Dominant       = S's light from Dir                Rest = what is left, as an ambient level
+ModShadowColor = min(1, Rest / (Rest + Dominant))  a channel
+shadow light   = an invisible point light at centre + Dir * radius * LightDistance,
+                 of radius (LightDistance + ShadowDistance + 2) * radius
+```
+
+A warm sun over a blue sky leaves a blue remainder: the shadows are blue because the sky is. Per frame and
+caster (`CreateProjectedShadow` `0x0106e8c0`, the point light's frustum `0x00f2b670`, `CalcTransforms`
+`0x010687e0`):
+
+- The frustum runs from the light through the caster's bounding sphere; depth is linear across the sphere.
+- `Res = clamp(trunc(2 * the sphere's radius on screen), 32, 1014)`; `FadeAlpha = ((Res - 32) / 992)^0.2`,
+  so a caster 16 pixels in radius has no shadow. Depth bias `0.02 * 512 / Res` of the sphere's depth.
+- The projection (`ModShadowProjectionPixelShader.usf`) multiplies scene colour, after the opaque scene and
+  before height fog and translucency:
+
+```
+ShadowAtt = sqrt(saturate(1 - (distance to the shadow light / its radius)^2))
+scene    *= lerp(lerp(1, lerp(1, ModShadowColor, FadeAlpha), ShadowAtt), 1, PCF^2)
+```
+
+  PCF is sixteen hardware taps of which eight are distinct (the offset table is read with a fixed column, a
+  stock-engine slip that retail has), turned by 45 degrees, a texel apart. The shadow dies out a few
+  bounds-radii behind the caster: retail's dynamic shadows are light and short by construction.
+
+The player's shadow is cast by the third-person body, which is in the scene with DICE's
+`bOwnerNoSeeWithShadow`: not drawn in her own view, still a shadow subject.
+
+**In the port** (`src/renderer/mod_shadow.hpp`, `mod_shadow_fragment`): each caster's depth map is a cell of
+the third slice of the shadow map array, and one pass over the picture applies up to eight shadows, largest
+first. Casters: enemies, the dynamic objects whose environment is on and casts, and the player. The port has
+no third-person body, so **the player's shadow is that of the first-person body**: no head. Not done: the
+shadows inside the first-person depth groups (the arms' on the legs), `ModulateBetter` while hanging, and
+pre-shadows. `ME_NO_DYNAMIC_SHADOWS=1` draws without them.
+
+## 11. Lens flares
+
+339 `LensFlareSource` actors in the ten chapters use 25 `LensFlare` templates (the sun, police lights, work
+lamps, train lamps, warning lights). A flare is its template's quads ("reflections") strung along the line
+from the source's place on the screen, `S`, through the screen's centre
+(`FLensFlareSceneProxy::DrawDynamicElements` `0x010a0d80`, `RenderReflections` `0x010a0230`,
+`GetElementValues` `0x0109efc0`):
+
+- The quad of ray distance `r` sits at `E = S * (1 - 2 r)` in normalized device coordinates: 0 at the source,
+  0.5 at the centre, 1 mirrored. Its width in pixels is
+  `(view width / 2) * Proj[0][0] * Size.x * Scaling * AxisScaling.x * DistMap_Scale.x`, whatever the distance;
+  a positive `Rotation` (radians) turns it clockwise. It is drawn at clip depth 0.1, just past the near plane.
+- Everything that varies is a raw distribution, stored as a lookup table `[min, max, entries...]` read at
+  `(x - StartTime) * TimeScale`, linear between entries (`FRawDistribution::GetEntry`, `0x00d72100`). The
+  input is the quad's distance from the centre or, with `bUseSourceDistance`, `|S| * |r|`; the `DistMap_*`
+  tables are read at the distance to the source in world units.
+- Every material is additive and is given the quad's colour (linear, unclamped, up to 150) as its vertex
+  colour and three numbers. The shipped vertex factory **swaps the two distances** the native code fills in:
+  the node `LensFlareRadialDistance` gets `|S| * |r|`, and `LensFlareSourceDistance` gets `|E|`.
+- `LensFlareOcclusion` is `ScreenPercentageMap(coverage)`: the part of the view's pixels that the source's
+  bounding box (bounds * 1.1 + 1.1) covers, as last frame's occlusion query counted them. No pixel: nothing
+  of the flare is drawn.
+- `LensFlareIntensity` is the cone's strength (`CheckViewStatus`, `0x0109f450`): 1 for a template without a
+  cone; with the cones the game uses, 1 in front of the lamp and not drawn behind it.
+- The "source" element is never drawn (no template gives it a material); the reflections are drawn in
+  ascending `RayDistance`, in the world's translucency, under the first-person body.
+
+**In the port** (`src/assets/level_lensflares.*`, `src/renderer/lens_flare.hpp`): templates and sources are
+read from the level packages; the quads are placed and sized as above and drawn with their own translated
+materials. One thing is done another way: the coverage is the box's outline on the screen, measured, times
+the part of a grid of sight lines to it that the level's meshes leave open (25 lines for a sun, 9 for a
+lamp), not an occlusion query; a mesh with no collision does not hide a flare. Not done: the 70 sources a
+level's Kismet switches on (`bAutoActivate=False`) stay off, and a source on a moving base (police cars,
+trains) stays where the level placed it. `ME_LENS_FLARE_DEBUG=1` says what becomes of every source;
+`ME_NO_LENS_FLARES=1` draws without them.
+
+## 12. Decals
+
+4421 decals are placed in the ten chapters (dirt, stains, painted arrows and stripes, drains, posters); 3919
+carry triangles. A placed `DecalComponent` stores, after its properties, the triangles it was clipped to on
+each receiver when the level was built (`UDecalComponent::Serialize`, `0x00fc6dc0`):
+
+```
+int32 NumStaticReceivers
+per receiver:  int32 Component (the receiving component)
+               int32 52, int32 NumVertices, the vertices
+               int32 2,  int32 NumIndices,  uint16 indices (a triangle list)
+               int32 NumTriangles
+               int32 light-map type, then that light map (an FLightMap1D on ten receivers)
+vertex (52):   float3 Position, packed TangentX, packed TangentZ (w: the basis' sign),
+               float2 UV, float2 LightMapCoordinate, 2 x float2 (texture coordinates 1 and 2)
+```
+
+- Nothing is projected at draw time: the stored texture coordinates are used as they are, with the ordinary
+  vertex factory. No shader clips or attenuates a decal.
+- Positions are in the receiver's own space on a static mesh, and in the decal's frame on BSP:
+  `world = HitLocation - x HitNormal + y HitTangent + z HitBinormal`.
+- 95 in 100 are unlit: modulate (3425 uses: the colour multiplies what the receiver wrote, so the decal takes
+  the receiver's baked light for nothing), translucent (755), additive (36). The 182 lit ones (drains,
+  leaves, posters) take the receiving mesh's light-map textures at the decal vertex's stored coordinates.
+- Each decal has `DepthBias` (-0.00006 of the depth range by default); a receiver's decals are drawn in
+  ascending `SortOrder`.
+
+**In the port** (`src/assets/level_decals.*`, `MeshBuffer::is_decal`): all placed decals of the loaded
+packages are read (the Jacknife start: 621 decals, 30,291 triangles, none unread) and emitted as buffers of
+their own, one a `SortOrder`. They are drawn with a depth bias (500 steps of the depth buffer at the
+triangle's depth, slope 1), unculled, casting no shadow, and before the other translucent surfaces. Not done:
+the 440 placed decals that store no receiver (retail may compute them when the level loads), a decal's own
+`FLightMap1D`, per-decal bias, and the decals of bullet holes and footsteps.
+
+## 13. In the port
 
 | File | What |
 |---|---|
 | `src/assets/level_lightmaps.*` | Light maps: components, BSP elements, the texture sets |
-| `src/assets/level_postprocess.*` | `WorldInfo` settings, `PostProcessVolume`s, `HeightFog` actors |
+| `src/assets/level_postprocess.*` | `WorldInfo` settings, `PostProcessVolume`s, `HeightFog` actors, the chain's material effects |
+| `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
+| `src/assets/level_lensflares.*`, `level_decals.*` | Lens-flare templates and sources; decals |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
-| `src/cutscene/screen_fade.hpp` | `TdHUD`'s fade state |
-| `src/renderer/post_process.hpp` | The constants of every pass, shared by both renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping; the settings in force at the view and their blend |
-| `src/renderer/builtin_shaders_msl.hpp`, section 4 | The passes: `fog_fragment`, `haze_fragment`, `bloom_gather_fragment`, `filter_fragment`, `meter_scene_fragment`, `meter_fragment`, `exposure_fragment`, `tonemap_fragment` |
-| `src/assets/material_system.cpp` | The light-map lookup and transfer in the material prelude |
-| `src/renderer/d3d11_renderer.cpp`, `metal_renderer.mm` | The targets and the pass sequence |
+| `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
+| `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
+| `src/renderer/light_environment.hpp`, `mod_shadow.hpp`, `lens_flare.hpp` | Sections 9, 10 and 11 |
+| `src/renderer/scene_shading_msl.hpp` | The scene block and the light-environment arithmetic every shader shares |
+| `src/renderer/builtin_shaders_msl.hpp`, section 4 | The passes: `fog_fragment`, `mod_shadow_fragment`, `haze_fragment`, `bloom_gather_fragment`, `filter_fragment`, `meter_scene_fragment`, `meter_fragment`, `exposure_fragment`, `tonemap_fragment`, `finish_fragment` |
+| `src/assets/material_system.cpp` | The light-map lookup and transfer, the environment's light, fog on translucency, the lens-flare inputs, in the material prelude |
+| `src/renderer/d3d11_renderer.cpp`, `opengl_renderer.cpp`, `metal_renderer.mm` | The targets and the pass sequence |
 
-The passes of a frame: scene (opaque) → fog → translucency and the first-person body → haze → bloom gather →
-blur across → blur down → metering (512, 128, 32, 8, 2, 1) → exposure step → blend, tone mapping and fade into
-the back buffer → HUD. Targets: scene and hazed scene RGBA16F, two quarter-size RGBA16F, six RGBA16 fixed-point
-metering buffers, two 1 x 1 R32F exposure buffers.
+The passes of a frame: sun shadow cascades and the dynamic shadows' depth maps → scene (opaque) → dynamic
+shadows → fog → decals, translucency, lens flares, then the first-person body → haze → bloom gather → blur
+across → blur down → metering (512, 128, 32, 8, 2, 1) → exposure step → the material effects that come before
+tone mapping → blend and tone mapping → the material effects after it → fade and motion blur into the back
+buffer → HUD. Targets: scene and hazed scene RGBA16F, two quarter-size RGBA16F, six RGBA16 fixed-point
+metering buffers, two 1 x 1 R32F exposure buffers, two display-range pictures for the effects.
 
 Shaders are written once, in Metal Shading Language, and translated for Direct3D
-([`WINDOWS_PORT.md`](WINDOWS_PORT.md)).
+([`WINDOWS_PORT.md`](WINDOWS_PORT.md)) and OpenGL ([`LINUX_PORT.md`](LINUX_PORT.md)). The OpenGL renderer
+also builds on Windows (`mirrorsedge_opengl.exe`), which is how it was checked: its pictures match Direct3D's
+to a mean difference of 0.4 of 255 or less.
 
 The exposure in time. The game loop asks for the start at the high clamp when a level opens
 (`PlayerTelemetry::exposure_reset`, as `TdHUD` asks retail), and from then on the exposure follows the view
@@ -307,8 +532,12 @@ Options for looking at things:
 | `ME_EXPOSURE=<v>` | Holds the exposure (the factor the scene is multiplied by) |
 | `ME_NO_HUD=1` | No debug HUD |
 | `ME_SHOW_UNBAKED=1` | Level geometry with no baked lighting in magenta |
+| `ME_SCREEN_EFFECT="Name:Param=v,.."` | Switches a material effect of the chain on by hand, e.g. `HealthEffect:Health=0.3` |
+| `ME_SHOT_LOOK="pitch,yaw"` | With `--intro-shots`: turns the view by hand (degrees), to look at something the intro does not |
+| `ME_LIGHT_ENV_DEBUG=1`, `ME_LENS_FLARE_DEBUG=1` | Sections 9 and 11 |
+| `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1` | A picture without them |
 
-## 9. Measured against retail
+## 14. Measured against retail
 
 The level intros are matched cameras: the port's intro camera is retail's to within a unit
 ([`LEVEL_INTROS.md`](LEVEL_INTROS.md)), and the recordings hold a retail back buffer for every second of each.
@@ -321,17 +550,17 @@ exposure, colour and where light falls.
 
 | Chapter | Pairs | Difference | Mean luminance, retail / port |
 |---|---|---|---|
-| Prologue (`edge_p`) | 36 | 43.8 | 145 / 148 |
-| Flight (`escape_p`) | 10 | 34.1 | 126 / 128 |
-| Jacknife (`stormdrain_p`) | 7 | 37.2 | 138 / 138 |
-| Heat (`cranes_p`) | 10 | 19.7 | 144 / 147 |
-| Ropeburn (`subway_p`) | 13 | 20.6 | 176 / 177 |
-| New Eden (`mall_p`) | 10 | 28.6 | 138 / 141 |
-| Pirandello Kruger (`factory_p`) | 6 | 31.1 | 188 / 188 |
-| The Boat (`boat_p`) | 10 | 27.3 | 83 / 90 |
-| Kate (`convoy_p`) | 1 | 64.3 | 214 / 199 |
-| The Shard (`scraper_p`) | 7 | 12.7 | 35 / 37 |
-| **All ten** | 110 | **31.9** (was **68.5**) | 139 / 139 |
+| Prologue (`edge_p`) | 36 | 43.2 | 145 / 147 |
+| Flight (`escape_p`) | 10 | 33.5 | 126 / 128 |
+| Jacknife (`stormdrain_p`) | 7 | 37.4 | 138 / 137 |
+| Heat (`cranes_p`) | 10 | 19.1 | 144 / 146 |
+| Ropeburn (`subway_p`) | 13 | 16.4 | 176 / 181 |
+| New Eden (`mall_p`) | 10 | 29.9 | 138 / 139 |
+| Pirandello Kruger (`factory_p`) | 6 | 30.7 | 188 / 188 |
+| The Boat (`boat_p`) | 10 | 16.6 | 83 / 89 |
+| Kate (`convoy_p`) | 1 | 60.3 | 214 / 205 |
+| The Shard (`scraper_p`) | 7 | 12.8 | 35 / 37 |
+| **All ten** | 110 | **30.0** (was **68.5**; 31.9 before sections 8 to 12) | 139 / 140 |
 
 The 68.5 is the renderer as it was: a forward sun with shadow cascades and a hemisphere standing in for the
 light maps, a filmic curve and screen-space ambient occlusion standing in for the chain. Its pictures had a
@@ -340,40 +569,38 @@ Along the way: light maps and the chain 50.8, BSP light maps 43.0, the fog's sla
 volumes 33.5, fades 31.9.
 
 What the remaining difference is made of, from the pictures: the first-person body (drawn where retail's is
-not, or posed a frame apart), retail's motion blur in fast stretches, the sun's lens flare (Pirandello Kruger,
-the Prologue), objects the port does not draw (banners, screens, runner-vision red), and the single Kate
-frame, which falls inside its opening fade.
+out of view, or posed a frame apart), objects the port does not draw (particles, banners, screens), and the
+single Kate frame, which falls inside its opening fade. The intros hold little of what sections 9 to 12 add
+(in the Prologue's and New Eden's matched frames the sun is off screen, and the player's shadow shows in
+few), so those were checked picture by picture (`MODLOG.md` section 23). The Boat and Ropeburn moved most (27.3 and 20.6 before); other
+work on the intros reached the port in between, so not all of that is this work's.
 
-## 10. What is still a stand-in, or missing
+## 15. What is still a stand-in, or missing
 
-- **Light for what is not level geometry.** Movers, characters, the first-person body, dropped weapons. Retail
-  lights these through `DynamicLightEnvironmentComponent` (a directional light and spherical harmonics made from
-  the lights around the object); the port still gives them the old stand-in, a sun with shadow cascades plus a
-  hemisphere. A door in shade comes out dark where retail's is light.
+- **Particles.** No `ParticleSystemComponent` is drawn: rooftop vent smoke, far smoke columns, flying paper,
+  water drips, birds. 1783 emitters are placed in the ten chapters, 1299 of them running from the start.
 - **Level geometry with no light map.** Drawn with what it emits only. The cooked light maps list no lights
   (their GUID arrays are empty), so which lights retail lets fall on such a mesh dynamically is not known from
   the data; none was seen in the pictures checked.
-- **Lens flares.** `LensFlareSource` actors (the sun in Pirandello Kruger, lamps) are not drawn. The vertex
-  factory ships (`LensFlareVertexFactory.usf`); the element layout is native.
-- **`TdMotionBlurPostProcess`.** The shader is a radial blur outside the middle of the screen
-  (`pow(distance, 0.1) - 0.95`, clamped to 0.07, times `MotionPacked.r`, eight taps); how the player's speed
-  becomes `MotionPacked` is native and not read yet.
-- **Material effects** of the chain (health, melee, reaction time and the rest) are still the old
-  approximations in `tonemap_fragment`.
-- **Fog on translucency.** Translucent surfaces are drawn after the fog pass and take none; retail fogs them
-  in their vertex shader.
-- **Modulated shadows** (the blue-tinted shadows dynamic objects cast), decals and particles.
-- **Fades outside the intros.** Only a start or restart and the intro's own Kismet fades are followed.
-- **Volumes switched by Kismet** stay as they ship.
+- **Light environments:** the differences listed in section 9; and `SkeletalMeshActor`s, dropped weapons and
+  pickups are not given one.
+- **Dynamic shadows:** the player's is cast by the first-person body (section 10).
+- **Lens flares:** Kismet-switched sources, sources on moving bases, coverage from sight lines (section 11).
+- **Decals:** the ones with no stored receiver, bullet holes and footsteps (section 12).
+- **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
+- **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.
 - **Metal.** The Metal renderer has the same passes, written without a Mac to run them on: the app and both
   shader sources compile there (`--dump-shaders`), and that is all that was checked.
 
-## 11. Scratch
+## 16. Scratch
 
 The scripts behind this page are outside git, in the main checkout's ignored `build/re/`: `lm_scan.py`
 (component light maps), `bsp_scan.py` and `bsp_verts.py` (BSP elements and their coordinates), `light_scan.py`
 and `unbaked_scan.py` (lights, meshes with no light map), `ppv_scan.py` (volumes), `fade_scan.py` (every
 `SeqAct_TdFadeEffect` and what fires it), and for the executable `exestr.py` (where a string is used),
 `execonst.py` (where a float constant is read) and `exegrep.py` (search a disassembled range), on top of
-`build/re/fpanim/exe.py`.
+`build/re/fpanim/exe.py`. The notes each of sections 8 to 12 was written from, with the disassembly and the
+data surveys behind them, are in `build/re/notes/` (`posteffects.md`, `motionblur.md`, `lightenv.md`,
+`modshadow.md`, `lensflare.md`, `decals.md`, and `particles.md` for what is not drawn yet), with their
+scripts in `build/re/<topic>/`.

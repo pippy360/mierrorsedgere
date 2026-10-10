@@ -1120,7 +1120,7 @@ struct MslToGlsl::Impl {
                 suffix = rename_ident(s.name);
                 sampler_slot = sm->second;
             }
-            const std::string name = rename_ident(tex) + "__" + suffix;
+            const std::string name = rename_ident(tex) + "_smp_" + suffix;
             for (size_t i = 0; i < units.size(); ++i) {
                 if (units[i].uniform != name) continue;
                 if (units[i].shadow != shadow) {
@@ -1153,6 +1153,7 @@ struct MslToGlsl::Impl {
         std::ostringstream globals;
         std::vector<std::string> args;       // the GLSL function's parameters
         std::vector<std::string> call_args;  // what main() passes for them
+        std::vector<std::pair<std::string, std::string>> block_aliases;  // argument name -> block member
         const Struct* stage_in = nullptr;
         EntryUnits units;
         for (const Param& p : f.params) {
@@ -1184,10 +1185,16 @@ struct MslToGlsl::Impl {
                 if (p.is_ptr && is_struct(p.type)) {
                     throw TranslateError("buffer argument '" + p.name + "' of " + f.name + ": only the vertex struct may be a pointer");
                 }
+                // A block's member is a global of the linked program, so the two stages' members must
+                // not share a name (NVIDIA's and Intel's linkers refuse "uniforms" in both VSB1 and
+                // FSB0). The member carries its block's name; the entry function sees it under the
+                // argument's name through a #define that lasts for that function only.
                 const std::string block = std::string(stage) + "B" + std::to_string(p.attr_index);
-                globals << "layout(std140) uniform " << block << " { " << map_type(p.type) << " " << name;
+                const std::string member = block + "_" + name;
+                globals << "layout(std140) uniform " << block << " { " << map_type(p.type) << " " << member;
                 if (p.is_ptr) globals << "[" << std::max(1, pointer_array_size) << "]";
                 globals << "; };\n";
+                block_aliases.emplace_back(name, member);
                 out.uniform_blocks.push_back({block, p.attr_index});
             } else if (p.attr == "texture") {
                 if (kind == TexKind::None) throw TranslateError("texture argument '" + p.name + "' of unknown type " + p.type);
@@ -1299,9 +1306,13 @@ struct MslToGlsl::Impl {
         main << "}\n";
 
         std::ostringstream o;
-        o << globals.str() << io.str() << map_type(f.ret) << " " << rename_ident(f.name) << "(";
+        o << globals.str() << io.str();
+        for (const auto& [name, member] : block_aliases) o << "#define " << name << " " << member << "\n";
+        o << map_type(f.ret) << " " << rename_ident(f.name) << "(";
         for (size_t i = 0; i < args.size(); ++i) o << (i ? ", " : "") << args[i];
-        o << ") {" << body << "}\n" << main.str();
+        o << ") {" << body << "}\n";
+        for (const auto& [name, member] : block_aliases) o << "#undef " << name << "\n";
+        o << main.str();
         out.vertex_stage = vertex;
         out.entry = f.name;
         return o.str();
