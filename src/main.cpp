@@ -1987,7 +1987,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     };
 
     auto load_chapter_or_level = [&](int ch_idx, const std::string& custom_path, bool play_intro = true,
-                                     const std::string& checkpoint_name = std::string()) {
+                                     const std::string& checkpoint_name = std::string(),
+                                     bool defer_begin_play = false) {
         std::string map_file = custom_path;
         if (map_file.empty()) {
             static const char* kChapterMaps[10] = {
@@ -2066,6 +2067,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
         }
 
+        if (defer_begin_play) {
+            level_play_pending = true;
+            return true;
+        }
+
         // The chapter's loading movie (DefaultEngine.ini [LoadMovies]); the level begins play when
         // it ends. Without one the level begins at once.
         if (max_frames == 0 && play_intro) {
@@ -2079,7 +2085,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return true;
     };
 
-    if (!load_chapter_or_level(current_chapter_idx, custom_level, /*play_intro=*/!start_in_main_menu)) {
+    if (!load_chapter_or_level(current_chapter_idx, custom_level, /*play_intro=*/!start_in_main_menu,
+                               std::string(), /*defer_begin_play=*/start_in_main_menu)) {
         std::cerr << "[Game ERROR] No playable level (check --game-root / --level)." << std::endl;
         if (game_controller) SDL_GameControllerClose(game_controller);
         destroy_surface();
@@ -2093,6 +2100,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         audio.set_menu_music(open);
         SDL_SetRelativeMouseMode(open ? SDL_FALSE : SDL_TRUE);
         SDL_ShowCursor(open ? SDL_ENABLE : SDL_DISABLE);
+        if (!open && level_play_pending && !cutscene_player.is_playing()) {
+            begin_level_play();
+        }
     };
 
     auto to_menu_coords = [&](int mx, int my, float& ux, float& uy) {
@@ -2320,11 +2330,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 set_menu_active(false);
             } else if (action == "NewGame") {
                 // NEW GAME: the Prologue, with its opening.
-                leave_frontend();
-                set_menu_active(false);
                 current_chapter_idx = 1;
                 renderer.set_selected_chapter(current_chapter_idx);
                 load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                leave_frontend();
+                set_menu_active(false);
             } else if (action.rfind("StartLevel ", 0) == 0) {
                 // PLAY CHAPTER: "StartLevel <map> [checkpoint]", the map by its file name ("edge_p").
                 std::string map_name = action.substr(11);
@@ -2383,12 +2393,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             const int tab = renderer.selected_menu_tab();
             if (tab == 0) {
                 // STORY: Launch selected chapter with Bink / 3D opening cutscene
-                set_menu_active(false);
                 load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true);
+                set_menu_active(false);
             } else if (tab == 1) {
                 // RACE (SPEED RUN): Launch selected course directly into timed run (no cutscene)
-                set_menu_active(false);
                 load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/false);
+                set_menu_active(false);
             } else if (tab == 2) {
                 // OPTIONS: Toggle / cycle the selected game setting
                 const int row = std::clamp(renderer.selected_menu_row(), 0, 5);
@@ -2698,8 +2708,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     int sel = (key == SDLK_0) ? 0 : (key - SDLK_0);
                     current_chapter_idx = sel;
                     renderer.set_selected_chapter(sel);
-                    set_menu_active(false);
                     load_chapter_or_level(sel, "", /*play_intro=*/true);
+                    set_menu_active(false);
                 }
             }
         }
