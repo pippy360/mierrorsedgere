@@ -350,6 +350,45 @@ void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom,
     }
 }
 
+int read_agg_geom_shapes(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<AggShape>& out) {
+    int convex = 0;
+    const auto elems = [&](const char* name) -> const std::vector<UPropertyList>* {
+        for (const UProperty& f : agg_geom.fields) {
+            if (f.name == name) return &f.elements;
+        }
+        return nullptr;
+    };
+    const auto add = [&](AggShape::Kind kind, const UPropertyList& el, const Vec3& half) {
+        AggShape s;
+        s.kind = kind;
+        const ElemMatrix tm = read_elem_matrix(pkg, el);
+        for (int r = 0; r < 4; ++r) s.rows[r] = tm.rows[r];
+        s.half = half;
+        out.push_back(s);
+    };
+    if (const auto* list = elems("ConvexElems")) convex = static_cast<int>(list->size());
+    // The same readings as append_agg_geom_triangles above.
+    if (const auto* list = elems("SphereElems")) {
+        for (const UPropertyList& el : *list) {
+            const float r = prop_float(el, "Radius");
+            if (r > 0.0f) add(AggShape::Sphere, el, Vec3(r, r, r));
+        }
+    }
+    if (const auto* list = elems("BoxElems")) {
+        for (const UPropertyList& el : *list) {
+            const Vec3 h(0.5f * prop_float(el, "X"), 0.5f * prop_float(el, "Y"), 0.5f * prop_float(el, "Z"));
+            if (h.x > 0.0f && h.y > 0.0f && h.z > 0.0f) add(AggShape::Box, el, h);
+        }
+    }
+    if (const auto* list = elems("SphylElems")) {
+        for (const UPropertyList& el : *list) {
+            const float r = prop_float(el, "Radius");
+            if (r > 0.0f) add(AggShape::Capsule, el, Vec3(r, r, 0.5f * std::max(0.0f, prop_float(el, "Length"))));
+        }
+    }
+    return convex;
+}
+
 
 // -----------------------------------------------------------------------------
 // Pure C++20 LZO1X Decompressor

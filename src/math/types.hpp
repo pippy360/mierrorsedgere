@@ -919,6 +919,13 @@ struct WeaponState {
     bool fired_this_tick = false;
 };
 
+// What a body of a person is made of, as far as a bullet tells them apart (physics/body_shapes.hpp).
+// TdBotPawn.TakeDamage looks at the name of HitInfo.PhysMaterial: 'PM_Character_Head' (the body on
+// the Neck bone, which is the head's capsule, and those of the two hands) multiplies a bullet's
+// damage by DamageMultiplier_Head, 2.0 in AITemplate_Default, which no template changes; anything
+// else by DamageMultiplier_Body, 1.0. The two materials have the same impact effect and sound.
+enum class ECharacterSurface : uint8_t { Body = 0, Head = 1 };
+
 struct BulletTracer {
     Vec3 start_pos{0.0f, 0.0f, 0.0f};
     Vec3 end_pos{0.0f, 0.0f, 0.0f};
@@ -935,7 +942,10 @@ struct BulletTracer {
     // 1 a bot the player shot, who gets his body's impact effect and sound; 2 the player, who
     // gets the sound alone; 3 a bot that gets nothing (shot by another bot, or dying).
     uint8_t pawn_hit = 0;
-    Vec3 pawn_normal{0.0f, 0.0f, 0.0f};  // out of the body where the bullet went in (zero: not known)
+    // Where it went into him is end_pos; the surface there, as HitInfo has it: its normal (out of
+    // the body; zero: not known) and its material.
+    Vec3 pawn_normal{0.0f, 0.0f, 0.0f};
+    ECharacterSurface pawn_surface = ECharacterSurface::Body;
 };
 
 struct DroppedWeapon {
@@ -1897,6 +1907,7 @@ struct LevelScene {
     std::vector<PhysicalMaterialInfo> physical_materials;
     int32_t default_physical = -1;         // TdWeapon.DefaultImpactMaterial
     int32_t character_physical = -1;       // the bodies of the bots' physics asset: PM_Character_Body
+    int32_t character_head_physical = -1;  // ...and PM_Character_Head: the neck's body and the hands'
     ImpactDecalInfo default_impact_decal;  // TdWeapon.InitDefaultDecalProperties
     std::vector<EffectFactory> effect_factories;
     std::vector<SpawnedEffect> spawned_effects;

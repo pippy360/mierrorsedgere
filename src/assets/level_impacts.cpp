@@ -20,6 +20,7 @@ const char* const kDefaultImpactMaterial = "TDPhysicalMaterials.Concrete.PM_Conc
 // only one TdSpContent.u and TdSpBossContent.u import), whose bodies are PM_Character_Body, the
 // neck and the hands PM_Character_Head; the two have the same impact effect and the same sound.
 const char* const kCharacterMaterial = "TDPhysicalMaterials.Character.Body.PM_Character_Body";
+const char* const kCharacterHeadMaterial = "TDPhysicalMaterials.Character.Head.PM_Character_Head";
 const char* const kDefaultDecalMaterial = "FX_ImpactEffects.Materials.M_FX_Decals_BulletImpacts_Generic_01";
 
 bool export_has_data(const UPKPackage& pkg, int32_t index) {
@@ -45,6 +46,7 @@ ImpactLibrary::ImpactLibrary(PackageManager& pm, LevelScene& scene, std::vector<
     scene_.physical_materials.clear();
     scene_.default_physical = -1;
     scene_.character_physical = -1;
+    scene_.character_head_physical = -1;
     scene_.default_impact_decal = ImpactDecalInfo{};
     scene_.effect_factories.clear();
     scene_.spawned_effects.clear();
@@ -227,6 +229,7 @@ int32_t ImpactLibrary::physical_of_material(const std::string& material_path) {
 void ImpactLibrary::read_weapon_defaults() {
     scene_.default_physical = physical(by_path(kDefaultImpactMaterial));
     scene_.character_physical = physical(by_path(kCharacterMaterial));
+    scene_.character_head_physical = physical(by_path(kCharacterHeadMaterial));
     // TdWeapon.InitDefaultDecalProperties
     ImpactDecalInfo d;
     d.material = by_path(kDefaultDecalMaterial) ? material(kDefaultDecalMaterial) : -1;

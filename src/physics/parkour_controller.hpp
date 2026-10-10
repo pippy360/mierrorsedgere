@@ -1,8 +1,10 @@
 #pragma once
 
 #include "../math/types.hpp"
+#include "body_shapes.hpp"
 #include "collision_world.hpp"
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +34,12 @@ struct LinearCurve {
 // her. (The band is not kept: she is always put at its middle.) A recording's capsule centre is
 // 90 over these feet on a floor and off it (tools/retail/trace.py).
 inline constexpr float kPawnFloorHover = 3.15f;
+
+// How far from EnemyBot::position a posed bot's bodies are looked for by a trigger pull's first
+// reject (ParkourController::pose_enemies_for_shot). Standing, walking or aiming they end 185 to 188
+// from it (the top of the head's capsule); the furthest any archetype's get in a state the port
+// plays is 271, part way through being disarmed (the oracle's stage 23 measures it).
+inline constexpr float kEnemyBodyReach = 320.0f;
 
 class ParkourController {
 public:
@@ -108,6 +116,35 @@ public:
     // ATdPlayerPawn::TakeDamage -> PlayHitCameraShake (0x012b0d60) + UTdHudEffectManager::DisplayHit (0x01264410)
     // dmt: 0 = Bullet (TdDmgType_Bullet), 1 = Melee (TdDmgType_Melee), 2 = FallDamage (DmgType_Fell)
     void apply_damage(float amount, int dmt = 0, const Vec3& hit_dir_world = Vec3(0.0f, 0.0f, 0.0f));
+
+    // The player's bullets against the enemies (body_shapes.hpp). The game's shot can meet a bot only
+    // in the bodies of his physics asset, placed by his bones as they are (UPhysicsAsset::LineCheck).
+    // The controller has no skeletons: it asks whoever poses the drawn ones, through this (the
+    // renderer's pose_enemy_bodies). Unset, as in the tools that run the controller with no
+    // renderer, or where a bot cannot be posed (no character assets), he is his pawn's cylinder.
+    void set_enemy_body_poser(EnemyBodyPoser poser) { m_enemy_body_poser = std::move(poser); }
+
+    // A trigger pull, as the weapons' fire does it, in its two steps.
+    // pose_enemies_for_shot: every living enemy the pull can reach (within `spread`, the tangent of
+    // the cone's half angle, of the line from `from` along the unit vector `toward`, `range` long) is
+    // posed once, as he is now: all of a shotgun's pellets meet the pose he had when the trigger was
+    // pulled, whatever the first of them does to him. `out` is by LevelScene::enemies.
+    // trace_enemies: one bullet's line through them, the level aside: the nearest enemy it goes into
+    // within `max_dist`, on his posed bodies, or on his cylinder if he has none in `posed`.
+    struct EnemyShotHit {
+        int32_t enemy = -1;      // LevelScene::enemies
+        float distance = 0.0f;   // along the line
+        Vec3 location{0.0f, 0.0f, 0.0f};
+        Vec3 normal{0.0f, 0.0f, 0.0f};  // out of him, where the bullet goes in
+        bool head = false;       // on PM_Character_Head (the cylinder: 150 or more above his feet)
+        bool posed = false;      // met on his posed bodies, not on his cylinder
+        uint8_t body = 0;        // then: which body of the asset, and its bone
+        std::string bone;
+    };
+    void pose_enemies_for_shot(const LevelScene& scene, const Vec3& from, const Vec3& toward, float range, float spread,
+                               std::vector<EnemyBodySet>& out) const;
+    bool trace_enemies(const LevelScene& scene, const std::vector<EnemyBodySet>& posed, const Vec3& from, const Vec3& dir,
+                       float max_dist, EnemyShotHit& out) const;
 
 private:
     // Core Subsystems
@@ -519,6 +556,10 @@ private:
 
     // UE3 Pawn.Base: the actor the pawn stands on (moving elevator parts carry the pawn).
     int32_t m_base_actor = -1;
+
+    // The enemies' bodies: who poses them (set_enemy_body_poser), and the current pull's.
+    EnemyBodyPoser m_enemy_body_poser;
+    std::vector<EnemyBodySet> m_shot_bodies;
 
     // Spawn / Respawn tracking
     Vec3 m_last_checkpoint_pos{0.0f, 0.0f, 100.0f};

@@ -1,5 +1,6 @@
 #include "parkour_controller.hpp"
 #include "../game/impact_effects.hpp"
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <algorithm>
@@ -5399,6 +5400,98 @@ void ParkourController::update_landing_moves(const InputFrame& input, float dt, 
 }
 
 // -----------------------------------------------------------------------------
+// The player's bullets against the enemies (body_shapes.hpp)
+// -----------------------------------------------------------------------------
+namespace {
+
+// TdBotPawn_Tutorial, the Training Area's partner (AITemplate_Tutorial; here also the staged
+// tutorial's "TutorialTrainer_Celeste"): its PreventWeaponImpactEffect returns true, so a bullet in
+// her leaves no effect and no sound.
+bool is_tutorial_bot(const EnemyBot& bot) {
+    std::string low = bot.archetype;
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return low.find("tutorial") != std::string::npos;
+}
+
+}  // namespace
+
+void ParkourController::pose_enemies_for_shot(const LevelScene& scene, const Vec3& from, const Vec3& toward, float range,
+                                              float spread, std::vector<EnemyBodySet>& out) const {
+    out.resize(scene.enemies.size());
+    for (EnemyBodySet& set : out) set.valid = false;
+    if (!m_enemy_body_poser) return;
+    // The bones are those of the frame on screen: the simulation's time has not moved on yet, and
+    // the bots' own step comes after the weapons'.
+    const float sim_time = m_telemetry.sim_time;
+    const bool reaction = m_telemetry.reaction_active;
+    spread = std::clamp(spread, 0.0f, 0.9f);
+    for (size_t i = 0; i < scene.enemies.size(); ++i) {
+        const EnemyBot& bot = scene.enemies[i];
+        if (!bot.alive) continue;
+        // Out of every pellet's reach: a pellet is at most `spread` of its way off the middle line,
+        // and his bodies within kEnemyBodyReach of where he stands.
+        const Vec3 to_bot = bot.position - from;
+        const float along = std::clamp(to_bot.dot(toward), 0.0f, std::max(range, 0.0f));
+        const float reach = kEnemyBodyReach + along * spread;
+        if ((to_bot - toward * along).length_sq() * (1.0f - spread * spread) > reach * reach) continue;
+        m_enemy_body_poser(bot, sim_time, reaction, out[i]);
+    }
+}
+
+bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector<EnemyBodySet>& posed, const Vec3& from,
+                                      const Vec3& dir, float max_dist, EnemyShotHit& out) const {
+    // The stand-in for a bot with no bodies here, his pawn's cylinder: TdPawn's is Radius 30,
+    // CollisionHeight 90, so 180 from his feet, and the head is taken to begin 150 up. (Retail's
+    // cylinders stop no bullet: BlockZeroExtent is off on both.)
+    constexpr float kBotHeight = 180.0f, kBotHeadFrom = 150.0f, kBotRadius = 30.0f;
+    out = EnemyShotHit{};
+    float best = max_dist;
+    for (size_t i = 0; i < scene.enemies.size(); ++i) {
+        const EnemyBot& bot = scene.enemies[i];
+        if (!bot.alive) continue;
+        if (i < posed.size() && posed[i].valid) {
+            // UPhysicsAsset::LineCheck: the nearest of his bodies; its material and its bone go
+            // with the hit (HitInfo.PhysMaterial, HitInfo.BoneName).
+            EnemyBodyHit h;
+            if (!trace_enemy_bodies(posed[i], from, dir, best, h)) continue;
+            if (out.enemy >= 0 && h.distance >= best) continue;
+            best = h.distance;
+            out.enemy = static_cast<int32_t>(i);
+            out.distance = h.distance;
+            out.location = h.location;
+            out.normal = h.normal;
+            out.head = h.surface == ECharacterSurface::Head;
+            out.posed = true;
+            out.body = h.body;
+            out.bone.assign(h.bone);
+            continue;
+        }
+        const Vec3 bot_center = bot.position + Vec3(0, 0, kBotHeight * 0.5f);
+        const float proj = (bot_center - from).dot(dir);
+        if (proj > 0.0f && proj < best) {
+            const Vec3 closest = from + dir * proj;
+            const float dist_xy = closest.distance_xy(bot.position);
+            const float rel_z = closest.z - bot.position.z;
+            if (dist_xy < 48.0f && rel_z >= -10.0f && rel_z <= kBotHeight) {
+                best = proj;
+                out.enemy = static_cast<int32_t>(i);
+                out.distance = proj;
+                out.head = (rel_z >= kBotHeadFrom);
+                out.posed = false;
+                out.body = 0;
+                out.bone.clear();
+                // Where it goes in: the near side of the cylinder, not its middle.
+                const float inside = kBotRadius * kBotRadius - dist_xy * dist_xy;
+                out.location = closest - dir * (inside > 0.0f ? std::sqrt(inside) : 0.0f);
+                const Vec3 outward(out.location.x - bot.position.x, out.location.y - bot.position.y, 0.0f);
+                out.normal = outward.length_sq() > 1.0e-6f ? outward.normalized() : dir * -1.0f;
+            }
+        }
+    }
+    return out.enemy >= 0;
+}
+
+// -----------------------------------------------------------------------------
 // Combat, Firearms, Ballistics & Disarm Subsystem
 // (Reverse-engineered from TdGame.u TdMove_Melee*, TdMove_Disarm, TdWeapon & DefaultWeapons.ini)
 // -----------------------------------------------------------------------------
@@ -5690,6 +5783,9 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         bool any_hit = false;
         bool any_kill = false;
 
+        // The enemies' bodies as they are at the pull, for every pellet of it.
+        pose_enemies_for_shot(scene, eye, fwd, ws.range, ws.spread_rad, m_shot_bodies);
+
         for (int p = 0; p < pellets; ++p) {
             // Deterministic golden-ratio spiral cone spread for multi-pellet shotguns and automatic fire
             float spread = ws.spread_rad * (m_telemetry.reaction_active ? 0.45f : 1.0f);
@@ -5704,35 +5800,15 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : ws.range;
             Vec3 tracer_end = wall_hit.hit ? wall_hit.point : (eye + ray_dir * std::min(ws.range, 2500.0f));
 
-            // Against the living enemies, each as his pawn's cylinder: TdPawn's is Radius 30,
-            // CollisionHeight 90, so 180 from his feet. (The game traces the bodies of his physics
-            // asset; the neck's is PM_Character_Head, which TdBotPawn.TakeDamage doubles.)
-            constexpr float kBotHeight = 180.0f, kBotHeadFrom = 150.0f, kBotRadius = 30.0f;
+            // Against the living enemies, short of the level: the nearest body of a bot's physics
+            // asset the line goes into (his pawn's cylinder where he has none here).
+            EnemyShotHit shot;
             EnemyBot* hit_bot = nullptr;
             float best_bot_dist = max_dist;
-            bool is_headshot = false;
-            Vec3 bot_normal(0.0f, 0.0f, 0.0f);
-
-            for (auto& bot : scene.enemies) {
-                if (!bot.alive) continue;
-                Vec3 bot_center = bot.position + Vec3(0, 0, kBotHeight * 0.5f);
-                Vec3 to_bot = bot_center - eye;
-                float proj = to_bot.dot(ray_dir);
-                if (proj > 0.0f && proj < best_bot_dist) {
-                    Vec3 closest = eye + ray_dir * proj;
-                    float dist_xy = closest.distance_xy(bot.position);
-                    float rel_z = closest.z - bot.position.z;
-                    if (dist_xy < 48.0f && rel_z >= -10.0f && rel_z <= kBotHeight) {
-                        best_bot_dist = proj;
-                        hit_bot = &bot;
-                        is_headshot = (rel_z >= kBotHeadFrom);
-                        // Where it goes in: the near side of the cylinder, not its middle.
-                        const float inside = kBotRadius * kBotRadius - dist_xy * dist_xy;
-                        tracer_end = closest - ray_dir * (inside > 0.0f ? std::sqrt(inside) : 0.0f);
-                        const Vec3 out(tracer_end.x - bot.position.x, tracer_end.y - bot.position.y, 0.0f);
-                        bot_normal = out.length_sq() > 1.0e-6f ? out.normalized() : ray_dir * -1.0f;
-                    }
-                }
+            if (trace_enemies(scene, m_shot_bodies, eye, ray_dir, max_dist, shot)) {
+                hit_bot = &scene.enemies[static_cast<size_t>(shot.enemy)];
+                best_bot_dist = shot.distance;
+                tracer_end = shot.location;
             }
 
             if (hit_bot != nullptr) {
@@ -5743,7 +5819,10 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                     t_falloff = std::clamp((best_bot_dist - ws.falloff_start) / (ws.falloff_end - ws.falloff_start), 0.0f, 1.0f);
                 }
                 float dmg = ws.damage + (ws.damage_far - ws.damage) * t_falloff;
-                if (is_headshot) dmg *= 2.0f;
+                // TdBotPawn.TakeDamage: Damage * DamageMultiplier_Head (2.0) when HitInfo.PhysMaterial
+                // is PM_Character_Head, the material of the head's body and of the hands'; the other
+                // bodies' DamageMultiplier_Body is 1.0.
+                if (shot.head) dmg *= 2.0f;
 
                 hit_bot->health -= dmg;
                 hit_bot->stunned = true;
@@ -5787,9 +5866,10 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.max_time = 0.09f;
             tr.hit_enemy = (hit_bot != nullptr);
             // TdBotPawn.PreventWeaponImpactEffect: a bot that is dying (the shot that killed him
-            // included: the damage comes first) shows nothing.
-            tr.pawn_hit = hit_bot ? (hit_bot->alive ? 1 : 3) : 0;
-            tr.pawn_normal = bot_normal;
+            // included: the damage comes first) shows nothing; TdBotPawn_Tutorial's never does.
+            tr.pawn_hit = hit_bot ? ((hit_bot->alive && !is_tutorial_bot(*hit_bot)) ? 1 : 3) : 0;
+            tr.pawn_normal = shot.normal;
+            tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;
             tr.from_player = true;
             tr.ammo = pellets > 1 ? 3 : (ws.is_heavy ? 1 : 0);
             tr.damage = ws.damage;

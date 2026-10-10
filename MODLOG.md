@@ -1960,3 +1960,136 @@ every distance, and the layer nearer by is never heard; a cue that plays in roun
 (none of the game's emitters has such a cue with layers). Under the pause menu the level's emitters and its
 sounds at a place now play on, heard from where she stands; retail pauses them. Nothing was listened to.
 macOS and clang were not compiled: there is no clang on this machine. In `TODO.md`.
+
+---
+
+## 39. A bullet meets an enemy in the bodies of his physics asset (agent/bot-bodies, 2026-10-10)
+
+Section 32 left a bot his pawn's cylinder, all of it one material, with the head taken to begin 150 uu up.
+The player's bullets are now traced through the sixteen bodies of the bots' physics asset, placed by the
+skeleton he is drawn with. `docs/RENDERING_RE.md` section 13 has the rules. The research they come from, with
+a second reader's verdict on every claim, is in the main checkout's ignored
+`build/re/impacts/research/bodies/` (`notes.md`, `verify.md`, the bodies as data in `male3p_physics.json`,
+the dumper `physasset.py`) and `portbots/` (the port's side).
+
+### 39.1 What the game does (TdGame.u's bytecode, MirrorsEdge.exe, the cooked packages)
+- **A shot is a line with no extent.** `Weapon.CalcWeaponFire`: `Trace(HitLocation, HitNormal, EndTrace,
+  StartTrace, true, vect(0,0,0), HitInfo, 1)`, trace flags 0x228bf (`AActor::execTrace`, 0x00ef7090).
+  `TdPawn`'s `CollisionCylinder` and `ActorCollisionCylinder` have `BlockZeroExtent` False and no subclass or
+  script turns it on; `TdPawnMesh3p` has `CollideActors` and `BlockZeroExtent`. A bullet can meet a pawn only
+  in his third-person mesh.
+- **That mesh answers with its physics asset.** `USkeletalMeshComponent::LineCheck` takes the per-triangle
+  path only for a mesh with `PerPolyCollisionBones`, and no enemy mesh has any. `UPhysicsAsset::LineCheck`
+  (0x00bd90f0) walks the `RB_BodySetup`s with `bBlockZeroExtent`, finds each one's bone in the skeleton
+  (`MatchRefBone`; a missing bone drops the body), takes the bone's matrix as it is and hands the shapes to
+  `FKAggregateGeom::LineCheck`; the nearest hit gives `Item` (the body), `BoneName` and `PhysMaterial`. It
+  looks at neither `bNoCollision` nor a shape's `bNoRBCollision`.
+- **The shapes.** `FKBoxElem::LineCheck` (0x00dcfb80): half extents 0.5 X, 0.5 Y, 0.5 Z about the element's
+  origin. `FKSphylElem::LineCheck` (0x00dd1310): axis the element's Z, half height 0.5 Length, a sphere of
+  `Radius` on each end. An element's `TM` is four planes, each stored W first (the only reading that gives an
+  orthonormal matrix: 5e-7 over the 17 shapes).
+- **One asset for every bot.** Each bot pawn class's `TdPawnMesh3p` names `CH_TKY_Cop_SWAT.Male3p_Physics`, the
+  only physics asset `TdSpContent.u` and `TdSpBossContent.u` import; the AI template chooses the mesh alone.
+  16 bodies, 7 boxes and 10 capsules; 13 are `PM_Character_Body`, and the `Neck`'s (a capsule round the head),
+  `LeftHand`'s and `RightHand`'s `PM_Character_Head`.
+- **Damage.** `TdBotPawn.TakeDamage` multiplies a bullet's by `DamageMultiplier_Head` when the material's name
+  is `PM_Character_Head`, else by `DamageMultiplier_Body`: 2.0 and 1.0, set in one ini section
+  (`AITemplate_Default`) and overridden by no template.
+- **What is seen and heard does not depend on the part:** both materials name
+  `PS_FX_Impact_Character_Body_Light_01` (shotgun `..._Body_Shotgun_01`) and `Faith.9mm_Faith_Impact`.
+  `PM_Character_Kevlar`, `_Shield` and `_Bag` are named by nothing outside `TDPhysicalMaterials.upk` (the name
+  tables of all 2424 cooked files): no enemy can show them, so the "shield, bag and kevlar have effects of
+  their own" that `TODO.md` carried was no gap. `TdBotPawn_Tutorial.PreventWeaponImpactEffect` returns true:
+  the tutorial's bot never shows or sounds an impact.
+
+### 39.2 Changes
+- **Shapes and the line through them** (`src/physics/body_shapes.hpp`, new, on `types.hpp` alone): a posed
+  box or capsule, a bot's set of them with a sphere round it, and `trace_enemy_bodies`: for a box the three
+  pairs of faces, for a capsule the cylinder's side between its ends and the two end spheres; the nearest
+  entry with its place, the surface's normal, the body, its bone and its material. The arithmetic is done
+  from the line's point nearest the shape, so a shot fired 4000 uu off loses nothing to rounding.
+- **The asset** (`src/assets/upk_loader.*`: `read_agg_geom_shapes`, the readings of the triangle version kept
+  as shapes; `src/anim/anim_system.*`: `load_enemy_bodies`, `bind_enemy_bodies`): `Male3p_Physics` read with
+  the SWAT package the meshes come from, each body's bone found by name in each of the eleven skeletons.
+- **One pose for what is drawn and what is hit** (`AnimSystem::pose_enemy_skeleton`): the choice of sequences
+  and the bones moved out of `evaluate_enemy_swat_indexed`, which now skins from it; `pose_enemy_bodies`
+  places the shapes from it with the same turn (`enemy_mesh_to_bot`, also what the skinning uses now) and the
+  renderers' model matrix. Its scratch is per thread and it keeps nothing, so it runs between frames beside
+  the renderers' parallel posing.
+- **The controller** (`src/physics/parkour_controller.*`): `set_enemy_body_poser`; at a trigger pull
+  `pose_enemies_for_shot` poses, once, each living bot within the cone's reach (`kEnemyBodyReach`), and
+  `trace_enemies` sends every pellet through those poses; a bot with no pose is the old cylinder, with its
+  rule of heights. The damage is doubled on the head's material. The tracer carries where the bullet went
+  in, the normal there and the material (`BulletTracer::pawn_surface`); the tutorial's bot gets `pawn_hit` 3.
+- **The effect** (`src/game/impact_effects.hpp`, `src/assets/level_impacts.cpp`, `src/math/types.hpp`): each
+  level loads `PM_Character_Head` beside `PM_Character_Body` (`LevelScene::character_head_physical`) and the
+  effect and sound are the hit material's.
+- **All three renderers:** a `pose_enemy_bodies` forwarder; `evaluate_combat_world_fx` is given the reaction
+  flag and, with `ME_SHOW_BODIES=1`, draws every living enemy's bodies as lines.
+- **`src/main.cpp`:** the poser is set in the game, the oracle and `--intro-shots`; `ME_SHOT_BOT` stands a bot
+  in front of an `--intro-shots` view and sends `ME_SHOT_FIRE`'s shots through his bodies; oracle stage 24
+  (`oracle_enemy_bodies`), alone as `--verify-bodies`, with `ME_BODIES_DEBUG=1` for its silhouettes.
+- **Where this leaves the design memo** (`portbots/notes.md` D1 to D9), and why: the header is in
+  `src/physics` beside its user, not `src/math`; the tracer carries the material's kind and the scene resolves
+  it, not a scene index (those are per level, and a tracer made by hand needs none); no
+  armour zone is carried, the hit names its bone, which is what `TdPawn.AdjustDamage` reads; the reach of the
+  first reject is 320 uu, not 256, because a bot part way through being disarmed has a body 271 uu from where
+  he stands; a body's `bNoCollision` is not looked at, since retail's line check does not; the debug lines go
+  through the shared `evaluate_combat_world_fx`, so each renderer changed by one condition and one argument.
+
+### 39.3 Checked (Windows, Direct3D 11 unless said)
+- **The asset as read against the package's dump** (`ME_SHOW_BODIES=1` lists it): 16 bodies, 17 shapes, the
+  bones, materials and kinds the same; the largest difference in a size 4.6e-08, in a `TM` component 3.4e-08.
+  All eleven skeletons the port draws have all 16 bones (the women's and the story characters' too).
+- **Pictures** (`--intro-shots` on the Prologue's roof, `ME_SHOT_STAND="-6350,-1950,5640"`, `ME_SHOT_BOT`,
+  `ME_SHOW_BODIES=1`), each looked at: a SWAT bot aiming a G36C front on and side on, a patrol cop running
+  with a pistol, a support cop walking with the Minimi, a pursuit cop and Celeste standing side on, Celeste
+  winding up for a blow, a SWAT bot staggered. In each the head's capsule is round the head or helmet, the
+  hands' capsules at the weapon's grips, the forearms' boxes, the upper arms' capsules, the torso's boxes, the
+  thighs, shins and feet on the limbs they belong to, the running cop's raised leg and foot included. On
+  Celeste the male shapes are wider than her body; winding up, with her head turned on her neck, the head's
+  capsule stands several units off the middle of her head, because the body is the `Neck` bone's (standing,
+  it is round her head). The first picture from the OpenGL renderer differs from Direct3D's by a mean of 0.25
+  of 255.
+- **Oracle stage 24** (`--verify-bodies`, 5 s), a SWAT bot aiming on the Training Area's combat terrace:
+  - *Asset:* the sizes of the 17 posed shapes within 0.0005 of the package's; 17 shapes on each of the eleven
+    archetypes; over 3520 poses (each archetype in eight states at forty moments) the furthest a body reaches
+    from where the bot stands is 270.8 uu (Celeste being disarmed; standing, walking, running or aiming 185
+    to 187, a windup 209, a stagger 214).
+  - *Lines:* 4836 lines from the front, the side and above, each against the same shapes walked in steps of
+    0.05 uu with a point-in-shape test: 1354 meet the same shape at the same place (the walk never more than
+    a step later), 3481 meet nothing either way, 1 grazes a shape for less than a step, none differ; every
+    normal is of length one, against the line and across the surface.
+  - *Rays* from 300 uu in front, level: at the head `Neck`, `PM_Character_Head`; at the belly `Spine1`; at a
+    hand `LeftHand`, `PM_Character_Head`; at a thigh `RightUpLeg`; between the shins nothing; 5 uu outside
+    the left upper arm nothing. The cylinder is met by all six, the last two included.
+  - *Pulls* through `ParkourController::step` with a Colt (45): at the head 90 and a tracer marked head, at a
+    hand 90, at a thigh 45, outside the shoulder 0 and the tracer goes on to the level; every tracer ends
+    where the same line was found to meet him beforehand. A Remington's pull: 10 pellets, 5 in him, one pose.
+    With a bot 400 uu aside and one behind her: one bot posed of three. The tutorial's bot: 45 of damage and
+    `pawn_hit` 3. With no poser, and with one that cannot pose him: the shot outside the shoulder meets the
+    cylinder for 45, the one at the head 90 by the rule of heights.
+  - A pose costs 8 to 10 microseconds.
+- **Shots at a bot** (`ME_SHOT_BOT="Assault_SWAT,aim,170,G36C,60"`, `ME_SHOT_FIRE=0`, `ME_IMPACT_DEBUG=1`): of
+  five, two meet `Spine2`, one `Spine1` and two pass him; each of the three logs `on a bot .. on
+  TDPhysicalMaterials.Character.Body.PM_Character_Body, normal (..): effect
+  PS_FX_Impact_Character_Body_Light_01, sound Faith.9mm_Faith_Impact`, and the pale puff is at his upper body
+  in the picture.
+- **`--verify-all`:** ALL SYSTEMS PASS, 23 stages. The result lines of stages 1 to 22 are, word for word,
+  those of the build without this work (`main` at `5a96740`, where the branch began; it was moved onto
+  `dd420a6` before the last run), and all 17 pictures come out pixel for pixel as the tracked ones: none is
+  regenerated. (Stage 7's shots now go through the bodies; nothing it measures depends on what they meet.)
+  Each level's log counts one physical material more (`PM_Character_Head`).
+- **The other targets** (`me_replay`, `me_anim`, `me_menu`, `me_glsl`, `mirrorsedge_opengl`) build; the full
+  build's 139 warnings are the ones it had.
+- **Not built:** the Metal renderer; its changes are the two lines and the forwarder the other two renderers
+  got. No clang on this machine, and no branch was pushed for the macOS build. **Not run:** the windowed game;
+  no shot was fired by hand.
+
+### 39.4 Not done
+Armour by the bone hit and by difficulty, the hit reaction by bone, the riot shield, Faith's own bodies under
+a bot's fire and the helicopter: each is in `TODO.md` with where its data is. A bot's bodies stand as the
+port's table of states poses him, not as retail's animation tree would. The story characters placed in a
+level are met in the same bodies, which was not checked against retail. The reach of the first reject was
+measured over the states the port plays, not over the cutscenes' own sequences. `ME_SHOW_BODIES=1` builds some
+18,000 vertices a bot each frame: fine for a few bots, slow in a level full of them.

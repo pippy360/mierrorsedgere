@@ -659,7 +659,40 @@ afresh. Two things make systems while the game runs:
   everything else the effect, the decal and the sound. A bot's surface is a body of his physics asset
   (`CH_TKY_Cop_SWAT.Male3p_Physics`, the only one the bots' packages import): `PM_Character_Body`, the neck
   and the hands `PM_Character_Head`, both with `PS_FX_Impact_Character_Body_Light_01` (a shotgun's pellet:
-  `..._Body_Shotgun_01`), a pale puff of dust.
+  `..._Body_Shotgun_01`), a pale puff of dust. `TdBotPawn_Tutorial.PreventWeaponImpactEffect` returns true:
+  the Training Area's partner never shows an effect nor sounds one.
+- How a bullet finds a bot. A shot is a line with no extent (`Weapon.CalcWeaponFire`: `Trace(.., vect(0,0,0),
+  HitInfo, TRACEFLAG_Bullet)`), and neither of a pawn's cylinders blocks one (`BlockZeroExtent` False on
+  `TdPawn`'s `CollisionCylinder` and `ActorCollisionCylinder`): it can meet a pawn only through his
+  third-person mesh, whose line check hands the line to its physics asset (no enemy mesh has
+  `PerPolyCollisionBones`). `UPhysicsAsset::LineCheck` (0x00bd90f0) walks every `RB_BodySetup` whose bone the
+  skeleton has, places its shapes by that bone's matrix as it is at that moment, and keeps the nearest hit:
+  the body's place in the list is the hit's `Item`, its bone `HitInfo.BoneName`, its material
+  `HitInfo.PhysMaterial`. A `KBoxElem`'s `X`, `Y`, `Z` are whole edges about the element's origin
+  (`FKBoxElem::LineCheck`, 0x00dcfb80); a `KSphylElem` is a capsule along the element's Z whose `Length` is the
+  cylinder's alone, with a half sphere of `Radius` on each end (`FKSphylElem::LineCheck`, 0x00dd1310); an
+  element's `TM` is stored as four planes, each W first. The pawn class's `TdPawnMesh3p` names the asset, the
+  AI template only the mesh, so every bot, the women included, carries the 16 bodies of `Male3p_Physics` on
+  his own skeleton (all eleven meshes the port draws have the sixteen bones):
+
+  | Body | Shape, in the bone's space | Material |
+  |---|---|---|
+  | `Hips` | box 13.0 x 39.9 x 21.0 and a capsule R 9.0, L 28.9 across the hips | Body |
+  | `Spine1` | box 21.0 x 35.3 x 25.2 | Body |
+  | `Spine2` | capsule R 12.0, L 21.5 across the chest | Body |
+  | `Neck` | capsule R 12.7, L 6.6, its middle 10.4 beyond the `Head` bone: the head | **Head** |
+  | `LeftArm`, `RightArm` | capsules R 9.9, L 15 along the bone | Body |
+  | `LeftForeArm`, `RightForeArm` | boxes 18.0 x 13.0 x 13.6 and 17.4 x 12.6 x 13.6 | Body |
+  | `LeftHand`, `RightHand` | capsules R 4.4 and 3.4, L 15 | **Head** |
+  | `LeftUpLeg` | capsule R 11.9, L 25.9 | Body |
+  | `RightUpLeg` | box 19.4 x 24.2 x 41.4 (the two thighs are not alike) | Body |
+  | `LeftLeg`, `RightLeg` | capsules R 10.3, L 28.9 and R 9.8, L 21.0 | Body |
+  | `LeftFoot`, `RightFoot` | boxes 15.0 x 29.3 x 7.5 and 14.5 x 30.6 x 8.5 | Body |
+
+  `TdBotPawn.TakeDamage` multiplies a bullet's damage by `DamageMultiplier_Head` when the material's name is
+  `PM_Character_Head`, else by `DamageMultiplier_Body`: 2.0 and 1.0 in `AITemplate_Default`, which no
+  template changes. So the head and the hands take double, and where on him a bullet lands decides nothing
+  else that is seen or heard.
 - The bullet's sound (`TdWeapon.SpawnImpactSounds`): the material's `TdPhysicalMaterialImpactSounds.LightAmmo`
   cue, the one every weapon plays (`GetWeaponSpecificImpactSound`), else its parents', else the default
   material's, played at the hit (`PlaySound(.., HitLocation)`). The cues are `A_Effects_Bullet_Impacts`'s, 26
@@ -685,21 +718,42 @@ systems and makes the factories'; every bullet tracer leaves its impact effect, 
 through the tracer's end against the meshes' own triangles, which carry their mesh element and so their
 material (the BSP counts as the default material), the level's or those of a lift's part or a door. Its
 impact sound is handed to the game loop, which plays it at the hit when the player is within the cue's
-`MaxRadius`; the level load brings in the cue packages the materials name. A bot the player shoots gets the
-body's effect where the bullet enters his pawn's cylinder (radius 30, 180 high), pointed as from a surface
-facing out of it, and the body's sound; the player gets the sound of a bot's shot that reaches her.
+`MaxRadius`; the level load brings in the cue packages the materials name. The player gets the sound of a
+bot's shot that reaches her.
+
+A bot the player shoots is met in his bodies (`src/physics/body_shapes.hpp`). The animation system reads
+`Male3p_Physics` out of `CH_TKY_Cop_SWAT.upk` when it loads the meshes (`AnimSystem::load_enemy_bodies`: the
+`RB_BodySetup`s' `BoneName`, `PhysMaterial` and `AggGeom`, kept as boxes and capsules in the bone's space) and
+finds each body's bone by name in every archetype's skeleton. `AnimSystem::pose_enemy_skeleton` is the one
+place that chooses a bot's sequences and works out his bones; the drawn mesh is skinned from it and
+`pose_enemy_bodies` places the shapes with it, by the same turn and the same model matrix the renderers draw
+him with, so what is hit is what is seen. Nothing of it is kept between calls or belongs to a frame. The
+controller has no skeletons: it is given a callback (`ParkourController::set_enemy_body_poser`, the
+renderer's `pose_enemy_bodies` in the game, the oracle and `--intro-shots`). At a trigger pull it poses, once,
+each living bot that the pull's cone can reach (within 320 uu of where he stands, measured: no state the port
+plays puts a body further than 271), then sends every pellet's line through them
+(`trace_enemy_bodies`: a slab test for a box, the cylinder's side and the two end spheres for a capsule, the
+nearest shape winning). The body met gives the tracer its end, the surface's normal and its material
+(`BulletTracer::pawn_normal`, `pawn_surface`); the damage is doubled on `PM_Character_Head`, which each level
+loads beside `PM_Character_Body` (`LevelScene::character_head_physical`); the impact effect is made there,
+pointed as from that surface, with the body's sound; the tutorial's bot shows and sounds nothing. With no
+callback (`me_replay`, which has no renderer) or no character assets a bot is still his pawn's cylinder
+(48 round his axis, 180 high, the head from 150 up), which retail never tests.
 
 What runs is sprite and mesh emitters with the module classes of the table: in the Prologue's opening area
 149 emitters of 95 systems, 38 of them mesh emitters, 1 left out; in Heat's 130 of 110 systems, 27 mesh
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
 attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
-the player (the game also asks whether the shooter was drawn lately); a bot is his pawn's cylinder, all of
-it the body's material, where the game traces the bodies of his physics asset (he takes no bullet hole, and
-does not in the game: section 12); sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
+the player (the game also asks whether the shooter was drawn lately); a bot's bodies stand as the port's own
+table of states poses him, not as retail's animation tree would (he takes no bullet hole, and does not in the
+game: section 12); the armour that `TdPawn.AdjustDamage` takes off by the bone hit, the riot shield, the
+player's own bodies under a bot's fire and the helicopter are not there (`TODO.md`);
+sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
 the pane is broken: [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
-`ME_IMPACT_DEBUG=1` says what every bullet hit and what it left.
+`ME_IMPACT_DEBUG=1` says what every bullet hit and what it left; `ME_SHOW_BODIES=1` draws every living
+enemy's bodies over him as lines.
 
 ## 14. In the port
 
@@ -710,6 +764,7 @@ draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and t
 | `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
 | `src/assets/level_lensflares.*`, `level_decals.*`, `level_particles.*` | Lens-flare templates and sources; decals; particle templates and placements |
 | `src/assets/level_impacts.*`, `src/game/impact_effects.hpp` | The physical materials' impact effects, impact sounds and bullet-hole decals, the script's emitter factories; what a bullet leaves, on the level, a mover or a person |
+| `src/physics/body_shapes.hpp`, `src/anim/anim_system.*` (`pose_enemy_bodies`) | The bodies of the bots' physics asset as boxes and capsules, placed by the skeleton the drawn mesh is skinned by, and a bullet's line through them |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
 | `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
 | `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
@@ -754,6 +809,9 @@ Options for looking at things:
 | `ME_SHOT_STAND="x,y,z"` | With `--intro-shots`: the pictures are the player's, standing there (feet), not the intro's camera's |
 | `ME_SHOT_MOVERS="degrees,units[,1]"` | With `--intro-shots`: lists the level's doors and lifts; the shots are fired before the first picture only, and after it every door is swung by the degrees and every lift part raised by the units (with the third number the shots are fired before the later pictures too) |
 | `ME_SHOT_BODY=<units>` | With `ME_SHOT_FIRE`: the shots stop in a person that far ahead, not in the level |
+| `ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds]]]]]"` | With `--intro-shots`: the level's own enemies are put away and one bot stands on the floor that far ahead of the view (220 unless given), in the state named (`idle`, `walk`, `run`, `aim`, `windup`, `strike`, `stagger`, `disarm`), with that weapon, turned by so many degrees from facing the view, so many seconds into a timed state; the shots of `ME_SHOT_FIRE` then meet his bodies and say which, e.g. `ME_SHOT_BOT="PatrolCop,run,170,Colt1911,70"` |
+| `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every living enemy, as lines: the head's material in the runner-vision red, the body's green; at start, lists the physics asset as read |
+| `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds); with the variable it prints what level lines meet across the bot it poses, front on and side on, by body |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
@@ -815,7 +873,8 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
   (section 10).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
-- **Bullets:** a bot is a cylinder of one material; a bot's shot is judged by distance alone (section 13).
+- **Bullets:** a bot wears no armour and there is no riot shield; a bot's shot at the player is line of
+  sight, not a line through her bodies, and whether it shows is judged by distance alone (section 13).
 - **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load lie on more than the
   game's do; a bullet hole on BSP is not kept to one node (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.

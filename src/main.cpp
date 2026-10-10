@@ -1034,6 +1034,427 @@ static int run_dump_sound_cues(const std::string& game_root, const std::string& 
     return 0;
 }
 
+
+// The player's bullets against an enemy's posed bodies (physics/body_shapes.hpp,
+// ParkourController::pose_enemies_for_shot and trace_enemies), on the Training Area's combat terrace
+// with the renderer's own skeletons. Oracle stage 24; --verify-bodies runs it alone.
+//   Asset   the bodies a posed bot carries against the sizes read out of the package
+//           (CH_TKY_Cop_SWAT.Male3p_Physics: 16 bodies, 7 boxes, 10 capsules), on every archetype,
+//           and how far from where he stands they reach in any state
+//   Lines   a few thousand lines through a posed bot from three sides, each against the same
+//           shapes walked in steps of a twentieth of a unit with a point-in-shape test
+//   Rays    lines with known answers, on his bodies and on the cylinder that stands in for them
+//   Pulls   the controller's own trigger pulls: the damage, what the tracer carries, how many bots
+//           a pull poses, the cylinder when nothing poses them, the tutorial's bot
+// -----------------------------------------------------------------------------
+static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, const me::MovementConfig& move_cfg) {
+    using namespace me;
+    constexpr float kDt = 1.0f / 60.0f;
+    const std::vector<EnemyBot> enemies_before = scene.enemies;
+    const std::vector<BulletTracer> tracers_before = scene.active_tracers;
+    const std::vector<DroppedWeapon> dropped_before = scene.dropped_weapons;
+
+    int posed_calls = 0;
+    const EnemyBodyPoser poser = [&](const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) {
+        ++posed_calls;
+        return renderer.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
+    };
+    ParkourController controller(move_cfg);
+    controller.set_enemy_body_poser(poser);
+
+    // She stands at the terrace's checkpoint and the bot where the tutorial's partner does, facing
+    // her (stage 7's ground): his forward is -Y, his right +X.
+    const Vec3 stand(751.8f, -1591.7f, 4992.0f), bot_at(751.8f, -1320.0f, 4992.0f);
+    const Vec3 fwd(0.0f, -1.0f, 0.0f), right(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    const auto make_bot = [&](const char* archetype, const char* weapon) {
+        EnemyBot bot;
+        bot.archetype = archetype;
+        bot.weapon_name = weapon;
+        bot.position = bot_at;
+        bot.home_position = bot_at;
+        bot.yaw_deg = -90.0f;
+        bot.anim_state = EEnemyAnimState::AimFire;
+        return bot;
+    };
+    bool pass = true;
+    std::cout << std::fixed << std::setprecision(2);
+
+    // --- Asset -----------------------------------------------------------------------------------
+    // A box's X, Y, Z and a capsule's Radius and Length as the package has them
+    // (build/re/impacts/research/bodies/physasset.py Characters/CH_TKY_Cop_SWAT.upk Male3p_Physics).
+    struct Stored {
+        uint8_t body;
+        const char* bone;
+        EBodyShape kind;
+        float a, b, c;
+        bool head;  // PM_Character_Head
+    };
+    static const Stored kStored[] = {
+        {0, "Hips", EBodyShape::Box, 13.000f, 39.941f, 20.976f, false},
+        {0, "Hips", EBodyShape::Capsule, 9.001f, 28.941f, 0.0f, false},
+        {1, "Spine1", EBodyShape::Box, 21.008f, 35.325f, 25.197f, false},
+        {2, "Spine2", EBodyShape::Capsule, 12.029f, 21.499f, 0.0f, false},
+        {3, "Neck", EBodyShape::Capsule, 12.745f, 6.573f, 0.0f, true},
+        {4, "LeftArm", EBodyShape::Capsule, 9.945f, 15.000f, 0.0f, false},
+        {5, "LeftForeArm", EBodyShape::Box, 17.995f, 12.976f, 13.555f, false},
+        {6, "LeftHand", EBodyShape::Capsule, 4.402f, 15.000f, 0.0f, true},
+        {7, "RightArm", EBodyShape::Capsule, 9.871f, 15.000f, 0.0f, false},
+        {8, "RightForeArm", EBodyShape::Box, 17.415f, 12.647f, 13.597f, false},
+        {9, "RightHand", EBodyShape::Capsule, 3.382f, 15.000f, 0.0f, true},
+        {10, "LeftUpLeg", EBodyShape::Capsule, 11.880f, 25.933f, 0.0f, false},
+        {11, "LeftLeg", EBodyShape::Capsule, 10.265f, 28.940f, 0.0f, false},
+        {12, "LeftFoot", EBodyShape::Box, 15.007f, 29.344f, 7.500f, false},
+        {13, "RightUpLeg", EBodyShape::Box, 19.406f, 24.178f, 41.414f, false},
+        {14, "RightLeg", EBodyShape::Capsule, 9.803f, 20.993f, 0.0f, false},
+        {15, "RightFoot", EBodyShape::Box, 14.472f, 30.596f, 8.512f, false},
+    };
+    scene.enemies = {make_bot("Assault_SWAT", "G36C")};
+    EnemyBodySet set;
+    const bool posed_ok = renderer.pose_enemy_bodies(scene.enemies[0], 0.0f, false, set) && set.valid;
+    bool asset_ok = posed_ok && set.bodies.size() == 16 && set.shapes.size() == std::size(kStored);
+    float worst_size = 0.0f;
+    for (size_t i = 0; asset_ok && i < std::size(kStored); ++i) {
+        const Stored& want = kStored[i];
+        const BodyShape& s = set.shapes[i];
+        asset_ok = s.kind == want.kind && s.body == want.body && set.bodies[s.body].bone == want.bone &&
+                   (set.bodies[s.body].surface == ECharacterSurface::Head) == want.head;
+        if (s.kind == EBodyShape::Box) {
+            worst_size = std::max({worst_size, std::abs(s.half.x * 2.0f - want.a), std::abs(s.half.y * 2.0f - want.b), std::abs(s.half.z * 2.0f - want.c)});
+        } else {
+            worst_size = std::max({worst_size, std::abs(s.half.x - want.a), std::abs(s.half.z * 2.0f - want.b)});
+        }
+    }
+    asset_ok = asset_ok && worst_size < 0.001f;
+    // Every archetype the port draws, in every state it plays: the bodies found, and their reach.
+    static const char* const kArchetypes[] = {"Assault_SWAT", "PatrolCop", "Support", "RiotCop", "PursuitCop", "Celeste",
+                                              "Kate",         "Jacknife",  "Ropeburn", "Miller",  "Kreeg"};
+    static const EEnemyAnimState kStates[] = {EEnemyAnimState::Idle,        EEnemyAnimState::Patrol,      EEnemyAnimState::Chase,
+                                              EEnemyAnimState::AimFire,     EEnemyAnimState::MeleeWindup, EEnemyAnimState::MeleeStrike,
+                                              EEnemyAnimState::HitStagger,  EEnemyAnimState::BeingDisarmed};
+    static const char* const kStateNames[] = {"idle", "walk", "run", "aim", "windup", "strike", "stagger", "disarm"};
+    std::string archetype_note, reach_note;
+    float reach = 0.0f, state_reach[std::size(kStates)] = {};
+    int poses = 0;
+    for (const char* archetype : kArchetypes) {
+        size_t shapes = 0;
+        for (size_t state = 0; state < std::size(kStates); ++state) {
+            for (int k = 0; k < 40; ++k) {
+                EnemyBot bot = make_bot(archetype, k % 2 ? "G36C" : "Colt1911");
+                bot.anim_state = kStates[state];
+                bot.anim_timer = static_cast<float>(k) * 0.025f;
+                EnemyBodySet s;
+                if (!renderer.pose_enemy_bodies(bot, static_cast<float>(k) * 0.0437f, false, s)) continue;
+                ++poses;
+                shapes = s.shapes.size();
+                float far = 0.0f;
+                for (const BodyShape& b : s.shapes) {
+                    far = std::max(far, (b.centre - bot.position).length() + (b.kind == EBodyShape::Box ? b.half.length() : b.half.x + b.half.z));
+                }
+                state_reach[state] = std::max(state_reach[state], far);
+                if (far > reach) {
+                    reach = far;
+                    reach_note = std::string(archetype) + ", " + kStateNames[state];
+                }
+            }
+        }
+        archetype_note += std::string(archetype_note.empty() ? "" : ", ") + archetype + " " + std::to_string(shapes);
+        asset_ok = asset_ok && shapes == std::size(kStored);
+    }
+    asset_ok = asset_ok && reach < kEnemyBodyReach;
+    double pose_us = 0.0;
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int k = 0; k < 2000; ++k) renderer.pose_enemy_bodies(scene.enemies[0], static_cast<float>(k) * 0.01f, false, set);
+        pose_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 2000.0;
+    }
+    std::cout << "  [Asset] " << (asset_ok ? "OK" : "FAIL") << ": " << set.bodies.size() << " bodies, " << set.shapes.size()
+              << " shapes on a posed bot, sizes within " << std::setprecision(5) << worst_size << std::setprecision(2)
+              << " of the package's; shapes by archetype: " << archetype_note << "; furthest reach from where he stands over " << poses
+              << " poses " << reach << " uu (" << reach_note << "; the first reject allows " << kEnemyBodyReach << "), by state:";
+    for (size_t k = 0; k < std::size(kStates); ++k) std::cout << " " << kStateNames[k] << " " << state_reach[k];
+    std::cout << std::endl;
+    pass = pass && asset_ok;
+    if (!posed_ok) {
+        std::cout << "  -> Stage 24 Result: FAIL (no bot could be posed: the character assets are missing)" << std::endl;
+        scene.enemies = enemies_before;
+        return false;
+    }
+
+    // --- Lines -----------------------------------------------------------------------------------
+    // The bot as the controller poses him for a pull, and what a pull's lines meet, against the
+    // shapes walked point by point.
+    controller.reset(stand, 90.0f);
+    std::vector<EnemyBodySet> posed;
+    controller.pose_enemies_for_shot(scene, stand + up * 150.0f, fwd * -1.0f, 4000.0f, 0.0f, posed);
+    set = posed[0];
+    const auto inside = [](const BodyShape& s, const Vec3& p) {
+        const Vec3 rel = p - s.centre;
+        const float x = rel.dot(s.axis[0]), y = rel.dot(s.axis[1]), z = rel.dot(s.axis[2]);
+        if (s.kind == EBodyShape::Box) return std::abs(x) <= s.half.x && std::abs(y) <= s.half.y && std::abs(z) <= s.half.z;
+        const float past = z - std::clamp(z, -s.half.z, s.half.z);
+        return x * x + y * y + past * past <= s.half.x * s.half.x;
+    };
+    constexpr float kStep = 0.05f;
+    int lines = 0, same_hit = 0, same_miss = 0, grazes = 0, wrong = 0, bad_normals = 0;
+    float worst_step = 0.0f;
+    const auto check_line = [&](const Vec3& from, const Vec3& dir, float length) {
+        ++lines;
+        EnemyBodyHit hit;
+        const bool met = trace_enemy_bodies(set, from, dir, length, hit);
+        float walked = -1.0f;
+        for (int k = 0; static_cast<float>(k) * kStep <= length && walked < 0.0f; ++k) {
+            const Vec3 p = from + dir * (static_cast<float>(k) * kStep);
+            if ((p - set.bound_centre).length() > set.bound_radius + 1.0f) continue;
+            for (const BodyShape& s : set.shapes) {
+                if (inside(s, p)) {
+                    walked = static_cast<float>(k) * kStep;
+                    break;
+                }
+            }
+        }
+        if (!met) {
+            walked < 0.0f ? ++same_miss : ++wrong;
+            return;
+        }
+        const BodyShape& s = set.shapes[static_cast<size_t>(hit.shape)];
+        if (walked >= hit.distance - 0.002f && walked <= hit.distance + kStep + 0.002f) {
+            ++same_hit;
+            worst_step = std::max(worst_step, walked - hit.distance);
+            // The normal: of length one, against the line, and across the shape's surface.
+            const bool normal_ok = std::abs(hit.normal.length() - 1.0f) < 1.0e-3f && hit.normal.dot(dir) <= 1.0e-3f &&
+                                   !inside(s, hit.location + hit.normal * 0.02f) && inside(s, hit.location - hit.normal * 0.02f);
+            if (!normal_ok) ++bad_normals;
+        } else if (!inside(s, from + dir * (hit.distance + kStep))) {
+            ++grazes;  // the line is in the shape for less than a step: the walk may pass over it
+        } else {
+            ++wrong;
+        }
+    };
+    for (int iy = -15; iy <= 15; ++iy) {
+        for (int iz = -1; iz <= 50; ++iz) {
+            const float y = static_cast<float>(iy) * 4.0f, z = static_cast<float>(iz) * 4.0f;
+            const Vec3 through = bot_at + right * y + up * z;
+            check_line(through + fwd * 300.0f, fwd * -1.0f, 600.0f);                               // front on
+            check_line(bot_at + fwd * y + up * z + right * 300.0f, right * -1.0f, 600.0f);          // side on
+            const Vec3 slant = (fwd * -1.0f + right * 0.45f - up * 0.6f).normalized();              // from above and aside
+            check_line(through - slant * 300.0f, slant, 600.0f);
+        }
+    }
+    const bool lines_ok = wrong == 0 && bad_normals == 0 && same_hit > 500 && same_miss > 500;
+    std::cout << "  [Lines] " << (lines_ok ? "OK" : "FAIL") << ": " << lines << " lines: " << same_hit << " meet the same shape where the walk does (the walk at most "
+              << std::setprecision(3) << worst_step << std::setprecision(2) << " uu later), " << same_miss << " meet nothing either way, " << grazes
+              << " graze a shape for less than a step, " << wrong << " differ; " << bad_normals << " wrong normals" << std::endl;
+    pass = pass && lines_ok;
+    if (std::getenv("ME_BODIES_DEBUG")) {
+        // What lines straight at him meet, front on and from his right, every 2 uu across and 4 up:
+        // the body's number in the asset as a hexadecimal digit.
+        for (int view = 0; view < 2; ++view) {
+            std::cout << (view == 0 ? "  from in front (his right to the left of the page):" : "  from his right (his front to the right of the page):") << std::endl;
+            for (int iz = 48; iz >= 0; --iz) {
+                std::string row;
+                for (int iy = -30; iy <= 30; ++iy) {
+                    const float y = static_cast<float>(iy) * 2.0f, z = static_cast<float>(iz) * 4.0f;
+                    EnemyBodyHit h;
+                    const bool met = view == 0 ? trace_enemy_bodies(set, bot_at - right * y + up * z + fwd * 300.0f, fwd * -1.0f, 600.0f, h)
+                                               : trace_enemy_bodies(set, bot_at + fwd * y + up * z + right * 300.0f, right * -1.0f, 600.0f, h);
+                    row += met ? "0123456789ABCDEF"[h.body & 15] : '.';
+                }
+                std::cout << "    " << std::setw(3) << iz * 4 << " " << row << std::endl;
+            }
+        }
+    }
+
+    // --- Rays ------------------------------------------------------------------------------------
+    // Where the rays with known answers are aimed, read off his bodies as they stand: the middle of
+    // the head's capsule (the Neck's body), of Spine1's box, of the left hand's capsule, of the right
+    // thigh's box; midway between the two shins' capsules; and at the left upper arm's height, 5 uu
+    // past its capsule on his left. What each must meet is known from the pictures of the pose
+    // (ME_SHOW_BODIES, ME_BODIES_DEBUG).
+    enum { kAimHead = 0, kAimBelly, kAimHand, kAimThigh, kAimLegs, kAimShoulder, kAims };
+    const auto aim_at = [&](const EnemyBodySet& s, int which) {
+        const auto shape = [&](uint8_t body, EBodyShape kind) -> const BodyShape& {
+            for (const BodyShape& b : s.shapes) {
+                if (b.body == body && b.kind == kind) return b;
+            }
+            return s.shapes.front();
+        };
+        if (which == kAimHead) return shape(3, EBodyShape::Capsule).centre;
+        if (which == kAimBelly) return shape(1, EBodyShape::Box).centre;
+        if (which == kAimHand) return shape(6, EBodyShape::Capsule).centre;
+        if (which == kAimThigh) return shape(13, EBodyShape::Box).centre;
+        if (which == kAimLegs) return (shape(11, EBodyShape::Capsule).centre + shape(14, EBodyShape::Capsule).centre) * 0.5f;
+        const BodyShape& arm = shape(4, EBodyShape::Capsule);
+        return arm.centre - right * (arm.half.x + std::abs(arm.axis[2].dot(right)) * arm.half.z + 5.0f);
+    };
+    struct Known {
+        const char* name;
+        const char* bone;  // the bone of the body the ray must meet; "" for nothing
+        bool head;         // ...and whether that body is PM_Character_Head
+        bool pulled;       // also fired at from her eyes, below
+    };
+    // (From her eyes, 166 over the floor and 270 off, the line to his belly goes through the forearm
+    // he holds in front of it and the one between his shins meets the knee in front: those two are
+    // level rays only.)
+    static const Known kKnown[kAims] = {
+        {"the head", "Neck", true, true},
+        {"the belly", "Spine1", false, false},
+        {"a hand", "LeftHand", true, true},
+        {"a thigh", "RightUpLeg", false, true},
+        {"between the legs", "", false, false},
+        {"just outside a shoulder", "", false, true},
+    };
+    // From 300 uu in front of him, straight at him: on his bodies, and on the cylinder that stands in
+    // for them (48 round his axis, 180 high, the head from 150 up), which every one of these meets.
+    bool rays_ok = true;
+    for (int a = 0; a < kAims; ++a) {
+        const Vec3 at = aim_at(set, a);
+        const Vec3 from = at + fwd * 300.0f, dir = fwd * -1.0f;
+        const Vec3 rel = at - bot_at;
+        ParkourController::EnemyShotHit on_bodies, on_cylinder;
+        const bool met = controller.trace_enemies(scene, posed, from, dir, 600.0f, on_bodies);
+        const bool met_cylinder = controller.trace_enemies(scene, {}, from, dir, 600.0f, on_cylinder);
+        const bool ok = met == (kKnown[a].bone[0] != '\0') &&
+                        (!met || (on_bodies.posed && on_bodies.bone == kKnown[a].bone && on_bodies.head == kKnown[a].head)) && met_cylinder &&
+                        !on_cylinder.posed && on_cylinder.head == (rel.z >= 150.0f);
+        rays_ok = rays_ok && ok;
+        std::cout << "  [Rays] " << (ok ? "OK" : "FAIL") << ": at " << kKnown[a].name << " (" << rel.dot(fwd) << " ahead of his feet, " << rel.dot(right)
+                  << " to his right, " << rel.z << " up): ";
+        if (met) {
+            std::cout << "body " << static_cast<int>(on_bodies.body) << " " << on_bodies.bone << (on_bodies.head ? ", PM_Character_Head" : ", PM_Character_Body")
+                      << ", " << on_bodies.distance << " uu off, normal (" << on_bodies.normal.x << ", " << on_bodies.normal.y << ", " << on_bodies.normal.z << ")";
+        } else {
+            std::cout << "nothing";
+        }
+        std::cout << "; the cylinder: " << (met_cylinder ? (on_cylinder.head ? "met, as the head" : "met, as the body") : "nothing") << std::endl;
+    }
+    pass = pass && rays_ok;
+
+    // --- Pulls -----------------------------------------------------------------------------------
+    // The controller's own fire: she stands on the terrace with a pistol that does not scatter, the
+    // view is turned onto a point of him as he stands at that moment and the trigger is pulled for
+    // one step.
+    controller.equip_weapon("Colt1911");
+    InputFrame idle{}, fire{};
+    fire.fire = true;
+    for (int i = 0; i < 30; ++i) controller.step(idle, kDt, scene);
+    struct Pull {
+        bool fired = false;
+        float damage = 0.0f;
+        int tracers = 0, bots_met = 0, posed = 0;
+        BulletTracer tracer;  // the last one of the pull
+        ParkourController::EnemyShotHit expected;  // what the same line meets, asked just before
+        bool expected_met = false;
+    };
+    // One pull at the aim `which` on the first of `bots`, which are the enemies for it.
+    const auto pull = [&](const std::vector<EnemyBot>& bots, int which, bool scatter) {
+        for (int i = 0; i < 16; ++i) controller.step(idle, kDt, scene);  // the weapon's interval, and the trigger let go
+        scene.enemies = bots;
+        scene.active_tracers.clear();
+        if (!scatter) controller.get_telemetry().weapon.spread_rad = 0.0f;
+        Pull p;
+        const int calls = posed_calls;
+        const Vec3 eye = controller.get_position() + Vec3(0.0f, 0.0f, controller.get_telemetry().eye_height);
+        EnemyBodySet at_pull;
+        renderer.pose_enemy_bodies(scene.enemies[0], controller.get_telemetry().sim_time, controller.get_telemetry().reaction_active, at_pull);
+        const Vec3 dir = (aim_at(at_pull, which) - eye).normalized();
+        std::vector<EnemyBodySet> now;
+        controller.pose_enemies_for_shot(scene, eye, dir, 4000.0f, 0.0f, now);
+        p.expected_met = controller.trace_enemies(scene, now, eye, dir, 4000.0f, p.expected);
+        posed_calls = calls;
+        controller.set_rotation(std::atan2(dir.y, dir.x) * RAD2DEG, std::asin(std::clamp(dir.z, -1.0f, 1.0f)) * RAD2DEG, 0.0f);
+        const float health = scene.enemies[0].health;
+        controller.step(fire, kDt, scene);
+        p.fired = controller.get_telemetry().weapon.fired_this_tick;
+        p.posed = posed_calls - calls;
+        p.damage = health - scene.enemies[0].health;
+        for (const BulletTracer& tr : scene.active_tracers) {
+            if (!tr.from_player) continue;
+            ++p.tracers;
+            p.bots_met += tr.pawn_hit != 0 ? 1 : 0;
+            p.tracer = tr;
+        }
+        return p;
+    };
+    const auto say = [&](const std::string& what, bool ok, const Pull& p, const std::string& more) {
+        std::cout << "  [Pulls] " << (ok ? "OK" : "FAIL") << ": " << what << ": " << (p.fired ? "" : "NOT FIRED, ") << "damage " << p.damage << ", ";
+        if (p.expected_met) {
+            std::cout << "the line meets " << (p.expected.posed ? "body " + std::to_string(p.expected.body) + " " + p.expected.bone : std::string("his cylinder"))
+                      << (p.expected.head ? " (head)" : " (body)") << " at (" << p.expected.location.x << ", " << p.expected.location.y << ", "
+                      << p.expected.location.z << "), ";
+        } else {
+            std::cout << "the line meets nobody, ";
+        }
+        std::cout << "tracer pawn_hit " << static_cast<int>(p.tracer.pawn_hit) << (p.tracer.pawn_surface == ECharacterSurface::Head ? " head" : " body")
+                  << " ends (" << p.tracer.end_pos.x << ", " << p.tracer.end_pos.y << ", " << p.tracer.end_pos.z << "), " << p.posed << " bot(s) posed"
+                  << more << std::endl;
+        pass = pass && ok;
+    };
+    // The tracer against what the same line met when asked beforehand: the place, the normal, the material.
+    const auto as_asked = [](const Pull& p) {
+        return p.expected_met && (p.tracer.end_pos - p.expected.location).length() < 0.05f && (p.tracer.pawn_normal - p.expected.normal).length() < 0.01f &&
+               (p.tracer.pawn_surface == ECharacterSurface::Head) == p.expected.head;
+    };
+    const std::vector<EnemyBot> swat = {make_bot("Assault_SWAT", "G36C")};
+    const float colt = controller.get_telemetry().weapon.damage;  // he is nearer than where its fall-off starts
+    for (int a = 0; a < kAims; ++a) {
+        if (!kKnown[a].pulled) continue;
+        const Pull p = pull(swat, a, false);
+        const bool meets = kKnown[a].bone[0] != '\0';
+        const bool ok = p.fired && p.posed == 1 &&
+                        (meets ? p.damage == colt * (kKnown[a].head ? 2.0f : 1.0f) && p.tracer.pawn_hit == 1 && as_asked(p) && p.expected.posed &&
+                                     p.expected.bone == kKnown[a].bone && p.expected.head == kKnown[a].head
+                               : p.damage == 0.0f && p.tracer.pawn_hit == 0 && !p.expected_met);
+        say(std::string("at ") + kKnown[a].name, ok, p, a == 0 ? " (the weapon's damage " + std::to_string(static_cast<int>(colt)) + ")" : std::string());
+    }
+
+    // A shotgun: every pellet of the pull meets the pose he had as the trigger was pulled, posed once,
+    // whatever the first pellet's blow made of him.
+    controller.equip_weapon("Remington870");
+    Pull p = pull(swat, kAimBelly, true);
+    say("a shotgun at the belly", p.fired && p.tracers > 1 && p.bots_met > 1 && p.posed == 1 && p.damage > 0.0f, p,
+        ", " + std::to_string(p.tracers) + " pellets, " + std::to_string(p.bots_met) + " in him");
+    controller.equip_weapon("Colt1911");
+
+    // Three bots: the one aimed at, one 400 uu to his side and one behind her. Only the first is posed.
+    std::vector<EnemyBot> three = swat;
+    three.push_back(make_bot("PatrolCop", "Colt1911"));
+    three.back().position = bot_at + right * 400.0f;
+    three.push_back(make_bot("Support", "FNMinimi"));
+    three.back().position = stand + fwd * 300.0f;
+    p = pull(three, kAimBelly, false);
+    say("with a bot 400 uu aside and one behind her", p.fired && p.damage == colt && p.posed == 1 && as_asked(p), p, "");
+
+    // The tutorial's partner (TdBotPawn_Tutorial.PreventWeaponImpactEffect): hurt, and nothing shown.
+    p = pull({make_bot("TutorialTrainer_Celeste", "Colt1911")}, kAimBelly, false);
+    say("at the tutorial's bot", p.fired && p.damage == colt && p.tracer.pawn_hit == 3 && p.expected_met && p.expected.posed, p, "");
+
+    // Nothing to pose them with (a tool with no renderer): his cylinder, and its rule of heights.
+    controller.set_enemy_body_poser(EnemyBodyPoser());
+    p = pull(swat, kAimShoulder, false);
+    say("with no poser, just outside a shoulder",
+        p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && !p.expected.head && p.damage == colt && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
+    p = pull(swat, kAimHead, false);
+    say("with no poser, at the head",
+        p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && p.expected.head && p.damage == colt * 2.0f && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
+    // ...and with one that cannot pose him, as the animation system answers without the character assets.
+    controller.set_enemy_body_poser([](const EnemyBot&, float, bool, EnemyBodySet& out) {
+        out.valid = false;
+        return false;
+    });
+    p = pull(swat, kAimShoulder, false);
+    say("with a poser that cannot pose him, just outside a shoulder",
+        p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && !p.expected.head && p.damage == colt && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
+    controller.set_enemy_body_poser(poser);
+
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "  -> Stage 24 Result: " << (pass ? "PASS" : "FAIL") << " (Asset=" << (asset_ok ? "OK" : "FAIL") << ", Lines=" << (lines_ok ? "OK" : "FAIL")
+              << ", Rays=" << (rays_ok ? "OK" : "FAIL") << ", a pose " << pose_us << " us)" << std::endl;
+    scene.enemies = enemies_before;
+    scene.active_tracers = tracers_before;
+    scene.dropped_weapons = dropped_before;
+    return pass;
+}
+
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
@@ -1165,6 +1586,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
 
     constexpr float kDt = 1.0f / 60.0f;
     ParkourController controller(move_cfg);
+    // As in the game: the bullets of stage 7 meet the enemies' posed bodies.
+    controller.set_enemy_body_poser([&renderer](const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) {
+        return renderer.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
+    });
     LevelScene sim_scene = sp00_scene;
 
     std::vector<std::string> telemetry_log;
@@ -2769,10 +3194,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     // Stage 23: the loudness of sounds at a place (oracle_sound_attenuation above).
     std::cout << "[Oracle Stage 23] Testing Sound Attenuation with Distance (the cues' own curves, per wave)..." << std::endl;
     const bool s23_pass = oracle_sound_attenuation(game_root);
+    // Stage 24: the player's bullets against an enemy's posed bodies (oracle_enemy_bodies above).
+    std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
+    const bool s24_pass = oracle_enemy_bodies(renderer, sim_scene, move_cfg);
 
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2870,6 +3298,9 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
     ParkourController controller(move_cfg);
     controller.reset(scene.player_spawn_pos, scene.player_spawn_yaw);
+    controller.set_enemy_body_poser([&renderer](const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) {
+        return renderer.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
+    });
 
     std::string stem = map_rel.substr(map_rel.find_last_of("/\\") + 1);
     stem = stem.substr(0, stem.find('.'));
@@ -2932,6 +3363,37 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             if (!pm.impact_sound.empty() && !audio->has_cue(pm.impact_sound)) audio->load_cue_bank(game_root, pm.impact_sound_package);
         }
     }
+    // ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds]]]]]": the level's own enemies are
+    // put away and one bot stands on the floor `distance` units ahead of the view (220 unless given),
+    // in the state named (idle, walk, run, aim, windup, strike, stagger, disarm), with that weapon,
+    // turned by `turn` degrees from facing the view, `seconds` into a state that is timed. The shots
+    // of ME_SHOT_FIRE then meet his bodies as the controller's do (ME_SHOW_BODIES=1 draws them).
+    bool shot_bot = false;
+    float bot_distance = 220.0f, bot_turn = 0.0f;
+    if (const char* bot_spec = std::getenv("ME_SHOT_BOT")) {
+        std::vector<std::string> field;
+        std::stringstream fields(bot_spec);
+        for (std::string item; std::getline(fields, item, ',');) field.push_back(item);
+        const auto given = [&](size_t i) { return i < field.size() && !field[i].empty(); };
+        EnemyBot bot;
+        bot.archetype = given(0) ? field[0] : std::string("Assault_SWAT");
+        static const std::pair<const char*, EEnemyAnimState> kStates[] = {
+            {"idle", EEnemyAnimState::Idle},          {"walk", EEnemyAnimState::Patrol},         {"run", EEnemyAnimState::Chase},
+            {"aim", EEnemyAnimState::AimFire},        {"windup", EEnemyAnimState::MeleeWindup},  {"strike", EEnemyAnimState::MeleeStrike},
+            {"stagger", EEnemyAnimState::HitStagger}, {"disarm", EEnemyAnimState::BeingDisarmed}};
+        for (const auto& [name, state] : kStates) {
+            if (given(1) && field[1] == name) bot.anim_state = state;
+        }
+        if (given(2)) bot_distance = static_cast<float>(std::atof(field[2].c_str()));
+        bot.weapon_name = given(3) ? field[3] : std::string("Colt1911");
+        if (given(4)) bot_turn = static_cast<float>(std::atof(field[4].c_str()));
+        if (given(5)) bot.anim_timer = static_cast<float>(std::atof(field[5].c_str()));
+        scene.enemies.clear();
+        scene.enemies.push_back(bot);
+        shot_bot = true;
+        std::cout << "[Shots] bot " << bot.archetype << ", state " << static_cast<int>(bot.anim_state) << ", " << bot_distance
+                  << " ahead, weapon " << bot.weapon_name << ", turned " << bot_turn << std::endl;
+    }
     if (movers) {
         for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
             const BargeDoorInstance& door = scene.barge_doors[d];
@@ -2959,21 +3421,63 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             tel.yaw_deg = look_yaw;
             tel.camera_roll_deg = 0.0f;
         }
+        if (shot_bot && !scene.enemies.empty()) {
+            // The bot, ahead of the view on the floor there.
+            Vec3 eye;
+            Rotator rot;
+            renderer.player_camera(tel, eye, rot);
+            const Vec3 ahead = Vec3(rot.forward().x, rot.forward().y, 0.0f).normalized_xy();
+            EnemyBot& bot = scene.enemies.front();
+            bot.position = Vec3(eye.x + ahead.x * bot_distance, eye.y + ahead.y * bot_distance, standing ? stand_at.z : tel.position.z);
+            const ImpactSurface floor = find_impact_surface(scene, Vec3(bot.position.x, bot.position.y, eye.z),
+                                                            Vec3(bot.position.x, bot.position.y, eye.z - 600.0f));
+            if (floor.hit) bot.position.z = floor.location.z;
+            bot.home_position = bot.position;
+            bot.yaw_deg = std::atan2(-ahead.y, -ahead.x) * RAD2DEG + bot_turn;
+        }
         if (fire_ammo >= 0 && fire_at >= 0.0f && now + dt >= fire_at && scene.collision) {
             fire_at = -1.0f;
             Vec3 eye;
             Rotator rot;
             renderer.player_camera(tel, eye, rot);
             static const float kSpread[5][2] = {{0.0f, 0.0f}, {-0.09f, 0.05f}, {0.09f, 0.05f}, {-0.05f, -0.07f}, {0.06f, -0.06f}};
+            // With a bot (ME_SHOT_BOT): his bodies as the last picture drew them, posed once for the
+            // five shots as the controller poses them for a trigger pull.
+            std::vector<EnemyBodySet> posed;
+            if (shot_bot) {
+                controller.get_telemetry().sim_time = tel.sim_time;
+                controller.get_telemetry().reaction_active = tel.reaction_active;
+                controller.pose_enemies_for_shot(scene, eye, rot.forward(), 8000.0f, 0.12f, posed);
+            }
             for (const auto& s : kSpread) {
                 const Vec3 dir = (rot.forward() + rot.right() * s[0] + rot.up() * s[1]).normalized();
                 const ImpactSurface hit = find_impact_surface(scene, eye, eye + dir * 8000.0f);  // the level, a lift or a door
-                if (!hit.hit && body_at <= 0.0f) continue;
+                ParkourController::EnemyShotHit shot;
+                const bool met = shot_bot && controller.trace_enemies(scene, posed, eye, dir, hit.hit ? (hit.location - eye).length() : 8000.0f, shot);
+                if (shot_bot) {
+                    std::cout << "[Shots] a shot " << s[0] << " across, " << s[1] << " up: ";
+                    if (met) {
+                        std::cout << (shot.posed ? "the bot's " + shot.bone + " (body " + std::to_string(shot.body) + ")" : std::string("the bot's cylinder"))
+                                  << (shot.head ? ", PM_Character_Head" : ", PM_Character_Body") << ", " << shot.distance << " uu off at ("
+                                  << shot.location.x << ", " << shot.location.y << ", " << shot.location.z << "), normal (" << shot.normal.x << ", "
+                                  << shot.normal.y << ", " << shot.normal.z << ")" << std::endl;
+                    } else {
+                        std::cout << "past the bot" << std::endl;
+                    }
+                }
+                if (!hit.hit && body_at <= 0.0f && !met) continue;
                 BulletTracer tr;
                 tr.start_pos = eye + dir * 30.0f;
                 tr.end_pos = hit.location;
                 tr.ammo = static_cast<uint8_t>(fire_ammo);
-                if (body_at > 0.0f) {
+                if (met) {
+                    tr.end_pos = shot.location;
+                    tr.from_player = true;
+                    tr.hit_enemy = true;
+                    tr.pawn_hit = 1;
+                    tr.pawn_normal = shot.normal;
+                    tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;
+                } else if (body_at > 0.0f) {
                     tr.end_pos = eye + dir * body_at;
                     tr.from_player = true;
                     tr.hit_enemy = true;
@@ -3180,6 +3684,10 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     // The first-person mesh's foot placement asks the level where the floor is under each foot.
     renderer.set_world_trace([&controller, &active_scene](const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal) {
         return controller.leg_line_check(from, to, active_scene, hit, normal);
+    });
+    // The player's bullets meet an enemy in the bodies of his physics asset, posed as he is drawn.
+    controller.set_enemy_body_poser([&renderer](const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) {
+        return renderer.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
     });
 
     CutscenePlayer cutscene_player;
@@ -4818,6 +5326,7 @@ int main(int argc, char* argv[]) {
     bool verify_all = false;
     bool verify_script = false;  // the level script's stage of the oracle, alone
     bool verify_sound = false;   // and the sound attenuation stage
+    bool verify_bodies = false;  // the enemies' bodies stage of the oracle, alone
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
     std::string cue_dump;      // --dump-sound-cues <file>
@@ -4853,6 +5362,8 @@ int main(int argc, char* argv[]) {
             verify_script = true;
         } else if (arg == "--verify-sound") {
             verify_sound = true;
+        } else if (arg == "--verify-bodies") {
+            verify_bodies = true;
         } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
@@ -4888,6 +5399,7 @@ int main(int argc, char* argv[]) {
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
                       << "  --verify-sound           Run only its sound attenuation stage (gain with distance, per cue)\n"
+                      << "  --verify-bodies          Run only its stage of bullets against the enemies' posed bodies\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
@@ -4925,6 +5437,17 @@ int main(int argc, char* argv[]) {
         renderer.set_game_root(game_root);
         if (!renderer.init_headless(1280, 720)) return 1;
         return measure_intro_handover(renderer, game_root, handover_map, true).valid ? 0 : 1;
+    }
+    if (verify_bodies) {
+        me::Renderer renderer;
+        renderer.set_game_root(game_root);
+        if (!renderer.init_headless(1280, 720)) return 1;
+        me::MovementConfig move_cfg;
+        me::load_movement_config_from_ini(me::get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+        me::LevelScene scene;
+        if (!me::load_level_scene(game_root, "Maps/SP00/Tutorial_p.me1", scene)) return 1;
+        std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
+        return oracle_enemy_bodies(renderer, scene, move_cfg) ? 0 : 1;
     }
     if (verify_script) {
         // ME_SCRIPT_SHOTS=<dir>: with pictures of the pane it breaks.

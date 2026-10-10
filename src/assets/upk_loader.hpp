@@ -125,6 +125,21 @@ struct UProperty;
 class UPKPackage;
 void append_agg_geom_triangles(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<Vec3>& out);
 
+// One element of a KAggregateGeom kept as what it is: a KSphereElem, a KBoxElem or a KSphylElem.
+struct AggShape {
+    enum Kind : uint8_t { Sphere = 0, Box = 1, Capsule = 2 };
+    Kind kind = Box;
+    // The element's TM: its X, Y and Z axes and its origin, in the body's space (a physics asset's
+    // body: its bone's).
+    Vec3 rows[4] = {Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 1.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), Vec3(0.0f, 0.0f, 0.0f)};
+    // A box's half edges (X, Y, Z are whole ones); a capsule's Radius in x and half of its Length in
+    // z, the Length being the cylinder's alone, along the element's Z; a sphere's Radius in x.
+    Vec3 half{0.0f, 0.0f, 0.0f};
+};
+// The spheres, boxes and capsules of a KAggregateGeom, in the order FKAggregateGeom::LineCheck
+// walks them. Returns how many convex elements it has besides: those are not kept.
+int read_agg_geom_shapes(const UPKPackage& pkg, const UProperty& agg_geom, std::vector<AggShape>& out);
+
 // The convex pieces of a volume actor's brush (its BrushComponent's BrushAggGeom.ConvexElems) in
 // world space, each as triangles, 3 vertices apiece.
 void read_actor_brush_hulls(const UPKPackage& pkg, int32_t actor_export_1based, std::vector<std::vector<Vec3>>& out);
