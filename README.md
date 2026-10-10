@@ -162,6 +162,8 @@ Options:
   --verify-all             Run deterministic headless oracle verification suite
   --verify-script          Run only its level-script stage: a real level's Kismet against breakable
                            glass, emitter factories and toggles (docs/GAMEPLAY_SCRIPTING_RE.md)
+  --handover-check <map>   Play the level's intro headless to its end and print the camera around the
+                           hand-over to the player (docs/LEVEL_INTROS.md section 5)
   --intro-shots <map> <t,t,..> <dir>
                            Play the level's intro headless and save the picture at those Matinee
                            times (docs/RENDERING_RE.md compares them with retail's)

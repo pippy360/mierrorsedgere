@@ -31,6 +31,11 @@ public:
 
     // Reset player position and orientation
     void reset(const Vec3& spawn_pos, float spawn_yaw = 0.0f);
+    // A cutscene ends and the player is let go where its animation left the mesh's root (the
+    // stand-in's place, on the floor or near it): she stands on the floor under it, facing `yaw`,
+    // and the view is let down onto her own standing pose as retail's is (parkour_controller.cpp,
+    // kHandoverLift).
+    void hand_over(const Vec3& root_end, float yaw, const LevelScene& scene);
     // The active checkpoint as the level script sets it (SeqAct_TdCheckpoint): where the player
     // respawns, and which one the HUD counts. `feet` is the pawn's feet.
     void set_checkpoint(const Vec3& feet, float yaw_deg, int index, const std::string& name);
@@ -481,6 +486,8 @@ private:
     float m_balance_time = 0.0f;            // since she stepped on to the beam
     float m_balance_sway = 0.0f;            // the lean's own wander, as shown
     float m_mesh_smooth_z = 0.0f;           // TdPawn.SmoothOffset: the mesh held back over a fast change of floor height
+    float m_hover_z = 0.0f;                 // how far over these feet retail's capsule bottom is (kFloorHover on a floor)
+    float m_handover_lift = 0.0f;           // what is left of a hand-over's lift (kHandoverLift)
     float m_smooth_last_z = 0.0f;
     bool m_smooth_was_walking = false;
     bool m_smooth_was_heave = false;        // ...the frame before was a pull-up's (its end drops her onto the floor)

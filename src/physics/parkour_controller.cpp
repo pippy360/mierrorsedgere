@@ -41,6 +41,18 @@ constexpr float kEyeHeightSlide = 70.0f;
 // UE3 APawn walking constants.
 constexpr float kMaxStepHeight = 35.0f;   // Pawn.MaxStepHeight
 constexpr float kMaxFloorDist = 2.4f;     // MAXFLOORDIST
+// Retail's capsule does not stand on the floor. Let go at the end of each level intro, its centre
+// comes to rest 93.15 above the floor this controller stands on (New Eden, The Shard, The Boat), or
+// stays where it is when it is between 92.9 and 93.4 (Heat): physWalking's band of 1.9 to 2.4 over
+// the floor (MINFLOORDIST, MAXFLOORDIST), moved to its middle, and one unit more. These feet are on
+// the floor, so retail's eye and first-person mesh are that much higher than this pawn's place
+// gives them: the hover is added to what is drawn, not to the physics.
+constexpr float kFloorHover = 3.15f;
+constexpr float kHoverRate = 79.0f;       // uu/s: how fast what is drawn takes a change of it
+// When the pawn's own animation comes back after a cutscene, retail's eye starts 6.5 uu over its
+// standing place and comes down in five frames at 79 uu/s, with the view's pitch (measured the same
+// in nine level intros): the tree blending in from its reference pose.
+constexpr float kHandoverLift = 6.5f;
 constexpr float kWalkableFloorZ = 0.71f;  // TdPawn.WalkableFloorZ
 // Floor probes start slightly above the feet so a pawn that ends a move marginally inside a floor
 // (float rounding at large world coordinates) still finds it.
@@ -576,6 +588,12 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.snatch_from_back = false;
     m_cam_mesh_offset = Vec3(0.0f, 0.0f, 0.0f);
     m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
+    // She stands: the capsule hovers. And the body faces where she does from the first frame.
+    m_hover_z = kFloorHover;
+    m_handover_lift = 0.0f;
+    m_telemetry.camera_mesh_offset.z = m_hover_z;
+    m_telemetry.mesh_smooth_z = 0.0f;
+    m_telemetry.body_yaw_deg = spawn_yaw;
     m_mesh_smooth_z = 0.0f;
     m_smooth_was_walking = false;
     m_smooth_was_heave = false;
@@ -760,8 +778,24 @@ void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw
     if (!grounded) {
         leave_ground(state.jump ? EMovement::MOVE_Jump : EMovement::MOVE_Falling);
         if (state.jump == 1) m_telemetry.move_state = EMovement::MOVE_Falling;
+        // In the air the anchor is the capsule's own place: nothing to add until a floor carries her.
+        m_hover_z = 0.0f;
+        m_telemetry.camera_mesh_offset.z = 0.0f;
     }
     if (state.jump) m_pre_jump_momentum = state.pre_jump_momentum;
+}
+
+void ParkourController::hand_over(const Vec3& root_end, float yaw, const LevelScene& scene) {
+    reset(root_end + Vec3(0.0f, 0.0f, 2.0f), yaw);
+    // Onto the floor under her now, not by a fall in the first frames of play.
+    FloorHit floor;
+    if (check_ground(scene, 2.0f + kMaxStepHeight, kPawnHeight, floor)) {
+        m_telemetry.position.z = floor.z;
+        m_base_actor = floor.actor_index;
+    }
+    m_smooth_last_z = m_telemetry.position.z;
+    m_handover_lift = kHandoverLift;
+    m_telemetry.camera_mesh_offset.z = m_hover_z + m_handover_lift;
 }
 
 void ParkourController::equip_weapon(const std::string& weapon_name) {
@@ -1206,7 +1240,21 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         m_smooth_was_walking = walking;
         m_smooth_was_heave = m_telemetry.move_state == EMovement::MOVE_GrabPullUp;
         m_smooth_last_z = m_telemetry.position.z;
-        m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z;
+        // The capsule's hover (kFloorHover): there while a floor carries her and in the air after it,
+        // where this pawn is as far under retail's as it was on the floor; not while she hangs from
+        // something, where her place comes from the ledge, the bar, the cable or the pipe.
+        {
+            const EMovement ms = m_telemetry.move_state;
+            const bool hangs = ms == EMovement::MOVE_Grabbing || ms == EMovement::MOVE_IntoGrab || ms == EMovement::MOVE_GrabTransfer ||
+                               ms == EMovement::MOVE_GrabPullUp || ms == EMovement::MOVE_ZipLine || ms == EMovement::MOVE_Swing ||
+                               ms == EMovement::MOVE_Climb;
+            const float target = hangs ? 0.0f : (m_telemetry.grounded ? kFloorHover : m_hover_z);
+            const float step = kHoverRate * effective_dt;
+            m_hover_z = std::abs(target - m_hover_z) <= step ? target : m_hover_z + (target > m_hover_z ? step : -step);
+            m_handover_lift = std::max(0.0f, m_handover_lift - step);
+        }
+        m_telemetry.mesh_smooth_z = m_mesh_smooth_z;
+        m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z + m_hover_z + m_handover_lift;
     }
     // Retail's frames have the pistol in her hand between 0.08 and 0.16 s after the move ends, not
     // on its last frame.
