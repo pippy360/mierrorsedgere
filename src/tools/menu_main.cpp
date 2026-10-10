@@ -254,8 +254,27 @@ int main(int argc, char** argv) {
         } else if (verb == "menu") {
             fe.open_main_menu();
             fe.update(dt);
+        } else if (verb == "pause") {
+            std::string map = "Edge_p";
+            cs >> map;
+            fe.open_pause_menu(map);
+            fe.update(dt);
+        } else if (verb == "overlay") {
+            std::string name;
+            cs >> name;
+            me::fe::Frame frame = fe.frame();
+            renderer.render_overlay(frame, rgba);
+            const std::string path = out_dir + "/" + name;
+            if (!me::fe::write_png(path, frame.width, frame.height, rgba.data())) {
+                std::cerr << "me_menu: could not write " << path << "\n";
+                return 1;
+            }
+            std::cout << "wrote " << path << "\n";
         } else if (verb == "state") {
-            std::cout << (fe.screen() == me::fe::Screen::Start ? "start" : "menu") << " column " << fe.panel() << " focus "
+            const char* scr = fe.screen() == me::fe::Screen::Start ? "start"
+                            : fe.screen() == me::fe::Screen::MainMenu ? "menu"
+                            : fe.screen() == me::fe::Screen::Pause ? "pause" : "ingame";
+            std::cout << scr << " column " << fe.panel() << " focus "
                       << fe.focused_button() << (fe.animating() ? " (animating)" : "");
             if (!fe.scene_name().empty()) std::cout << " scene " << fe.scene_name() << " focus " << fe.scene_focus();
             std::cout << "\n";

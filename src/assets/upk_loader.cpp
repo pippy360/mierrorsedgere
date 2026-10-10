@@ -954,26 +954,32 @@ size_t UPKPackage::find_property_start(const FObjectExport& exp) const {
 
     for (size_t i = 0; i < num_cands; ++i) {
         size_t c = cands[i];
+        if (c + 24 > ss) continue;
+        int32_t n_idx = 0, n_num = 0;
+        std::memcpy(&n_idx, data_.data() + so + c, 4);
+        std::memcpy(&n_num, data_.data() + so + c + 4, 4);
+        if (n_idx >= 0 && static_cast<size_t>(n_idx) < names_.size() && n_num >= 0 &&
+            names_[n_idx] != "None") {
+            int32_t t_idx = 0, t_num = 0, p_sz = 0;
+            std::memcpy(&t_idx, data_.data() + so + c + 8, 4);
+            std::memcpy(&t_num, data_.data() + so + c + 12, 4);
+            std::memcpy(&p_sz, data_.data() + so + c + 16, 4);
+            if (t_idx >= 0 && static_cast<size_t>(t_idx) < names_.size() &&
+                t_num == 0 && p_sz >= 0 && static_cast<size_t>(p_sz) <= ss &&
+                kValidTypes.find(names_[t_idx]) != kValidTypes.end()) {
+                return so + c;
+            }
+        }
+    }
+    for (size_t i = 0; i < num_cands; ++i) {
+        size_t c = cands[i];
         if (c + 8 > ss) continue;
         int32_t n_idx = 0, n_num = 0;
         std::memcpy(&n_idx, data_.data() + so + c, 4);
         std::memcpy(&n_num, data_.data() + so + c + 4, 4);
-        if (n_idx >= 0 && static_cast<size_t>(n_idx) < names_.size() && n_num >= 0) {
-            const std::string& pname = names_[n_idx];
-            if (pname == "None") {
-                return so + c;
-            }
-            if (c + 24 <= ss) {
-                int32_t t_idx = 0, t_num = 0, p_sz = 0;
-                std::memcpy(&t_idx, data_.data() + so + c + 8, 4);
-                std::memcpy(&t_num, data_.data() + so + c + 12, 4);
-                std::memcpy(&p_sz, data_.data() + so + c + 16, 4);
-                if (t_idx >= 0 && static_cast<size_t>(t_idx) < names_.size() &&
-                    t_num == 0 && p_sz >= 0 && static_cast<size_t>(p_sz) <= ss &&
-                    kValidTypes.find(names_[t_idx]) != kValidTypes.end()) {
-                    return so + c;
-                }
-            }
+        if (n_idx >= 0 && static_cast<size_t>(n_idx) < names_.size() && n_num == 0 &&
+            names_[n_idx] == "None") {
+            return so + c;
         }
     }
     return so + (has_stack ? 32 : 4);

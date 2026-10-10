@@ -442,7 +442,7 @@ bool Assets::menu_rect(const std::string& widget, Rect& out) const {
     return true;
 }
 
-bool Assets::load(const std::string& game_root, int viewport_height, std::string& error) {
+bool Assets::load(const std::string& game_root, int viewport_height, std::string& error, bool load_menu_level) {
     fs::path cooked = fs::path(game_root) / "TdGame" / "CookedPC";
     if (!fs::exists(cooked)) cooked = fs::path(game_root) / "CookedPC";
     if (!fs::exists(cooked)) {
@@ -453,6 +453,7 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
     PackageManager& pm = *pm_;
     game_root_ = game_root;
     viewport_height_ = viewport_height;
+    menu_level_loaded_ = false;
 
     auto open = [&](const fs::path& rel) -> std::shared_ptr<UPKPackage> {
         const fs::path p = cooked / rel;
@@ -696,14 +697,12 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
     // Textures.
     auto resources = open(fs::path("UI") / "TdUIResources.upk");
     auto menus = open(fs::path("UI") / "UI_Menus.upk");
-    auto menu_map = open(fs::path("Maps") / "Menu" / "TdMainMenu.me1");
     if (!menus) {
         error = "UI/UI_Menus.upk is missing or unreadable";
         return false;
     }
-    if (!(resources && load_image(pm, *resources, "StartTitleImage", title)) &&
-        !(menu_map && load_image(pm, *menu_map, "StartTitleImage", title))) {
-        warnings.push_back("TdUIResources.Scene.StartTitleImage not found");
+    if (resources) {
+        load_image(pm, *resources, "StartTitleImage", title);
     }
     if (!(resources && load_image(pm, *resources, "button_full", button))) {
         warnings.push_back("TdUIResources.button_full not found");
@@ -721,14 +720,31 @@ bool Assets::load(const std::string& game_root, int viewport_height, std::string
         }
     }
 
-    // Cameras and the city.
+    if (load_menu_level) ensure_menu_level();
+    return true;
+}
+
+void Assets::ensure_menu_level() {
+    if (menu_level_loaded_ || !pm_) return;
+    menu_level_loaded_ = true;
+    const fs::path p = fs::path(pm_->cooked_root()) / "Maps" / "Menu" / "TdMainMenu.me1";
+    std::shared_ptr<UPKPackage> menu_map;
+    if (fs::exists(p)) {
+        auto pkg = std::make_shared<UPKPackage>(p.string());
+        if (pkg->is_valid()) {
+            pm_->add_loaded(p.stem().string(), pkg);
+            menu_map = std::move(pkg);
+        }
+    }
+    if (!title.valid() && !(menu_map && load_image(*pm_, *menu_map, "StartTitleImage", title))) {
+        warnings.push_back("TdUIResources.Scene.StartTitleImage not found");
+    }
     if (!menu_map) {
         warnings.push_back("Maps/Menu/TdMainMenu.me1 not found: no background");
-        return true;
+        return;
     }
     kismet.load(*menu_map, warnings);
-    load_city(pm, menu_map, city, warnings);
-    return true;
+    load_city(*pm_, menu_map, city, warnings);
 }
 
 }  // namespace me::fe

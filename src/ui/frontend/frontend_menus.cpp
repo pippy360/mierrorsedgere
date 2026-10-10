@@ -152,7 +152,10 @@ void SubMenu::navigate(int face) {
     }
     const UiWidget& from = scene_->widgets[static_cast<size_t>(focus_)];
     int target = from.forced_nav[face];
-    if (target >= 0 && !focusable(target)) target = -1;
+    for (int guard = 0; guard < 16 && target >= 0 && !focusable(target); ++guard) {
+        target = scene_->widgets[static_cast<size_t>(target)].forced_nav[face];
+        if (target == focus_) target = -1;
+    }
     if (target < 0 && !forced_navigation_only_) {
         // The nearest focusable widget that way.
         float best = 1.0e9f;
@@ -1356,7 +1359,228 @@ private:
     float scroll_ = 0.0f;
 };
 
+// --- TdUIScene_Pause, TdUIScene_SPPause, TdUIScene_TutorialPause, TdUIScene_PauseOptions -----
+
+class PauseBaseMenu : public SubMenu {
+public:
+    PauseBaseMenu(Frontend& fe, const std::string& package, const std::string& scene) : SubMenu(fe, package, scene) {}
+
+    void opened() override {
+        bar_append("<Strings:TdGameUI.TdButtonCallouts.Back>", Key::Escape);
+        bar_append("<Strings:TdGameUI.TdButtonCallouts.Accept>", Key::Accept);
+        content_panel_ = scene_->find("ContentPanel");
+        panel_bg_ = scene_->find("PanelBgImage");
+        if (panel_bg_ >= 0) scene_->widgets[static_cast<size_t>(panel_bg_)].image.present = false;
+        scene_->layout();
+        open_panel();
+    }
+
+    void focus_changed() override {
+        if (focus_ < 0 || opening_ || closing_) return;
+        const Rect& r = scene_->widgets[static_cast<size_t>(focus_)].rect;
+        stick_.select_top = r.t / 720.0f;
+        stick_.select_bottom = r.b / 720.0f;
+        stick_.select_opacity = 1.0f;
+    }
+
+    void tick(float dt) override {
+        constexpr float kAnimDuration = 0.3f;
+        auto cosine_interp = [](float a, float b, float t) { return a + (b - a) * (1.0f - std::cos(t * 3.14159265f)) * 0.5f; };
+        if (opening_) {
+            anim_ = std::min(anim_ + dt, kAnimDuration);
+            stick_.width = cosine_interp(0.02f, 1.0f, anim_ / kAnimDuration);
+            if (anim_ >= kAnimDuration) {
+                opening_ = false;
+                if (content_panel_ >= 0) {
+                    scene_->widgets[static_cast<size_t>(content_panel_)].hidden = false;
+                    focus_first(content_panel_);
+                }
+                focus_changed();
+            }
+        } else if (closing_) {
+            anim_ = std::max(anim_ - dt, 0.0f);
+            stick_.width = cosine_interp(0.0f, 1.0f, anim_ / kAnimDuration);
+            if (anim_ <= 0.0f) {
+                closing_ = false;
+                on_resume_game();
+            }
+        }
+    }
+
+    void key_pressed(Key key) override {
+        if (opening_ || closing_) return;
+        SubMenu::key_pressed(key);
+    }
+
+    void key_released(Key key) override {
+        if (opening_ || closing_) return;
+        if (key == Key::Escape) {
+            play("Cancel");
+            play_closing_anim();
+            return;
+        }
+        if (key == Key::Accept && focus_ >= 0 && scene_->widgets[static_cast<size_t>(focus_)].cls == "UILabelButton") {
+            clicked(focus_);
+        }
+    }
+
+    void mouse_click(float x, float y) override {
+        if (opening_ || closing_) return;
+        SubMenu::mouse_click(x, y);
+    }
+
+    void clicked(int widget) override {
+        if (opening_ || closing_ || widget < 0) return;
+        play("Accept");
+        handle_option_button(scene_->widgets[static_cast<size_t>(widget)].name);
+    }
+
+    void draw(Frame& f, float scale, float origin_x, float gamma, bool top) override {
+        if (!scene_) return;
+        if (panel_bg_ >= 0) {
+            const Rect& r = scene_->widgets[static_cast<size_t>(panel_bg_)].rect;
+            DrawOp op;
+            op.kind = DrawOp::Kind::Stick;
+            op.rect = Rect{origin_x + r.l * scale, r.t * scale, origin_x + r.r * scale, r.b * scale};
+            op.stick = stick_;
+            f.ui.push_back(std::move(op));
+        }
+        SubMenu::draw(f, scale, origin_x, gamma, top);
+    }
+
+protected:
+    void open_panel() {
+        if (content_panel_ >= 0) scene_->widgets[static_cast<size_t>(content_panel_)].hidden = true;
+        anim_ = 0.0f;
+        opening_ = true;
+        closing_ = false;
+        stick_.width = 0.02f;
+        stick_.move_amount = 0.0f;
+        stick_.select_opacity = 0.0f;
+    }
+
+    void play_closing_anim() {
+        if (closing_) return;
+        if (content_panel_ >= 0) scene_->widgets[static_cast<size_t>(content_panel_)].hidden = true;
+        set_focus(-1);
+        stick_.select_opacity = 0.0f;
+        stick_.move_amount = 1.0f;
+        if (!opening_) anim_ = 0.3f;
+        opening_ = false;
+        closing_ = true;
+    }
+
+    virtual void handle_option_button(const std::string& name) = 0;
+    virtual void on_resume_game() = 0;
+
+    int content_panel_ = -1;
+    int panel_bg_ = -1;
+    StickParams stick_{};
+    float anim_ = 0.0f;
+    bool opening_ = false;
+    bool closing_ = false;
+};
+
+class PauseOptionsMenu : public PauseBaseMenu {
+public:
+    explicit PauseOptionsMenu(Frontend& fe) : PauseBaseMenu(fe, "TdUI", "TdPauseOptions") {}
+
+    void opened() override {
+        if (UiWidget* gp = scene_->get("GamepadSettingsButton")) {
+            gp->hidden = !profile().controller;
+            gp->disabled = !profile().controller;
+        }
+        PauseBaseMenu::opened();
+    }
+
+protected:
+    void handle_option_button(const std::string& name) override {
+        if (name == "VideoSettingsButton") open(make_sub_menu(fe_, "TdVideoSettingsPC"));
+        else if (name == "AudioSettingsButton") open(make_sub_menu(fe_, "TdAudioSettings"));
+        else if (name == "ControlsSettingsButton") open(make_sub_menu(fe_, "TdKeyMappings"));
+        else if (name == "GameSettingsButton") open(make_sub_menu(fe_, "TdGameSettings"));
+    }
+
+    void on_resume_game() override { close(); }
+};
+
+std::string stem_map_name(std::string s) {
+    const size_t slash = s.find_last_of("/\\");
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    const size_t q = s.find('?');
+    if (q != std::string::npos) s = s.substr(0, q);
+    const size_t dot = s.rfind('.');
+    if (dot != std::string::npos) s = s.substr(0, dot);
+    return s;
+}
+
+class PauseMenu : public PauseBaseMenu {
+public:
+    PauseMenu(Frontend& fe, std::string map_file)
+        : PauseBaseMenu(fe, same_name(stem_map_name(map_file), "Tutorial_p") ? "TdUI_InGame_Tutorial" : "TdUI_InGame",
+                        same_name(stem_map_name(map_file), "Tutorial_p") ? "TdTutorialPause" : "TdSPPause"),
+          map_file_(stem_map_name(std::move(map_file))), tutorial_(same_name(map_file_, "Tutorial_p")) {}
+
+    void opened() override {
+        if (!tutorial_) {
+            for (const MapProvider& m : assets().maps) {
+                if (!same_name(m.file, map_file_)) continue;
+                std::string title = m.name;
+                const size_t dash = title.find('-');
+                if (dash != std::string::npos) title = title.substr(dash + 1);
+                while (!title.empty() && title.front() == ' ') title.erase(title.begin());
+                while (!title.empty() && title.back() == ' ') title.pop_back();
+                if (UiWidget* w = scene_->get("TitleLabel")) w->text = title;
+                break;
+            }
+        }
+        PauseBaseMenu::opened();
+    }
+
+protected:
+    void handle_option_button(const std::string& name) override {
+        if (name == "ResumeGameButton") {
+            play_closing_anim();
+        } else if (name == "SkipButton") {
+            accept_cancel_box("<Strings:TdGameUI.TdMessageBox.SkipTutorial_Title>",
+                              "<Strings:TdGameUI.TdMessageBox.SkipTutorial_Message>",
+                              [this](int option) {
+                                  if (option == 1) {
+                                      host_action("SkipTutorial");
+                                      close();
+                                  }
+                              });
+        } else if (name == "OptionsButton") {
+            open(std::make_unique<PauseOptionsMenu>(fe_));
+        } else if (name == "QuitButton") {
+            accept_cancel_box("<Strings:TdGameUI.TdMessageBox.QuitToMenu_Title>",
+                              "<Strings:TdGameUI.TdMessageBox.QuitToMenu_Message>",
+                              [this](int option) {
+                                  if (option == 1) {
+                                      host_action("QuitToMainMenu");
+                                      close();
+                                  }
+                              });
+        }
+    }
+
+    void on_resume_game() override {
+        host_action("Resume");
+        close();
+    }
+
+private:
+    std::string map_file_;
+    bool tutorial_ = false;
+};
+
 }  // namespace
+
+std::unique_ptr<SubMenu> make_pause_menu(Frontend& fe, const std::string& map_file) {
+    auto menu = std::make_unique<PauseMenu>(fe, map_file);
+    if (!menu->valid()) menu.reset();
+    return menu;
+}
 
 std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
     std::unique_ptr<SubMenu> menu;
@@ -1368,6 +1592,9 @@ std::unique_ptr<SubMenu> make_sub_menu(Frontend& fe, const std::string& scene) {
     else if (scene == "TdCredits") menu = std::make_unique<CreditsMenu>(fe);
     else if (scene == "TdTTSelectStretchOffline") menu = std::make_unique<RaceMenu>(fe, scene, true);
     else if (scene == "TdLRSelectLevelOffline") menu = std::make_unique<RaceMenu>(fe, scene, false);
+    else if (scene == "TdPauseOptions") menu = std::make_unique<PauseOptionsMenu>(fe);
+    else if (scene == "TdSPPause") menu = std::make_unique<PauseMenu>(fe, "Edge_p");
+    else if (scene == "TdTutorialPause") menu = std::make_unique<PauseMenu>(fe, "Tutorial_p");
     if (menu && !menu->valid()) menu.reset();
     return menu;
 }

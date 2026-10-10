@@ -409,6 +409,9 @@ struct UiSystem::Impl {
                 if (const UProperty* a = v.field("TextStyleCustomization", "TextAlignment", k)) out.align[k] = static_cast<int8_t>(align_of(a->s, kAlignLeft));
             }
         }
+        if (is_true(v.field("TextStyleCustomization", "bOverrideClipMode"), false)) {
+            if (const UProperty* c = v.field("TextStyleCustomization", "ClipMode")) out.wrap = c->s == "CLIP_Wrap" ? 1 : 0;
+        }
         for (int k = 0; k < 2; ++k) out.autosize[k] = is_true(v.field("AutoSizeParameters", "bAutoSizeEnabled", 0, nullptr, k), false);
     }
 
@@ -674,7 +677,7 @@ std::unique_ptr<UiScene> UiSystem::load_scene(const std::string& package, const 
         w.hidden = is_true(v.find("bHidden"), false);
         if (const UProperty* p = v.find("Opacity")) w.opacity = p->f;
         if (const UProperty* p = v.find("ZDepth")) w.zdepth = p->f;
-        if (const UProperty* p = v.find("TabIndex")) w.tab_index = p->i;
+        if (const UProperty* p = v.find("TabIndex"); p && p->i >= 0) w.tab_index = p->i;
         if (const UProperty* p = v.field("DataSource", "MarkupString")) w.markup = p->s;
         if (w.markup.empty()) {
             if (const UProperty* p = v.field("ImageDataSource", "MarkupString")) w.markup = p->s;
@@ -1103,7 +1106,8 @@ void UiScene::layout() {
             return width;
         }
         const float width = (resolve(wi, 2) - resolve(wi, 0)) * view_scale;
-        const size_t lines = ui_wrap(*ts.font, w.text, width, ts.wrap).size();
+        const bool wrap = w.string.wrap >= 0 ? (w.string.wrap != 0) : ts.wrap;
+        const size_t lines = ui_wrap(*ts.font, w.text, width, wrap).size();
         return static_cast<float>(ts.font->line_height) * ts.font->scale / view_scale * static_cast<float>(std::max<size_t>(lines, 1));
     };
     // Auto-sizing moves the far face, or the near one when only the far one is docked.
@@ -1431,6 +1435,7 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
         if (ts.font && ts.font->valid()) {
             const int halign = w.string.align[0] >= 0 ? w.string.align[0] : ts.align[0];
             const int valign = w.string.align[1] >= 0 ? w.string.align[1] : ts.align[1];
+            const bool wrap = w.string.wrap >= 0 ? (w.string.wrap != 0) : ts.wrap;
             float color[4] = {ts.color[0], ts.color[1], ts.color[2], ts.color[3] * opacity};
             float shadow[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             bool has_shadow = false;
@@ -1442,7 +1447,7 @@ void UiScene::draw_widget(Frame& f, int index, float scale, float origin_x, floa
                 shadow[3] = ss.color[3] * opacity;
                 has_shadow = shadow[3] > 0.0f;
             }
-            ui_draw_text(f, *ts.font, w.text, box, halign == kAlignDefault ? 0 : halign, valign == kAlignDefault ? 0 : valign, ts.wrap, color,
+            ui_draw_text(f, *ts.font, w.text, box, halign == kAlignDefault ? 0 : halign, valign == kAlignDefault ? 0 : valign, wrap, color,
                          has_shadow ? shadow : nullptr, w.string.shadow_h, w.string.shadow_v, gamma);
         }
     }

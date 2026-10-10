@@ -137,5 +137,7 @@ std::unique_ptr<SubMenu> make_tiny_message_box(Frontend& fe, const std::string& 
                                                std::function<void()> closed);
 // TdUIScene_OnlineCheck: "NOT ONLINE", PLAY OFFLINE or BACK. `play_offline` runs after it has closed.
 std::unique_ptr<SubMenu> make_online_check(Frontend& fe, std::function<void()> play_offline);
+// TdUIScene_SPPause / TdUIScene_TutorialPause: the in-game pause menu for `map_file`.
+std::unique_ptr<SubMenu> make_pause_menu(Frontend& fe, const std::string& map_file);
 
 }  // namespace me::fe

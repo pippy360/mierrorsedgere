@@ -70,6 +70,7 @@ struct UiStringComp {
     float shadow_h = 0.06f;           // HorizontalPctOffset
     float shadow_v = 0.06f;           // VerticalPctOffset
     int8_t align[2] = {-1, -1};       // TextStyleCustomization.TextAlignment where it overrides the style
+    int8_t wrap = -1;                 // TextStyleCustomization.ClipMode where it overrides the style
     bool autosize[2] = {false, false};
 };
 
@@ -144,7 +145,7 @@ struct UiWidget {
     bool hidden = false;
     float opacity = 1.0f;
     float zdepth = 0.0f;
-    int tab_index = 0;
+    int tab_index = 10000;
     int forced_nav[4] = {-1, -1, -1, -1};  // NavigationTargets.ForcedNavigationTarget by face
     std::vector<int> pages;                // UITabControl.Pages
     int tab_button = -1;                   // UITabPage.TabButton

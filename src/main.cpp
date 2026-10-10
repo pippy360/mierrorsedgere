@@ -1542,9 +1542,74 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", LeftMelee=" << (hit_left_melee_ok ? "OK" : "FAIL")
               << ", FallDamage=" << (hit_fall_ok ? "OK" : "FAIL") << ")" << std::endl;
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, and damage screen effects stage 17
+    // -------------------------------------------------------------------------
+    // Stage 18: Retail In-Game Pause Menu (TdSPPause, TdTutorialPause, TdPauseOptions)
+    // -------------------------------------------------------------------------
+    std::cout << "[Oracle Stage 18] Testing Retail In-Game Pause Menu (TdSPPause / TdTutorialPause / TdPauseOptions)..." << std::endl;
+    bool s18_sp_ok = false, s18_opt_ok = false, s18_tut_ok = false, s18_overlay_ok = false;
+    {
+        fe::Frontend fe;
+        std::string fe_err;
+        if (fe.init(game_root, 1280, 720, fe_err, /*load_menu_level=*/false)) {
+            fe::SoftRenderer sr(fe.assets());
+            std::vector<uint8_t> rgba;
+            auto step_fe = [&](int ticks) {
+                for (int i = 0; i < ticks; ++i) fe.update(0.1f);
+            };
+
+            fe.open_pause_menu("Edge_p");
+            step_fe(6);  // finish 0.3s StickOpenAnim and 0.5s saturation ramp
+            s18_sp_ok = fe.is_pause_open() && fe.scene_name() == "TdSPPause" &&
+                        std::abs(fe.pause_saturation() - 1.0f) < 0.01f;
+
+            sr.render_overlay(fe.frame(), rgba);
+            size_t transparent_px = 0, opaque_px = 0;
+            for (size_t p = 3; p < rgba.size(); p += 4) {
+                if (rgba[p] == 0) ++transparent_px;
+                else if (rgba[p] >= 200) ++opaque_px;
+            }
+            // The pause overlay leaves most of the 1280x720 frame transparent for the 3D scene while drawing the red stick & buttons.
+            s18_overlay_ok = (rgba.size() == 1280u * 720u * 4u) &&
+                             (transparent_px > 1280u * 720u / 2u) &&
+                             (opaque_px > 20000u);
+
+            // Navigate Resume -> Achievements (skipped, disabled) -> Options and open TdPauseOptions -> TdVideoSettingsPC.
+            fe.key_down(fe::Key::Down);
+            fe.key_up(fe::Key::Down);
+            fe.key_down(fe::Key::Accept);
+            fe.key_up(fe::Key::Accept);
+            step_fe(4);  // finish TdPauseOptions StickOpenAnim
+            const bool in_pause_opt = (fe.scene_name() == "TdPauseOptions");
+            fe.key_down(fe::Key::Accept);
+            fe.key_up(fe::Key::Accept);
+            const bool in_video_unsat = (fe.scene_name() == "TdVideoSettingsPC") && (fe.pause_saturation() == 0.0f);
+            fe.key_down(fe::Key::Escape);
+            fe.key_up(fe::Key::Escape);
+            fe.key_down(fe::Key::Escape);
+            fe.key_up(fe::Key::Escape);
+            step_fe(4);  // finish TdPauseOptions StickCloseAnim -> back to TdSPPause
+            const bool back_to_sp = (fe.scene_name() == "TdSPPause");
+            fe.key_down(fe::Key::Escape);
+            fe.key_up(fe::Key::Escape);
+            step_fe(4);  // finish TdSPPause StickCloseAnim -> Resume
+            s18_opt_ok = in_pause_opt && in_video_unsat && back_to_sp &&
+                         !fe.is_pause_open() && (fe.take_action() == "Resume");
+
+            fe.open_pause_menu("Tutorial_p");
+            step_fe(4);
+            s18_tut_ok = fe.is_pause_open() && fe.scene_name() == "TdTutorialPause";
+        }
+    }
+    const bool s18_pass = s18_sp_ok && s18_opt_ok && s18_tut_ok && s18_overlay_ok;
+    std::cout << "  -> Stage 18 Result: " << (s18_pass ? "PASS" : "FAIL")
+              << " (TdSPPause=" << (s18_sp_ok ? "OK" : "FAIL")
+              << ", OverlayAlpha=" << (s18_overlay_ok ? "OK" : "FAIL")
+              << ", TdPauseOptions=" << (s18_opt_ok ? "OK" : "FAIL")
+              << ", TdTutorialPause=" << (s18_tut_ok ? "OK" : "FAIL") << ")" << std::endl;
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, and pause menu stage 18
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2228,16 +2293,18 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     std::unique_ptr<fe::SoftRenderer> frontend_renderer;
     std::vector<uint8_t> frontend_rgba;
     bool frontend_active = false;
-    if (start_in_main_menu) {
+    {
         frontend = std::make_unique<fe::Frontend>();
         std::string frontend_error;
-        if (frontend->init(game_root, kFrontendW, kFrontendH, frontend_error)) {
+        if (frontend->init(game_root, kFrontendW, kFrontendH, frontend_error, start_in_main_menu)) {
             frontend_renderer = std::make_unique<fe::SoftRenderer>(frontend->assets());
-            frontend_active = true;
-            renderer.set_menu_open(false);
-            audio.set_menu_music(true);
-            SDL_SetRelativeMouseMode(SDL_FALSE);
-            SDL_ShowCursor(SDL_ENABLE);
+            if (start_in_main_menu) {
+                frontend_active = true;
+                renderer.set_menu_open(false);
+                audio.set_menu_music(true);
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+                SDL_ShowCursor(SDL_ENABLE);
+            }
         } else {
             std::cerr << "[Frontend] " << frontend_error << " - falling back to the chapter-select overlay." << std::endl;
             frontend.reset();
@@ -2278,7 +2345,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
         }
         if (in_frontend) trace_file << ",\"frontend\":true";
-        if (renderer.is_menu_open()) trace_file << ",\"menu\":true";
+        if (renderer.is_menu_open() || (frontend && frontend->is_pause_open())) trace_file << ",\"menu\":true";
         trace_file << "}\n";
         for (const AudioEngine::PlayEvent& e : audio.take_play_log()) {
             trace_file << std::setprecision(6) << "{\"type\":\"sound\",\"frame\":" << frame_counter << ",\"t\":" << now
@@ -2322,7 +2389,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     std::cout << "  [ / ] (or B / N): Previous / Next Tutorial Checkpoint" << std::endl;
     std::cout << "  R: Reset to Active Checkpoint" << std::endl;
     std::cout << "  P / F12: Screenshot PNG" << std::endl;
-    std::cout << "  ESC: Quit\n" << std::endl;
+    std::cout << "  ESC: Pause Menu (TdSPPause / TdTutorialPause)\n" << std::endl;
 
     while (running) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -2330,8 +2397,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         last_time = now;
         if (dt > 0.1f) dt = 0.1f; // clamp hitch spikes
 
-        // While the front end is up it owns the frame: its own events, update and picture.
-        if (frontend_active) {
+        // While the front end (main menu or in-game pause menu) is up it owns the frame:
+        // its own events, update and picture.
+        if (frontend_active || (frontend && frontend->is_pause_open())) {
             SDL_Event fev;
             while (SDL_PollEvent(&fev)) {
                 if (fev.type == SDL_QUIT) {
@@ -2342,6 +2410,14 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         renderer.resize(drawable_w, drawable_h);
                     }
                 } else if ((fev.type == SDL_KEYDOWN && fev.key.repeat == 0) || fev.type == SDL_KEYUP) {
+                    if (fev.type == SDL_KEYDOWN && fev.key.keysym.sym == SDLK_F12 &&
+                        frontend->scene_name() != "TdKeyMappings") {
+                        auto t = std::time(nullptr);
+                        std::ostringstream ss;
+                        ss << "screenshots/screenshot_" << std::put_time(std::localtime(&t), "%Y%m%d_%H%M%S") << ".png";
+                        renderer.save_screenshot_png(ss.str());
+                        continue;
+                    }
                     fe::Key key = fe::Key::Other;
                     switch (fev.key.keysym.sym) {
                         case SDLK_LEFT:     key = fe::Key::Left; break;
@@ -2427,10 +2503,27 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
             if (action == "Quit") {
                 running = false;
-            } else if (action == "Continue") {
-                // CONTINUE GAME: the chapter loaded at start-up.
+            } else if (action == "Continue" || action == "Resume") {
+                // CONTINUE GAME or RESUME from Pause Menu: back into the active chapter.
                 leave_frontend();
                 set_menu_active(false);
+            } else if (action == "QuitToMainMenu") {
+                // EXIT TO MAIN MENU from Pause Menu (TdUIScene_Pause.OnLeaveGameMessageBoxAction).
+                cutscene_player.stop();
+                controller.get_telemetry().intro_active = false;
+                frontend->open_main_menu();
+                frontend_active = true;
+                renderer.set_menu_open(false);
+                audio.set_menu_music(true);
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+                SDL_ShowCursor(SDL_ENABLE);
+            } else if (action == "SkipTutorial") {
+                // SKIP TUTORIAL from TdTutorialPause (TdSPTutorialGame.OnLevelCompleted -> edge_p?Edge_Start).
+                leave_frontend();
+                set_menu_active(false);
+                current_chapter_idx = 1;
+                renderer.set_selected_chapter(current_chapter_idx);
+                load_chapter_or_level(current_chapter_idx, "", /*play_intro=*/true, "Edge_Start");
             } else if (action == "NewGame") {
                 // NEW GAME: the Prologue, with its opening.
                 current_chapter_idx = 1;
@@ -2470,15 +2563,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     leave_frontend();
                     set_menu_active(false);
                 }
+            } else if (!frontend_active && !(frontend && frontend->is_pause_open())) {
+                leave_frontend();
+                set_menu_active(false);
             }
 
             if (frontend_active) {
                 frontend_renderer->render(frontend->frame(), frontend_rgba);
-                renderer.set_frontend_frame(frontend_rgba.data(), kFrontendW, kFrontendH);
+                renderer.set_frontend_frame(frontend_rgba.data(), kFrontendW, kFrontendH, /*overlay=*/false, 0.0f);
+            } else if (frontend && frontend->is_pause_open()) {
+                frontend_renderer->render_overlay(frontend->frame(), frontend_rgba);
+                renderer.set_frontend_frame(frontend_rgba.data(), kFrontendW, kFrontendH, /*overlay=*/true, frontend->pause_saturation());
             }
             audio.update(dt, Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f), 0.0f, false);
             renderer.render_frame(active_scene, controller.get_telemetry());
-            write_trace(controller.get_telemetry(), /*in_frontend=*/true);
+            write_trace(controller.get_telemetry(), /*in_frontend=*/frontend_active);
 
             ++frame_counter;
             if (max_frames > 0 && frame_counter >= max_frames) {
@@ -2568,6 +2667,25 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (row == 5) {
                     renderer.set_selected_menu_tab(0);
                 }
+            }
+        };
+
+        auto open_ingame_pause_menu = [&]() {
+            if (frontend) {
+                static const char* const kChapterMaps[10] = {
+                    "Maps/SP00/Tutorial_p.me1", "Maps/SP01/Edge_p.me1", "Maps/SP02/Stormdrain_p.me1",
+                    "Maps/SP03/Cranes_p.me1",   "Maps/SP04/Subway_p.me1", "Maps/SP05/Mall_p.me1",
+                    "Maps/SP06/Factory_p.me1",  "Maps/SP07/Boat_p.me1",   "Maps/SP08/Convoy_p.me1",
+                    "Maps/SP09/Scraper_p.me1"
+                };
+                const std::string map_for_pause = active_scene.map_name.empty()
+                    ? std::string(kChapterMaps[std::clamp(current_chapter_idx, 0, 9)])
+                    : active_scene.map_name;
+                frontend->open_pause_menu(map_for_pause);
+                SDL_SetRelativeMouseMode(SDL_FALSE);
+                SDL_ShowCursor(SDL_ENABLE);
+            } else {
+                set_menu_active(true);
             }
         };
 
@@ -2664,11 +2782,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (!renderer.is_menu_open() && !cutscene_player.is_playing() && ev.wheel.y != 0) {
                     input.cycle_weapon_dir = (ev.wheel.y > 0) ? 1 : -1;
                 }
+            } else if (ev.type == SDL_CONTROLLERBUTTONDOWN && ev.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+                if (renderer.is_menu_open()) {
+                    set_menu_active(false);
+                } else if (!splash_hint_open && !cutscene_player.is_playing()) {
+                    open_ingame_pause_menu();
+                }
             } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
                 SDL_Keycode key = ev.key.keysym.sym;
                 if (key == SDLK_ESCAPE) {
                     if (renderer.is_menu_open()) {
-                        running = false;
+                        set_menu_active(false);
                     } else if (splash_hint_open) {
                         splash_hint_open = false;
                         controller.get_telemetry().splash_hint_text.clear();
@@ -2684,7 +2808,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                             abandon_cutscene();
                         }
                     } else {
-                        set_menu_active(true);
+                        open_ingame_pause_menu();
                     }
                 } else if (splash_hint_open && (key == SDLK_SPACE || key == SDLK_RETURN)) {
                     suppress_space_until_release = true;
@@ -3114,7 +3238,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     if (lower(tr.level) == "tdmainmenu") {
                         // The Shard's end: back to the main menu (after the credits in retail).
                         std::cout << "[Script] chapter complete: to the main menu" << std::endl;
-                        set_menu_active(true);
+                        if (frontend) {
+                            frontend->open_main_menu();
+                            frontend_active = true;
+                            renderer.set_menu_open(false);
+                            audio.set_menu_music(true);
+                            SDL_SetRelativeMouseMode(SDL_FALSE);
+                            SDL_ShowCursor(SDL_ENABLE);
+                        } else {
+                            set_menu_active(true);
+                        }
                     } else {
                         const std::string map_file = find_map_file(tr.level);
                         if (map_file.empty()) {
