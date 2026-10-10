@@ -530,10 +530,14 @@ surfaces. The ones with no stored receiver are clipped onto the level's static m
 (Heat: 75 of 83 find something to lie on; Jacknife: 21 of 24, 558 triangles). `ME_DECAL_SELFCHECK=1` clips
 the decals that *do* store receivers the same way and compares areas: Jacknife 1.12 of the stored area, 577
 of 621 decals within 0.8..1.25; the Prologue 1.01, 12 of 12. Every bullet tracer that ends on a surface
-leaves its hole, clipped against the collision world's triangles in the box and drawn with the particles'
-batches under the decals' bias. Not as the game: the receivers are found in the box, not by the hit
-component; movers, doors and lift cabs take no decal; a bullet hole does not fade, it goes. Not done: a
-decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
+leaves its hole, clipped against the triangles in the box of what it hit and drawn with the particles'
+batches under the decals' bias. What it hit is the level, or a part of a lift or a door where that is now
+(`find_impact_surface`): the game gives `SpawnDecal` the hit component, so the hole is that component's and
+goes where it goes. A hole in a mover is clipped and kept in the place the level has the mover in, and its
+triangles are carried to where the mover is each frame they are drawn, a lift's part by its offset and a
+door about its hinge (`dynamic_decal_vertices`). Not as the game: the receivers are found in the box, not by
+the hit component; a bullet hole does not fade, it goes; the decals computed at load lie on static meshes
+and BSP only. Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
 ## 13. Particles
 
@@ -615,6 +619,20 @@ afresh. Two things make systems while the game runs:
   ray mirrored in the surface and lifted from it: `R = D - 2 N (D . N); R += (1 - R . N) 0.3 N`. Few
   materials have effects of their own (concrete, metal, glass, tarmac, wood and some of their kinds: 9 of
   the Prologue's 38); the others inherit.
+  What the bullet stopped in decides what is played (`TdWeapon.RegisterPendingImpact`,
+  `PlayImpactEffects`): a bot shot by another bot, or one that is dying, shows nothing
+  (`TdBotPawn.PreventWeaponImpactEffect`); the player, when a bot's shot reaches her, gets the sound alone;
+  everything else the effect, the decal and the sound. A bot's surface is a body of his physics asset
+  (`CH_TKY_Cop_SWAT.Male3p_Physics`, the only one the bots' packages import): `PM_Character_Body`, the neck
+  and the hands `PM_Character_Head`, both with `PS_FX_Impact_Character_Body_Light_01` (a shotgun's pellet:
+  `..._Body_Shotgun_01`), a pale puff of dust.
+- The bullet's sound (`TdWeapon.SpawnImpactSounds`): the material's `TdPhysicalMaterialImpactSounds.LightAmmo`
+  cue, the one every weapon plays (`GetWeaponSpecificImpactSound`), else its parents', else the default
+  material's, played at the hit (`PlaySound(.., HitLocation)`). The cues are `A_Effects_Bullet_Impacts`'s, 26
+  of them (`Concrete.9mm_Concrete_Impact`, `Metal_Thin.9mm_Metal_Thin_Impact`, ...). Past the `MaxRadius` of
+  the cue's attenuation node a sound is not started at all (stock Unreal Engine 3: the audio device asks
+  `USoundCue::IsAudible`; not read out of the executable): 2000 uu for concrete, 300 for
+  `Faith.9mm_Faith_Impact`, the bodies' cue, so a bot hit further off than three metres is silent.
 - The script (`SeqAct_ActorFactory` with an `ActorFactoryEmitter`, 1080 of them): the factory's particle
   system at each of the action's spawn points. 1024 are the cracking and breaking of glass panes; the rest
   feathers, sparks, falling dust.
@@ -627,14 +645,20 @@ vertices: the colour rides where a mesh vertex has its light map's first coeffic
 sub-image blend (or a mesh particle's sub-image scale and offset) beside it. The script switches the placed
 systems and makes the factories'; every bullet tracer leaves its impact effect, found by a short line check
 through the tracer's end against the meshes' own triangles, which carry their mesh element and so their
-material (the BSP counts as the default material).
+material (the BSP counts as the default material), the level's or those of a lift's part or a door. Its
+impact sound is handed to the game loop, which plays it at the hit when the player is within the cue's
+`MaxRadius`; the level load brings in the cue packages the materials name. A bot the player shoots gets the
+body's effect where the bullet enters his pawn's cylinder (radius 30, 180 high), pointed as from a surface
+facing out of it, and the body's sound; the player gets the sound of a bot's shot that reaches her.
 
 What runs is sprite and mesh emitters with the module classes of the table: in the Prologue's opening area
 149 emitters of 95 systems, 38 of them mesh emitters, 1 left out; in Heat's 130 of 110 systems, 27 mesh
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
 attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
-the player (the game also asks whether the shooter was drawn lately); a bullet that hits a pawn leaves
-nothing; sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
+the player (the game also asks whether the shooter was drawn lately); a bot is his pawn's cylinder, all of
+it the body's material, where the game traces the bodies of his physics asset, and he takes no bullet hole
+(the game hands `SpawnDecal` the default decal and his mesh; whether the mesh takes it is not checked);
+sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
 the pane is broken: [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
@@ -648,7 +672,7 @@ draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and t
 | `src/assets/level_postprocess.*` | `WorldInfo` settings, `PostProcessVolume`s, `HeightFog` actors, the chain's material effects |
 | `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
 | `src/assets/level_lensflares.*`, `level_decals.*`, `level_particles.*` | Lens-flare templates and sources; decals; particle templates and placements |
-| `src/assets/level_impacts.*`, `src/game/impact_effects.hpp` | The physical materials' impact effects and bullet-hole decals, the script's emitter factories; what a bullet leaves |
+| `src/assets/level_impacts.*`, `src/game/impact_effects.hpp` | The physical materials' impact effects, impact sounds and bullet-hole decals, the script's emitter factories; what a bullet leaves, on the level, a mover or a person |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
 | `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
 | `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
@@ -690,9 +714,12 @@ Options for looking at things:
 | `ME_SHOT_LOOK="pitch,yaw"` | With `--intro-shots`: turns the view by hand (degrees), to look at something the intro does not |
 | `ME_LIGHT_ENV_DEBUG=1`, `ME_LENS_FLARE_DEBUG=1` | Sections 9 and 11 |
 | `ME_SHOT_FIRE=<0..3>` | With `--intro-shots`: a fifth of a second before each picture, five shots from the view along it (0 a light weapon, 1 heavy, 2 a helicopter's gun, 3 a shotgun) |
+| `ME_SHOT_STAND="x,y,z"` | With `--intro-shots`: the pictures are the player's, standing there (feet), not the intro's camera's |
+| `ME_SHOT_MOVERS="degrees,units[,1]"` | With `--intro-shots`: lists the level's doors and lifts; the shots are fired before the first picture only, and after it every door is swung by the degrees and every lift part raised by the units (with the third number the shots are fired before the later pictures too) |
+| `ME_SHOT_BODY=<units>` | With `ME_SHOT_FIRE`: the shots stop in a person that far ahead, not in the level |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
-| `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect and the hole it left |
+| `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
 | `ME_DECAL_SELFCHECK=1` | Clips the decals that store receivers as the ones that do not are clipped, and compares |
 
 ## 15. Measured against retail
@@ -748,8 +775,10 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
   (section 10).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
-- **Bullets:** a pawn that is hit shows nothing; a bot's shot is judged by distance alone (section 13).
-- **Decals:** a decal's own vertex light map, per-decal bias; none on movers (section 12).
+- **Bullets:** a bot is a cylinder of one material and takes no bullet hole; a bot's shot is judged by
+  distance alone (section 13).
+- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load are not on movers
+  (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
 - **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.

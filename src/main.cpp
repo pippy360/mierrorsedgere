@@ -2298,8 +2298,45 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     const char* fire_spec = std::getenv("ME_SHOT_FIRE");
     const int fire_ammo = fire_spec ? std::clamp(std::atoi(fire_spec), 0, 3) : -1;
     float fire_at = -1.0f;
+    // ME_SHOT_STAND="x,y,z" (feet): the pictures are the player's, standing there, not the intro's.
+    Vec3 stand_at(0.0f, 0.0f, 0.0f);
+    const char* stand_spec = std::getenv("ME_SHOT_STAND");
+    const bool standing = stand_spec && std::sscanf(stand_spec, "%f,%f,%f", &stand_at.x, &stand_at.y, &stand_at.z) == 3;
+    // ME_SHOT_MOVERS="degrees,units[,1]": the level's doors and lifts are listed; the shots are
+    // fired before the first picture only, and after it every door is swung by so many degrees and
+    // every part of a lift raised by so many units, to see the bullet holes go with them. With the
+    // third number the shots are fired before the later pictures too, at the movers where they are then.
+    float swing_deg = 0.0f, raise = 0.0f;
+    int fire_again = 0;
+    const char* movers_spec = std::getenv("ME_SHOT_MOVERS");
+    const bool movers = movers_spec && std::sscanf(movers_spec, "%f,%f,%d", &swing_deg, &raise, &fire_again) >= 2;
+    bool movers_moved = false;
+    // ME_SHOT_BODY="units": the shots stop in a person that far ahead, not in the level: the
+    // effect and the sound of a body.
+    const char* body_spec = std::getenv("ME_SHOT_BODY");
+    const float body_at = body_spec ? static_cast<float>(std::atof(body_spec)) : 0.0f;
+    if (movers) {
+        for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
+            const BargeDoorInstance& door = scene.barge_doors[d];
+            std::cout << "[Shots] door " << d << " " << door.name << ": hinge (" << door.hinge_pos.x << ", " << door.hinge_pos.y << ", "
+                      << door.hinge_pos.z << "), middle (" << door.center_pos.x << ", " << door.center_pos.y << ", " << door.center_pos.z
+                      << "), " << door.parts.size() << " parts" << std::endl;
+        }
+        for (size_t e = 0; e < scene.elevators.size(); ++e) {
+            const ElevatorInstance& lift = scene.elevators[e];
+            std::cout << "[Shots] lift " << e << " " << lift.name << ": cab at (" << lift.start_pos.x << ", " << lift.start_pos.y << ", "
+                      << lift.start_pos.z << "), half (" << lift.cab_half_extents.x << ", " << lift.cab_half_extents.y << ", "
+                      << lift.cab_half_extents.z << "), offset (" << lift.cab_local_offset.x << ", " << lift.cab_local_offset.y << ", "
+                      << lift.cab_local_offset.z << "), " << lift.parts.size() << " parts" << std::endl;
+        }
+    }
     auto frame = [&](float dt) {
         cutscene.update(dt, scene, tel);
+        if (standing) {
+            tel.position = stand_at;
+            tel.intro_active = false;
+            tel.intro_camera_only = false;
+        }
         if (look) {
             tel.pitch_deg = look_pitch;
             tel.yaw_deg = look_yaw;
@@ -2313,18 +2350,27 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             static const float kSpread[5][2] = {{0.0f, 0.0f}, {-0.09f, 0.05f}, {0.09f, 0.05f}, {-0.05f, -0.07f}, {0.06f, -0.06f}};
             for (const auto& s : kSpread) {
                 const Vec3 dir = (rot.forward() + rot.right() * s[0] + rot.up() * s[1]).normalized();
-                const CollisionHit hit = scene.collision->line_check(eye, eye + dir * 8000.0f, COLL_BlockZeroExtent);
-                if (!hit.hit) continue;
+                const ImpactSurface hit = find_impact_surface(scene, eye, eye + dir * 8000.0f);  // the level, a lift or a door
+                if (!hit.hit && body_at <= 0.0f) continue;
                 BulletTracer tr;
                 tr.start_pos = eye + dir * 30.0f;
                 tr.end_pos = hit.location;
                 tr.ammo = static_cast<uint8_t>(fire_ammo);
+                if (body_at > 0.0f) {
+                    tr.end_pos = eye + dir * body_at;
+                    tr.from_player = true;
+                    tr.hit_enemy = true;
+                    tr.pawn_hit = 1;
+                    tr.pawn_normal = dir * -1.0f;
+                }
                 scene.active_tracers.push_back(tr);
             }
             const size_t effects = scene.spawned_effects.size(), holes = scene.dynamic_decals.size();
-            update_impact_effects(scene, 0.0f, tel.position);
+            std::vector<SimSoundEvent> heard;
+            update_impact_effects(scene, 0.0f, eye, &heard);
             std::cout << "[Shots] fired " << scene.active_tracers.size() << " shots: " << scene.spawned_effects.size() - effects
-                      << " impact effects, " << scene.dynamic_decals.size() - holes << " bullet holes" << std::endl;
+                      << " impact effects, " << scene.dynamic_decals.size() - holes << " bullet holes, " << heard.size() << " impact sounds"
+                      << std::endl;
             scene.active_tracers.clear();
         }
         update_impact_effects(scene, dt, tel.position);
@@ -2333,9 +2379,26 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         for (const IntroFadeEvent& ev : cutscene.take_intro_fades()) fade.apply(ev);
         fade.update(dt);
         CutscenePlayer::pose_intro_doors(scene, now);
+        if (movers_moved) {
+            for (BargeDoorInstance& door : scene.barge_doors) {
+                door.open_angle_rad = swing_deg * 0.01745329252f;
+                const float c = std::cos(door.open_angle_rad), s = std::sin(door.open_angle_rad);
+                Mat4 m = Mat4::identity();
+                m.m[0] = c;
+                m.m[1] = s;
+                m.m[4] = -s;
+                m.m[5] = c;
+                m.m[12] = door.hinge_pos.x - c * door.hinge_pos.x + s * door.hinge_pos.y;
+                m.m[13] = door.hinge_pos.y - s * door.hinge_pos.x - c * door.hinge_pos.y;
+                door.model_matrix = m;
+            }
+            for (ElevatorInstance& lift : scene.elevators) {
+                for (ElevatorPart& part : lift.parts) part.offset = Vec3(0.0f, 0.0f, raise);
+            }
+        }
         tel.speed_2d = 0.0f;  // no speed effects
         tel.sim_time = now;
-        tel.fade_amount = fade.shown();
+        tel.fade_amount = standing ? 1.0f : fade.shown();
         tel.fade_color = fade.color;
         tel.exposure_reset = dt <= 0.0f;  // the level opens
         tel.screen_effects = screen_effects_from_environment();
@@ -2343,7 +2406,8 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     };
     frame(0.0f);
     for (float t : wanted) {
-        fire_at = std::max(t - 0.2f, 0.0f);
+        fire_at = movers && written > 0 && fire_again == 0 ? -1.0f : std::max(t - 0.2f, 0.0f);
+        movers_moved = movers && written > 0;
         const int steps = std::max(1, static_cast<int>(std::ceil((t - now) * 30.0f)));
         const float dt = (t - now) / static_cast<float>(steps);
         for (int i = 0; i < steps && dt > 0.0f; ++i) frame(dt);
@@ -2808,6 +2872,24 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     if (!s.cue.empty() && !audio.has_cue(s.cue)) audio.load_cue_bank(game_root, s.bank);
                 }
             }
+        }
+        // The surfaces' bullet impact sounds (TdPhysicalMaterialImpactSounds: A_Effects_Bullet_Impacts).
+        for (const PhysicalMaterialInfo& pm : active_scene.physical_materials) {
+            if (!pm.impact_sound.empty() && !audio.has_cue(pm.impact_sound)) audio.load_cue_bank(game_root, pm.impact_sound_package);
+        }
+        if (std::getenv("ME_IMPACT_DEBUG")) {
+            size_t named = 0, found = 0;
+            for (const PhysicalMaterialInfo& pm : active_scene.physical_materials) {
+                if (pm.impact_sound.empty()) continue;
+                ++named;
+                if (audio.has_cue(pm.impact_sound)) {
+                    ++found;
+                } else {
+                    std::cout << "[Impact] no cue " << pm.impact_sound_package << "." << pm.impact_sound << " for " << pm.path << std::endl;
+                }
+            }
+            std::cout << "[Impact] impact sounds: the cues of " << found << " of the " << named << " physical materials that name one are loaded"
+                      << std::endl;
         }
         pending_level_loaded_audio = true;
         was_vo_playing = false;

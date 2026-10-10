@@ -5397,7 +5397,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     }
 
     // What the bullets leave where they land (game/impact_effects.hpp)
-    update_impact_effects(scene, dt, m_telemetry.position);
+    update_impact_effects(scene, dt, m_telemetry.position, &m_telemetry.sound_events);
 
     // Update 3D bullet tracers in the level scene
     for (auto it = scene.active_tracers.begin(); it != scene.active_tracers.end();) {
@@ -5669,25 +5669,33 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : ws.range;
             Vec3 tracer_end = wall_hit.hit ? wall_hit.point : (eye + ray_dir * std::min(ws.range, 2500.0f));
 
-            // Ray-Capsule intersection against living enemies (Headshot & Torso hitboxes)
+            // Against the living enemies, each as his pawn's cylinder: TdPawn's is Radius 30,
+            // CollisionHeight 90, so 180 from his feet. (The game traces the bodies of his physics
+            // asset; the neck's is PM_Character_Head, which TdBotPawn.TakeDamage doubles.)
+            constexpr float kBotHeight = 180.0f, kBotHeadFrom = 150.0f, kBotRadius = 30.0f;
             EnemyBot* hit_bot = nullptr;
             float best_bot_dist = max_dist;
             bool is_headshot = false;
+            Vec3 bot_normal(0.0f, 0.0f, 0.0f);
 
             for (auto& bot : scene.enemies) {
                 if (!bot.alive) continue;
-                Vec3 bot_center = bot.position + Vec3(0, 0, 52.0f);
+                Vec3 bot_center = bot.position + Vec3(0, 0, kBotHeight * 0.5f);
                 Vec3 to_bot = bot_center - eye;
                 float proj = to_bot.dot(ray_dir);
                 if (proj > 0.0f && proj < best_bot_dist) {
                     Vec3 closest = eye + ray_dir * proj;
                     float dist_xy = closest.distance_xy(bot.position);
                     float rel_z = closest.z - bot.position.z;
-                    if (dist_xy < 48.0f && rel_z >= -10.0f && rel_z <= 105.0f) {
+                    if (dist_xy < 48.0f && rel_z >= -10.0f && rel_z <= kBotHeight) {
                         best_bot_dist = proj;
                         hit_bot = &bot;
-                        is_headshot = (rel_z >= 72.0f);
-                        tracer_end = closest;
+                        is_headshot = (rel_z >= kBotHeadFrom);
+                        // Where it goes in: the near side of the cylinder, not its middle.
+                        const float inside = kBotRadius * kBotRadius - dist_xy * dist_xy;
+                        tracer_end = closest - ray_dir * (inside > 0.0f ? std::sqrt(inside) : 0.0f);
+                        const Vec3 out(tracer_end.x - bot.position.x, tracer_end.y - bot.position.y, 0.0f);
+                        bot_normal = out.length_sq() > 1.0e-6f ? out.normalized() : ray_dir * -1.0f;
                     }
                 }
             }
@@ -5743,6 +5751,10 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.timer = 0.09f;
             tr.max_time = 0.09f;
             tr.hit_enemy = (hit_bot != nullptr);
+            // TdBotPawn.PreventWeaponImpactEffect: a bot that is dying (the shot that killed him
+            // included: the damage comes first) shows nothing.
+            tr.pawn_hit = hit_bot ? (hit_bot->alive ? 1 : 3) : 0;
+            tr.pawn_normal = bot_normal;
             tr.from_player = true;
             tr.ammo = pellets > 1 ? 3 : (ws.is_heavy ? 1 : 0);
             tr.damage = ws.damage;
@@ -6039,6 +6051,15 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 // Check line of sight so enemies don't shoot through solid walls
                 TraceHit los = trace_ray(bot_muzzle, target_pt, scene, COLL_BlockZeroExtent);
                 Vec3 tracer_end = los.hit ? los.point : target_pt;
+                // Whether the shot lands: not while she is evading or in a cutscene.
+                bool evading = (m_telemetry.intro_active ||
+                                m_telemetry.move_state == EMovement::MOVE_Slide ||
+                                m_telemetry.move_state == EMovement::MOVE_MeleeSlide ||
+                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
+                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
+                                m_telemetry.move_state == EMovement::MOVE_Snatch ||
+                                m_telemetry.speed_2d > 540.0f);
 
                 BulletTracer tr{};
                 tr.start_pos = bot_muzzle;
@@ -6047,6 +6068,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.max_time = 0.085f;
                 tr.hit_enemy = false;
                 tr.from_player = false;
+                tr.pawn_hit = (!los.hit && !evading) ? 2 : 0;  // it reaches her: PlayImpactEffects plays the sound alone
                 {
                     const auto has = [&](const char* part) { return bot.weapon_name.find(part) != std::string::npos; };
                     tr.ammo = (has("Remington") || has("Neostead")) ? 3
@@ -6058,14 +6080,6 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 emit_sound("BerettaM93R_Fire", bot_muzzle, false);
 
                 // Deal damage if line-of-sight is clear and Faith isn't actively evading or in a cutscene
-                bool evading = (m_telemetry.intro_active ||
-                                m_telemetry.move_state == EMovement::MOVE_Slide ||
-                                m_telemetry.move_state == EMovement::MOVE_MeleeSlide ||
-                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
-                                m_telemetry.move_state == EMovement::MOVE_Snatch ||
-                                m_telemetry.speed_2d > 540.0f);
                 if (!los.hit && !evading) {
                     apply_damage(10.0f, 0, bot_muzzle - target_pt);
                 } else if (!los.hit) {

@@ -892,6 +892,11 @@ struct BulletTracer {
     uint8_t ammo = 0;
     bool impact_done = false;  // its impact effect and its bullet hole have been made
     float damage = 20.0f;      // what it does to the level actor it hits (the level's script hears of it)
+    // The person it stopped in (TdWeapon.RegisterPendingImpact / PlayImpactEffects): 0 nobody;
+    // 1 a bot the player shot, who gets his body's impact effect and sound; 2 the player, who
+    // gets the sound alone; 3 a bot that gets nothing (shot by another bot, or dying).
+    uint8_t pawn_hit = 0;
+    Vec3 pawn_normal{0.0f, 0.0f, 0.0f};  // out of the body where the bullet went in (zero: not known)
 };
 
 struct DroppedWeapon {
@@ -1727,6 +1732,12 @@ struct PhysicalMaterialInfo {
     int32_t parent = -1;
     // TdPhysicalMaterialImpactEffects: the particle template by ammunition (BulletTracer::ammo), -1 none.
     int32_t effects[4] = {-1, -1, -1, -1};
+    // TdPhysicalMaterialImpactSounds.LightAmmo, the one every weapon plays (TdWeapon.
+    // GetWeaponSpecificImpactSound): the cue as "Group.Name", its package, and the MaxRadius of
+    // its attenuation node, past which it is not heard.
+    std::string impact_sound;
+    std::string impact_sound_package;
+    float impact_sound_radius = 2000.0f;
     // TdPhysicalMaterialDecals, by the weapon's decal type: light, heavy, shotgun.
     bool has_decals = false;
     float critical_angle = 0.0f;  // degrees from the surface's normal: under it an impact, over it a ricochet
@@ -1755,6 +1766,12 @@ struct DynamicDecal {
     int32_t material = -1;
     float life = 30.0f;  // DecalManager.DecalLifeSpan
     std::vector<Vertex> vertices;
+    // What it lies on, when that moves (the decal is attached to its HitComponent's actor): 0 the
+    // level, 1 a part of a lift (elevators[mover].parts[part]), 2 a door (barge_doors[mover]).
+    // The vertices are then in the mover's place as the level has it, and go with it when drawn.
+    uint8_t mover_kind = 0;
+    int32_t mover = -1;
+    int32_t part = -1;
 };
 
 // An emitter an actor factory of the level's script makes (ActorFactoryEmitter).
@@ -1836,6 +1853,7 @@ struct LevelScene {
     // What a bullet leaves where it lands (assets/level_impacts.hpp, game/impact_effects.hpp).
     std::vector<PhysicalMaterialInfo> physical_materials;
     int32_t default_physical = -1;         // TdWeapon.DefaultImpactMaterial
+    int32_t character_physical = -1;       // the bodies of the bots' physics asset: PM_Character_Body
     ImpactDecalInfo default_impact_decal;  // TdWeapon.InitDefaultDecalProperties
     std::vector<EffectFactory> effect_factories;
     std::vector<SpawnedEffect> spawned_effects;

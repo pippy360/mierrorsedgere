@@ -1524,3 +1524,68 @@ The damage classes are bullet, barge and blow only; a ground punch or kick deals
 `GameBreakableActor`s' `SeqEvent_Destroyed` (exploding barrels) are not run; a pane has no shards beyond its
 particle effects. Nothing here was played by hand: the run at a pane is the controller's, in the oracle. In
 `TODO.md`.
+
+---
+
+## 32. Bullet impacts: the impact sound, the effect on a person, bullet holes on movers (agent/bullet-impacts, 2026-10-10)
+
+Section 29 left three things open: a bullet that hit a person left nothing, no impact sound was played, and
+movers, doors and lift cabs took no bullet hole. `docs/RENDERING_RE.md` sections 12 and 13 have the rules.
+
+### 32.1 What the game does (TdGame.u's bytecode, the cooked packages)
+- `TdWeapon.RegisterPendingImpact`: a bot shows nothing when `TdBotPawn.PreventWeaponImpactEffect` says so
+  (the shooter is a `TdAIController`, or the bot is in state `Dying`); anything else that is not static gets
+  `PlayImpactEffects` at once, static actors after `TracedDistance / 20000` s.
+- `TdWeapon.PlayImpactEffects`: the effect and the decal for anything but the player, then
+  `SpawnImpactSounds` for everything, the player included.
+- `SpawnImpactSounds`: `TdPhysicalMaterialImpactSounds.LightAmmo` of the hit's physical material, else its
+  parents', else `DefaultImpactMaterial`'s, by `PlaySound(.., HitLocation)`. 26 cues, all in
+  `A_Effects_Bullet_Impacts.upk`; attenuation `MaxRadius` 2000 uu for concrete, 300 for the bodies' cue.
+- A bot's bodies (`CH_TKY_Cop_SWAT.Male3p_Physics`) are `PM_Character_Body`, neck and hands
+  `PM_Character_Head`: effect `PS_FX_Impact_Character_Body_Light_01` (shotgun `..._Body_Shotgun_01`), sound
+  `Faith.9mm_Faith_Impact`, no decal list. `TdBotPawn.TakeDamage` multiplies by `DamageMultiplier_Head` (2.0)
+  on `PM_Character_Head`.
+- `SpawnImpactDecal` passes `HitInfo.HitComponent` to `DecalManager.SpawnDecal`: the hole is the component's.
+
+### 32.2 Changes
+- **Data** (`src/assets/level_impacts.*`, `src/math/types.hpp`): a physical material carries its impact cue,
+  the cue's package and its `MaxRadius` (`ImpactLibrary::cue_max_radius`); the scene knows the bodies'
+  material (`LevelScene::character_physical`).
+- **What a bullet leaves** (`src/game/impact_effects.hpp`): `find_impact_surface` meets the level, a lift's
+  part or a door where it is now (`MoverPose`), passing what the script has hidden as section 31 does;
+  `spawn_decal` clips in the mover's place as the level has it and marks the hole with its mover;
+  `dynamic_decal_vertices` carries it to the mover's place when drawn (`src/renderer/particles.hpp`).
+  `update_impact_effects` hands the impact sound to the game loop as a `SimSoundEvent`, when the player is
+  within the cue's radius, and for a tracer that stopped in a person (`BulletTracer::pawn_hit`,
+  `pawn_normal`) makes the body's effect and sound, the sound alone for the player, nothing for a dying bot.
+- **Who is hit** (`src/physics/parkour_controller.cpp`): the player's tracer says which, and ends where the
+  bullet enters the bot. A bot's hit box was 48 around and from 10 below his feet to 105 above them, the head
+  from 72: a level shot from standing height (166) at a bot on the same floor passed over it, so a shot at
+  his chest or head never landed. It is now his pawn's cylinder's height, 180 (`TdPawn`: `CollisionHeight`
+  90), the head from 150. A bot's tracer says whether it reached the player.
+- **Sound** (`src/main.cpp`): the level load brings in the cue packages the materials name.
+- **Test aids** (`--intro-shots`): `ME_SHOT_STAND`, `ME_SHOT_MOVERS`, `ME_SHOT_BODY`; `ME_IMPACT_DEBUG=1` names
+  the sound and what a hole lies on, and at a level's load counts the impact cues found.
+
+### 32.3 Checked (Windows, Direct3D 11)
+- **Sound:** in the Prologue the cues of 26 of the 26 physical materials that name one are found by the audio
+  engine after the level's load; five shots at a roof give five `Concrete.9mm_Concrete_Impact`, at a door or
+  a lift's wall five `Metal_Thin.9mm_Metal_Thin_Impact`.
+- **A door** (the Prologue's first, `ME_SHOT_STAND="-6632,-2210,5640"`, `ME_SHOT_LOOK="0,180"`): five holes on
+  the closed leaf; swung by 60 degrees they are on the leaf and none is left in the doorway; swung by 15 and
+  shot again, the five new ones lie on the turned leaf beside the five carried there.
+- **A lift** (Escape's first cab, `ME_SHOT_STAND="6039.5,5696,10612"`, `ME_SHOT_LOOK="0,90"`): five holes on
+  the cab's wall, which rise with it when the cab is raised 60 units.
+- **A person:** `ME_SHOT_BODY=110` draws the body's puff, a light weapon's and a shotgun's. In the windowed
+  game, a squad spawned ahead (`H`) and an MP5K's trigger held: the shot that lands logs
+  `on a bot .. PS_FX_Impact_Character_Body_Light_01, sound Faith.9mm_Faith_Impact (too far to hear)` at
+  480 uu, and each of the squad's shots that reaches the player `on the player .. sound
+  Faith.9mm_Faith_Impact`. Before the hit box was raised the same shots, aimed at the chest, hit nobody.
+- **Oracle:** `--verify-all` passes every stage.
+- **macOS:** the app compiles and links on `macos-15`. Not run.
+
+### 32.4 Not done
+A bot is a cylinder of one material, where the game traces his physics asset's bodies, and takes no bullet
+hole; the decals computed at load are still not on movers; the sounds were checked in the log, not by ear.
+Two `--intro-shots` runs started at once both hung after their first frame; one at a time, each takes half a
+minute. In `TODO.md`.
