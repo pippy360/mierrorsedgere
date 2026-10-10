@@ -544,7 +544,7 @@ private:
     Val compile_expr(const ExprNode& nd);
     // `sub_uv`: a sprite's two sub-images, blended (the node ParticleSubUV on a particle material).
     Val texture_sample(const ExprNode& nd, int32_t tex_ref, const std::string& param, bool is_param, bool param_cube,
-                       const ExprInput& coords, bool sub_uv = false);
+                       const ExprInput& coords, int sub_uv = 0);
     int tex_slot(bool cube, bool is_param, const std::string& param, const std::string& path, TexDefault fb);
     int uniform_slot(bool vec, const std::string& name, const std::array<float, 4>& def);
     Val material_input(const char* name, int n, const std::array<float, 4>& def);
@@ -653,7 +653,7 @@ int GraphCompiler::uniform_slot(bool vec, const std::string& name, const std::ar
 }
 
 Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std::string& param, bool is_param,
-                                  bool param_cube, const ExprInput& coords, bool sub_uv) {
+                                  bool param_cube, const ExprInput& coords, int sub_uv) {
     std::string path;
     std::string cls;
     if (tex_ref != 0) {
@@ -696,10 +696,14 @@ Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std
     const std::string k = std::to_string(slot);
     std::string s = cube ? ("c" + k + ".sample(sc" + k + ", " + uv.code + ")")
                          : ("t" + k + ".sample(s" + k + ", " + uv.code + ")");
-    if (sub_uv && !cube && !c.ok()) {
+    if (sub_uv == 1 && !cube && !c.ok()) {
         // ParticleSpriteVertexFactory.usf: TexCoords[0] and [1] are the two sub-images, [2].x their blend.
         out_.texcoord_mask |= 3u;
         s = "mix(t" + k + ".sample(s" + k + ", P.uv0), t" + k + ".sample(s" + k + ", P.uv1), saturate(P.lm_uv.x))";
+    } else if (sub_uv == 2 && !cube) {
+        // A mesh particle's sub-image: the mesh's own coordinates scaled and moved into it, by what the
+        // particle's vertices carry beside their colour.
+        s = "t" + k + ".sample(s" + k + ", " + uv.code + " * P.lm1.xy + P.lm2.xy)";
     }
     float scale[4];
     float bias[4];
@@ -779,7 +783,8 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         if (particle_) return emit(4, "float4(P.lm0, P.lm_uv.y)");
         return {"P.vcolor", 4};
     }
-    if (c == "MeshEmitterVertexColor") return {"float4(1.0)", 4};
+    // A mesh particle's colour rides in its vertices as a sprite's does (renderer/particles.hpp).
+    if (c == "MeshEmitterVertexColor") return emit(4, "float4(P.lm0, P.lm_uv.y)");
     if (c == "ScreenPosition") {
         if (prop_bool(p, "ScreenAlign", false)) {
             return emit(4, "float4(P.screen_uv, P.screen_pos.z / P.screen_pos.w, 1.0)");
@@ -1069,7 +1074,7 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         const bool param_cube = c == "TextureSampleParameterCube";
         const std::string pname = is_param ? prop_name(p, "ParameterName", "None") : std::string();
         return texture_sample(nd, prop_object(p, "Texture"), pname, is_param, param_cube, read_input(p, "Coordinates"),
-                              c == "ParticleSubUV" && particle_);
+                              c == "ParticleSubUV" && particle_ ? 1 : (c == "MeshSubUV" ? 2 : 0));
     }
 
     // ---- Scene color / depth (translucent materials only) -----------------

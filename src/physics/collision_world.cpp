@@ -221,7 +221,7 @@ void CollisionWorld::clear() {
 
 void CollisionWorld::reserve(size_t triangle_count) { tris_.reserve(triangle_count); }
 
-void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels) {
+void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element) {
     const Vec3 n = (b - a).cross(c - a);
     const float len2 = n.length_sq();
     if (!(len2 > 1e-8f) || !std::isfinite(len2)) return;
@@ -232,6 +232,7 @@ void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, i
     t.normal = n / std::sqrt(len2);
     t.actor = actor;
     t.channels = channels;
+    t.element = element;
     tris_.push_back(t);
 }
 
@@ -407,6 +408,7 @@ CollisionHit CollisionWorld::sweep_box(const Vec3& start, const Vec3& delta, con
                 best.normal = sr.normal;
                 best.location = start + delta * sr.time;
                 best.actor = t.actor;
+                best.element = t.element;
             }
         }
     }
@@ -492,6 +494,7 @@ CollisionHit CollisionWorld::line_check(const Vec3& start, const Vec3& end, uint
             best.normal = (t.normal.dot(dir) > 0.0f) ? -t.normal : t.normal;
             best.location = start + dir * tt;
             best.actor = t.actor;
+            best.element = t.element;
         }
     }
     (void)have_hit;
@@ -522,6 +525,35 @@ bool CollisionWorld::overlap_box(const Vec3& center, const Vec3& extent, uint8_t
         }
     }
     return false;
+}
+
+void CollisionWorld::query_box(const Vec3& center, const Vec3& extent, uint8_t channels, std::vector<uint32_t>& out) const {
+    if (nodes_.empty()) return;
+    const Vec3 lo = center - extent, hi = center + extent;
+    const AABB query(lo, hi);
+    uint32_t stack[64];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        const Node& node = nodes_[stack[--sp]];
+        if (!node.box.intersects(query)) continue;
+        if (node.count == 0) {
+            const uint32_t self = static_cast<uint32_t>(&node - nodes_.data());
+            if (sp + 2 <= 64) {
+                stack[sp++] = node.first;
+                stack[sp++] = self + 1;
+            }
+            continue;
+        }
+        for (uint32_t i = node.first; i < node.first + node.count; ++i) {
+            const Triangle& t = tris_[i];
+            if ((t.channels & channels) == 0) continue;
+            if (std::min({t.a.x, t.b.x, t.c.x}) > hi.x || std::max({t.a.x, t.b.x, t.c.x}) < lo.x) continue;
+            if (std::min({t.a.y, t.b.y, t.c.y}) > hi.y || std::max({t.a.y, t.b.y, t.c.y}) < lo.y) continue;
+            if (std::min({t.a.z, t.b.z, t.c.z}) > hi.z || std::max({t.a.z, t.b.z, t.c.z}) < lo.z) continue;
+            out.push_back(i);
+        }
+    }
 }
 
 }  // namespace me

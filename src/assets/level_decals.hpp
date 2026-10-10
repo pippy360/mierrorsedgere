@@ -22,6 +22,15 @@
 // on a static mesh, and in the decal's frame on BSP:
 //   world = HitLocation - x HitNormal + y HitTangent + z HitBinormal.
 //
+// A placed decal that stores no receiver at all (440 of the game's 4421: one added after the
+// level's last lighting build) has them computed when the level begins play
+// (UDecalComponent, 0x00fc78f0: ComputeReceivers when StaticReceivers is empty): the triangles
+// of what lies in its box, clipped to the box. The box is orthographic: Width along HitTangent,
+// Height along HitBinormal, NearPlane..FarPlane along -HitNormal, centred on HitLocation; and
+//   u = 0.5 + OffsetX - TileX dot(P - HitLocation, HitTangent) / Width      (v likewise),
+// which is also what every stored vertex satisfies. assets/upk_loader.cpp does that clipping.
+// A decal whose stored receivers are all empty stays empty, as in the game.
+//
 // The many DecalComponents that belong to no DecalActor are the bullet-hole templates of
 // the physical materials; they have no receivers and are not read.
 // -----------------------------------------------------------------------------
@@ -62,6 +71,21 @@ struct LevelDecal {
     int32_t sort_order = 0;  // the decals of one receiver are drawn in ascending order
     bool hidden = false;
     std::vector<DecalReceiver> receivers;
+    // The projection box and its texture mapping: used when no receiver is stored.
+    bool compute_receivers = false;
+    float width = 200.0f;
+    float height = 200.0f;
+    float near_plane = 0.0f;
+    float far_plane = 300.0f;
+    float tile_x = 1.0f;
+    float tile_y = 1.0f;
+    float offset_x = 0.0f;
+    float offset_y = 0.0f;
+    float backface_angle = 0.001f;
+    bool project_on_backfaces = false;
+    bool flip_backface_direction = false;
+    bool project_on_bsp = true;
+    bool project_on_static_meshes = true;
 };
 
 void extract_level_decals(const std::vector<std::shared_ptr<UPKPackage>>& packages, std::vector<LevelDecal>& out);

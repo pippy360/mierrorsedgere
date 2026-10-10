@@ -1347,3 +1347,70 @@ Pressing `Escape` (or controller `Start`) during gameplay previously opened a cu
   - `BlockedVaultWhenEnergized=OK`, `ShockKnockback=OK`, `HealthAfterShock=10`, `VaultWhenDeenergized=OK`, `RealVols[Electric=6, BarbedWire=35, Exclusion=1]`.
 - All 17 verified oracle stages (`Stage 1`–`Stage 19`) pass with exit code `0`.
 
+---
+
+## 29. Rendering gaps: mesh particles and LOD, script-switched effects, bullet impacts and bullet holes, computed decals, the shadow's head (agent/rendering-gaps, 2026-10-10)
+
+What sections 23 and 24 left on the "still missing" list. `docs/RENDERING_RE.md` sections 10 to 13 have the
+rules; this is what changed and how it was checked.
+
+### 29.1 Changes
+- **Particles** (`src/assets/level_particles.*`, `src/renderer/particles.hpp`, `src/assets/material_system.cpp`):
+  mesh emitters (`ParticleModuleTypeDataMesh`, `MeshMaterial`, `MeshRotation`, `MeshRotationRate`,
+  `MeshRotationRateMultiplyLife`), `Orbit`, `LocationEmitter`, `OrientationAxisLock`, `ColorScaleOverLife`;
+  every LOD level of an emitter, picked by the system's distance (`LODDistances`, `LODDistanceCheckTime`), out
+  to 30,000 uu. The material translator gives a mesh particle its colour (`MeshEmitterVertexColor`) and its
+  sub-image (`MeshSubUV`).
+- **The script switches effects** (`src/game/level_script.*`, `src/main.cpp`): `SeqAct_Toggle`, a Matinee's
+  `InterpTrackToggle` keys, `SeqAct_ToggleHidden` and `SeqAct_Destroy` reach the placed emitters and the
+  `LensFlareSource`s (`ScriptHost::toggle_effect`, `hide_effect`). `SeqAct_ActorFactory` with an
+  `ActorFactoryEmitter` makes its particle system at the action's spawn points (`spawn_effect`).
+- **What a bullet leaves** (`src/assets/level_impacts.*`, `src/game/impact_effects.hpp`, new): the physical
+  materials the level's materials name, with their parents, impact effects by ammunition and bullet-hole decal
+  templates. The collision world's triangles of a mesh's own geometry keep their mesh element
+  (`CollisionWorld::Triangle::element`, `CollisionHit::element`), each actor the physical material of each
+  element. Every bullet tracer (now tagged light, heavy, helicopter or shotgun) is followed to the surface it
+  ended on and leaves the effect and the decal `TdWeapon.SpawnImpactEffects` / `SpawnImpactDecal` would.
+  The particle world runs the spawned systems and hands the dynamic decals to the renderers with its batches;
+  all three draw a decal batch with the decals' depth bias.
+- **Decals with no stored receiver** (`src/assets/level_decals.*`, `src/assets/upk_loader.cpp`): clipped at
+  load onto the static meshes' collision-tree triangles and the BSP, honouring `bAcceptsDecals`.
+- **The player's shadow** (`src/renderer/mod_shadow.hpp`, the three renderers): a head and a torso stand in
+  with the first-person body in her shadow's depth map.
+- Switches: `ME_NO_COMPUTED_DECALS`, `ME_DECAL_SELFCHECK`, `ME_IMPACT_DEBUG`, and `ME_SHOT_FIRE` for the picture
+  harness (five shots from the view before each picture).
+
+### 29.2 Results
+- **Particles loaded:** Heat's opening area 110 systems, 130 emitters run, 27 of them mesh emitters, 4 left
+  out, all `TypeDataMeshPhysX` (section 24: 96 run, 38 left out); the Prologue's 95 systems, 149 run, 38 mesh
+  emitters, 1 left out, 18 systems waiting for the script.
+- **Impacts loaded:** the Prologue 38 physical materials, 9 with effects of their own, 22 with decal lists
+  (508 templates), named by 328 of its 435 materials; Jacknife 45, 14, 24 (537), 463 of 565 and 25 emitter
+  factories; Heat 262 factories.
+- **A shot, in pictures** (`ME_SHOT_FIRE=0`, Jacknife's opening alley, the view turned to the ground): five
+  shots, five impact effects (`PS_FX_Impact_Concrete_Light_01`, reached through `PM_Gravel`'s parents), five
+  bullet holes of two triangles each; the same frame without the shots differs over 10,708 pixels around
+  them. On the Prologue's rooftop structure (`S_RooftopStructure_03`, `bAcceptsDecals=False`) the effects are
+  made and the holes are not, as the data asks.
+- **Computed decals:** Heat 75 of 83 find something to lie on, Jacknife 21 of 24 (558 triangles). The
+  self-check, on decals whose stored triangles are known: Jacknife 1.12 of the stored area, 577 of 621 within
+  0.8..1.25; the Prologue 1.01, 12 of 12.
+- **The shadow:** checked in the Prologue's intro at 62 s with the view turned down at the roof.
+- **A shot in the running game** (windowed, Jacknife's start, a posted `T` for the pistol and `F` to fire, the
+  game's own window captured): the log has the impact, its effect and its hole (`ME_IMPACT_DEBUG=1`), and the
+  script's load line reads 18 emitter factories, 16 with a spawn point.
+- **Against retail's pictures** over the ten level intros: 30.0 (30.0 before). Per chapter unchanged to a
+  tenth except Jacknife 37.1 (37.4), Heat 19.5 (19.1) and The Shard 12.9 (13.1): the mesh particles and the
+  LOD levels are what these frames hold of this work.
+- **Direct3D against OpenGL:** Heat at 6 s a mean difference of 0.53 of 255, the Prologue at 62 s 0.07, the
+  Jacknife frame with the shots 0.93 (the holes and the puffs are in the same places; the difference is the
+  floor's texture filtering).
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS; the tracked screenshots are regenerated.
+- **macOS:** the app compiles and links on `macos-15` and both Metal shader sources compile. Not run.
+
+### 29.3 Not checked, and still missing
+The oracle does not run the levels' scripts, so the script's switching of emitters and flares and its emitter
+factories were checked by reading the sequences and the load logs, not by a run that reaches one. Glass does
+not break (a pane's sequence waits for damage and death events the port does not send), which is what 1024 of
+the 1080 factories are for. PhysX emitters, attractors and collision modules, flares on movers, a hit pawn's
+effect and the impact sounds are not done. In `TODO.md`.

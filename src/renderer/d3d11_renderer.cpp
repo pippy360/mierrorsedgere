@@ -326,6 +326,7 @@ struct D3D11Renderer::Impl {
     ParticleWorld particles;                 // the level's particle systems, kept between frames
     std::vector<uint8_t> mod_enemy_ready;
     bool viewmodel_built = false;            // the first-person body is already posed for this frame
+    std::vector<Vertex> head_vertices;       // the head and torso her shadow is given (mod_shadow.hpp)
     std::vector<Vertex> flare_vertices;
     static constexpr int kMaxMaterialUniforms = 256;
 
@@ -2158,6 +2159,11 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     set_matrix(uniforms.model, body);
                     push_uniforms();
                     draw_scene_vertices(impl->faith_viewmodel_mesh);
+                    // The head and the torso that body lacks.
+                    player_body_stand_in(cam_pos, telemetry.position, fwd, right, up, impl->head_vertices);
+                    set_matrix(uniforms.model, identity);
+                    push_uniforms();
+                    draw_scene_vertices(impl->head_vertices);
                 }
             }
             std::memcpy(uniforms.sun_view_proj, sun_vp_saved, sizeof(sun_vp_saved));
@@ -2459,6 +2465,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     const SceneMaterial* m = nullptr;
                     ID3D11PixelShader* ps = impl->section_shader(section, &sh, &m);
                     if (!ps) continue;
+                    decal_bias = b.decal;  // a bullet hole lies in its surface
                     use_material_pipeline(ps, *sh, *m, false);
                     impl->bind_lightmap(-1);
                     draw_scene_vertices(b.vertices);

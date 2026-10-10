@@ -43,6 +43,7 @@ struct CollisionHit {
     Vec3 normal{0.0f, 0.0f, 1.0f};   // contact normal, facing the query (against the motion)
     Vec3 location{0.0f, 0.0f, 0.0f}; // box centre / line point at the time of contact
     int32_t actor = -1;              // LevelScene::actors index of the owning actor (-1 = none)
+    uint16_t element = 0;            // the hit triangle's mesh element, when it is one of a mesh's own triangles
 };
 
 class CollisionWorld {
@@ -52,12 +53,13 @@ public:
         Vec3 normal;           // unit geometric normal (a, b, c winding)
         int32_t actor = -1;
         uint8_t channels = COLL_BlockAll;
+        uint16_t element = 0;  // a mesh's own triangle: the mesh element it belongs to
     };
 
     void clear();
     void reserve(size_t triangle_count);
     // Adds a world-space triangle; degenerate (zero-area) triangles are dropped.
-    void add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels);
+    void add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element = 0);
     // Builds the bounding volume hierarchy. Must be called before querying.
     void build();
     // Updates the blocking channel mask of all triangles belonging to `actor`.
@@ -80,6 +82,9 @@ public:
     // Static overlap test of an axis-aligned box against the triangles.
     [[nodiscard]] bool overlap_box(const Vec3& center, const Vec3& extent,
                                    uint8_t channels = COLL_BlockNonZeroExtent) const;
+
+    // The triangles (places in triangles()) with any of `channels` whose bounds touch the box.
+    void query_box(const Vec3& center, const Vec3& extent, uint8_t channels, std::vector<uint32_t>& out) const;
 
 private:
     struct Node {

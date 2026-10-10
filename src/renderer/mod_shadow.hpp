@@ -26,7 +26,8 @@
 //
 // Here the depth maps share the third slice of the sun shadow map array, a cell each, and
 // one pass over the picture applies them all. The player's shadow is cast by the
-// first-person body (the game casts it from the third-person body, which the port has not).
+// first-person body (the game casts it from the third-person body, which the port has not),
+// and since that body is arms and legs, by a head and a torso standing in with it.
 // -----------------------------------------------------------------------------
 
 #include "light_environment.hpp"
@@ -184,6 +185,54 @@ inline void fill_mod_shadow_uniforms(const std::vector<ModShadow>& shadows, ModS
         u.cell[i][3] = inv;  // ShadowFilterRadius 2 * 0.5: the taps are a texel apart
         u.depth[i][0] = s.min_z;
         u.depth[i][1] = s.max_z;
+    }
+}
+
+// What the first-person body lacks, for her shadow: a head behind the eye and a torso from the
+// neck down to the hips, as two ellipsoids in the world. `eye` and `feet` are the view's and the
+// pawn's; `forward`, `right` and `up` the view's axes. Both keep level whatever the view's pitch.
+inline void player_body_stand_in(const Vec3& eye, const Vec3& feet, const Vec3& forward, const Vec3& right, const Vec3& up,
+                                 std::vector<Vertex>& out) {
+    // The way she faces, on the ground: a quarter turn from the view's right.
+    Vec3 ahead(-right.y, right.x, 0.0f);
+    ahead = ahead.length_sq() > 1.0e-6f ? ahead.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+    const Vec3 level = std::abs(forward.z) < 0.95f ? forward : up * (forward.z < 0.0f ? 1.0f : -1.0f);
+    if (ahead.dot(level) < 0.0f) ahead = ahead * -1.0f;
+    const Vec3 side(-ahead.y, ahead.x, 0.0f);
+    out.clear();
+    const auto ellipsoid = [&out](const Vec3& centre, const Vec3& a, float ra, const Vec3& b, float rb, const Vec3& c, float rc) {
+        const int rings = 6, segments = 10;
+        const auto point = [&](int ring, int segment) {
+            const float lat = (static_cast<float>(ring) / static_cast<float>(rings) - 0.5f) * 3.14159265f;
+            const float lon = static_cast<float>(segment) / static_cast<float>(segments) * 6.28318531f;
+            Vertex v;
+            v.position = centre + a * (std::cos(lat) * std::cos(lon) * ra) + b * (std::cos(lat) * std::sin(lon) * rb) + c * (std::sin(lat) * rc);
+            return v;
+        };
+        for (int r = 0; r < rings; ++r) {
+            for (int s = 0; s < segments; ++s) {
+                const Vertex p0 = point(r, s), p1 = point(r, s + 1), p2 = point(r + 1, s), p3 = point(r + 1, s + 1);
+                out.push_back(p0);
+                out.push_back(p1);
+                out.push_back(p2);
+                out.push_back(p2);
+                out.push_back(p1);
+                out.push_back(p3);
+            }
+        }
+    };
+    const Vec3 z(0.0f, 0.0f, 1.0f);
+    ellipsoid(eye - ahead * 8.5f + z * 0.5f, ahead, 9.5f, side, 8.0f, z, 11.5f);
+    // The torso: from under the head to the hips, which sit a little over half way up from her feet.
+    const Vec3 neck = eye - ahead * 9.0f - z * 12.0f;
+    const Vec3 hips = feet + z * std::max(0.57f * (eye.z - feet.z), 10.0f) - ahead * 3.0f;
+    const Vec3 spine = neck - hips;
+    const float length = spine.length();
+    if (length > 8.0f) {
+        const Vec3 along = spine * (1.0f / length);
+        Vec3 depth = side.cross(along);
+        depth = depth.length_sq() > 1.0e-6f ? depth.normalized() : ahead;
+        ellipsoid((neck + hips) * 0.5f, depth, 10.0f, side, 16.0f, along, length * 0.5f + 4.0f);
     }
 }
 

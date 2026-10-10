@@ -414,9 +414,12 @@ The player's shadow is cast by the third-person body, which is in the scene with
 **In the port** (`src/renderer/mod_shadow.hpp`, `mod_shadow_fragment`): each caster's depth map is a cell of
 the third slice of the shadow map array, and one pass over the picture applies up to eight shadows, largest
 first. Casters: enemies, the dynamic objects whose environment is on and casts, and the player. The port has
-no third-person body, so **the player's shadow is that of the first-person body**: no head. Not done: the
-shadows inside the first-person depth groups (the arms' on the legs), `ModulateBetter` while hanging, and
-pre-shadows. `ME_NO_DYNAMIC_SHADOWS=1` draws without them.
+no third-person body, so **the player's shadow is cast by the first-person body**, which is arms and legs:
+a head and a torso stand in with it, two ellipsoids drawn into her shadow's depth map only
+(`player_body_stand_in`: the head behind the eye, the torso from the neck to the hips, level whatever the
+view's pitch). They are shapes of about her size, not her mesh. Not done: the shadows inside the first-person
+depth groups (the arms' on the legs), `ModulateBetter` while hanging, and pre-shadows.
+`ME_NO_DYNAMIC_SHADOWS=1` draws without them.
 
 ## 11. Lens flares
 
@@ -449,10 +452,10 @@ from the source's place on the screen, `S`, through the screen's centre
 read from the level packages; the quads are placed and sized as above and drawn with their own translated
 materials. One thing is done another way: the coverage is the box's outline on the screen, measured, times
 the part of a grid of sight lines to it that the level's meshes leave open (25 lines for a sun, 9 for a
-lamp), not an occlusion query; a mesh with no collision does not hide a flare. Not done: the 70 sources a
-level's Kismet switches on (`bAutoActivate=False`) stay off, and a source on a moving base (police cars,
-trains) stays where the level placed it. `ME_LENS_FLARE_DEBUG=1` says what becomes of every source;
-`ME_NO_LENS_FLARES=1` draws without them.
+lamp), not an occlusion query; a mesh with no collision does not hide a flare. The 70 sources that wait for
+the level's script (`bAutoActivate=False`) are switched by it, as the emitters are (section 13). Not done: a
+source on a moving base (police cars, trains) stays where the level placed it. `ME_LENS_FLARE_DEBUG=1` says
+what becomes of every source; `ME_NO_LENS_FLARES=1` draws without them.
 
 ## 12. Decals
 
@@ -481,12 +484,56 @@ vertex (52):   float3 Position, packed TangentX, packed TangentZ (w: the basis' 
 - Each decal has `DepthBias` (-0.00006 of the depth range by default); a receiver's decals are drawn in
   ascending `SortOrder`.
 
-**In the port** (`src/assets/level_decals.*`, `MeshBuffer::is_decal`): all placed decals of the loaded
-packages are read (the Jacknife start: 621 decals, 30,291 triangles, none unread) and emitted as buffers of
-their own, one a `SortOrder`. They are drawn with a depth bias (500 steps of the depth buffer at the
-triangle's depth, slope 1), unculled, casting no shadow, and before the other translucent surfaces. Not done:
-the 440 placed decals that store no receiver (retail may compute them when the level loads), a decal's own
-`FLightMap1D`, per-decal bias, and the decals of bullet holes and footsteps.
+**A decal with no stored receiver** (440 of the 4421: one added after the level's last lighting build) has
+its receivers computed when the level begins play (`0x00fc78f0`: `ComputeReceivers` when `StaticReceivers` is
+empty): the triangles of what lies in its box, clipped to the box. The box is orthographic, `Width` along
+`HitTangent`, `Height` along `HitBinormal`, `NearPlane`..`FarPlane` along `-HitNormal`, centred on
+`HitLocation`, and
+
+```
+u = 0.5 + OffsetX - TileX dot(P - HitLocation, HitTangent) / Width          (v likewise, with HitBinormal)
+```
+
+which every stored vertex satisfies too. A mesh takes it only if its component has `bAcceptsDecals`; a
+triangle only if it faces the decal (`BackfaceAngle` 0.001, unless `bProjectOnBackfaces`). What is clipped is
+the mesh's collision-tree (kDOP) triangles, facing by their geometric normal.
+
+**A bullet hole** (`TdWeapon.SpawnImpactDecal`) is a decal made while the game runs. With `N` the surface's
+normal and `D` the bullet's direction, `AngleOfImpact = acos(-N . D)`. The surface's physical material
+(section 13) holds a `TdPhysicalMaterialDecals`: a `CriticalAngle` and, for light weapons, heavy weapons and
+shotguns, a list of `DecalComponent` templates for an impact (under the angle) and one for a ricochet (over
+it). One of the list is taken by chance; an empty list sends the search to the material's parents, and
+then to a 16 x 16 decal of the weapon's `DefaultDecalMaterial`. Then:
+
+```
+RandScaling = 1 + FRand() * 0.5
+DecalRotation 360    any angle
+DecalRotation -360   turned to the way the bullet went along the surface, and
+                     Stretching = 1 + AngleOfImpact / 90 * DecalStretchingMultiplier (1.5)
+DecalManager.SpawnDecal(material, hit, rotator(-N), Width RandScaling, Height RandScaling Stretching,
+                        Thickness 10, ..)      FarPlane = Thickness / 2, NearPlane = -FarPlane
+```
+
+so the box reaches 5 uu to each side of the surface. `DecalManager` keeps a hundred (`MaxActiveDecals`), each
+for 30 seconds (`DecalLifeSpan`), the oldest making room. A mesh takes one only with `bAcceptsDecals` and
+`bAcceptsDecalsDuringGameplay`: many do not (the Prologue's rooftop structures, for one). A decal's frame
+follows from its `Orientation` and `DecalRotation` (checked on the 4225 placed decals that save one): with
+`X`, `Y`, `Z` the orientation's axes and `a` the rotation, `HitNormal = -X`,
+`HitTangent = -Y cos a - Z sin a`, `HitBinormal = Z cos a - Y sin a`. Footprints are made by
+`TdGhostPawnBase` only, the time trials' ghost: the story's player leaves none.
+
+**In the port** (`src/assets/level_decals.*`, `MeshBuffer::is_decal`, `src/game/impact_effects.hpp`): all
+placed decals of the loaded packages are read (the Jacknife start: 621 decals, 30,291 triangles, none unread)
+and emitted as buffers of their own, one a `SortOrder`. They are drawn with a depth bias (500 steps of the
+depth buffer at the triangle's depth, slope 1), unculled, casting no shadow, and before the other translucent
+surfaces. The ones with no stored receiver are clipped onto the level's static meshes and BSP at load
+(Heat: 75 of 83 find something to lie on; Jacknife: 21 of 24, 558 triangles). `ME_DECAL_SELFCHECK=1` clips
+the decals that *do* store receivers the same way and compares areas: Jacknife 1.12 of the stored area, 577
+of 621 decals within 0.8..1.25; the Prologue 1.01, 12 of 12. Every bullet tracer that ends on a surface
+leaves its hole, clipped against the collision world's triangles in the box and drawn with the particles'
+batches under the decals' bias. Not as the game: the receivers are found in the box, not by the hit
+component; movers, doors and lift cabs take no decal; a bullet hole does not fade, it goes. Not done: a
+decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
 ## 13. Particles
 
@@ -523,6 +570,11 @@ that long when it is first seen.
 | `SizeMultiplyLife`, `RotationRateMultiplyLife`, `VelocityOverLifetime` | scale by a curve over the life |
 | `AccelerationOverLifetime` | adds to the velocity |
 | `SubUV` | the sub-image index over the life |
+| `ColorScaleOverLife` | scales colour and alpha by curves over the life (or over the emitter's time) |
+| `MeshRotation`, `MeshRotationRate`, `MeshRotationRateMultiplyLife` | a mesh particle's rotation about its three axes, in turns |
+| `Orbit` | an offset from the particle's place, turned about it at a rate (birds and bats circling) |
+| `LocationEmitter` | spawns at a particle of another emitter of the system (`EmitterName`), one by chance or each in turn, with a share of its velocity |
+| `OrientationAxisLock` | a sprite that stands along an axis of the emitter's space and turns about it to face the view |
 
 **A sprite** is a quad around the particle (`ParticleSpriteVertexFactory.usf`, and the code that sets its
 constants, `0x0109c930`). With `R` and `U` the world directions of screen right and up and `a` the rotation:
@@ -539,21 +591,54 @@ image and the next, and their blend; the material node `ParticleSubUV` is the bl
 smoke is a 4 x 4 flipbook cross-fading from image 8 to 13 over a puff's life. The particle's colour (linear,
 unclamped) is the material's vertex colour. Every placed template is unlit.
 
-**In the port** (`src/assets/level_particles.*`, `src/renderer/particles.hpp`): the templates and placements
-are read as above; the systems within 20,000 uu of the view are run each frame and their sprites drawn with
-their own translated materials in the translucency pass, a batch an emitter, far systems first. The sprites
-are ordinary scene vertices: the colour rides where a mesh vertex has its light map's first coefficient, the
-alpha and the sub-image blend beside it.
+**A mesh emitter** (`ParticleModuleTypeDataMesh`: the far smoke columns, the flying paper; 35% of the
+placements have one) draws its static mesh at every particle, scaled by the particle's size and turned
+by its three-axis rotation, with the mesh's own materials or the emitter's (`bOverrideMaterial`, a
+`MeshMaterial` module). The particle's colour reaches the material as the node `MeshEmitterVertexColor`, and
+a sub-image emitter's current image as a scale and an offset of the mesh's texture coordinates (`MeshSubUV`).
 
-What runs is the sprite emitters and the sixteen module classes of the table. Left out, each emitter whole:
-**mesh emitters** (`ParticleModuleTypeDataMesh`: the far smoke columns and the flying paper, 35% of the
-placements have one), `Orbit` and `LocationEmitter` (bird flocks, bat swarms), `OrientationAxisLock`,
-`ColorScaleOverLife`, attractors, collision, and PhysX. In The Shard's opening area that is 959 emitters run
-and 251 left out; in Heat's, 96 and 38. Also not done: the systems a level's Kismet switches on (410
-placements wait), the ones spawned at run time (bullet impacts, breaking glass, footsteps), LOD levels past the
-first (the port draws the first out to its range, where retail thins the far ones), and sorting against other
-translucent surfaces. The emitter tick's order is stock Unreal Engine 3's of that year, not read out of the
-executable. `ME_NO_PARTICLES=1` draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why.
+**Levels of detail.** A template's `LODDistances` pick an emitter's LOD level by the system's distance from
+the view, looked at every `LODDistanceCheckTime` (a quarter of a second). A level is a whole set of the
+emitter's values, not a patch on the first. The particles alive carry on under the new level.
+
+**Switched and spawned.** 410 placements wait for the level's script (`bAutoActivate=False`):
+`SeqAct_Toggle` (turn on, turn off, toggle), a Matinee's toggle track (`InterpTrackToggle`, on the actors of
+its group), `SeqAct_ToggleHidden` and `SeqAct_Destroy`. A system that is switched off spawns no more and
+what is alive lives out (`bKillOnDeactivate` aside); switched on again after it has run out, it starts
+afresh. Two things make systems while the game runs:
+
+- A bullet (`TdWeapon.SpawnImpactEffects`). The surface's material names a `PhysicalMaterial`
+  (`Material.PhysMaterial`, an instance's own or its parent's), which has a `Parent` and a
+  `TdPhysicalMaterialProperty` with a `ParticleSystem` for each ammunition (`LightAmmo`, `HeavyAmmo`,
+  `HeliAmmo`, `ShotgunPellet`). The effect is the surface's, else its parents', else that of the weapon's
+  `DefaultImpactMaterial` (`PM_Concrete`); it is made at the hit within 3000 uu, with its X axis along the
+  ray mirrored in the surface and lifted from it: `R = D - 2 N (D . N); R += (1 - R . N) 0.3 N`. Few
+  materials have effects of their own (concrete, metal, glass, tarmac, wood and some of their kinds: 9 of
+  the Prologue's 38); the others inherit.
+- The script (`SeqAct_ActorFactory` with an `ActorFactoryEmitter`, 1080 of them): the factory's particle
+  system at each of the action's spawn points. 1024 are the cracking and breaking of glass panes; the rest
+  feathers, sparks, falling dust.
+
+**In the port** (`src/assets/level_particles.*`, `src/assets/level_impacts.*`, `src/renderer/particles.hpp`,
+`src/game/impact_effects.hpp`): the templates and placements are read as above; the systems within 30,000 uu
+of the view are run each frame at their LOD level and drawn with their own translated materials in the
+translucency pass, a batch an emitter, far systems first. Sprites and mesh particles are ordinary scene
+vertices: the colour rides where a mesh vertex has its light map's first coefficient, the alpha and the
+sub-image blend (or a mesh particle's sub-image scale and offset) beside it. The script switches the placed
+systems and makes the factories'; every bullet tracer leaves its impact effect, found by a short line check
+through the tracer's end against the meshes' own triangles, which carry their mesh element and so their
+material (the BSP counts as the default material).
+
+What runs is sprite and mesh emitters with the module classes of the table: in the Prologue's opening area
+149 emitters of 95 systems, 38 of them mesh emitters, 1 left out; in Heat's 130 of 110 systems, 27 mesh
+emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
+attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
+the player (the game also asks whether the shooter was drawn lately); a bullet that hits a pawn leaves
+nothing; a pane of glass does not break, because nothing sends the damage event its script waits for, so
+the factories behind it never fire; sprites are not sorted against other translucent surfaces. The emitter
+tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
+draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
+`ME_IMPACT_DEBUG=1` says what every bullet hit and what it left.
 
 ## 14. In the port
 
@@ -563,6 +648,7 @@ executable. `ME_NO_PARTICLES=1` draws without them; `ME_PARTICLE_DEBUG=1` lists 
 | `src/assets/level_postprocess.*` | `WorldInfo` settings, `PostProcessVolume`s, `HeightFog` actors, the chain's material effects |
 | `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
 | `src/assets/level_lensflares.*`, `level_decals.*`, `level_particles.*` | Lens-flare templates and sources; decals; particle templates and placements |
+| `src/assets/level_impacts.*`, `src/game/impact_effects.hpp` | The physical materials' impact effects and bullet-hole decals, the script's emitter factories; what a bullet leaves |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
 | `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
 | `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
@@ -603,8 +689,11 @@ Options for looking at things:
 | `ME_SCREEN_EFFECT="Name:Param=v,.."` | Switches a material effect of the chain on by hand, e.g. `HealthEffect:Health=0.3` |
 | `ME_SHOT_LOOK="pitch,yaw"` | With `--intro-shots`: turns the view by hand (degrees), to look at something the intro does not |
 | `ME_LIGHT_ENV_DEBUG=1`, `ME_LENS_FLARE_DEBUG=1` | Sections 9 and 11 |
-| `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1` | A picture without them |
-| `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why |
+| `ME_SHOT_FIRE=<0..3>` | With `--intro-shots`: a fifth of a second before each picture, five shots from the view along it (0 a light weapon, 1 heavy, 2 a helicopter's gun, 3 a shotgun) |
+| `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
+| `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
+| `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect and the hole it left |
+| `ME_DECAL_SELFCHECK=1` | Clips the decals that store receivers as the ones that do not are clipped, and compares |
 
 ## 15. Measured against retail
 
@@ -621,14 +710,14 @@ exposure, colour and where light falls.
 |---|---|---|---|
 | Prologue (`edge_p`) | 36 | 43.2 | 145 / 147 |
 | Flight (`escape_p`) | 10 | 33.5 | 126 / 128 |
-| Jacknife (`stormdrain_p`) | 7 | 37.4 | 138 / 137 |
-| Heat (`cranes_p`) | 10 | 19.1 | 144 / 146 |
+| Jacknife (`stormdrain_p`) | 7 | 37.1 | 138 / 137 |
+| Heat (`cranes_p`) | 10 | 19.5 | 144 / 146 |
 | Ropeburn (`subway_p`) | 13 | 16.4 | 176 / 181 |
 | New Eden (`mall_p`) | 10 | 30.0 | 138 / 139 |
 | Pirandello Kruger (`factory_p`) | 6 | 30.7 | 188 / 188 |
 | The Boat (`boat_p`) | 10 | 16.6 | 83 / 89 |
 | Kate (`convoy_p`) | 1 | 60.3 | 214 / 205 |
-| The Shard (`scraper_p`) | 7 | 13.1 | 35 / 38 |
+| The Shard (`scraper_p`) | 7 | 12.9 | 35 / 38 |
 | **All ten** | 110 | **30.0** (was **68.5**; 31.9 before sections 8 to 13) | 139 / 140 |
 
 The 68.5 is the renderer as it was: a forward sun with shadow cascades and a hemisphere standing in for the
@@ -642,20 +731,25 @@ out of view, or posed a frame apart), objects the port does not draw (banners, s
 single Kate frame, which falls inside its opening fade. The intros hold little of what sections 9 to 12 add
 (in the Prologue's and New Eden's matched frames the sun is off screen, and the player's shadow shows in
 few), so those were checked picture by picture (`MODLOG.md` section 23). The Boat and Ropeburn moved most (27.3 and 20.6 before); other
-work on the intros reached the port in between, so not all of that is this work's.
+work on the intros reached the port in between, so not all of that is this work's. Mesh particles and the
+LOD levels moved three chapters by tenths (Jacknife 37.4 to 37.1, Heat 19.1 to 19.5, The Shard 13.1 to 12.9)
+and left the total where it was; bullets, script-switched effects and the computed decals are not in an
+intro and were checked by themselves (`MODLOG.md` section 29).
 
 ## 16. What is still a stand-in, or missing
 
-- **Particles:** mesh emitters (the far smoke columns, the flying paper), `Orbit` and `LocationEmitter` (birds,
-  bats), the systems Kismet switches on or spawns, LOD levels past the first (section 13).
+- **Particles:** PhysX emitters, attractors and collision modules; sorting against other translucent
+  surfaces; glass panes do not break, so the effects behind them never play (section 13).
 - **Level geometry with no light map.** Drawn with what it emits only. The cooked light maps list no lights
   (their GUID arrays are empty), so which lights retail lets fall on such a mesh dynamically is not known from
   the data; none was seen in the pictures checked.
 - **Light environments:** the differences listed in section 9; and `SkeletalMeshActor`s, dropped weapons and
   pickups are not given one.
-- **Dynamic shadows:** the player's is cast by the first-person body (section 10).
-- **Lens flares:** Kismet-switched sources, sources on moving bases, coverage from sight lines (section 11).
-- **Decals:** the ones with no stored receiver, bullet holes and footsteps (section 12).
+- **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
+  (section 10).
+- **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
+- **Bullets:** a pawn that is hit shows nothing; a bot's shot is judged by distance alone (section 13).
+- **Decals:** a decal's own vertex light map, per-decal bias; none on movers (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
 - **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.

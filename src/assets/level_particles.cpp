@@ -35,22 +35,23 @@ float number(const UPropertyList& props, const Defaults& defaults, const char* n
     return p->type == "IntProperty" ? static_cast<float>(p->i) : p->f;
 }
 
+// A member of a tagged struct property: the export's, or the class default's.
+const UProperty* struct_member(const UPropertyList& props, const Defaults& defaults, const char* name, const char* field) {
+    if (const UProperty* own = find_prop(props, name)) {
+        if (const UProperty* p = find_prop(own->fields, field)) return p;
+    }
+    for (const UPropertyList* list : defaults) {
+        const UProperty* base = find_prop(*list, name);
+        if (!base) continue;
+        if (const UProperty* p = find_prop(base->fields, field)) return p;
+    }
+    return nullptr;
+}
+
 // A RawDistribution struct value: each member is the export's, or the class default's.
 RawDistribution distribution(const UPropertyList& props, const Defaults& defaults, const char* name) {
-    const UProperty* own = find_prop(props, name);
-    const auto member = [&](const char* field) -> const UProperty* {
-        if (own) {
-            if (const UProperty* p = find_prop(own->fields, field)) return p;
-        }
-        for (const UPropertyList* list : defaults) {
-            const UProperty* base = find_prop(*list, name);
-            if (!base) continue;
-            if (const UProperty* p = find_prop(base->fields, field)) return p;
-        }
-        return nullptr;
-    };
     RawDistribution d;
-    if (const UProperty* table = member("LookupTable")) {
+    if (const UProperty* table = struct_member(props, defaults, name, "LookupTable")) {
         d.table.reserve(table->ints.size());
         for (int32_t bits : table->ints) {
             float v = 0.0f;
@@ -58,10 +59,10 @@ RawDistribution distribution(const UPropertyList& props, const Defaults& default
             d.table.push_back(v);
         }
     }
-    if (const UProperty* p = member("LookupTableChunkSize")) d.chunk = std::max(1, p->i);
-    if (const UProperty* p = member("LookupTableTimeScale")) d.time_scale = p->f;
-    if (const UProperty* p = member("LookupTableStartTime")) d.start_time = p->f;
-    if (const UProperty* p = member("Op")) d.op = p->i;
+    if (const UProperty* p = struct_member(props, defaults, name, "LookupTableChunkSize")) d.chunk = std::max(1, p->i);
+    if (const UProperty* p = struct_member(props, defaults, name, "LookupTableTimeScale")) d.time_scale = p->f;
+    if (const UProperty* p = struct_member(props, defaults, name, "LookupTableStartTime")) d.start_time = p->f;
+    if (const UProperty* p = struct_member(props, defaults, name, "Op")) d.op = p->i;
     if (d.table.size() < static_cast<size_t>(2 + d.chunk)) d.op = 0;  // nothing baked: the value is 0
     d.valid = d.op == 1;
     return d;
@@ -90,59 +91,75 @@ struct ModuleShape {
     const char* flags[3];
 };
 
+using Kind = ParticleModuleInfo::Kind;
+
 // The modules renderer/particles.hpp runs.
 const ModuleShape kModules[] = {
-    {"ParticleModuleLifetime", ParticleModuleInfo::Kind::Lifetime, "Lifetime", nullptr, nullptr, {nullptr, nullptr, nullptr}},
-    {"ParticleModuleSize", ParticleModuleInfo::Kind::Size, "StartSize", nullptr, nullptr, {nullptr, nullptr, nullptr}},
-    {"ParticleModuleVelocity", ParticleModuleInfo::Kind::Velocity, "StartVelocity", "StartVelocityRadial", nullptr,
-     {"bInWorldSpace", nullptr, nullptr}},
-    {"ParticleModuleRotation", ParticleModuleInfo::Kind::Rotation, "StartRotation", nullptr, nullptr, {nullptr, nullptr, nullptr}},
-    {"ParticleModuleRotationRate", ParticleModuleInfo::Kind::RotationRate, "StartRotationRate", nullptr, nullptr,
-     {nullptr, nullptr, nullptr}},
-    {"ParticleModuleColor", ParticleModuleInfo::Kind::Color, "StartColor", "StartAlpha", nullptr, {"bClampAlpha", nullptr, nullptr}},
-    {"ParticleModuleColorOverLife", ParticleModuleInfo::Kind::ColorOverLife, "ColorOverLife", "AlphaOverLife", nullptr,
-     {"bClampAlpha", nullptr, nullptr}},
-    {"ParticleModuleSizeMultiplyLife", ParticleModuleInfo::Kind::SizeMultiplyLife, "LifeMultiplier", nullptr, nullptr,
-     {"MultiplyX", "MultiplyY", "MultiplyZ"}},
-    {"ParticleModuleSubUV", ParticleModuleInfo::Kind::SubUV, "SubImageIndex", nullptr, nullptr, {nullptr, nullptr, nullptr}},
-    {"ParticleModuleAccelerationOverLifetime", ParticleModuleInfo::Kind::AccelerationOverLifetime, "AccelOverLife", nullptr, nullptr,
+    {"ParticleModuleLifetime", Kind::Lifetime, "Lifetime", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleSize", Kind::Size, "StartSize", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleVelocity", Kind::Velocity, "StartVelocity", "StartVelocityRadial", nullptr, {"bInWorldSpace", nullptr, nullptr}},
+    {"ParticleModuleRotation", Kind::Rotation, "StartRotation", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleRotationRate", Kind::RotationRate, "StartRotationRate", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleColor", Kind::Color, "StartColor", "StartAlpha", nullptr, {"bClampAlpha", nullptr, nullptr}},
+    {"ParticleModuleColorOverLife", Kind::ColorOverLife, "ColorOverLife", "AlphaOverLife", nullptr, {"bClampAlpha", nullptr, nullptr}},
+    {"ParticleModuleColorScaleOverLife", Kind::ColorScaleOverLife, "ColorScaleOverLife", "AlphaScaleOverLife", nullptr,
+     {"bEmitterTime", nullptr, nullptr}},
+    {"ParticleModuleSizeMultiplyLife", Kind::SizeMultiplyLife, "LifeMultiplier", nullptr, nullptr, {"MultiplyX", "MultiplyY", "MultiplyZ"}},
+    {"ParticleModuleSubUV", Kind::SubUV, "SubImageIndex", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleAccelerationOverLifetime", Kind::AccelerationOverLifetime, "AccelOverLife", nullptr, nullptr,
      {"bAlwaysInWorldSpace", nullptr, nullptr}},
-    {"ParticleModuleAcceleration", ParticleModuleInfo::Kind::Acceleration, "Acceleration", nullptr, nullptr,
+    {"ParticleModuleAcceleration", Kind::Acceleration, "Acceleration", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleLocation", Kind::Location, "StartLocation", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleVelocityOverLifetime", Kind::VelocityOverLifetime, "VelOverLife", nullptr, nullptr, {"Absolute", nullptr, nullptr}},
+    {"ParticleModuleRotationRateMultiplyLife", Kind::RotationRateMultiplyLife, "LifeMultiplier", nullptr, nullptr,
      {nullptr, nullptr, nullptr}},
-    {"ParticleModuleLocation", ParticleModuleInfo::Kind::Location, "StartLocation", nullptr, nullptr, {nullptr, nullptr, nullptr}},
-    {"ParticleModuleVelocityOverLifetime", ParticleModuleInfo::Kind::VelocityOverLifetime, "VelOverLife", nullptr, nullptr,
-     {"Absolute", nullptr, nullptr}},
-    {"ParticleModuleRotationRateMultiplyLife", ParticleModuleInfo::Kind::RotationRateMultiplyLife, "LifeMultiplier", nullptr, nullptr,
-     {nullptr, nullptr, nullptr}},
-    {"ParticleModuleLocationPrimitiveSphere", ParticleModuleInfo::Kind::LocationSphere, "StartRadius", "StartLocation", "VelocityScale",
+    {"ParticleModuleLocationPrimitiveSphere", Kind::LocationSphere, "StartRadius", "StartLocation", "VelocityScale",
      {"SurfaceOnly", "Velocity", nullptr}},
-    {"ParticleModuleLocationPrimitiveCylinder", ParticleModuleInfo::Kind::LocationCylinder, "StartRadius", "StartLocation",
-     "StartHeight", {"SurfaceOnly", "Velocity", "RadialVelocity"}},
+    {"ParticleModuleLocationPrimitiveCylinder", Kind::LocationCylinder, "StartRadius", "StartLocation", "StartHeight",
+     {"SurfaceOnly", "Velocity", "RadialVelocity"}},
+    {"ParticleModuleMeshRotation", Kind::MeshRotation, "StartRotation", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleMeshRotationRate", Kind::MeshRotationRate, "StartRotationRate", nullptr, nullptr, {nullptr, nullptr, nullptr}},
+    {"ParticleModuleMeshRotationRateMultiplyLife", Kind::MeshRotationRateMultiplyLife, "LifeMultiplier", nullptr, nullptr,
+     {nullptr, nullptr, nullptr}},
+    {"ParticleModuleOrbit", Kind::Orbit, "OffsetAmount", "RotationAmount", "RotationRateAmount", {nullptr, nullptr, nullptr}},
+    {"ParticleModuleLocationEmitter", Kind::LocationEmitter, nullptr, nullptr, nullptr, {"InheritSourceVelocity", nullptr, nullptr}},
+    {"ParticleModuleOrientationAxisLock", Kind::AxisLock, nullptr, nullptr, nullptr, {nullptr, nullptr, nullptr}},
 };
 
-// One emitter's first LOD level. False when the port cannot run it (`why` says what is in the way).
-bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std::string>& material_paths, ParticleEmitterInfo& out,
-                  std::string& why) {
+using MeshFor = std::function<int32_t(const std::string& path, const std::string& name)>;
+
+// One LOD level of an emitter. False when the port cannot run it (`why` says what is in the way;
+// empty when the level is simply switched off).
+bool read_lod(const UPKPackage& pkg, int32_t lod_export, std::vector<std::string>& material_paths, const MeshFor& mesh_for,
+              ParticleEmitterInfo& out, std::string& why) {
     const auto& exports = pkg.get_exports();
     const auto valid = [&](int32_t i) { return i > 0 && static_cast<size_t>(i) <= exports.size(); };
-    UPropertyList emitter;
-    parse_export_properties(pkg, emitter_export, emitter);
-    out.name = prop_name(emitter, "EmitterName", "");
-    const UProperty* lods = find_prop(emitter, "LODLevels");
-    if (!lods || lods->ints.empty() || !valid(lods->ints[0])) {
-        why = "no LOD level";
-        return false;
-    }
     UPropertyList lod;
-    parse_export_properties(pkg, lods->ints[0], lod);
-    if (!prop_bool(lod, "bEnabled", true)) {
-        why = "";  // switched off in the template: nothing to draw, and nothing missing
-        return false;
-    }
-    if (prop_object(lod, "TypeDataModule") != 0) {
-        const int32_t type_data = prop_object(lod, "TypeDataModule");
-        why = valid(type_data) ? pkg.get_export_class(exports[static_cast<size_t>(type_data) - 1]) : std::string("type data");
-        return false;
+    parse_export_properties(pkg, lod_export, lod);
+    out.enabled = prop_bool(lod, "bEnabled", true);
+
+    // A mesh emitter draws a static mesh a particle; nothing else with type data is run.
+    bool override_material = false;
+    if (const int32_t type_data = prop_object(lod, "TypeDataModule"); type_data != 0) {
+        const std::string cls = valid(type_data) ? pkg.get_export_class(exports[static_cast<size_t>(type_data) - 1]) : std::string("type data");
+        if (cls != "ParticleModuleTypeDataMesh") {
+            why = cls;
+            return false;
+        }
+        UPropertyList t;
+        parse_export_properties(pkg, type_data, t);
+        const Defaults d = script_default_chain("Default__ParticleModuleTypeDataMesh");
+        const UProperty* mesh = own_or_default(t, d, "Mesh");
+        if (!mesh || mesh->i == 0 || !mesh_for) {
+            why = "a mesh emitter without a mesh";
+            return false;
+        }
+        out.mesh = mesh_for(object_canonical_path(pkg, mesh->i), object_full_path(pkg, mesh->i));
+        if (out.mesh < 0) {
+            why = "a mesh emitter whose mesh is not loaded";
+            return false;
+        }
+        override_material = flag(t, d, "bOverrideMaterial", false);
     }
 
     // The required module.
@@ -159,8 +176,8 @@ bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std
         if (material && material->i != 0) out.material = material_index(object_canonical_path(pkg, material->i), material_paths);
         const std::string alignment = enum_name(r, d, "ScreenAlignment");
         out.screen_alignment = alignment == "PSA_Velocity" ? 2 : (alignment == "PSA_Rectangle" ? 1 : 0);
-        if (alignment == "PSA_TypeSpecific") out.screen_alignment = 0;
         out.local_space = flag(r, d, "bUseLocalSpace", false);
+        out.kill_on_deactivate = flag(r, d, "bKillOnDeactivate", false);
         out.duration = number(r, d, "EmitterDuration", 1.0f);
         out.loops = static_cast<int32_t>(number(r, d, "EmitterLoops", 0.0f));
         out.delay = number(r, d, "EmitterDelay", 0.0f);
@@ -174,10 +191,12 @@ bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std
         out.sub_images_v = std::max(1, static_cast<int32_t>(number(r, d, "SubImages_Vertical", 1.0f)));
         out.max_draw_count = flag(r, d, "bUseMaxDrawCount", true) ? static_cast<int32_t>(number(r, d, "MaxDrawCount", 500.0f)) : 0;
     }
-    if (out.material < 0) {
+    if (out.mesh < 0 && out.material < 0) {
         why = "no material";
         return false;
     }
+    // A mesh emitter draws its mesh's own materials unless it is told to use the emitter's.
+    if (out.mesh >= 0 && !override_material) out.material = -1;
 
     // The spawn module.
     const int32_t spawn = prop_object(lod, "SpawnModule");
@@ -209,6 +228,15 @@ bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std
             parse_export_properties(pkg, m, props);
             const Defaults d = script_default_chain("Default__" + cls);
             if (!flag(props, d, "bEnabled", true)) continue;
+            if (cls == "ParticleModuleMeshMaterial") {
+                // The mesh's material slots, replaced.
+                if (const UProperty* list = own_or_default(props, d, "MeshMaterials")) {
+                    for (int32_t ref : list->ints) {
+                        out.mesh_materials.push_back(ref != 0 ? material_index(object_canonical_path(pkg, ref), material_paths) : -1);
+                    }
+                }
+                continue;
+            }
             const ModuleShape* shape = nullptr;
             for (const ModuleShape& candidate : kModules) {
                 if (cls == candidate.cls) shape = &candidate;
@@ -224,10 +252,28 @@ bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std
             if (shape->c) info.c = distribution(props, d, shape->c);
             for (int k = 0; k < 3; ++k) {
                 // The size multiplier's axes and the alpha clamp are on unless the level says not.
-                const bool fallback = shape->kind == ParticleModuleInfo::Kind::SizeMultiplyLife ||
-                                      shape->kind == ParticleModuleInfo::Kind::Color ||
-                                      shape->kind == ParticleModuleInfo::Kind::ColorOverLife;
+                const bool fallback = shape->kind == Kind::SizeMultiplyLife || shape->kind == Kind::Color ||
+                                      shape->kind == Kind::ColorOverLife;
                 if (shape->flags[k]) info.flag[k] = flag(props, d, shape->flags[k], fallback);
+            }
+            if (shape->kind == Kind::Orbit) {
+                // Which of the three are read again every frame (all are read at spawn by default).
+                static const char* kOptions[3] = {"OffsetOptions", "RotationOptions", "RotationRateOptions"};
+                for (int k = 0; k < 3; ++k) {
+                    const UProperty* update = struct_member(props, d, kOptions[k], "bProcessDuringUpdate");
+                    info.flag[k] = update && update->b;
+                }
+            } else if (shape->kind == Kind::LocationEmitter) {
+                info.name = to_lower(enum_name(props, d, "EmitterName"));
+                info.link = enum_name(props, d, "SelectionMethod") == "ELESM_Sequential" ? 1 : 0;
+                info.scale = number(props, d, "InheritSourceVelocityScale", 1.0f);
+            } else if (shape->kind == Kind::AxisLock) {
+                static const char* kAxes[6] = {"EPAL_X", "EPAL_Y", "EPAL_Z", "EPAL_NEGATIVE_X", "EPAL_NEGATIVE_Y", "EPAL_NEGATIVE_Z"};
+                const std::string axis = enum_name(props, d, "LockAxisFlags");
+                for (int k = 0; k < 6; ++k) {
+                    if (axis == kAxes[k]) info.link = k + 1;
+                }
+                if (info.link == 0) continue;  // EPAL_NONE, or a rotation about an axis: not locked
             }
             out.modules.push_back(std::move(info));
         }
@@ -235,15 +281,95 @@ bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std
     return true;
 }
 
+// An emitter: its first LOD level, and the lower ones behind it.
+bool read_emitter(const UPKPackage& pkg, int32_t emitter_export, std::vector<std::string>& material_paths, const MeshFor& mesh_for,
+                  ParticleEmitterInfo& out, std::string& why) {
+    const auto& exports = pkg.get_exports();
+    const auto valid = [&](int32_t i) { return i > 0 && static_cast<size_t>(i) <= exports.size(); };
+    UPropertyList emitter;
+    parse_export_properties(pkg, emitter_export, emitter);
+    const UProperty* lods = find_prop(emitter, "LODLevels");
+    if (!lods || lods->ints.empty() || !valid(lods->ints[0])) {
+        why = "no LOD level";
+        return false;
+    }
+    if (!read_lod(pkg, lods->ints[0], material_paths, mesh_for, out, why)) return false;
+    if (!out.enabled) {
+        why = "";  // switched off in the template: nothing to draw, and nothing missing
+        return false;
+    }
+    out.name = to_lower(prop_name(emitter, "EmitterName", ""));
+    for (size_t k = 1; k < lods->ints.size(); ++k) {
+        ParticleEmitterInfo lower;
+        std::string lower_why;
+        // A lower level the port cannot run keeps the level above it.
+        if (!valid(lods->ints[k]) || !read_lod(pkg, lods->ints[k], material_paths, mesh_for, lower, lower_why)) {
+            lower = out.lower_lods.empty() ? out : out.lower_lods.back();
+            lower.lower_lods.clear();
+        }
+        lower.name = out.name;
+        out.lower_lods.push_back(std::move(lower));
+    }
+    return true;
+}
+
+// A ParticleSystem export as a template of the scene, read once. `left_out` counts what stood in
+// an emitter's way.
+int32_t read_template(const UPKPackage& pkg, int32_t template_export, LevelScene& scene, std::vector<std::string>& material_paths,
+                      const MeshFor& mesh_for, std::map<std::string, int>* left_out) {
+    const auto& exports = pkg.get_exports();
+    const auto valid = [&](int32_t i) { return i > 0 && static_cast<size_t>(i) <= exports.size(); };
+    if (!valid(template_export)) return -1;
+    const std::string path = object_canonical_path(pkg, template_export);
+    const std::string key = to_lower(path);
+    for (size_t i = 0; i < scene.particle_templates.size(); ++i) {
+        if (to_lower(scene.particle_templates[i].path) == key) return static_cast<int32_t>(i);
+    }
+    ParticleSystemTemplate t;
+    t.path = path;
+    UPropertyList props;
+    parse_export_properties(pkg, template_export, props);
+    const Defaults d = script_default_chain("Default__ParticleSystem");
+    t.warmup_time = number(props, d, "WarmupTime", 0.0f);
+    t.lod_check_time = number(props, d, "LODDistanceCheckTime", 0.25f);
+    if (const UProperty* distances = find_prop(props, "LODDistances")) {
+        for (int32_t bits : distances->ints) {
+            float v = 0.0f;
+            std::memcpy(&v, &bits, sizeof(v));
+            t.lod_distances.push_back(v);
+        }
+    }
+    if (const UProperty* list = find_prop(props, "Emitters")) {
+        for (int32_t e : list->ints) {
+            if (!valid(e)) continue;
+            ParticleEmitterInfo info;
+            std::string why;
+            if (read_emitter(pkg, e, material_paths, mesh_for, info, why)) {
+                t.emitters.push_back(std::move(info));
+            } else if (!why.empty()) {
+                ++t.emitters_left_out;
+                if (left_out) ++(*left_out)[why];
+            }
+        }
+    }
+    scene.particle_templates.push_back(std::move(t));
+    return static_cast<int32_t>(scene.particle_templates.size()) - 1;
+}
+
 }  // namespace
 
+int32_t particle_template_for(const UPKPackage& pkg, int32_t template_export, LevelScene& scene,
+                              std::vector<std::string>& material_paths, const MeshFor& mesh_for) {
+    const int32_t index = read_template(pkg, template_export, scene, material_paths, mesh_for, nullptr);
+    return index >= 0 && !scene.particle_templates[static_cast<size_t>(index)].emitters.empty() ? index : -1;
+}
+
 void extract_level_particles(const std::vector<std::shared_ptr<UPKPackage>>& packages, LevelScene& scene,
-                             std::vector<std::string>& material_paths) {
+                             std::vector<std::string>& material_paths, const MeshFor& mesh_for) {
     scene.particle_templates.clear();
     scene.particle_systems.clear();
-    std::map<std::string, int32_t> template_by_path;
     std::map<std::string, int> left_out;  // what stood in an emitter's way -> emitters
-    size_t physx_only = 0, waiting = 0, no_template = 0, emitters = 0, emitters_left_out = 0;
+    size_t physx_only = 0, waiting = 0, no_template = 0, emitters = 0, mesh_emitters = 0, emitters_left_out = 0;
     for (const auto& pkg_ptr : packages) {
         if (!pkg_ptr) continue;
         const UPKPackage& pkg = *pkg_ptr;
@@ -286,38 +412,19 @@ void extract_level_particles(const std::vector<std::shared_ptr<UPKPackage>>& pac
             }
             const int32_t template_export = p.i;
 
-            const std::string path = to_lower(object_canonical_path(pkg, template_export));
-            auto known = template_by_path.find(path);
-            if (known == template_by_path.end()) {
-                ParticleSystemTemplate t;
-                t.path = object_canonical_path(pkg, template_export);
-                UPropertyList props;
-                parse_export_properties(pkg, template_export, props);
-                t.warmup_time = prop_float(props, "WarmupTime", 0.0f);
-                if (const UProperty* list = find_prop(props, "Emitters")) {
-                    for (int32_t e : list->ints) {
-                        if (!valid(e)) continue;
-                        ParticleEmitterInfo info;
-                        std::string why;
-                        if (read_emitter(pkg, e, material_paths, info, why)) {
-                            t.emitters.push_back(std::move(info));
-                        } else if (!why.empty()) {
-                            ++t.emitters_left_out;
-                            ++left_out[why];
-                        }
-                    }
-                }
-                scene.particle_templates.push_back(std::move(t));
-                known = template_by_path.emplace(path, static_cast<int32_t>(scene.particle_templates.size()) - 1).first;
-            }
-            const ParticleSystemTemplate& t = scene.particle_templates[static_cast<size_t>(known->second)];
+            const int32_t template_index = read_template(pkg, template_export, scene, material_paths, mesh_for, &left_out);
+            if (template_index < 0) continue;
+            const ParticleSystemTemplate& t = scene.particle_templates[static_cast<size_t>(template_index)];
             emitters += t.emitters.size();
+            for (const ParticleEmitterInfo& e : t.emitters) mesh_emitters += e.mesh >= 0 ? 1 : 0;
             emitters_left_out += static_cast<size_t>(t.emitters_left_out);
             if (t.emitters.empty()) continue;
 
             ParticleSystemPlacement placement;
-            placement.name = package_name_of(pkg) + "." + exports[i].object_name;
-            placement.template_index = known->second;
+            placement.package = to_lower(package_name_of(pkg));
+            placement.export_index = actor_index;
+            placement.name = package_name_of(pkg) + "." + export_object_name(pkg, actor_index);
+            placement.template_index = template_index;
             if (const UProperty* v = find_prop(actor, "Location")) placement.location = Vec3(v->v[0], v->v[1], v->v[2]);
             float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
             if (const UProperty* r = find_prop(actor, "Rotation")) {
@@ -344,9 +451,9 @@ void extract_level_particles(const std::vector<std::shared_ptr<UPKPackage>>& pac
     }
     if (!scene.particle_systems.empty() || physx_only > 0 || emitters_left_out > 0) {
         std::cout << "[Level] Particles: " << scene.particle_systems.size() << " systems of " << scene.particle_templates.size()
-                  << " templates, " << emitters << " sprite emitters run (" << waiting << " systems wait to be switched on; "
-                  << emitters_left_out << " emitters left out; " << physx_only << " PhysX-only placements, " << no_template
-                  << " without a template)" << std::endl;
+                  << " templates, " << emitters << " emitters run, " << mesh_emitters << " of them mesh emitters (" << waiting
+                  << " systems wait to be switched on; " << emitters_left_out << " emitters left out; " << physx_only
+                  << " PhysX-only placements, " << no_template << " without a template)" << std::endl;
         if (std::getenv("ME_PARTICLE_DEBUG")) {
             for (const auto& [why, n] : left_out) std::cout << "[Level]   left out, " << n << " template emitters: " << why << std::endl;
         }

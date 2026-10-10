@@ -50,6 +50,7 @@ set(CORE_SOURCES
     src/assets/level_lensflares.cpp
     src/assets/level_lights.cpp
     src/assets/level_particles.cpp
+    src/assets/level_impacts.cpp
     src/assets/level_postprocess.cpp
     src/game/level_script.cpp
     src/physics/collision_world.cpp

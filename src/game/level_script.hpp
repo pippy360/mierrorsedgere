@@ -38,6 +38,7 @@ struct ScriptActor {
     std::string name;         // "Trigger_16"
     Vec3 location{0.0f, 0.0f, 0.0f};
     float yaw_deg = 0.0f;
+    float pitch_deg = 0.0f;
     // Trigger: CylinderComponent
     bool has_cylinder = false;
     float radius = 40.0f;
@@ -71,6 +72,14 @@ struct ScriptMatinee {
     float length = 0.0f;
     std::vector<std::pair<float, std::string>> events;  // InterpTrackEvent keys of every group
     std::vector<ScriptSound> sounds;                    // InterpTrackSound keys of every group
+    // InterpTrackToggle keys: at `time` the actors of the Matinee's group `group` (those linked to
+    // the SeqAct_Interp's variable link of that name) are switched: 0 on, 1 off, 2 the other way.
+    struct Toggle {
+        float time = 0.0f;
+        std::string group;
+        int action = 0;
+    };
+    std::vector<Toggle> toggles;
     int player_cutscene = -1;                           // index into LevelScene::cutscenes, -1 if the pawn is not in it
 };
 
@@ -209,6 +218,13 @@ struct ScriptHost {
     std::function<void(bool on)> slomo;
     // SeqAct_ShowLoading / SeqAct_HideLoading
     std::function<void(bool shown)> loading_indicator;
+    // An emitter or a lens flare switched by SeqAct_Toggle or a Matinee's toggle track: 0 on,
+    // 1 off, 2 the other way. And one hidden or shown (SeqAct_ToggleHidden, SeqAct_Destroy).
+    std::function<void(const ScriptActor& actor, int action)> toggle_effect;
+    std::function<void(const ScriptActor& actor, bool hidden)> hide_effect;
+    // SeqAct_ActorFactory with an ActorFactoryEmitter: the factory (its package's stem in lower
+    // case and its export) makes its particle system at a spawn point.
+    std::function<void(const std::string& package, int32_t factory_export, const ScriptActor& at)> spawn_effect;
     // SeqAct_ChangeCollision / SeqAct_Toggle on collision/volume actors
     std::function<void(const ScriptActor& actor, bool collide_actors, bool block_actors)> change_collision;
     // Line checks for SeqEvent_LOS (bCheckForObstructions): true when the way is clear

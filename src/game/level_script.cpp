@@ -151,7 +151,10 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
         UPropertyList props;
         parse_export_properties(pkg, export_index, props);
         if (const UProperty* loc = find_prop(props, "Location")) a.location = Vec3(loc->v[0], loc->v[1], loc->v[2]);
-        if (const UProperty* rot = find_prop(props, "Rotation")) a.yaw_deg = static_cast<float>(rot->vi[1]) * (360.0f / 65536.0f);
+        if (const UProperty* rot = find_prop(props, "Rotation")) {
+            a.yaw_deg = static_cast<float>(rot->vi[1]) * (360.0f / 65536.0f);
+            a.pitch_deg = static_cast<float>(rot->vi[0]) * (360.0f / 65536.0f);
+        }
         a.collide_actors = prop_bool(props, "bCollideActors", true);
         a.bounds.min_pt = a.location;
         a.bounds.max_pt = a.location;
@@ -338,6 +341,10 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                 n.actor = actor_for(n.package, obj);
                 n.text = is_export(pkg, obj) ? class_of(pkg, obj) : std::string();
             }
+        } else if (c == "SeqAct_ActorFactory") {
+            // An emitter's factory is followed (its particle system is made); the others are not.
+            const int32_t factory = prop_object(props, "Factory");
+            if (is_export(pkg, factory) && class_of(pkg, factory) == "ActorFactoryEmitter") n.i = factory;
         } else if (c == "SeqAct_Delay") {
             n.f = prop_float(props, "Duration", 1.0f);
         } else if (c == "SeqAct_Gate") {
@@ -498,6 +505,7 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                     parse_export_properties(pkg, g, gp);
                     const UProperty* tracks = find_prop(gp, "InterpTracks");
                     if (!tracks) continue;
+                    const std::string group_name = prop_name(gp, "GroupName", "InterpGroup");
                     for (int32_t t : tracks->ints) {
                         const std::string cls = class_of(pkg, t);
                         if (cls.empty()) continue;
@@ -506,6 +514,18 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                         if (cls == "InterpTrackEvent") {
                             if (const UProperty* keys = find_prop(tp, "EventTrack")) {
                                 for (const auto& k : keys->elements) m.events.emplace_back(prop_float(k, "Time", 0.0f), prop_name(k, "EventName"));
+                            }
+                        } else if (cls == "InterpTrackToggle") {
+                            if (const UProperty* keys = find_prop(tp, "ToggleTrack")) {
+                                for (const auto& k : keys->elements) {
+                                    ScriptMatinee::Toggle toggle;
+                                    toggle.time = prop_float(k, "Time", 0.0f);
+                                    toggle.group = group_name;
+                                    // ETrackToggleAction; ETTA_Off is the first and is not saved.
+                                    const std::string action = prop_name(k, "ToggleAction", "ETTA_Off");
+                                    toggle.action = action == "ETTA_On" ? 0 : (action == "ETTA_Toggle" ? 2 : 1);
+                                    m.toggles.push_back(std::move(toggle));
+                                }
                             }
                         } else if (cls.find("InterpTrackSound") != std::string::npos) {
                             if (const UProperty* keys = find_prop(tp, "Sounds")) {
@@ -665,6 +685,17 @@ const ScriptActor* LevelScript::begin_play(const std::string& checkpoint_name) {
     } else {
         log("[Script] level loaded; no checkpoint of that name" + (checkpoint_name.empty() ? std::string() : " ('" + checkpoint_name + "')"));
     }
+    // The emitters the script can make (SeqAct_ActorFactory with an ActorFactoryEmitter).
+    size_t factories = 0, placed = 0;
+    for (size_t i = 0; i < graph_->nodes.size(); ++i) {
+        const ScriptGraph::Node& n = graph_->nodes[i];
+        if (n.cls != "SeqAct_ActorFactory" || n.i <= 0) continue;
+        ++factories;
+        bool point = false;
+        for (int t : linked_vars(static_cast<int>(i), "Spawn Point")) point = point || graph_->nodes[static_cast<size_t>(t)].actor >= 0;
+        placed += point ? 1 : 0;
+    }
+    if (factories > 0) log("[Script] emitter factories: " + std::to_string(factories) + ", " + std::to_string(placed) + " with a spawn point");
     return cp >= 0 ? &graph_->actors[static_cast<size_t>(cp)] : nullptr;
 }
 
@@ -1032,6 +1063,16 @@ void LevelScript::fire_matinee_keys(int node, float previous, float position) {
     for (const auto& [when, name] : m.events) {
         if (when > previous && when <= position) fire_output(node, name.c_str());
     }
+    // The toggle tracks switch the emitters and lens flares of their groups.
+    if (host_.toggle_effect) {
+        for (const ScriptMatinee::Toggle& toggle : m.toggles) {
+            if (!(toggle.time > previous && toggle.time <= position)) continue;
+            for (int v : linked_vars(node, toggle.group.c_str())) {
+                const int actor = graph_->nodes[static_cast<size_t>(v)].actor;
+                if (actor >= 0) host_.toggle_effect(graph_->actors[static_cast<size_t>(actor)], toggle.action);
+            }
+        }
+    }
     // A player cutscene's sound track plays from the player; another Matinee's would play from
     // its actors, positioned, which is not done here (an ambient loop would otherwise be heard
     // everywhere at full volume).
@@ -1384,6 +1425,11 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
             if (actor < 0) continue;
             const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
             const std::string& acls = sa.cls;
+            if (acls.find("Emitter") != std::string::npos || acls == "LensFlareSource") {
+                // Emitter.OnToggle, LensFlareSource.OnToggle: the system or the flare goes on or off.
+                if (host_.toggle_effect) host_.toggle_effect(sa, (s.impulses & 1u) ? 0 : ((s.impulses & 2u) ? 1 : 2));
+                continue;
+            }
             if (acls.find("Trigger") == std::string::npos && acls.find("Volume") == std::string::npos) continue;
             for (size_t i = 0; i < graph_->nodes.size(); ++i) {
                 if (graph_->nodes[i].originator != actor) continue;
@@ -1491,6 +1537,33 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
             }
         }
         if (!fired && n.outputs.size() > 1) s.out |= 1u << (n.outputs.size() - 1);
+    } else if (c == "SeqAct_ToggleHidden" || c == "SeqAct_Destroy") {
+        // Hide / UnHide / Toggle, or gone for good: followed for the emitters and lens flares.
+        for (int t : linked_vars(node, "Target")) {
+            const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
+            if (actor < 0 || !host_.hide_effect) continue;
+            const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
+            if (sa.cls.find("Emitter") == std::string::npos && sa.cls != "LensFlareSource") continue;
+            if (c == "SeqAct_Destroy" || (s.impulses & 1u)) {
+                host_.hide_effect(sa, true);
+            } else if (s.impulses & 2u) {
+                host_.hide_effect(sa, false);
+            }
+        }
+        s.out = all_outputs;
+    } else if (c == "SeqAct_ActorFactory" && n.i > 0) {
+        // "Spawn Actor" (the first input): the factory's emitter at every spawn point.
+        if ((s.impulses & 1u) && host_.spawn_effect) {
+            int made = 0;
+            for (int t : linked_vars(node, "Spawn Point")) {
+                const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
+                if (actor < 0) continue;
+                host_.spawn_effect(graph_->packages[static_cast<size_t>(n.package)], n.i, graph_->actors[static_cast<size_t>(actor)]);
+                ++made;
+            }
+            log("[Script] " + n.name + " makes its emitter at " + std::to_string(made) + " spawn point(s)");
+        }
+        fire_output(node, "Finished");
     } else if (c == "SeqAct_TdDisarmRopeburn") {
         // The Ropeburn counter-disarm is not played here: the fight is given to the player so the
         // chapter goes on.
