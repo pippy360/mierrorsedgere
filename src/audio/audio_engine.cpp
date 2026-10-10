@@ -110,6 +110,16 @@ VoiceAttenuation default_voice_attenuation() {
     return att;
 }
 
+// How far a wave carries: at the MaxRadius of any attenuating node above it the volume is set to 0
+// (kSoundWorldMax for a wave nothing attenuates).
+float carrying_distance(const VoiceAttenuation& att) {
+    float reach = kSoundWorldMax;
+    for (const DrawnAttenuation& n : att.nodes) {
+        if (n.attenuate) reach = std::min(reach, n.max_radius);
+    }
+    return reach;
+}
+
 // "Linear 10/2000", "LogReverse 1/18000 x LogReverse 10/8000", for ME_AUDIO_DEBUG.
 std::string describe_attenuation(const VoiceAttenuation& att) {
     static const char* const kModels[] = {"Linear", "Logarithmic", "Inverse", "LogReverse", "NaturalSound"};
@@ -180,7 +190,7 @@ void AudioEngine::shutdown() {
     sound_clips_.clear();
     sound_cues_.clear();
     ambient_emitters_.clear();
-    ambient_radii_.clear();
+    ambient_plays_.clear();
     positional_requests_.clear();
     pending_voices_.clear();
     for (SourceVoice& v : source_voices_) v = SourceVoice{};
@@ -914,33 +924,59 @@ void AudioEngine::update(float dt,
 #endif
 }
 
-// The radii an emitter's cue plays with, drawn the first time the emitter is looked at.
-const AudioEngine::EmitterRadii& AudioEngine::emitter_radii(size_t emitter) {
-    if (ambient_radii_.size() < ambient_emitters_.size()) ambient_radii_.resize(ambient_emitters_.size());
-    EmitterRadii& r = ambient_radii_[emitter];
+// What an emitter's cue plays with: its radii, drawn the first time the emitter is looked at, and
+// with them the layer of the cue that carries farthest (EmitterPlay).
+const AudioEngine::EmitterPlay& AudioEngine::emitter_play(size_t emitter) {
+    if (ambient_plays_.size() < ambient_emitters_.size()) ambient_plays_.resize(ambient_emitters_.size());
+    EmitterPlay& r = ambient_plays_[emitter];
     const AmbientEmitterInfo& em = ambient_emitters_[emitter];
     const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
     const bool has_cue = cue_it != sound_cues_.end();
     if (r.drawn && r.has_cue == has_cue && r.radii.size() == (has_cue ? cue_it->second.attenuations.size() : 0)) return r;
+    r = EmitterPlay{};
     r.drawn = true;
     r.has_cue = has_cue;
-    r.radii.clear();
     if (!has_cue) {
-        // A wave with no cue of its own: the class's defaults (emitter_attenuation below).
-        r.reach = SoundAttenuation{}.max_radius[1];
+        // A wave with no cue of its own: the class's defaults.
+        r.attenuation = default_voice_attenuation();
         return r;
     }
-    r.radii = draw_cue_radii(cue_it->second);
-    r.reach = 0.0f;
-    for (const DrawnRadii& d : r.radii) r.reach = std::max(r.reach, d.max_radius);
-    if (r.reach == 0.0f) r.reach = kSoundWorldMax;
+    const SoundCueDef& cue = cue_it->second;
+    r.radii = draw_cue_radii(cue);
+    // A layer is the cue's loaded waves under one set of nodes. The one that carries farthest is the
+    // emitter's, the first the graph reaches when two carry equally far. (A concatenator's waves are
+    // not layers but one stitched clip under the cue's name. A cue that plays in rounds,
+    // next_ambient_voice, takes each round's first wave whatever is chosen here: none of the game's
+    // emitters has such a cue with layers that carry different distances.)
+    std::vector<int> layer;
+    float carries = -1.0f;
+    if (!cue.is_concatenator) {
+        for (const std::string& wave : cue.wave_names) {
+            const auto clip = sound_clips_.find(wave);
+            if (clip == sound_clips_.end() || clip->second.pcm_data.empty()) continue;
+            std::vector<int> path = wave_attenuations(cue, wave);
+            if (!r.waves.empty() && path == layer) {
+                r.waves.push_back(wave);
+                continue;
+            }
+            VoiceAttenuation attenuation = make_voice_attenuation(cue, path, r.radii, em.location, nullptr);
+            const float reach = carrying_distance(attenuation);
+            if (reach <= carries) continue;
+            carries = reach;
+            layer = std::move(path);
+            r.attenuation = std::move(attenuation);
+            r.waves.assign(1, wave);
+        }
+    }
+    if (r.waves.empty()) r.attenuation = make_voice_attenuation(cue, wave_attenuations(cue, std::string()), r.radii, em.location, nullptr);
     return r;
 }
 
 // The nearest 4 AmbientSound emitters of the *_Aud.me1 sublevels that can be heard. Each plays at
 // the gain its cue's attenuation nodes give it at the listener's distance (USoundNodeAttenuation,
-// or USoundNodeAmbient for an AmbientSoundSimple), and is in the running only while the listener is
-// inside the largest of their MaxRadius, where retail's emitter plays on at volume 0.
+// or USoundNodeAmbient for an AmbientSoundSimple), and is in the running only while that gain is
+// above nothing: retail's emitter plays on at volume 0 out of range, here it would keep one of the
+// four sources from an emitter that is heard.
 // With a menu up they are silent: retail's front end is a map of its own (TdMainMenu) with no
 // AmbientSound in it, only its music and the UI's cues, and a paused game's sounds are paused.
 void AudioEngine::update_ambient_emitters(float dt) {
@@ -968,8 +1004,7 @@ void AudioEngine::update_ambient_emitters(float dt) {
     for (size_t i = 0; i < ambient_emitters_.size(); ++i) {
         Vec3 d = ambient_emitters_[i].location - listener_pos_;
         float d2 = d.dot(d);
-        const float reach = emitter_radii(i).reach;
-        if (reach >= kSoundWorldMax || d2 < reach * reach) {
+        if (emitter_play(i).attenuation.gain(std::sqrt(d2)) > 0.0f) {
             cands.push_back({static_cast<int32_t>(i), d2});
         }
     }
@@ -991,13 +1026,11 @@ void AudioEngine::update_ambient_emitters(float dt) {
         const auto& em = ambient_emitters_[eidx];
         const float distance = std::sqrt(cands[slot].dist_sq);
         const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
-        // The attenuation of the wave about to start: the nodes above it in the emitter's cue, with
-        // the emitter's radii. A wave that has no cue gets Default__SoundNodeAttenuation.
-        const auto emitter_attenuation = [&](const std::vector<int>* path, const std::string& wave) {
+        // The attenuation of a round's wave: the nodes above it in the emitter's cue, with the
+        // emitter's radii.
+        const auto round_attenuation = [&](const std::vector<int>& path) {
             if (cue_it == sound_cues_.end()) return default_voice_attenuation();
-            const SoundCueDef& cue = cue_it->second;
-            return make_voice_attenuation(cue, path ? *path : wave_attenuations(cue, wave), emitter_radii(static_cast<size_t>(eidx)).radii,
-                                          em.location, nullptr);
+            return make_voice_attenuation(cue_it->second, path, emitter_play(static_cast<size_t>(eidx)).radii, em.location, nullptr);
         };
         auto start = [&](const SoundClip* clip, bool loop, VoiceAttenuation att, float pitch) {
             if (!clip) return false;
@@ -1038,9 +1071,18 @@ void AudioEngine::update_ambient_emitters(float dt) {
             // The cue's own graph says how it repeats: a wave under a SoundNodeLooping
             // plays end to end; with a SoundNodeDelay between them each round waits first.
             if (!next_ambient_voice(slot, em)) {
-                float dummy_v = em.volume, dummy_p = em.pitch;
-                const SoundClip* clip = resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
-                if (clip) start(clip, true, emitter_attenuation(nullptr, clip->name), em.pitch);
+                // One of the waves of the layer the emitter plays (EmitterPlay), or what its name
+                // resolves to when it has no layer to choose from.
+                const EmitterPlay& play = emitter_play(static_cast<size_t>(eidx));
+                const SoundClip* clip = nullptr;
+                if (!play.waves.empty()) {
+                    const auto it = sound_clips_.find(play.waves[static_cast<size_t>(std::rand()) % play.waves.size()]);
+                    if (it != sound_clips_.end()) clip = &it->second;
+                } else {
+                    float dummy_v = em.volume, dummy_p = em.pitch;
+                    clip = resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
+                }
+                if (clip) start(clip, true, play.attenuation, em.pitch);
             }
         }
         float voice_volume = 1.0f, voice_pitch = 1.0f;
@@ -1050,8 +1092,7 @@ void AudioEngine::update_ambient_emitters(float dt) {
                 auto it = sound_clips_.find(ambient_voice_[slot].clip);
                 // (A wave that is not loaded is skipped: the next round picks again.)
                 if (it != sound_clips_.end() &&
-                    start(&it->second, false, emitter_attenuation(&ambient_voice_[slot].attenuations, ambient_voice_[slot].clip),
-                          em.pitch * ambient_voice_[slot].pitch)) {
+                    start(&it->second, false, round_attenuation(ambient_voice_[slot].attenuations), em.pitch * ambient_voice_[slot].pitch)) {
                     ambient_mode_[slot] = AmbientMode::Playing;
                 } else {
                     next_ambient_voice(slot, em);
@@ -1086,6 +1127,8 @@ void AudioEngine::update_ambient_emitters(float dt) {
             alSourcef(asrc, AL_GAIN, gain);
             alSourcef(asrc, AL_PITCH, em.pitch * voice_pitch * slomo_pitch_scale_);
         }
+#else
+        (void)voice_pitch;
 #endif
         if (ambient_sounding_[slot]) {
             ambient_info_[slot].distance = distance;
@@ -1339,7 +1382,7 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
 bool AudioEngine::load_level_audio(const std::string& game_root, const std::string& map_file) {
     namespace fs = std::filesystem;
     ambient_emitters_.clear();
-    ambient_radii_.clear();
+    ambient_plays_.clear();
     level_loaded_cues_.clear();
     vo_elapsed_ = 0.0f;
     vo_duration_ = 0.0f;

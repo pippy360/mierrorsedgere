@@ -356,16 +356,22 @@ private:
     PositionalVoice ambient_info_[kAmbientPoolSize];
     // An emitter's cue is one play that starts with the level and lasts as long as it does: the
     // radii of its attenuation nodes are drawn once, the first time the emitter is looked at, and
-    // not again when it comes back into the pool. `reach` is the largest MaxRadius drawn, past
-    // which every wave of the cue is silent (kSoundWorldMax for a cue with no radius).
-    struct EmitterRadii {
+    // not again when it comes back into the pool. Retail plays every layer of the cue. An emitter
+    // here has one source, which plays one wave, so of a cue that mixes layers under different
+    // attenuation nodes (767 of the 1,650 emitters of the *_Aud files; in 701 the layers' MaxRadius
+    // differ: a vent's hiss to 1500 uu with its hum to 3000) it plays the layer that carries
+    // farthest, the one heard wherever retail's emitter is. `waves` are that layer's and
+    // `attenuation` the nodes above it with the radii drawn: the emitter is in the running for a
+    // source while they leave it any volume at all.
+    struct EmitterPlay {
         bool drawn = false;
         bool has_cue = false;
         std::vector<DrawnRadii> radii;
-        float reach = 0.0f;
+        std::vector<std::string> waves;                       // sound_clips_ keys; none: whatever its name resolves to
+        VoiceAttenuation attenuation;
     };
-    std::vector<EmitterRadii> ambient_radii_;                 // by ambient_emitters_ index
-    const EmitterRadii& emitter_radii(size_t emitter);
+    std::vector<EmitterPlay> ambient_plays_;                  // by ambient_emitters_ index
+    const EmitterPlay& emitter_play(size_t emitter);
 
     // Stamina-coupled Faith breathing cadence state (A_Character_Female_01.upk)
     float breath_timer_ = 0.0f;

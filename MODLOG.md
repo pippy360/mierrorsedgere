@@ -1863,3 +1863,100 @@ listener is the pawn's location plus eye height. `HearSound`'s test is applied t
 emitter pool still plays one wave of a layered cue. Nothing was listened to: every figure above is a gain
 read back with no audio device, and nothing was held against a retail recording. macOS was not compiled:
 the check needs a pushed branch, which this task was not to make. In `TODO.md`.
+
+---
+
+## 38. Sounds at a place, after review: the listener behind a menu, emitters with layers (agent/sound-attenuation, 2026-10-10)
+
+Three reviews of section 37's work found nine things, which come to four: a menu's frame gave the audio
+engine a listener at the world's origin, a level emitter could hold one of the four emitter sources while
+silent, two documents said more than had been read, and a build without OpenAL had a new warning. All nine
+held and are fixed here. `docs/AUDIO_SYSTEM_RE.md` section 3.2 has the rules.
+
+### 38.1 What the game does (Engine.u's bytecode, the cooked `*_Aud` files)
+- `PlayerController.ClientHearSound` (Engine.u, read with `tools/uscript_bytecode.py`) makes the component
+  of a sound `HearSound` let through: at `SourceLocation` when the sound has no actor; with no place and
+  `bAllowSpatialization = false` when its actor is the view target or the controller; else on the actor (at
+  `SourceLocation` when one is given that is not the actor's own). `USoundNodeAttenuation::ParseNodes` does
+  nothing for a component with that flag clear (0x00B7DD68), and `Default__AudioComponent` has it on. An
+  occluded sound gets `VolumeMultiplier *= 0.5`. Section 37's document had stated the flag's part without a
+  source.
+- `PlayerController.Kismet_ClientPlaySound` makes its component with
+  `SourceActor.CreateAudioComponent(ASound, false, true)`, no location, and clears the same flag when passed
+  `bSuppressSpatialization`. `Actor.PlaySound` and `Actor.CreateAudioComponent` are natives.
+- Still not read: that `Actor.PlaySound` is what calls `HearSound` (0x00EF4480 sits in three vtables,
+  nothing calls it directly), and that the float `IsAudibleSimple` compares with 1.0 is the cue's duration
+  (the cue's virtual at vtable offset 0x114, named by its place in stock Unreal Engine 3).
+- The emitters' cues: of the 1,650 `AmbientSound` actors in the `*_Aud` files 767 have a cue with two
+  attenuation nodes, each over its own input of a mixer under the loop, and the other 883 one node above
+  all their waves. None of the 767 has a delay node, two nodes on one branch or `bAttenuate` off, and every
+  wave of every emitter's cue is loaded. In 701 the two `MaxRadius` differ: `A_Prop_AirPipe_Indoor` (207
+  emitters) Logarithmic 150 / 3000 with Logarithmic 2 / 1500, `A_Prop_AirVent_Indoor` (111) and
+  `A_Prop_AirVent_Low_Indoor` (83) Logarithmic 2 / 1500 with Logarithmic 150 / 3000, `A_Prop_ACAiry_Indoor`
+  (78) Logarithmic 1 / 2000 with Linear 150 / 4000. In 59 of the 767 the two ranges overlap, so the draw
+  decides which layer carries farther; 64 tie exactly (61 `A_Prop_WaterPipeBright_Indoor`: LogReverse
+  50 / 1000 with NaturalSound 50 / 1000). Retail plays both layers, each at its own node's volume.
+
+### 38.2 Changes
+- **The listener** (`src/main.cpp`): the loop's front-end and pause branch called `audio.update` with the
+  listener at (0, 0, 0). Since section 37 that update starts the sounds asked for at a place and sets the
+  playing ones by their distance, so a sound the level's script asked for as play began from a menu
+  (`begin_level_play` runs inside that branch on Continue, and on New Game or a chapter with no loading
+  movie) was tested and started from the origin, and under the pause menu every sound at a place was set by
+  its distance from the origin. Both branches now go through one `update_audio`, which takes the pawn's
+  location plus her eye height and the view's direction from the telemetry.
+- **Emitters** (`src/audio/audio_engine.*`): `EmitterRadii` is `EmitterPlay`: the radii drawn for the
+  emitter, the waves of the layer it plays and the nodes above them. A layer is the cue's loaded waves
+  under one set of nodes; `emitter_play` takes the one that carries farthest with the radii drawn (the
+  smallest `MaxRadius` of the attenuating nodes above it), the first in the graph on a tie. An emitter that
+  loops a wave picks it among that layer's (it was any wave of the cue, so about half the vents played the
+  layer that is silent past 1500 uu). It is a candidate for a source while that layer's product is above 0 at the
+  listener's distance (it was: while inside the largest `MaxRadius` of any node of the cue, which also kept
+  a LogReverse emitter in the running between `Max - Min` and `Max`, where its volume is 0).
+- **Without OpenAL**: `voice_pitch` in `update_ambient_emitters` is marked used in the block's `#else`.
+- **Oracle** (`src/main.cpp`): stage 23 has a tenth part, the factory's emitters heard from 150 and from
+  2000 uu above each in turn: no source at volume 0, every two-layer cue with single-valued radii on the
+  curve of its farthest layer.
+- **Documents**: `docs/AUDIO_SYSTEM_RE.md` section 3.2 names where `bAllowSpatialization` is cleared, marks
+  what was not read (the `PlaySound` to `HearSound` call, the duration behind `IsAudibleSimple`, the uniform
+  draw of a radius) and describes the emitters' layer; `docs/RENDERING_RE.md` section 13 no longer says the
+  impact sound's start test is an unread stock rule of the audio device.
+
+### 38.3 Checked (Windows, no audio device)
+- **The listener**, in the engine alone, the player at (-6632, -2210, 5640): with a menu frame's update at
+  the origin a concrete impact playing 300 uu from her reads 8762.9 uu and gain 0, and a 0.72 s cue asked
+  for 300 uu away on that frame is never started; with her own position it stays at 0.8543 and the cue
+  starts at 0.8543. The loop itself was not run (it needs the window): the change there is by reading.
+- **Emitters, every level**: heard from 100, 150, 1000 and 2000 uu above each emitter of the eleven maps in
+  turn (6,600 places), the sources that sound at distance gain 0 were 1,922 of 17,940 before and are 0 of
+  17,894. One reviewer's count, 150 uu above each emitter, of places where all four sources sound and one is
+  at 0 while an emitter at 0.1 or more has none: the Prologue 4, the factory 17, the convoy 19, now 0 in all
+  six maps walked. Another's, 100 uu above, by the source's gain being at most 0.001: the Prologue 10, the
+  mall 12, the cranes 4, now 2, 0 and 1; the three left are above 0 (two at a distance gain of 0.0016, 1997
+  uu into a `MaxRadius` of 2000, one in the last decibels of a NaturalSound curve).
+- **Stage 23**, the new part: 937 emitter sources heard, 0 at volume 0, 884 held against their farthest
+  layer's curve, worst difference 0.0000; `A_Prop_AirVent_Indoor` straight below at 2000 uu 0.1353
+  (`ln(2000 / 3000) / ln(150 / 3000)`). With section 37's engine under the same stage it fails: 210 of 935
+  at volume 0, worst difference 0.6851. The rest of the stage is as in section 37.
+- **Through the game's own path** (`--intro-shots`, `ME_AUDIO_DEBUG=1`, the Prologue): from
+  `ME_SHOT_STAND="-8784,-5296,7400"` two `A_Prop_AirVent_Indoor` 2168 and 2396 uu off play a wave of the hum
+  on Logarithmic 150 / 3000 at 0.1084 and 0.0750. From section 37's stand the shots at 673, 1199, 1207,
+  1208 and 1517 uu are at 0.667, 0.403, 0.398, 0.398 and 0.243 and the fans at 735 and 801 uu at 0.850 and
+  0.794, as before.
+- **The loader** is untouched: its dump of every cue is byte for byte section 37's, and agrees with the
+  scan on 19,363 of 19,363 cue records, 19,316 of 19,316 nodes and 2,030 of 2,030 cues (2,042 of 2,042
+  keys of the first scan's table).
+- **Warnings**: `g++ -std=c++20 -Wall -Wextra -Wno-unused-parameter -DME_NO_OPENAL -fsyntax-only` on
+  `audio_engine.cpp` gave `variable 'voice_pitch' set but not used` at section 37 and gives nothing now
+  beyond the three pragma lines it gives on `main`; with OpenAL, and for `main.cpp`, nothing.
+- **`--verify-all`**: ALL SYSTEMS PASS, every stage from 1 to 23. The 17 screenshots it writes are byte for
+  byte the tracked ones.
+
+### 38.4 Not done
+The game's loop was not run, so the menu's listener is checked in the engine and by reading only. The four
+emitter sources still go to the nearest emitters that are heard, not the loudest: over the walk above, 90 of
+17,894 sources are at a distance gain of at most 0.002. A layered emitter is its farthest layer alone at
+every distance, and the layer nearer by is never heard; a cue that plays in rounds takes its first layer
+(none of the game's emitters has such a cue with layers). Under the pause menu the level's emitters and its
+sounds at a place now play on, heard from where she stands; retail pauses them. Nothing was listened to.
+macOS and clang were not compiled: there is no clang on this machine. In `TODO.md`.

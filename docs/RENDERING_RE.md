@@ -664,9 +664,13 @@ afresh. Two things make systems while the game runs:
   cue, the one every weapon plays (`GetWeaponSpecificImpactSound`), else its parents', else the default
   material's, played at the hit (`PlaySound(.., HitLocation)`). The cues are `A_Effects_Bullet_Impacts`'s, 26
   of them (`Concrete.9mm_Concrete_Impact`, `Metal_Thin.9mm_Metal_Thin_Impact`, ...). Past the `MaxRadius` of
-  the cue's attenuation node a sound is not started at all (stock Unreal Engine 3: the audio device asks
-  `USoundCue::IsAudible`; not read out of the executable): 2000 uu for concrete, 300 for
-  `Faith.9mm_Faith_Impact`, the bodies' cue, so a bot hit further off than three metres is silent.
+  the cue's attenuation node a sound played this way is not started at all, whatever its length:
+  `APlayerController::HearSound` (0x00EF4480) asks `USoundCue::IsAudible` (0x00B76D90) with the view
+  target's location, and nearer than that the node sets the volume by the distance
+  (`docs/AUDIO_SYSTEM_RE.md` section 3.2; that `PlaySound` goes through `HearSound` is stock Unreal Engine 3,
+  the call itself was not read; the audio device's own test, in `CreateComponent`, refuses only cues of at
+  most a second). That is 2000 uu for concrete and 300 for `Faith.9mm_Faith_Impact`, the bodies' cue, so a
+  bot hit further off than three metres is silent.
 - The script (`SeqAct_ActorFactory` with an `ActorFactoryEmitter`, 1080 of them): the factory's particle
   system at each of the action's spawn points. 1024 are the cracking and breaking of glass panes; the rest
   feathers, sparks, falling dust.
