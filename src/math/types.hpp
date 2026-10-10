@@ -593,19 +593,49 @@ struct SoundClip {
     std::vector<SoundSubtitleLine> subtitles;
 };
 
+// A USoundNodeAttenuation as cooked (Engine.u; the defaults are Default__SoundNodeAttenuation's):
+// how the wave below it falls off with its distance from the listener, and whether it is placed in
+// the world at all. A radius is a RawDistributionFloat whose cooked table holds a pair of values;
+// each play draws one between them (FRawDistributionFloat::GetValue, MirrorsEdge.exe 0x01169EB0).
+// The pair is kept as stored: three of the game's tables run from the higher value to the lower.
+struct SoundAttenuation {
+    // SoundDistanceModel: 0 Linear, 1 Logarithmic, 2 Inverse, 3 LogReverse, 4 NaturalSound.
+    uint8_t model = 0;
+    float min_radius[2] = {400.0f, 400.0f};    // MinRadius: full volume up to here (uu)
+    float max_radius[2] = {5000.0f, 5000.0f};  // MaxRadius: silent from here on
+    float db_at_max = -60.0f;                  // dBAttenuationAtMax (NaturalSound only)
+    bool attenuate = true;                     // bAttenuate
+    bool spatialize = true;                    // bSpatialize
+    // The low pass with distance. Read and kept; nothing applies it (docs/AUDIO_SYSTEM_RE.md 3.2).
+    bool lowpass = true;                       // bAttenuateWithLowPassFilter
+    float lpf_min_radius[2] = {1500.0f, 1500.0f};
+    float lpf_max_radius[2] = {5000.0f, 5000.0f};
+    // A USoundNodeAmbient's own radii (an AmbientSoundSimple actor's cue): its ParseNodes
+    // (0x00B7E6B0) has no switch on DistanceModel, the fall-off is always the linear one.
+    bool linear_only = false;
+    // DICE's TdSoundNodeAttenuation (TdGame.u): bDelay holds the sound back by its first distance
+    // over SpeedOfSound, and the node attenuates a second time, linearly, on that first distance.
+    bool td = false;
+    bool delay = false;
+    float speed_of_sound[2] = {33100.0f, 33101.0f};
+    int32_t export_index = 0;                  // the node's export in its package (1-based)
+};
+
 // One node of a SoundCue's graph, as USoundNode::ParseNodes walks it when the cue plays: a mixer
 // plays all of its inputs, a random node one weighted child, delays and modulators offset / scale
-// what is below them. Other node types (attenuation, mix groups, ...) pass through to their child.
+// what is below them, an attenuation node gives what is below it its fall-off with distance. Other
+// node types (mix groups, loops, ...) pass through to their child.
 struct SoundCueNode {
-    enum class Kind : uint8_t { Passthrough, Wave, Mixer, Random, Delay, Modulator };
+    enum class Kind : uint8_t { Passthrough, Wave, Mixer, Random, Delay, Modulator, Attenuation, Ambient };
     Kind kind = Kind::Passthrough;
     std::string wave;            // Wave: the clip's name
     std::vector<int> children;   // indices into SoundCueDef::nodes (-1: missing)
     std::vector<float> weights;  // Mixer: InputVolume per child; Random: Weights per child
-    float min_value = 0.0f;      // Delay: DelayDuration (s); Modulator: VolumeModulation
+    float min_value = 0.0f;      // Delay: DelayDuration (s); Modulator, Ambient: VolumeModulation
     float max_value = 0.0f;
-    float min_pitch = 1.0f;      // Modulator: PitchModulation
+    float min_pitch = 1.0f;      // Modulator, Ambient: PitchModulation
     float max_pitch = 1.0f;
+    int attenuation = -1;        // Attenuation, Ambient: index into SoundCueDef::attenuations
 };
 
 struct SoundCueDef {
@@ -614,8 +644,14 @@ struct SoundCueDef {
     std::string sound_group = "InGameSFX";
     float volume_multiplier = 0.75f;
     float pitch_multiplier = 1.0f;
-    float min_radius = 200.0f;
-    float max_radius = 3000.0f;
+    float duration = 0.0f;              // Duration as cooked (s); 0 when the cue stores none
+    // USoundCue::MaxAudibleDistance: how far the cue can be heard at all, the largest MaxRadius of
+    // its nodes (USoundCue::CalculateMaxAudibleDistance, 0x00B76C80). No cue is cooked with one;
+    // the audio engine works it out when it takes the cue in. 0: not worked out yet.
+    float max_audible_distance = 0.0f;
+    // Every attenuation node of the graph, once each (a node two branches share is one node, and
+    // one play draws its radii once).
+    std::vector<SoundAttenuation> attenuations;
     bool looping = false;
     bool is_concatenator = false;
     bool has_modulator = false;
@@ -628,12 +664,11 @@ struct SoundCueDef {
     std::vector<std::pair<std::string, std::string>> imported_waves;
 };
 
+// A level's AmbientSound actor. How far it carries is its cue's own attenuation nodes'.
 struct AmbientEmitterInfo {
     Vec3 location{0.0f, 0.0f, 0.0f};
     std::string cue_name;
     std::string wave_name;
-    float min_radius = 200.0f;
-    float max_radius = 3000.0f;
     float volume = 1.0f;
     float pitch = 1.0f;
 };

@@ -18,6 +18,7 @@ The recorder half comes from [tesseract](https://github.com/pippy360/tesseract)'
 | `intro_check.py` | Windows to play, anywhere to compare | Plays the port's intros with `--trace` and lays them over those recordings: eye position, view direction, the hand-over, and every sound cue. `docs/LEVEL_INTROS.md` has the method and the results. |
 | `render_check.py` | Windows to render, anywhere to compare | Asks the port for the pictures of each level intro at the moments of the retail frames (`--intro-shots`) and measures each pair: mean colour, luminance, saturation, and the difference on a 32 x 18 grid. `docs/RENDERING_RE.md` is built on it. |
 | `anim_check.py` | anywhere, with `me_anim` built | Runs the port's first-person animation tree (`me_anim`) over the recordings and scores what it plays against the `anim1p` records retail logged, per movement state. `docs/FIRST_PERSON_ANIMATION_RE.md` has the method and the results. |
+| `attenuation_check.py` | anywhere, with the game's packages read once by each side | Compares what the port's loader makes of every sound cue's attenuation nodes (`mirrorsedge_windows.exe --dump-sound-cues <file>`, 13 s) with a scan of the same packages by a reader that shares no code with it: class, model, radius pairs, flags, place in the graph. `docs/AUDIO_SYSTEM_RE.md` section 3.2. |
 | `src/tools/replay_main.cpp` → `me_replay` | anywhere | Headless: loads the level from the retail packages and steps the controller once per recorded retail frame. |
 
 ## 1. Record (Windows, retail installed)

@@ -753,6 +753,7 @@ Options for looking at things:
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
+| `ME_AUDIO_DEBUG=1` | Every sound at a place: its cue's attenuation nodes, its distance from the listener and the gain that gives it, when it starts and as the gain changes; the level's emitters likewise. With `--intro-shots` the shots' impact sounds and the level's emitters go through the audio engine, with no device, heard from the view ([`AUDIO_SYSTEM_RE.md`](AUDIO_SYSTEM_RE.md) section 3.2) |
 | `ME_DECAL_SELFCHECK=1` | Clips the decals that store receivers as the ones that do not are clipped, and compares |
 | `ME_DECAL_DEBUG=1` | Lists the decals of receivers that move or are drawn apart, and what each was bound to |
 | `ME_NO_DYNAMIC_DECALS=1` | A picture without those |
