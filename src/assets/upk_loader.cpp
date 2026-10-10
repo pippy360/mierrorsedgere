@@ -1,6 +1,9 @@
 #include "upk_loader.hpp"
 #include "level_intro.hpp"
 #include "level_lightmaps.hpp"
+#include "level_decals.hpp"
+#include "level_lensflares.hpp"
+#include "level_lights.hpp"
 #include "level_postprocess.hpp"
 #include "material_system.hpp"
 #include "package_manager.hpp"
@@ -1298,9 +1301,21 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             bool has_materials = false;
             a.material_overrides = read_component_materials(comp_idx, has_materials);
             a.lightmap = read_component_lightmap(*this, comp_idx);
+            a.component_export = comp_idx;
             if (!has_materials && comp_exp.archetype > 0 && static_cast<size_t>(comp_exp.archetype) <= exports_.size()) {
                 a.material_overrides = read_component_materials(comp_exp.archetype, has_materials);
             }
+        }
+
+        // The DynamicSMActor family is never light-mapped: lit by its light environment, or straight
+        // by the lights (renderer/light_environment.hpp).
+        {
+            int32_t env_idx = 0;
+            if (const auto* p = get_prop("LightEnvironment")) env_idx = p->obj_ref_index;
+            a.dynamic_class = cls_name == "InterpActor" || cls_name == "KActor" || cls_name == "KActorSpawnable" ||
+                              cls_name == "DynamicSMActor" || cls_name == "DynamicSMActor_Spawnable" ||
+                              (env_idx > 0 && comp_idx > 0);
+            if (a.dynamic_class) a.lighting = read_dynamic_lighting(*this, env_idx, comp_idx);
         }
 
         // Classification
@@ -3336,10 +3351,11 @@ public:
                     wv.lm1 = lm.vertex_samples[sample + 1];
                     wv.lm2 = lm.vertex_samples[sample + 2];
                 }
-            } else if (lightmaps_) {
+            } else if (lightmaps_ && !a.dynamic_class) {
                 // Level geometry nothing was baked for (the sky dome, the far skyline's cards) is lit
                 // by nothing: every light of these levels is in the light maps, and the lights left
-                // dynamic do not reach the static channels. It shows what it emits.
+                // dynamic do not reach the static channels. It shows what it emits. (A dynamic object
+                // keeps lm_u = -2: its light comes from its light environment.)
                 wv.lm_u = -1.0f;
                 if (show_unbaked) wv.lm0 = wv.lm1 = wv.lm2 = pack_rgb9e5(Vec3(3.0f, 0.0f, 3.0f));
             }
@@ -3378,6 +3394,76 @@ public:
             emit_range(flat, 0, static_cast<uint32_t>(sm.triangles.size()), false);
         }
         return box;
+    }
+
+    // A level decal's stored triangles on one receiver (assets/level_decals.hpp). `receiver` is the
+    // actor whose static mesh it lies on, null on BSP.
+    void emit_decal(const LevelDecal& decal, const DecalReceiver& rec, const LevelActor* receiver,
+                    std::map<int32_t, std::vector<Vertex>>& bins, AABB& box) {
+        const int32_t mat = material_id(decal.material_path);
+        const MaterialUVSlots slots = uv_slots(mat, decal.material_path);
+        ActorTransform xf(Vec3(0.0f, 0.0f, 0.0f), Rotator(), Vec3(1.0f, 1.0f, 1.0f));
+        if (receiver) xf = ActorTransform::of(*receiver);
+        auto safe_inv = [](float s) { return (std::abs(s) > 1e-12f) ? 1.0f / s : 0.0f; };
+        const Vec3 inv_scale(safe_inv(xf.scale.x), safe_inv(xf.scale.y), safe_inv(xf.scale.z));
+        const float det_sign = (xf.scale.x * xf.scale.y * xf.scale.z < 0.0f) ? -1.0f : 1.0f;
+
+        // A lit decal on a light-mapped static mesh takes that mesh's light map, at its own stored
+        // coordinates (the static-mesh proxy's decal light cache, 0x00db93e0). Only those decals store
+        // coordinates; the unlit ones (dirt, stains, paint: 95 in 100) need no light of their own.
+        int32_t lm_set = -1;
+        uint32_t lm_scale[3] = {0u, 0u, 0u};
+        if (receiver && lightmaps_ && receiver->lightmap.kind == ActorLightMap::Kind::Texture) {
+            bool stored = false;
+            for (const DecalVertex& v : rec.vertices) stored = stored || v.lightmap_uv[0] != 0.0f || v.lightmap_uv[1] != 0.0f;
+            if (stored) {
+                lm_set = lightmaps_->index_of(receiver->lightmap.package_path, receiver->lightmap.textures);
+                if (lm_set < 0 || lm_set >= 2047) lm_set = -1;
+                for (int k = 0; k < 3; ++k) lm_scale[k] = pack_rgb9e5(receiver->lightmap.scale[k]);
+            }
+        }
+        std::vector<Vertex>& dst = bins[bin_key(mat, lm_set)];
+        const auto emit = [&](uint16_t index) {
+            const DecalVertex& dv = rec.vertices[index];
+            Vertex wv;
+            if (receiver) {
+                wv.position = xf.apply(dv.position);
+                const Vec3 wn = xf.axis_x * (dv.normal.x * inv_scale.x) + xf.axis_y * (dv.normal.y * inv_scale.y) +
+                                xf.axis_z * (dv.normal.z * inv_scale.z);
+                const Vec3 wt = xf.axis_x * (dv.tangent.x * xf.scale.x) + xf.axis_y * (dv.tangent.y * xf.scale.y) +
+                                xf.axis_z * (dv.tangent.z * xf.scale.z);
+                wv.normal = (wn.length_sq() > 1e-20f) ? wn.normalized() : Vec3(0.0f, 0.0f, 1.0f);
+                wv.tangent = (wt.length_sq() > 1e-20f) ? wt.normalized() : Vec3(1.0f, 0.0f, 0.0f);
+                wv.tangent_sign = dv.tangent_sign * det_sign;
+            } else {
+                wv.position = decal.hit_location - decal.hit_normal * dv.position.x + decal.hit_tangent * dv.position.y +
+                              decal.hit_binormal * dv.position.z;
+                wv.normal = dv.normal;
+                wv.tangent = dv.tangent;
+                wv.tangent_sign = dv.tangent_sign;
+            }
+            // The two texture coordinate sets the material reads, of the decal vertex's three.
+            const int first = slots.is_default() ? 0 : std::clamp(static_cast<int>(slots.index[0]), 0, 2);
+            const int second = slots.is_default() ? 1 : std::clamp(static_cast<int>(slots.index[1]), 0, 2);
+            wv.u = dv.uv[first][0];
+            wv.v = dv.uv[first][1];
+            wv.u2 = dv.uv[second][0];
+            wv.v2 = dv.uv[second][1];
+            if (lm_set >= 0) {
+                wv.lm_u = std::max(0.0f, dv.lightmap_uv[0] * receiver->lightmap.coord_scale[0] + receiver->lightmap.coord_bias[0]);
+                wv.lm_v = dv.lightmap_uv[1] * receiver->lightmap.coord_scale[1] + receiver->lightmap.coord_bias[1];
+                wv.lm0 = lm_scale[0];
+                wv.lm1 = lm_scale[1];
+                wv.lm2 = lm_scale[2];
+            }
+            dst.push_back(wv);
+            box.expand(wv.position);
+        };
+        for (size_t i = 0; i + 2 < rec.indices.size(); i += 3) {
+            emit(rec.indices[i]);
+            emit(rec.indices[det_sign < 0.0f ? i + 2 : i + 1]);
+            emit(rec.indices[det_sign < 0.0f ? i + 1 : i + 2]);
+        }
     }
 
     static void flush(MeshBuffer& mb, std::map<int32_t, std::vector<Vertex>>& bins) {
@@ -3466,7 +3552,7 @@ void append_actor_collision(const LevelActor& a, int32_t actor_index, const Stat
         }
     };
     emit(sm->simple_collision, simple_ch);
-    emit(sm->complex_collision, complex_ch);
+    emit(sm->complex_collision, complex_ch | COLL_ShadowCast);
 }
 
 void build_level_geometry(std::vector<LevelActor>& actors,
@@ -3477,7 +3563,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           const std::vector<BspRenderBin>* bsp_render_bins,
                           const AABB* bsp_bounds,
                           MaterialUVResolver* material_uvs,
-                          LightMapSets* lightmaps) {
+                          LightMapSets* lightmaps,
+                          const std::vector<LevelDecal>* decals) {
     out_meshes.clear();
 
     // Batched world buffers for single-draw-call-per-material rendering
@@ -3492,6 +3579,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
     std::map<int32_t, std::vector<Vertex>> rv_bins;
 
     AABB overall(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+    std::vector<MeshBuffer> dynamic_buffers;  // the dynamic objects the port leaves in place
+    size_t dynamic_modes[3] = {0, 0, 0};
     size_t placed_meshes = 0;
     size_t hidden_meshes = 0;
     size_t missing_meshes = 0;
@@ -3518,6 +3607,33 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             continue;
         }
         ++placed_meshes;
+        if (a.dynamic_class && emitter.use_materials()) {
+            // A buffer of its own, so that it can be given its own light.
+            MeshBuffer mb;
+            mb.name = "UE3_Dynamic_" + a.source_package + "_" + a.unique_name;
+            mb.is_runner_vision = a.is_runner_vision;
+            mb.dynamic_lit = true;
+            mb.lighting = a.lighting;
+            std::map<int32_t, std::vector<Vertex>> bins;
+            const AABB own_box = emitter.emit(a, *sm, bins, mb.vertices);
+            MeshEmitter::flush(mb, bins);
+            if (mb.vertices.empty()) continue;
+            mb.bounds = own_box;
+            if (valid_box(own_box)) {
+                a.world_bounds = own_box;
+                overall.expand(own_box.min_pt);
+                overall.expand(own_box.max_pt);
+            }
+            ++dynamic_modes[static_cast<size_t>(a.lighting.mode)];
+            if (std::getenv("ME_LIGHT_ENV_DEBUG")) {
+                static const char* kModes[3] = {"environment", "direct", "unlit"};
+                std::cout << "[LightEnv] " << a.class_name << " " << a.source_package << "." << a.unique_name << " (" << a.mesh_name
+                          << "): " << kModes[static_cast<size_t>(a.lighting.mode)] << ", channels " << a.lighting.channels
+                          << (a.lighting.cast_shadows ? ", casts" : ", no shadow") << std::endl;
+            }
+            dynamic_buffers.push_back(std::move(mb));
+            continue;
+        }
         const AABB box = emitter.emit(a, *sm, a.is_runner_vision ? rv_bins : world_bins,
                                       a.is_runner_vision ? rv_batch.vertices : world_batch.vertices);
         if (valid_box(box)) {
@@ -3561,6 +3677,58 @@ void build_level_geometry(std::vector<LevelActor>& actors,
     if (!rv_batch.vertices.empty()) {
         rv_batch.bounds = overall;
         out_meshes.push_back(std::move(rv_batch));
+    }
+    if (!dynamic_buffers.empty()) {
+        std::cout << "[Level] " << dynamic_buffers.size() << " dynamic objects in place: " << dynamic_modes[0]
+                  << " with a light environment, " << dynamic_modes[1] << " lit straight by the lights, " << dynamic_modes[2]
+                  << " unlit" << std::endl;
+        for (MeshBuffer& mb : dynamic_buffers) out_meshes.push_back(std::move(mb));
+    }
+
+    // The level's decals, on what was just placed: a buffer for each SortOrder, lowest first.
+    if (decals && !decals->empty() && emitter.use_materials()) {
+        std::map<std::pair<std::string, int32_t>, size_t> owners;  // (package, mesh component) -> actor
+        for (size_t i = 0; i < actors.size(); ++i) {
+            if (actors[i].component_export > 0) owners[{actors[i].source_package, actors[i].component_export}] = i;
+        }
+        std::map<int32_t, std::map<int32_t, std::vector<Vertex>>> by_order;
+        AABB decal_box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+        size_t placed = 0, triangles = 0, orphaned = 0;
+        for (const LevelDecal& decal : *decals) {
+            if (decal.hidden) continue;
+            bool any = false;
+            for (const DecalReceiver& rec : decal.receivers) {
+                if (rec.indices.size() < 3) continue;
+                const LevelActor* receiver = nullptr;
+                if (!rec.on_bsp) {
+                    const auto it = owners.find({decal.package, rec.component});
+                    // Not on what the port hides, moves or lights apart.
+                    if (it == owners.end() || actors[it->second].is_hidden || actors[it->second].elevator >= 0 ||
+                        actors[it->second].barge_door >= 0 || actors[it->second].dynamic_class) {
+                        ++orphaned;
+                        continue;
+                    }
+                    receiver = &actors[it->second];
+                }
+                emitter.emit_decal(decal, rec, receiver, by_order[decal.sort_order], decal_box);
+                triangles += rec.indices.size() / 3;
+                any = true;
+            }
+            placed += any ? 1 : 0;
+        }
+        size_t decal_sections = 0;
+        for (auto& [order, bins] : by_order) {
+            MeshBuffer mb;
+            mb.name = "UE3_Level_Decals_" + std::to_string(order);
+            mb.is_decal = true;
+            MeshEmitter::flush(mb, bins);
+            if (mb.vertices.empty()) continue;
+            mb.bounds = valid_box(decal_box) ? decal_box : overall;
+            decal_sections += mb.sections.size();
+            out_meshes.push_back(std::move(mb));
+        }
+        std::cout << "[Level] " << placed << " decals drawn: " << triangles << " triangles in " << decal_sections
+                  << " material sections (" << orphaned << " receivers left out: hidden, moving or not loaded)" << std::endl;
     }
 }
 
@@ -3703,6 +3871,8 @@ void build_elevator_part_geometry(LevelScene& scene, const std::unordered_map<st
             mb.is_runner_vision = a.is_runner_vision;
             mb.elevator = static_cast<int32_t>(e);
             mb.elevator_part = static_cast<int32_t>(p);
+            mb.dynamic_lit = true;
+            mb.lighting = a.lighting;
             std::map<int32_t, std::vector<Vertex>> bins;
             const AABB box = emitter.emit(a, *sm, bins, mb.vertices);
             if (emitter.use_materials()) MeshEmitter::flush(mb, bins);
@@ -3851,6 +4021,8 @@ void build_barge_door_geometry(LevelScene& scene, const std::unordered_map<std::
             mb.name = "UE3_Door_" + a.source_package + "_" + a.unique_name;
             mb.is_runner_vision = a.is_runner_vision;
             mb.barge_door = static_cast<int32_t>(d);
+            mb.dynamic_lit = true;
+            mb.lighting = a.lighting;
             std::map<int32_t, std::vector<Vertex>> bins;
             const AABB emitted_box = emitter.emit(a, *sm, bins, mb.vertices);
             if (emitter.use_materials()) MeshEmitter::flush(mb, bins);
@@ -5055,15 +5227,17 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         }
         collision->reserve(bsp.size() / 3 + 1024);
         for (size_t i = 0; i + 2 < bsp.size(); i += 3) {
-            collision->add_triangle(bsp[i], bsp[i + 1], bsp[i + 2], -1, COLL_BlockAll);
+            collision->add_triangle(bsp[i], bsp[i + 1], bsp[i + 2], -1, COLL_BlockAll | COLL_ShadowCast);
         }
     }
     // Each section's vertices carry the two UV sets its material reads, which have to be known
     // while the geometry is emitted: this translates the graphs once, without their textures.
     std::unique_ptr<MaterialUVResolver> material_uvs;
     if (pm) material_uvs = std::make_unique<MaterialUVResolver>(*pm);
+    std::vector<LevelDecal> decals;
+    if (pm) extract_level_decals(loaded_packages, decals);
     build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr,
-                         &bsp_render_bins, &bsp_bounds, material_uvs.get(), pm ? &lightmap_sets : nullptr);
+                         &bsp_render_bins, &bsp_bounds, material_uvs.get(), pm ? &lightmap_sets : nullptr, &decals);
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
     build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
@@ -5079,6 +5253,19 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     }
     out_scene.collision = std::move(collision);
     extract_level_postprocess(*master_pkg, loaded_packages, out_scene);
+    extract_level_lights(loaded_packages, out_scene.lights);
+    extract_level_lens_flares(loaded_packages, out_scene, material_paths);
+    // The chain's material effects are materials like any other: they join the level's library.
+    if (pm) {
+        extract_post_chain(*pm, out_scene.post_effects);
+        for (PostEffectInfo& fx : out_scene.post_effects) {
+            const std::string key = to_lower(fx.material_path);
+            size_t at = 0;
+            while (at < material_paths.size() && to_lower(material_paths[at]) != key) ++at;
+            if (at == material_paths.size()) material_paths.push_back(fx.material_path);
+            fx.material = static_cast<int32_t>(at);
+        }
+    }
 
     // Resolve, translate and load every material referenced by the level geometry
     // (ME_MATERIAL_VERBOSE=1 prints per-material diagnostics, ME_MAX_TEXTURE_SIZE caps mip size).

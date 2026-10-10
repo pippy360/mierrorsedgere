@@ -567,6 +567,8 @@ private:
     int counter_ = 0;
     int depth_ = 0;
     bool translucent_ = false;
+    bool reads_scene_ = false;  // may sample the scene: translucent, or a full-screen effect's material
+    bool lens_flare_ = false;   // bUsedWithLensFlare: its vertex colour and LensFlare* inputs are the quad's (the scene block)
     std::unordered_map<int32_t, Val> cache_;
     std::unordered_set<int32_t> visiting_;
     std::unordered_map<std::string, int> tex_slot_keys_;
@@ -763,7 +765,7 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
     if (c == "ReflectionVector") return {"P.trefl", 3};
     if (c == "CameraVector") return {"P.tcam", 3};
     if (c == "LightVector") return {"P.tlight", 3};
-    if (c == "VertexColor") return {"P.vcolor", 4};
+    if (c == "VertexColor") return {lens_flare_ ? "S.flare_color" : "P.vcolor", 4};
     if (c == "MeshEmitterVertexColor") return {"float4(1.0)", 4};
     if (c == "ScreenPosition") {
         if (prop_bool(p, "ScreenAlign", false)) {
@@ -772,7 +774,12 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         return {"P.screen_pos", 4};
     }
     if (c == "PixelDepth") return {"P.screen_pos.w", 1};
-    if (c == "LensFlareIntensity" || c == "LensFlareOcclusion") return {"1.0", 1};
+    // The quad's numbers (renderer/lens_flare.hpp). On another kind of mesh: a flare in full view.
+    if (c == "LensFlareRadialDistance") return {lens_flare_ ? "S.flare_inputs.x" : "0.0", 1};
+    if (c == "LensFlareSourceDistance") return {lens_flare_ ? "S.flare_inputs.y" : "0.0", 1};
+    if (c == "LensFlareOcclusion") return {lens_flare_ ? "S.flare_inputs.z" : "1.0", 1};
+    if (c == "LensFlareIntensity") return {lens_flare_ ? "S.flare_inputs.w" : "1.0", 1};
+    if (c == "LensFlareRayDistance") return {lens_flare_ ? "S.flare_ray.x" : "0.0", 1};
     if (c.rfind("LensFlare", 0) == 0) return {"0.0", 1};
 
     // ---- Arithmetic ----------------------------------------------------------
@@ -1053,14 +1060,14 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
 
     // ---- Scene color / depth (translucent materials only) -----------------
     if (c == "SceneTexture" || c == "DestColor") {
-        if (!translucent_) return {"float4(0.0)", 4};
+        if (!reads_scene_) return {"float4(0.0)", 4};
         out_.uses_scene_color = true;
         Val co = c == "SceneTexture" ? input(p, "Coordinates") : Val{};
         const std::string uv = co.ok() ? coerce(co, 2).code : "P.screen_uv";
         return emit(4, "mat_scene_color(scene_color, scene_smp, " + uv + ")");
     }
     if (c == "SceneDepth" || c == "DestDepth") {
-        if (!translucent_) return {"65000.0", 1};
+        if (!reads_scene_) return {"65000.0", 1};
         out_.uses_scene_depth = true;
         Val co = c == "SceneDepth" ? input(p, "Coordinates") : Val{};
         const std::string uv = co.ok() ? coerce(co, 2).code : "P.screen_uv";
@@ -1131,7 +1138,11 @@ Val GraphCompiler::material_input(const char* name, int n, const std::array<floa
 void GraphCompiler::run() {
     const UPropertyList& mp = g_.props;
     MatBlendMode blend = parse_blend(mp);
-    const MatLightingModel lighting = parse_lighting(mp);
+    MatLightingModel lighting = parse_lighting(mp);
+    // A lens flare's component takes no light: its materials show what they emit, whatever
+    // lighting model they were left on.
+    lens_flare_ = prop_bool(mp, "bUsedWithLensFlare", false);
+    if (lens_flare_) lighting = MatLightingModel::Unlit;
     const bool is_masked_flag = prop_bool(mp, "bIsMasked", false);
     const bool masked = blend == MatBlendMode::Masked || is_masked_flag;
     if (blend == MatBlendMode::Opaque && is_masked_flag) blend = MatBlendMode::Masked;
@@ -1141,6 +1152,9 @@ void GraphCompiler::run() {
     out_.two_sided = prop_bool(mp, "TwoSided", false);
     translucent_ = blend == MatBlendMode::Translucent || blend == MatBlendMode::Additive ||
                    blend == MatBlendMode::Modulate;
+    // An opaque unlit material that reads the scene is a material effect of the post-process chain
+    // (FX_PostProcess): drawn over the whole picture, with the picture so far as its scene colour.
+    reads_scene_ = translucent_ || (blend == MatBlendMode::Opaque && lighting == MatLightingModel::Unlit);
 
     std::vector<std::string> normal_stmts;
     std::vector<std::string> main_stmts;
@@ -1202,6 +1216,7 @@ void GraphCompiler::run() {
     }
     if (out_.uses_scene_color) src << ", texture2d<float> scene_color [[texture(" << matbind::kSceneColorTexture << ")]]";
     if (out_.uses_scene_depth) src << ", depth2d<float> scene_depth [[texture(" << matbind::kSceneDepthTexture << ")]]";
+    src << ", constant SceneUniforms& S [[buffer(" << matbind::kSceneBuffer << ")]]";
     src << ", sampler scene_smp [[sampler(" << matbind::kSceneSampler << ")]]";
     src << ", depth2d_array<float> shadow_map [[texture(" << matbind::kShadowMapTexture << ")]]";
     src << ", texture2d<float> lm_a [[texture(" << matbind::kLightMapTexture << ")]]";
@@ -1221,7 +1236,7 @@ void GraphCompiler::run() {
         case MatLightingModel::Phong:
         case MatLightingModel::NonDirectional:
             src << "    MatLightMap m_lmap = mat_scene_lightmap(P, F, shadow_map, lm_a, lm_b, lm_c, scene_smp);\n";
-            src << "    float3 m_color = m_emissive + mat_lighting(P, F, m_lmap, " << diffuse.code << ", " << diffuse_power.code
+            src << "    float3 m_color = m_emissive + mat_lighting(P, F, S, m_lmap, " << diffuse.code << ", " << diffuse_power.code
                 << ", " << specular.code << ", " << specular_power.code << ", " << tslm.code << ", "
                 << (lighting == MatLightingModel::NonDirectional ? 1 : 0) << ");\n";
             break;
@@ -1237,7 +1252,7 @@ void GraphCompiler::run() {
             src << "        }\n";
             src << "        P.tlight = float3(0.0, 0.0, 1.0);\n";
             src << "    }\n";
-            src << "    float3 m_color = m_emissive + mat_lighting_custom(P, F, " << diffuse.code << ", " << tslm.code
+            src << "    float3 m_color = m_emissive + mat_lighting_custom(P, F, S, " << diffuse.code << ", " << tslm.code
                 << ", m_custom, m_lmap);\n";
             break;
     }
@@ -1247,10 +1262,15 @@ void GraphCompiler::run() {
             src << "    return mat_out_opaque(P, F, m_color);\n";
             break;
         case MatBlendMode::Translucent:
-            src << "    return mat_out_translucent(P, F, m_color, " << opacity.code << ");\n";
+            src << "    return mat_out_translucent(P, F, S, m_color, " << opacity.code << ");\n";
             break;
         case MatBlendMode::Additive:
-            src << "    return mat_out_additive(P, F, m_color, " << opacity.code << ");\n";
+            if (lens_flare_) {
+                // The quad stands next to the eye: no fog between.
+                src << "    return float4(max(m_color, float3(0.0)) * max(" << opacity.code << ", 0.0), 0.0);\n";
+            } else {
+                src << "    return mat_out_additive(P, F, S, m_color, " << opacity.code << ");\n";
+            }
             break;
         case MatBlendMode::Modulate:
             src << "    return mat_out_modulate(P, F, m_color, " << opacity.code << ");\n";
@@ -1553,6 +1573,7 @@ SceneMaterial MaterialBuilder::build(const std::string& leaf_path) {
             if (auto it = scalars.find(u.param); it != scalars.end()) v = {it->second, 0.0f, 0.0f, 0.0f};
         }
         sm.uniforms.push_back(v);
+        sm.uniform_names.push_back(u.param);
     }
 
     if (!cm->warnings.empty()) {
@@ -1998,9 +2019,21 @@ inline float3 mat_hemisphere(MatParams P, constant FrameUniforms& F, float3 diff
     return mix(up_l, tsl, tslm) * upper_c + mix(lo_l, tsl, tslm) * lower_c;
 }
 
-inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, MatLightMap lm,
+inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, constant SceneUniforms& S, MatLightMap lm,
                            float3 diffuse, float diffuse_power,
                            float3 specular, float specular_power, float3 tslm, int model) {
+    // What is not the level's own geometry is lit by its object's light environment
+    // (renderer/scene_shading_msl.hpp), when the renderer has given one.
+    if (lm.baked < 0.5 && env_given(S)) {
+        float3 n = normalize(mat_tangent_to_world(P, P.tnormal));
+        if (model == 1) {  // non-directional: every light at full weight
+            float3 to_light;
+            float falloff = env_point_falloff(S, P.wpos, to_light);
+            return diffuse * (falloff * S.env_point_color.rgb + env_ambient(S, n, 1.0));
+        }
+        return env_lighting(S, P.wpos, n, normalize(float3(F.camera_pos) - P.wpos), diffuse, diffuse_power, specular,
+                            specular_power);
+    }
     // Against the level's own light map the mask is what the graph says, unclamped, as in the game;
     // the stand-in's magnitudes cannot take values above one (docs/MATERIAL_SYSTEM.md, section 7).
     float3 m = (model == 1) ? float3(1.0) : (lm.baked > 0.5 ? tslm : saturate(tslm));
@@ -2021,22 +2054,55 @@ inline float3 mat_lighting(MatParams P, constant FrameUniforms& F, MatLightMap l
     return c;
 }
 
-inline float3 mat_lighting_custom(MatParams P, constant FrameUniforms& F, float3 diffuse, float3 tslm,
+inline float3 mat_lighting_custom(MatParams P, constant FrameUniforms& F, constant SceneUniforms& S, float3 diffuse, float3 tslm,
                                   float3 custom_sum, MatLightMap lm) {
     if (lm.baked > 0.5) return custom_sum;
+    if (env_given(S)) {  // PointLightPixelShader.usf, custom lighting: the graph's own result times the falloff
+        float3 to_light;
+        return custom_sum * (env_point_falloff(S, P.wpos, to_light) * S.env_point_color.rgb);
+    }
     return custom_sum + mat_hemisphere(P, F, diffuse, tslm, 2, lm.shadow) + diffuse * kAmbient;
 }
 
+// ---- Height fog on what is drawn after the fog pass (HeightFogCommon.usf, CalculateVertexHeightFog,
+// which the game runs per vertex of a translucent or additive surface; here per pixel).
+// rgb: the fog's light on the way; a: how much of the surface's own colour arrives.
+inline float4 mat_height_fog(MatParams P, constant FrameUniforms& F, constant SceneUniforms& S) {
+    float3 to_surface = P.wpos - float3(F.camera_pos);
+    float distance_to = length(to_surface);
+    float vz = (abs(to_surface.z) <= 0.001) ? 0.001 : to_surface.z;
+    float cam_z = float3(F.camera_pos).z;
+    float4 min_pct = (S.fog_min_height - cam_z) / vz;
+    float4 max_pct = (S.fog_max_height - cam_z) / vz;
+    float4 layer = max(float4(0.0), float4(distance_to) - S.fog_start) * abs(saturate(max_pct) - saturate(min_pct));
+    float4 scattering = exp2(S.fog_distance_scale * layer);
+    if (layer.x >= S.fog_extinction.x) scattering.x = 0.0;
+    if (layer.y >= S.fog_extinction.y) scattering.y = 0.0;
+    if (layer.z >= S.fog_extinction.z) scattering.z = 0.0;
+    if (layer.w >= S.fog_extinction.w) scattering.w = 0.0;
+    float4 in_scattering = scattering - 1.0;
+    float a4 = scattering.w;
+    float a34 = a4 * scattering.z;
+    float a234 = a34 * scattering.y;
+    float3 fog = in_scattering.w * S.fog_inscatter[3].rgb + a4 * in_scattering.z * S.fog_inscatter[2].rgb +
+                 a34 * in_scattering.y * S.fog_inscatter[1].rgb + a234 * in_scattering.x * S.fog_inscatter[0].rgb;
+    return float4(fog, a234 * scattering.x);
+}
+
 // ---- Output: scene colour is linear and unbounded, as the game's is (BasePassPixelShader.usf).
-// Fog, haze, exposure and the tone curve come after, on the whole picture.
+// Opaque surfaces get their fog from the fog pass; haze, exposure and the tone curve come after, on
+// the whole picture. A translucent surface carries its own fog: Color * Fog.a + Fog.rgb, and an
+// additive one Color * Fog.a * Opacity.
 inline float4 mat_out_opaque(MatParams P, constant FrameUniforms& F, float3 c) {
     return float4(max(c, float3(0.0)), 1.0);
 }
-inline float4 mat_out_translucent(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
-    return float4(max(c, float3(0.0)), saturate(opacity));
+inline float4 mat_out_translucent(MatParams P, constant FrameUniforms& F, constant SceneUniforms& S, float3 c, float opacity) {
+    float4 fog = mat_height_fog(P, F, S);
+    return float4(max(c, float3(0.0)) * fog.a + fog.rgb, saturate(opacity));
 }
-inline float4 mat_out_additive(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
-    return float4(max(c, float3(0.0)) * max(opacity, 0.0), 0.0);
+inline float4 mat_out_additive(MatParams P, constant FrameUniforms& F, constant SceneUniforms& S, float3 c, float opacity) {
+    float4 fog = mat_height_fog(P, F, S);
+    return float4(max(c, float3(0.0)) * (fog.a * max(opacity, 0.0)), 0.0);
 }
 inline float4 mat_out_modulate(MatParams P, constant FrameUniforms& F, float3 c, float opacity) {
     return float4(max(c, float3(0.0)), opacity);
@@ -2082,6 +2148,7 @@ MaterialUVSlots MaterialUVResolver::slots(const std::string& material_path) {
 
 std::string material_check_msl() {
     static const char* kArguments = R"msl((MatVSOut in [[stage_in]], constant FrameUniforms& F [[buffer(0)]],
+        constant SceneUniforms& S [[buffer(2)]],
         texture2d<float> t0 [[texture(0)]], sampler s0 [[sampler(0)]], sampler scene_smp [[sampler(15)]],
         depth2d_array<float> shadow_map [[texture(27)]], texture2d<float> lm_a [[texture(24)]],
         texture2d<float> lm_b [[texture(25)]], texture2d<float> lm_c [[texture(26)]]) {
@@ -2093,20 +2160,20 @@ std::string material_check_msl() {
     std::string source = material_common_msl();
     source += "\nfragment float4 mat_check_lit";
     source += kArguments;
-    source += R"msl(    float3 m_color = mat_lighting(P, F, m_lmap, base.xyz, 1.0, base.xyz, 15.0, float3(0.0), 0);
+    source += R"msl(    float3 m_color = mat_lighting(P, F, S, m_lmap, base.xyz, 1.0, base.xyz, 15.0, float3(0.0), 0);
     return mat_out_opaque(P, F, m_color);
 }
 )msl";
     source += "\nfragment float4 mat_check_custom";
     source += kArguments;
-    source += R"msl(    float3 m_color = mat_lighting_custom(P, F, base.xyz, float3(0.0), base.xyz, m_lmap);
-    return mat_out_translucent(P, F, m_color, base.w);
+    source += R"msl(    float3 m_color = mat_lighting_custom(P, F, S, base.xyz, float3(0.0), base.xyz, m_lmap);
+    return mat_out_translucent(P, F, S, m_color, base.w);
 }
 )msl";
     source += "\nfragment float4 mat_check_unlit";
     source += kArguments;
     source += R"msl(    float4 seen = mat_scene_color(t0, scene_smp, P.uv0);
-    return mat_out_additive(P, F, base.xyz + seen.xyz, base.w) + mat_out_modulate(P, F, base.xyz, base.w);
+    return mat_out_additive(P, F, S, base.xyz + seen.xyz, base.w) + mat_out_modulate(P, F, base.xyz, base.w);
 }
 )msl";
     return source;

@@ -245,7 +245,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                           const std::vector<BspRenderBin>* bsp_render_bins = nullptr,
                           const AABB* bsp_bounds = nullptr,
                           class MaterialUVResolver* material_uvs = nullptr,
-                          class LightMapSets* lightmaps = nullptr);
+                          class LightMapSets* lightmaps = nullptr,
+                          const std::vector<struct LevelDecal>* decals = nullptr);
 
 // Appends one actor's UE3 collision triangles (world space) to `out` with the per-triangle
 // channels implied by the actor flags and the mesh's UseSimple*Collision settings.

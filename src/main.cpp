@@ -9,6 +9,14 @@
 #else
 #define ME_PLATFORM_TITLE "Linux"
 #endif
+#if defined(_WIN32) && defined(ME_RENDERER_OPENGL)
+// The OpenGL backend built on Windows to check it (docs/LINUX_PORT.md): on a laptop with two GPUs
+// an OpenGL context goes to the integrated one unless the executable asks otherwise this way.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
 
 #include "math/types.hpp"
 #include "assets/upk_loader.hpp"
@@ -16,11 +24,13 @@
 #include "audio/audio_engine.hpp"
 #include "cutscene/cutscene_player.hpp"
 #include "cutscene/screen_fade.hpp"
+#include "game/screen_effects.hpp"
 #include "game/level_script.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
 #include "platform/platform.hpp"
 #include "renderer/renderer.hpp"
+#include "renderer/render_common.hpp"
 #include "renderer/builtin_shaders_msl.hpp"
 #include "renderer/sun_shadow.hpp"
 #include "assets/material_system.hpp"
@@ -1571,8 +1581,17 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     fade.restart();
     float now = 0.0f;
     int written = 0;
+    // ME_SHOT_LOOK="pitch,yaw" (degrees): the view turned by hand, to look at something the intro does not.
+    float look_pitch = 0.0f, look_yaw = 0.0f;
+    const char* look_spec = std::getenv("ME_SHOT_LOOK");
+    const bool look = look_spec && std::sscanf(look_spec, "%f,%f", &look_pitch, &look_yaw) == 2;
     auto frame = [&](float dt) {
         cutscene.update(dt, scene, tel);
+        if (look) {
+            tel.pitch_deg = look_pitch;
+            tel.yaw_deg = look_yaw;
+            tel.camera_roll_deg = 0.0f;
+        }
         now += dt;
         (void)cutscene.take_intro_sounds();
         for (const IntroFadeEvent& ev : cutscene.take_intro_fades()) fade.apply(ev);
@@ -1580,9 +1599,10 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         CutscenePlayer::pose_intro_doors(scene, now);
         tel.speed_2d = 0.0f;  // no speed effects
         tel.sim_time = now;
-        tel.fade_amount = fade.amount;
+        tel.fade_amount = fade.shown();
         tel.fade_color = fade.color;
         tel.exposure_reset = dt <= 0.0f;  // the level opens
+        tel.screen_effects = screen_effects_from_environment();
         renderer.render_frame(scene, tel);
     };
     frame(0.0f);
@@ -1797,6 +1817,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     // The screen fade (TdHUD's FadeInEffect), declared here for the script host below.
     ScreenFade screen_fade;
+    ScreenEffects screen_effects;
     bool level_play_pending = false;  // the loading movie is on; the level begins play after it
 
     // Where a cutscene leaves the pawn: at its animation's root unless its Kismet teleported the
@@ -3223,7 +3244,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             fade_intro_before = intro_now;
             fade_last_sim_time = tel.sim_time;
             fade_map = active_scene.map_name;
-            controller.get_telemetry().fade_amount = screen_fade.amount;
+            controller.get_telemetry().fade_amount = screen_fade.shown();
+            // The chain's material effects (falling, health, reaction time, hits), from the pawn's state.
+            if (restarted || level_opened) screen_effects.restart();
+            if (!renderer.is_menu_open()) screen_effects.update(tel, dt, controller.get_telemetry().screen_effects);
+            for (ScreenEffect& forced : screen_effects_from_environment()) {
+                controller.get_telemetry().screen_effects.push_back(std::move(forced));
+            }
             controller.get_telemetry().fade_color = screen_fade.color;
         }
 

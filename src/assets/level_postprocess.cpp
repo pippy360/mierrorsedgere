@@ -1,5 +1,6 @@
 #include "level_postprocess.hpp"
 
+#include "package_manager.hpp"
 #include "ue3_props.hpp"
 #include "upk_loader.hpp"
 
@@ -52,6 +53,39 @@ void read_settings(const UPropertyList& f, PostProcessSettings& s) {
 }
 
 }  // namespace
+
+void extract_post_chain(PackageManager& pm, std::vector<PostEffectInfo>& out) {
+    out.clear();
+    const std::shared_ptr<UPKPackage> pkg = pm.load("FX_PostProcess");
+    if (!pkg) return;
+    const auto& exports = pkg->get_exports();
+    for (size_t i = 0; i < exports.size(); ++i) {
+        if (pkg->get_export_class(exports[i]) != "PostProcessChain") continue;
+        if (export_object_name(*pkg, static_cast<int32_t>(i) + 1) != "FX_PostProcess") continue;
+        UPropertyList chain;
+        parse_export_properties(*pkg, static_cast<int32_t>(i) + 1, chain);
+        const UProperty* effects = find_prop(chain, "Effects");
+        if (!effects) break;
+        bool after_tone_mapping = false;
+        for (int32_t effect : effects->ints) {
+            if (effect <= 0 || static_cast<size_t>(effect) > exports.size()) continue;
+            const std::string cls = pkg->get_export_class(exports[static_cast<size_t>(effect) - 1]);
+            if (cls == "TdToneMappingPostProcess") after_tone_mapping = true;
+            if (cls != "MaterialEffect") continue;
+            UPropertyList props;
+            parse_export_properties(*pkg, effect, props);
+            const int32_t material = prop_object(props, "Material");
+            if (material == 0) continue;
+            PostEffectInfo info;
+            info.name = prop_name(props, "EffectName");
+            info.material_path = object_canonical_path(*pkg, material);
+            info.show_in_game = prop_bool(props, "bShowInGame", true);
+            info.after_tone_mapping = after_tone_mapping;
+            out.push_back(std::move(info));
+        }
+        break;
+    }
+}
 
 void extract_level_postprocess(const UPKPackage& persistent_level, const std::vector<std::shared_ptr<UPKPackage>>& packages,
                                LevelScene& out) {

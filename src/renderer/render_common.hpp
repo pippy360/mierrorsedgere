@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace me {
@@ -20,6 +22,57 @@ namespace me {
 // several hundred thousand units across, and the sun's flare beyond it. The shaders that turn a
 // depth-buffer value back into a distance carry the same number (post_linear_depth, mat_linear_depth).
 constexpr float kFarPlane = 10000000.0f;
+
+// The quad a material effect of the post-process chain is drawn with: two triangles over the whole
+// target, in clip space (the material vertex stage is given identity matrices), with texture
+// coordinates 0..1 from the top left.
+// The depth bias the level's decals are drawn with (MeshBuffer::is_decal): they lie in the very
+// surfaces they were clipped to. The game gives each DepthBias -0.00006 of its depth range by
+// default (and no slope bias); here it is a count of the depth buffer's steps at the triangle's
+// own depth, which holds at any distance on a floating-point buffer, and a slope term for the
+// grazing views.
+inline constexpr int kDecalDepthBias = -500;
+inline constexpr float kDecalSlopeBias = -1.0f;
+
+inline const std::vector<Vertex>& screen_quad_vertices() {
+    static const std::vector<Vertex> quad = [] {
+        static const float corners[6][2] = {{-1.0f, 1.0f}, {1.0f, 1.0f}, {-1.0f, -1.0f}, {-1.0f, -1.0f}, {1.0f, 1.0f}, {1.0f, -1.0f}};
+        std::vector<Vertex> v(6);
+        for (int i = 0; i < 6; ++i) {
+            v[static_cast<size_t>(i)].position = Vec3(corners[i][0], corners[i][1], 0.5f);
+            v[static_cast<size_t>(i)].u = v[static_cast<size_t>(i)].u2 = corners[i][0] * 0.5f + 0.5f;
+            v[static_cast<size_t>(i)].v = v[static_cast<size_t>(i)].v2 = 0.5f - corners[i][1] * 0.5f;
+        }
+        return v;
+    }();
+    return quad;
+}
+
+// ME_SCREEN_EFFECT="Name[:Parameter=value[,Parameter=value...]]": a material effect of the chain
+// switched on by hand, to look at it (docs/RENDERING_RE.md). Empty when the variable is not set.
+inline std::vector<ScreenEffect> screen_effects_from_environment() {
+    std::vector<ScreenEffect> out;
+    const char* spec = std::getenv("ME_SCREEN_EFFECT");
+    if (!spec || !*spec) return out;
+    const std::string text(spec);
+    ScreenEffect fx;
+    const size_t colon = text.find(':');
+    fx.name = text.substr(0, colon);
+    size_t at = (colon == std::string::npos) ? text.size() : colon + 1;
+    while (at < text.size()) {
+        size_t end = text.find(',', at);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(at, end - at);
+        const size_t eq = item.find('=');
+        if (eq != std::string::npos) {
+            const float value = static_cast<float>(std::atof(item.c_str() + eq + 1));
+            fx.params.emplace_back(item.substr(0, eq), std::array<float, 4>{value, value, value, value});
+        }
+        at = end + 1;
+    }
+    out.push_back(std::move(fx));
+    return out;
+}
 
 inline bool tex_format_is_bc(TexFormat f) {
     return f == TexFormat::DXT1 || f == TexFormat::DXT3 || f == TexFormat::DXT5;

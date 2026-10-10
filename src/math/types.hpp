@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <string>
@@ -496,6 +497,49 @@ struct Vertex {
     uint32_t lm2 = 0;
 };
 
+// A light of the level that a light environment can gather (assets/level_lights.hpp).
+struct LevelLight {
+    enum class Kind : uint8_t { Directional, Point, Spot, Sky };
+    Kind kind = Kind::Point;
+    Vec3 position{0.0f, 0.0f, 0.0f};
+    Vec3 direction{1.0f, 0.0f, 0.0f};    // the way the light travels (directional, spot)
+    Vec3 color{0.0f, 0.0f, 0.0f};        // pow(LightColor, 2.2) * Brightness
+    Vec3 lower_color{0.0f, 0.0f, 0.0f};  // sky: LowerColor, LowerBrightness
+    float radius = 1024.0f;
+    float falloff = 2.0f;
+    float cos_inner = 1.0f;
+    float cos_outer = 0.7193f;
+    uint32_t channels = 0;               // LightingChannelContainer bits
+    bool cast_shadows = true;
+    bool cast_static_shadows = true;
+    bool cast_composite = false;
+    // On the world's dynamic light list (a *Movable light, bForceDynamicLight, a SkyLightToggleable):
+    // no light environment gathers it; it lights whatever shares a channel with it, directly.
+    bool dynamic_list = false;
+};
+
+// How something that is not baked level geometry is lit (renderer/light_environment.hpp): by its own
+// light environment (a DynamicLightEnvironmentComponent, with these settings), or, where the level
+// left the environment switched off, straight by the lights that share a channel with it.
+struct DynamicLighting {
+    enum class Mode : uint8_t { Environment, Direct, Unlit };
+    Mode mode = Mode::Environment;
+    float light_distance = 1.5f;
+    float shadow_distance = 1.0f;
+    float bounce = 0.1f;                // BouncedLightingIntensity
+    float bounce_desaturation = -1.0f;  // BouncedLightingDesaturation
+    float light_desaturation = 0.0f;
+    Vec3 ambient_glow{0.0f, 0.0f, 0.0f};
+    bool synthesize_point = true;
+    bool synthesize_sh = true;
+    // Its shadow (renderer/mod_shadow.hpp): bCastShadows, and the faint light from above that every
+    // shadow environment has beside the level's lights.
+    bool cast_shadows = true;
+    Vec3 ambient_shadow_color{0.15f, 0.15f, 0.15f};
+    Vec3 ambient_shadow_dir{0.0f, 0.0f, 1.0f};
+    uint32_t channels = 1u << 3;        // the owner's LightingChannels: Dynamic
+};
+
 // A contiguous range of MeshBuffer::vertices drawn with one scene material
 // (index into LevelScene::materials->materials, -1 = legacy procedural shading).
 struct MeshSection {
@@ -517,6 +561,14 @@ struct MeshBuffer {
     int32_t elevator = -1;
     int32_t elevator_part = -1;
     int32_t barge_door = -1;
+    // A dynamic object (a lift's part, a door, an InterpActor or KActor the port leaves in place):
+    // never light-mapped, lit as `lighting` says.
+    bool dynamic_lit = false;
+    DynamicLighting lighting;
+    // The level's decals (assets/level_decals.hpp): they lie in their receivers' surfaces, so they are
+    // drawn with a depth bias, after what they lie on and before the other translucent surfaces, and
+    // cast no shadow.
+    bool is_decal = false;
 };
 
 struct SoundSubtitleLine {
@@ -615,6 +667,22 @@ struct PostProcessSettings {
     Vec3 haze_sun_location{0.0f, 0.0f, 0.0f};
     // How long the view takes to go over to these settings (Scene_InterpolationDuration).
     float interpolation_duration = 1.0f;
+};
+
+// A material effect of the game's post-process chain (Effects/FX_PostProcess.upk): a material drawn
+// over the whole picture, reading the picture so far as its scene colour.
+struct PostEffectInfo {
+    std::string name;                // EffectName: "HealthEffect", "UncontrolledFallingEffect", ...
+    std::string material_path;       // the effect's material
+    bool show_in_game = true;        // bShowInGame as shipped: on without script asking
+    bool after_tone_mapping = true;  // where it stands in the chain against TdToneMappingPostProcess
+    int32_t material = -1;           // its place in the scene's material library
+};
+
+// One of them switched on for a frame, with the parameters script has given its material.
+struct ScreenEffect {
+    std::string name;
+    std::vector<std::pair<std::string, std::array<float, 4>>> params;
 };
 
 // A PostProcessVolume: its settings hold wherever the view is inside its brush, over the world's
@@ -719,6 +787,9 @@ struct LevelActor {
     bool is_elevator_part = false;
     std::string source_package;
     ActorLightMap lightmap;
+    int32_t component_export = 0;  // its mesh component, a 1-based export of source_package (decals name their receivers by it)
+    bool dynamic_class = false;  // an InterpActor, a KActor...: never light-mapped
+    DynamicLighting lighting;    // how it is lit then
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
     // TdZiplineVolume.SplineLocations: the cable the pawn rides, NumSplineSegments + 1 points on the
@@ -1258,6 +1329,8 @@ struct SimSoundEvent {
 struct PlayerTelemetry {
     // The screen fade (TdHUD's FadeInEffect): 1 = the picture, 0 = all fade_color.
     float fade_amount = 1.0f;
+    // The chain's material effects that are on this frame (game/screen_effects.hpp).
+    std::vector<ScreenEffect> screen_effects;
     Vec3 fade_color{1.0f, 1.0f, 1.0f};
     // TdHUD.PostBeginPlay's WorldInfo.SetSceneExposureReset: for this frame, the exposure goes back
     // to where a level opens (its high clamp) and adapts from there.
@@ -1325,6 +1398,14 @@ struct PlayerTelemetry {
     bool melee_hit_confirmed = false;
     bool disarm_prompt_visible = false;
     float hit_marker_timer = 0.0f;
+    // Hits the pawn took, for the screen effects (game/screen_effects.hpp): a count that goes up
+    // with each, and the last one's damage. A melee hit also has where it came from, in turns
+    // from straight ahead (0.5 = from behind).
+    uint32_t melee_hit_count = 0;
+    float melee_hit_damage = 0.0f;
+    float melee_hit_turns = 0.0f;
+    uint32_t fall_hit_count = 0;
+    float fall_hit_damage = 0.0f;
     float damage_flash_timer = 0.0f;
     bool falling_to_death = false;
     bool fall_death_impact = false;
@@ -1473,6 +1554,58 @@ struct LevelIntroSequence {
 // -----------------------------------------------------------------------------
 // Level Scene representation
 // -----------------------------------------------------------------------------
+// A raw distribution's lookup table, as the cooked data carries it (FRawDistribution):
+// [min, max, entries of `chunk` floats ...], read at (x - start_time) * time_scale.
+struct RawDistribution {
+    std::vector<float> table;
+    int32_t chunk = 1;
+    float time_scale = 0.0f;
+    float start_time = 0.0f;
+    bool valid = false;  // a constant or a curve; otherwise the value is 0
+};
+
+// One quad of a lens flare (LensFlareElement), assets/level_lensflares.hpp.
+struct LensFlareElement {
+    std::string name;
+    float ray_distance = 0.0f;  // where along the line source -> screen centre -> beyond: 0 the source, 0.5 the centre
+    bool enabled = false;
+    bool use_source_distance = false;
+    bool normalize_radial_distance = false;
+    bool modulate_color_by_source = false;
+    float size_x = 0.0f;
+    float size_y = 0.0f;
+    std::vector<int32_t> materials;  // LFMaterials, as scene materials (-1: none)
+    RawDistribution material_index, scaling, axis_scaling, rotation, color, alpha;
+    RawDistribution dist_scale, dist_color, dist_alpha;  // by the distance to the source
+};
+
+// A LensFlare template.
+struct LensFlareTemplate {
+    std::string path;
+    std::vector<LensFlareElement> elements;  // the reflections that have a material, in drawing order
+    float outer_cone = 0.0f;                 // degrees; 0: no cone
+    float inner_cone = 0.0f;
+    float cone_fudge_factor = 0.5f;
+    float radius = 0.0f;
+    // Coverage of the view -> LensFlareOcclusion. The class's own is a constant 1.
+    RawDistribution screen_percentage_map{{1.0f, 1.0f, 1.0f, 1.0f}, 1, 0.0f, 0.0f, true};
+    Vec3 box_center{0.0f, 0.0f, 0.0f};  // FixedRelativeBoundingBox, around the source
+    Vec3 box_extent{0.0f, 0.0f, 0.0f};
+    bool box_inverted = false;          // stored with Min above Max
+};
+
+// A LensFlareSource actor.
+struct LensFlareSourceInfo {
+    std::string name;
+    int32_t template_index = -1;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Vec3 forward{1.0f, 0.0f, 0.0f};  // the actor's X axis: what a template's cone is measured from
+    float source_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    bool active = true;     // bAutoActivate; off: waits for the level's script
+    bool hidden = false;
+    bool has_base = false;  // rides something that moves
+};
+
 struct ScriptGraph;
 
 struct LevelScene {
@@ -1491,6 +1624,10 @@ struct LevelScene {
     // checkpoints are off. False for a level without a script (the tutorial's staged list).
     bool script_checkpoints = false;
     std::vector<PostProcessVolumeInfo> post_volumes;  // highest priority first
+    std::vector<PostEffectInfo> post_effects;         // the chain's material effects, in its order
+    std::vector<LevelLight> lights;                   // what lights the dynamic objects
+    std::vector<LensFlareTemplate> lens_flare_templates;
+    std::vector<LensFlareSourceInfo> lens_flares;
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)

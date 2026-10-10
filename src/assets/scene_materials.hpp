@@ -67,6 +67,7 @@ constexpr int kSceneDepthTexture = 29;   // texture(29): copy of opaque scene de
 constexpr int kSceneSampler = 15;        // sampler(15): linear, clamped, all mips: the scene copies and the light maps
 constexpr int kFrameBuffer = 0;          // buffer(0): FrameUniforms
 constexpr int kMaterialBuffer = 1;       // buffer(1): float4 material uniforms
+constexpr int kSceneBuffer = 2;          // buffer(2): SceneUniforms (renderer/post_process.hpp): the height fog
 }  // namespace matbind
 
 // One generated MSL fragment shader (shared by all material instances with identical code).
@@ -131,6 +132,15 @@ struct SceneMaterial {
     std::vector<TexDefault> tex2d_default;     // default per 2D slot
     std::vector<int> texcube;                  // scene texture index per cube slot (-1 => default)
     std::vector<std::array<float, 4>> uniforms;  // parameter values per uniform slot
+    std::vector<std::string> uniform_names;      // the scalar or vector parameter each slot holds
+
+    // The slot of a named parameter, or -1: what script sets at run time (a fade amount, a colour).
+    [[nodiscard]] int uniform_index(const std::string& parameter) const {
+        for (size_t i = 0; i < uniform_names.size(); ++i) {
+            if (uniform_names[i] == parameter) return static_cast<int>(i);
+        }
+        return -1;
+    }
 };
 
 struct SceneMaterialLibrary {

@@ -209,6 +209,7 @@ inline float sample_world_shadow(float3 world_pos, float3 N, constant FrameUnifo
 
 fragment float4 world_fragment(VertexOut in [[stage_in]],
                                constant FrameUniforms& uniforms [[buffer(0)]],
+                               constant SceneUniforms& S [[buffer(2)]],
                                texture2d<float> swat_d_tex [[texture(0)]],
                                texture2d<float> wep_d_tex  [[texture(1)]],
                                texture2d<float> wep_s_tex  [[texture(2)]],
@@ -254,6 +255,41 @@ fragment float4 world_fragment(VertexOut in [[stage_in]],
     } else {
         if (dot(vtx_N, geo_N) < 0.0) vtx_N = -vtx_N;
         N = normalize(mix(geo_N, vtx_N, 0.55));
+    }
+
+    // A character or a weapon under its light environment (renderer/scene_shading_msl.hpp): the
+    // diffuse and specular maps, linear, times the multipliers of its material instance.
+    if (in.uv2.x > 0.5 && env_given(S)) {
+        float3 env_diffuse = in.color.rgb * float3(uniforms.actor_tint);
+        float3 env_specular = float3(0.0);
+        float env_power = 20.0;
+        if (in.uv2.x < 1.12) {
+            int env_arch = int(in.uv2.y + 0.5);
+            float dm = 4.20;
+            float sm = 0.85;
+            env_power = 36.0;
+            if (env_arch == 1) { dm = 1.25; sm = 0.95; env_power = 18.0; }
+            else if (env_arch == 2) { dm = 3.80; sm = 0.85; env_power = 36.0; }
+            else if (env_arch == 3) { dm = 1.25; sm = 1.05; env_power = 48.0; }
+            else if (env_arch == 4) { dm = 1.48; sm = 1.15; env_power = 48.0; }
+            else if (env_arch == 5) { dm = 1.20; sm = 0.60; env_power = 18.0; }
+            env_diffuse = swat_d_tex.sample(world_tex_sampler, in.uv).rgb * dm;
+            env_specular = swat_s_tex.sample(world_tex_sampler, in.uv).rgb * sm;
+        } else if (in.uv2.x < 1.5) {
+            env_diffuse = float3(0.006, 0.008, 0.013);  // the visor
+            env_specular = float3(0.85, 0.90, 0.98);
+            env_power = 64.0;
+        } else if (in.uv2.x < 2.5) {
+            if (!(in.color.r > 0.85 && in.color.g < 0.20)) {
+                env_diffuse = wep_d_tex.sample(world_tex_sampler, in.uv).rgb;
+                env_specular = wep_s_tex.sample(world_tex_sampler, in.uv).rgb;
+            }
+        } else {
+            env_diffuse = ammo_d_tex.sample(world_tex_sampler, in.uv).rgb * float3(1.65, 1.35, 0.88);
+            env_specular = float3(0.85, 0.68, 0.36);
+            env_power = 32.0;
+        }
+        return float4(env_lighting(S, in.world_pos, N, V, env_diffuse, 1.0, env_specular, env_power), 1.0);
     }
 
     float3 L = normalize(float3(uniforms.sun_dir));
@@ -459,6 +495,7 @@ vertex VertexOut viewmodel_vertex(constant VertexIn* vertices [[buffer(0)]],
 
 fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
                                    constant FrameUniforms& uniforms [[buffer(0)]],
+                                   constant SceneUniforms& S [[buffer(2)]],
                                    texture2d<float> vm_skin_tex  [[texture(0)]],
                                    texture2d<float> vm_glove_tex [[texture(1)]],
                                    texture2d<float> vm_lower_tex [[texture(2)]],
@@ -487,6 +524,28 @@ fragment float4 viewmodel_fragment(VertexOut in [[stage_in]],
     float vtx_len = length(vtx_N);
     float3 N = (vtx_len > 1e-4) ? (vtx_N / vtx_len) : geo_N;
     if (dot(N, V) < -0.25) N = -N;
+
+    // Under the first-person light environment (renderer/scene_shading_msl.hpp; its lights are given
+    // relative to the eye, as this mesh is): skin, glove, trousers and brass from their own maps.
+    if (env_given(S) && (slot == 1 || slot == 2 || slot == 3 || slot == 5)) {
+        float3 env_diffuse;
+        float3 env_specular = float3(0.04);
+        float env_power = 20.0;
+        if (slot == 1) {
+            env_diffuse = pow(max(vm_skin_tex.sample(vm_sampler, in.uv).rgb, float3(0.0)), float3(2.2));
+        } else if (slot == 2) {
+            env_diffuse = pow(max(vm_glove_tex.sample(vm_sampler, in.uv).rgb, float3(0.0)), float3(2.2));
+            env_specular = float3(0.08);
+            env_power = 26.0;
+        } else if (slot == 3) {
+            env_diffuse = pow(max(vm_lower_tex.sample(vm_sampler, in.uv).rgb, float3(0.0)), float3(2.2));
+        } else {
+            env_diffuse = vm_ammo_tex.sample(vm_sampler, in.uv).rgb * float3(1.55, 1.25, 0.78);
+            env_specular = float3(0.95, 0.78, 0.40) * 0.5;
+            env_power = 36.0;
+        }
+        return float4(env_lighting(S, in.world_pos, N, V, env_diffuse, 1.0, env_specular, env_power), 1.0);
+    }
 
     float3 L = normalize(float3(0.35, -0.45, 0.82));
     float3 H = normalize(L + V);
@@ -645,7 +704,9 @@ struct PostUniforms {
     float4 lum_weights;          // (0.3, 0.59, 0.11) * SceneDesaturation
     float4 gamma;                // GammaColorScale, 1 / gamma
     float4 overlay;
-    float4 fade;                 // rgb: FadeColor; a: FadeInAmount (1 = the picture, 0 = the colour)              // GammaOverlayColor
+    float4 fade;                 // rgb: FadeColor; a: FadeInAmount (1 = the picture, 0 = the colour)
+    float4 motion;               // TdMotionBlur: x the blur's amount, 0 = none
+    float4 motion_centre;        // xy: where on screen the blur streams from
     float4 curve_m[16];
     float4 curve_b[16];
     float4 filter_taps[16];      // x: offset in texels along the axis, y: weight
@@ -697,6 +758,66 @@ fragment float4 fog_fragment(PostVertexOut in [[stage_in]],
     float3 fog = in_scattering.w * P.fog_inscatter[3].rgb + a4 * in_scattering.z * P.fog_inscatter[2].rgb +
                  a34 * in_scattering.y * P.fog_inscatter[1].rgb + a234 * in_scattering.x * P.fog_inscatter[0].rgb;
     return float4(fog, a1234);
+}
+
+// The dynamic objects' shadows (renderer/mod_shadow.hpp; ModShadowProjectionPixelShader.usf,
+// HardwarePCFMain). Must match ModShadowUniformsGPU.
+struct ModShadowUniforms {
+    float4 count;       // x: shadows in use
+    float4 row0[8];     // world -> the shadow's clip space, a row a member
+    float4 row1[8];
+    float4 row2[8];
+    float4 row3[8];
+    float4 light[8];    // xyz: the shadow light's place; w: 1 / its radius
+    float4 color[8];    // rgb: lerp(1, ModShadowColor, FadeAlpha); a: the depth bias, of the subject's depth
+    float4 cell[8];     // xy: the cell's centre in the map, z: its half-size, w: one texel (uv)
+    float4 depth[8];    // x: MinSubjectZ, y: MaxSubjectZ
+};
+
+// Blended dest * src: what is returned multiplies the scene.
+fragment float4 mod_shadow_fragment(PostVertexOut in [[stage_in]],
+                                    depth2d<float> depth_tex [[texture(1)]],
+                                    depth2d_array<float> shadow_map [[texture(27)]],
+                                    constant FrameUniforms& F [[buffer(0)]],
+                                    constant ModShadowUniforms& M [[buffer(1)]]) {
+    constexpr sampler cmp(coord::normalized, filter::linear, address::clamp_to_edge, compare_func::less_equal);
+    float depth = post_scene_depth(depth_tex, in.uv);
+    float3 world = float3(F.camera_pos) + post_screen_vector(in.uv, F) * depth;
+    float4 p = float4(world, 1.0);
+    float3 result = float3(1.0);
+    int n = int(M.count.x + 0.5);
+    for (int i = 0; i < n; ++i) {
+        float w = dot(M.row3[i], p);
+        float min_z = M.depth[i].x;
+        float max_z = M.depth[i].y;
+        if (w <= min_z) continue;  // on the light's side of the subject
+        float2 xy = float2(dot(M.row0[i], p), dot(M.row1[i], p)) / w;
+        if (abs(xy.x) >= 1.0 || abs(xy.y) >= 1.0) continue;
+        float3 lv = (M.light[i].xyz - world) * M.light[i].w;
+        float att = sqrt(saturate(1.0 - dot(lv, lv)));
+        if (att <= 0.0) continue;
+        // Depth runs 0..1 across the subject's sphere, along the light's axis; what lies beyond is
+        // held at 0.999, so that it is tested against the subject's own depth.
+        float lin = min((w - min_z) / (max_z - min_z), 0.999) - M.color[i].a;
+        float zc = min_z + lin * (max_z - min_z);
+        float ref = (max_z / (max_z - min_z)) * (zc - min_z) / max(zc, 1e-4);
+        float2 uv = M.cell[i].xy + float2(xy.x, -xy.y) * M.cell[i].z;
+        float t = M.cell[i].w;
+        // The game's sixteen taps are eight, each taken twice (its offset table is read with a fixed
+        // column), turned by 45 degrees.
+        float pcf = shadow_map.sample_compare(cmp, uv + float2(-2.121, 0.000) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(-1.414, -0.707) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(-1.414, 0.707) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(-0.707, 0.000) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(-0.707, 1.414) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(0.000, 0.707) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(0.000, 2.121) * t, 2, ref)
+                  + shadow_map.sample_compare(cmp, uv + float2(0.707, 1.414) * t, 2, ref);
+        pcf *= 0.125;
+        float3 shadowed = mix(float3(1.0), M.color[i].rgb, att);
+        result *= mix(shadowed, float3(1.0), pcf * pcf);
+    }
+    return float4(result, 1.0);
 }
 
 // TdDirHazePixelShader.usf: a glow towards the sun that grows with distance, added to the scene.
@@ -851,31 +972,45 @@ fragment float4 tonemap_fragment(PostVertexOut in [[stage_in]],
     toned = float3(toned.r * P.curve_m[sr].r + P.curve_b[sr].r,
                    toned.g * P.curve_m[sg].g + P.curve_b[sg].g,
                    toned.b * P.curve_m[sb].b + P.curve_b[sb].b);
-    toned = saturate(toned);
+    return float4(saturate(toned), 1.0);
+}
 
-    // Stand-ins for the chain's material effects, which are not translated yet: reaction time
-    // (M_FX_FullScreenFX_Reactiontime_01) and low health (M_FX_FullScreenFX_HealthEffect_01).
-    if (F.reaction_active > 0.5) {
-        float luma = dot(toned, float3(0.299, 0.587, 0.114));
-        toned = saturate(mix(float3(luma) * float3(0.70, 0.88, 1.08), toned, 0.65));
-    }
-    if (F.health < 50.0) {
-        float dmg = saturate((50.0 - F.health) / 50.0);
-        float dist = length(in.uv - 0.5) * 1.414;
-        float vig = pow(saturate(dist - 0.4), 2.5) * dmg * (0.8 + 0.2 * sin(F.sim_time * 8.0));
-        toned = mix(toned, float3(0.85, 0.02, 0.02), vig);
-    }
-
-    // The chain's FadeInEffect (FX_PostProcess.FadeInEffect, after the tone mapping): the picture
-    // towards FadeColor as FadeInAmount falls from 1 to 0, what is already near the colour first.
+// The chain's FadeInEffect (FX_PostProcess.FadeInEffect): the picture towards FadeColor as
+// FadeInAmount falls from 1 to 0, what is already near the colour first.
+inline float3 post_fade(float3 picture, constant PostUniforms& P) {
     float away = 1.0 - P.fade.a;
-    if (away > 0.0) {
-        float3 diff = P.fade.rgb - toned;
-        float weight = pow(away, 1.5);
-        float near_first = saturate((1.0 - saturate(0.577 * dot(diff, diff))) * 2.5 * away);
-        toned = mix(mix(toned, P.fade.rgb, near_first), toned + diff * weight, weight);
+    if (away <= 0.0) return picture;
+    float3 diff = P.fade.rgb - picture;
+    float weight = pow(away, 1.5);
+    float near_first = saturate((1.0 - saturate(0.577 * dot(diff, diff))) * 2.5 * away);
+    return mix(mix(picture, P.fade.rgb, near_first), picture + diff * weight, weight);
+}
+
+// The end of the chain, on the tone-mapped picture: the fade, then TdMotionBlur
+// (TdMotionBlurShader.usf, MainPixelShader). The blur streams from the middle of the view and
+// touches only its outer part (nothing within 0.6 of the half-diagonal), eight taps of falling
+// weight. In the game's shader the step is a scalar, the direction's x, added to both u and v:
+// the smear runs along one diagonal everywhere and the middle column has none. Kept as it is.
+fragment float4 finish_fragment(PostVertexOut in [[stage_in]],
+                                texture2d<float> picture_tex [[texture(0)]],
+                                sampler smp [[sampler(0)]],
+                                constant PostUniforms& P [[buffer(1)]]) {
+    float2 from_centre = float2(1.0 - 2.0 * in.uv.x, 1.0 - 2.0 * in.uv.y);
+    float len = length(from_centre);
+    float reach = clamp(pow(max(len, 1e-6), 0.1) - 0.95, 0.0, 0.07);
+    float step_uv = (len > 1e-6 ? from_centre.x / len : 0.0) * reach * P.motion.x * 0.125;
+    if (step_uv == 0.0) return float4(post_fade(picture_tex.sample(smp, in.uv).rgb, P), 1.0);
+    float2 lo = 0.5 * P.texel.xy;
+    float2 hi = 1.0 - lo;
+    float2 uv = in.uv;
+    float3 sum = float3(0.0);
+    float weight = 1.0;
+    for (int k = 0; k < 8; ++k) {
+        sum += weight * post_fade(picture_tex.sample(smp, clamp(uv, lo, hi)).rgb, P);
+        uv += float2(step_uv, step_uv);
+        weight -= 0.125;
     }
-    return float4(toned, 1.0);
+    return float4(sum * 0.222222, 1.0);
 }
 
 // -----------------------------------------------------------------------------

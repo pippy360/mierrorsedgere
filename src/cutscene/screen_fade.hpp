@@ -11,7 +11,6 @@
 //   TriggerCustomColorFadeOut the colour; if FadeAmount > 0, out over max(Time, 1/60)
 // SeqAct_TdFadeEffect, the Kismet action levels fade with, calls the last two with
 // each channel of its FadeColor divided by 255 as integers: 1 at 255, else 0.
-// The step itself is native; it is taken here as a straight line over the time.
 // -----------------------------------------------------------------------------
 
 #include "../math/types.hpp"
@@ -54,7 +53,13 @@ struct ScreenFade {
             fade_in(e.duration, e.color);
         }
     }
+    // What the chain's FadeInEffect is given: TdHUD.SetPostProcessVars (0x01267330 in the game's
+    // executable) moves FadeAmount in a straight line and writes 3F^2 - 2F^3 of it as FadeInAmount.
+    [[nodiscard]] float shown() const { return amount * amount * (3.0f - 2.0f * amount); }
+
+    // A frame's step is no longer than 0.066 s, as there.
     void update(float dt) {
+        dt = std::min(dt, 0.066f);
         if (in_time > 0.0f) {
             amount = std::min(1.0f, amount + dt / in_time);
             if (amount >= 1.0f) in_time = 0.0f;

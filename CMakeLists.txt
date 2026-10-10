@@ -46,6 +46,9 @@ set(CORE_SOURCES
     src/assets/ini_config.cpp
     src/assets/level_intro.cpp
     src/assets/level_lightmaps.cpp
+    src/assets/level_decals.cpp
+    src/assets/level_lensflares.cpp
+    src/assets/level_lights.cpp
     src/assets/level_postprocess.cpp
     src/game/level_script.cpp
     src/physics/collision_world.cpp
@@ -112,21 +115,23 @@ set(OPENGL_RENDERER_SOURCES
 )
 # glcorearb.h includes <KHR/khrplatform.h>; both are vendored under src/renderer/gl.
 set(OPENGL_RENDERER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/gl)
-if(APPLE)
-    option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS" ON)
+if(APPLE OR WIN32)
+    option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS and Windows" ON)
 endif()
 
 # me_glsl: translates every built-in and material shader to GLSL and compiles it on the GPU
 # (docs/LINUX_PORT.md). Builds wherever SDL2 is available.
-if(UNIX)
-    add_executable(me_glsl src/tools/glsl_main.cpp src/renderer/msl_to_glsl.cpp src/platform/platform.cpp ${CORE_SOURCES})
-    target_link_libraries(me_glsl PRIVATE ZLIB::ZLIB Threads::Threads)
-    if(APPLE)
-        target_link_libraries(me_glsl PRIVATE SDL2)
-    else()
-        find_package(SDL2 REQUIRED)
-        target_link_libraries(me_glsl PRIVATE SDL2::SDL2 ${CMAKE_DL_LIBS})
-    endif()
+add_executable(me_glsl src/tools/glsl_main.cpp src/renderer/msl_to_glsl.cpp src/platform/platform.cpp ${CORE_SOURCES})
+target_link_libraries(me_glsl PRIVATE ZLIB::ZLIB Threads::Threads)
+if(APPLE)
+    target_link_libraries(me_glsl PRIVATE SDL2)
+elseif(WIN32)
+    find_package(SDL2 CONFIG REQUIRED)
+    target_link_libraries(me_glsl PRIVATE SDL2::SDL2)
+    target_compile_definitions(me_glsl PRIVATE SDL_MAIN_HANDLED)
+else()
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(me_glsl PRIVATE SDL2::SDL2 ${CMAKE_DL_LIBS})
 endif()
 
 if(APPLE)
@@ -195,6 +200,23 @@ target_link_libraries(mirrorsedge_windows PRIVATE
     d3dcompiler
     dxguid
 )
+
+# mirrorsedge_opengl: the OpenGL (Linux) backend on Windows, to check it against the Direct3D one on
+# the machine that has the retail assets (docs/LINUX_PORT.md). Same command line; it finds its DLLs
+# next to mirrorsedge_windows.exe.
+if(ME_OPENGL)
+    add_executable(mirrorsedge_opengl src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+    target_compile_definitions(mirrorsedge_opengl PRIVATE ME_RENDERER_OPENGL=1)
+    target_include_directories(mirrorsedge_opengl PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR})
+    target_link_libraries(mirrorsedge_opengl PRIVATE
+        SDL2::SDL2
+        OpenAL::OpenAL
+        PkgConfig::VORBISFILE
+        PkgConfig::FFMPEG
+        ZLIB::ZLIB
+        Threads::Threads
+    )
+endif()
 
 # The DLLs the game loads (SDL2, OpenAL Soft, Vorbis, FFmpeg and what they need) are copied next to the
 # executable, so it starts from Explorer or any shell without MSYS2 on PATH.

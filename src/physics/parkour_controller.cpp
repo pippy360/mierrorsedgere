@@ -2737,6 +2737,8 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
         m_landing_timer = c.hard_landing_time;
         m_state_timer = 0.0f;
         m_telemetry.health = std::max(1.0f, m_telemetry.health - 15.0f);
+        ++m_telemetry.fall_hit_count;  // TdPlayerPawn.TakeFallingDamage: HardLandingDamage
+        m_telemetry.fall_hit_damage = 15.0f;
         m_damage_cooldown = c.health_regen_delay;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
         m_sprint_energy = 0.0f;
@@ -5700,6 +5702,16 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 bot.anim_state = EEnemyAnimState::MeleeStrike;
                 if (m_telemetry.move_state != EMovement::MOVE_Snatch && !m_telemetry.intro_active) {
                     m_telemetry.health = std::max(0.0f, m_telemetry.health - 22.0f);
+                    {
+                        // where the blow came from against where she looks, in turns
+                        const Vec3 to_bot = bot.position - m_telemetry.position;
+                        const float bearing = std::atan2(to_bot.y, to_bot.x) * RAD2DEG - m_telemetry.yaw_deg;
+                        float turns = bearing / 360.0f;
+                        turns -= std::floor(turns);
+                        ++m_telemetry.melee_hit_count;
+                        m_telemetry.melee_hit_damage = 22.0f;
+                        m_telemetry.melee_hit_turns = turns;
+                    }
                     m_telemetry.damage_flash_timer = 0.35f;
                     m_damage_cooldown = m_config.health_regen_delay;
                 }

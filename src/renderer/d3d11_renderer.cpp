@@ -2,6 +2,9 @@
 #include "builtin_shaders_msl.hpp"
 #include "hud_font.hpp"
 #include "msl_to_hlsl.hpp"
+#include "lens_flare.hpp"
+#include "light_environment.hpp"
+#include "mod_shadow.hpp"
 #include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
@@ -252,6 +255,7 @@ struct D3D11Renderer::Impl {
     Program viewmodel_program;
     // The post-process chain (builtin_shaders_msl.hpp, section 4)
     Program fog_program;
+    Program mod_shadow_program;
     Program haze_program;
     Program bloom_gather_program;
     Program filter_program;
@@ -259,6 +263,7 @@ struct D3D11Renderer::Impl {
     Program meter_program;
     Program exposure_program;
     Program tonemap_program;
+    Program finish_program;
     struct ColorTarget {
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11RenderTargetView> rtv;
@@ -271,7 +276,10 @@ struct D3D11Renderer::Impl {
     ColorTarget filter_b;       // quarter size: the blur's first axis
     ColorTarget meter[kMeterSteps];  // the exposure's metering: 512 .. 1 across, 16-bit fixed point
     ColorTarget exposure[2];    // 1 x 1: exposure squared over 64, this frame's and the last's
+    ColorTarget picture[2];     // the tone-mapped picture (RGBA8), for the passes that work on it in turn
+    ColorTarget scene_effect;   // the scene after a material effect that stands before the tone mapper
     PostSettingsBlend post_settings;  // the post-process settings in force at the view
+    MotionBlurState motion_blur;      // TdMotionBlur: the camera's velocity, smoothed
     int exposure_current = 0;
     float exposure_sim_time = -1.0f;  // telemetry.sim_time the exposure was last moved at
     std::string exposure_map;         // the level it adapted in
@@ -289,6 +297,7 @@ struct D3D11Renderer::Impl {
     // Rasterizer & blend states
     ComPtr<ID3D11RasterizerState> raster_no_cull;
     ComPtr<ID3D11RasterizerState> raster_cull_back;
+    ComPtr<ID3D11RasterizerState> raster_decal;  // no culling, the decals' depth bias
     ComPtr<ID3D11RasterizerState> raster_shadow_near;
     ComPtr<ID3D11RasterizerState> raster_shadow_far;
     ComPtr<ID3D11BlendState> blend_opaque;
@@ -308,6 +317,14 @@ struct D3D11Renderer::Impl {
     ComPtr<ID3D11Buffer> cb_frame;     // FrameUniforms: vertex b1, pixel b0
     ComPtr<ID3D11Buffer> cb_screen;    // float2 screen size: HUD / UI vertex b1
     ComPtr<ID3D11Buffer> cb_material;  // float4 material uniforms: pixel b1
+    ComPtr<ID3D11Buffer> cb_scene;     // SceneUniforms: pixel b2 of the material shaders
+    SceneUniformsGPU scene_constants{};  // what it holds
+    SceneLightEnvironments light_envs;   // of the dynamic objects, kept between frames
+    std::vector<LensFlareQuad> flare_quads;  // this frame's
+    std::vector<ModShadow> mod_shadows;      // this frame's dynamic shadows (mod_shadow.hpp)
+    std::vector<uint8_t> mod_enemy_ready;
+    bool viewmodel_built = false;            // the first-person body is already posed for this frame
+    std::vector<Vertex> flare_vertices;
     static constexpr int kMaxMaterialUniforms = 256;
 
     // Framebuffer targets
@@ -321,7 +338,7 @@ struct D3D11Renderer::Impl {
     ComPtr<ID3D11DepthStencilView> depth_dsv;
     ComPtr<ID3D11ShaderResourceView> depth_srv;
     ComPtr<ID3D11Texture2D> shadow_depth_tex;  // sun shadow cascades: 2-slice 4096x4096 depth array (renderer/sun_shadow.hpp)
-    ComPtr<ID3D11DepthStencilView> shadow_dsv[2];
+    ComPtr<ID3D11DepthStencilView> shadow_dsv[3];
     ComPtr<ID3D11ShaderResourceView> shadow_srv;
     ComPtr<ID3D11Texture2D> scene_color_copy;  // opaque scene color (SceneTexture / DestColor)
     ComPtr<ID3D11ShaderResourceView> scene_color_copy_srv;
@@ -806,6 +823,7 @@ struct D3D11Renderer::Impl {
         if (!make_program("world_vertex", "world_fragment", VertexKind::Scene, world_program)) return false;
         if (!make_program("viewmodel_vertex", "viewmodel_fragment", VertexKind::Scene, viewmodel_program)) return false;
         if (!make_program("post_vertex", "fog_fragment", VertexKind::None, fog_program)) return false;
+        if (!make_program("post_vertex", "mod_shadow_fragment", VertexKind::None, mod_shadow_program)) return false;
         if (!make_program("post_vertex", "haze_fragment", VertexKind::None, haze_program)) return false;
         if (!make_program("post_vertex", "bloom_gather_fragment", VertexKind::None, bloom_gather_program)) return false;
         if (!make_program("post_vertex", "filter_fragment", VertexKind::None, filter_program)) return false;
@@ -813,6 +831,7 @@ struct D3D11Renderer::Impl {
         if (!make_program("post_vertex", "meter_fragment", VertexKind::None, meter_program)) return false;
         if (!make_program("post_vertex", "exposure_fragment", VertexKind::None, exposure_program)) return false;
         if (!make_program("post_vertex", "tonemap_fragment", VertexKind::None, tonemap_program)) return false;
+        if (!make_program("post_vertex", "finish_fragment", VertexKind::None, finish_program)) return false;
         if (!make_program("hud_vertex", "hud_fragment", VertexKind::Hud, hud_program)) return false;
         if (!make_program("ui_tex_vertex", "ui_tex_fragment", VertexKind::UiTex, ui_tex_program)) return false;
 
@@ -837,6 +856,11 @@ struct D3D11Renderer::Impl {
         rs.CullMode = D3D11_CULL_BACK;
         rs.FrontCounterClockwise = mat_front_ccw ? TRUE : FALSE;
         device->CreateRasterizerState(&rs, &raster_cull_back);
+        rs.CullMode = D3D11_CULL_NONE;
+        rs.DepthBias = kDecalDepthBias;
+        rs.SlopeScaledDepthBias = kDecalSlopeBias;
+        device->CreateRasterizerState(&rs, &raster_decal);
+        rs.DepthBias = 0;
         // Shadow passes: slope-scaled bias, capped in UU (the cap is in map depth units).
         rs.CullMode = D3D11_CULL_NONE;
         rs.FrontCounterClockwise = FALSE;
@@ -890,6 +914,7 @@ struct D3D11Renderer::Impl {
         cb_post = make_constants(sizeof(PostUniformsGPU));
         cb_screen = make_constants(16);
         cb_material = make_constants(static_cast<size_t>(kMaxMaterialUniforms) * 16);
+        cb_scene = make_constants(sizeof(SceneUniformsGPU));
         return cb_frame && cb_screen && cb_material && linear_sampler && blend_ui && raster_no_cull && depth_write_state;
     }
 
@@ -1316,6 +1341,8 @@ struct D3D11Renderer::Impl {
 
         // The post-process chain's own targets.
         ok = ok && make_color_target(scene_hazed, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        for (auto& p : picture) ok = ok && make_color_target(p, width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+        ok = ok && make_color_target(scene_effect, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT);
         ok = ok && make_color_target(filter_a, width / kFilterDownsample, height / kFilterDownsample, DXGI_FORMAT_R16G16B16A16_FLOAT);
         ok = ok && make_color_target(filter_b, width / kFilterDownsample, height / kFilterDownsample, DXGI_FORMAT_R16G16B16A16_FLOAT);
         for (int i = 0; i < kMeterSteps; ++i) {
@@ -1336,13 +1363,13 @@ struct D3D11Renderer::Impl {
             d.Width = kSunShadowMapSize;
             d.Height = kSunShadowMapSize;
             d.MipLevels = 1;
-            d.ArraySize = 2;  // kSunShadowNearSlice, kSunShadowFarSlice
+            d.ArraySize = 3;  // kSunShadowNearSlice, kSunShadowFarSlice, kModShadowSlice
             d.Format = DXGI_FORMAT_R32_TYPELESS;
             d.SampleDesc.Count = 1;
             d.Usage = D3D11_USAGE_DEFAULT;
             d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
             ok = SUCCEEDED(device->CreateTexture2D(&d, nullptr, &shadow_depth_tex));
-            for (UINT slice = 0; ok && slice < 2; ++slice) {
+            for (UINT slice = 0; ok && slice < 3; ++slice) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC sv{};
                 sv.Format = DXGI_FORMAT_D32_FLOAT;
                 sv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
@@ -1354,7 +1381,7 @@ struct D3D11Renderer::Impl {
             shv.Format = DXGI_FORMAT_R32_FLOAT;
             shv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
             shv.Texture2DArray.MipLevels = 1;
-            shv.Texture2DArray.ArraySize = 2;
+            shv.Texture2DArray.ArraySize = 3;
             ok = ok && SUCCEEDED(device->CreateShaderResourceView(shadow_depth_tex.Get(), &shv, &shadow_srv));
             shadow_far_valid = false;
         }
@@ -1725,8 +1752,21 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
 
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->VSSetConstantBuffers(1, 1, impl->cb_frame.GetAddressOf());
-    ID3D11Buffer* pixel_constants[2] = {impl->cb_frame.Get(), impl->cb_material.Get()};
-    ctx->PSSetConstantBuffers(0, 2, pixel_constants);
+    ID3D11Buffer* pixel_constants[3] = {impl->cb_frame.Get(), impl->cb_material.Get(), impl->cb_scene.Get()};
+    ctx->PSSetConstantBuffers(0, 3, pixel_constants);
+    {
+        // What a material's pixel shader is given beside the frame's constants: the height fog a
+        // translucent surface takes, and (per dynamic object, below) its light environment.
+        impl->scene_constants = SceneUniformsGPU{};
+        fill_fog_uniforms(active_scene, cam_pos, impl->scene_constants.fog);
+        impl->update_constants(impl->cb_scene, &impl->scene_constants, sizeof(impl->scene_constants));
+        impl->light_envs.begin_frame(active_scene);
+    }
+    // The light environment of what is drawn next; none for the level's own geometry.
+    auto set_light_env = [&](const LightEnvLighting* lighting, const Vec3& relative_to) {
+        if (!light_env_uniforms(lighting, relative_to, impl->scene_constants.env)) return;
+        impl->update_constants(impl->cb_scene, &impl->scene_constants, sizeof(impl->scene_constants));
+    };
     impl->unbind_shader_resources();
     impl->bind_static_samplers(impl->builtin_shaders);
 
@@ -1969,6 +2009,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl->cached_mesh_buffers[i]) continue;
                 if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
+                if (mesh.is_decal) continue;
                 bool moved = apply_scene_mesh_model(i);
                 if (moved || sh_prev_moved) push_uniforms();
                 sh_prev_moved = moved;
@@ -2016,6 +2057,87 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
         // Near cascade (or the menu's fixed square): every caster, every frame.
         render_shadow_cascade(kSunShadowNearSlice, sun_near_vp, impl->raster_shadow_near, /*dynamic_casters=*/true);
+    }
+
+    // Pass 0b: the dynamic objects' own shadows (mod_shadow.hpp): a depth map each, from its light
+    // environment's shadow light, in cells of the shadow map array's third slice.
+    impl->mod_shadows.clear();
+    impl->viewmodel_built = false;
+    if (shadow_pass && !scene_hidden && !in_main_menu && !impl->menu_open) {
+        ModShadowView shadow_view;
+        shadow_view.position = cam_pos;
+        shadow_view.forward = fwd;
+        shadow_view.proj_x = proj.m[0];
+        shadow_view.proj_y = proj.m[5];
+        shadow_view.width = fw;
+        shadow_view.height = fh;
+        impl->mod_enemy_ready.assign(active_scene.enemies.size(), 0);
+        for (size_t ei = 0; need_enemies && ei < active_scene.enemies.size() && ei < impl->frame_enemy_draws.size(); ++ei) {
+            impl->mod_enemy_ready[ei] = (impl->frame_enemy_draws[ei].in_view || impl->frame_enemy_draws[ei].in_shadow) ? 1 : 0;
+        }
+        const bool body_casts = !bink_video_active && impl->anim_system.is_loaded();
+        collect_mod_shadows(active_scene, impl->light_envs, shadow_view, body_casts ? &telemetry.position : nullptr,
+                            telemetry.yaw_deg, impl->mod_enemy_ready, telemetry.sim_time, impl->mod_shadows);
+        if (!impl->mod_shadows.empty()) {
+            ID3D11DepthStencilView* dsv = impl->shadow_dsv[kModShadowSlice].Get();
+            ctx->OMSetRenderTargets(0, nullptr, dsv);
+            ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+            float sun_vp_saved[16];
+            std::memcpy(sun_vp_saved, uniforms.sun_view_proj, sizeof(sun_vp_saved));
+            use_program(impl->shadow_program);
+            ctx->OMSetDepthStencilState(impl->depth_write_state.Get(), 0);
+            ctx->RSSetState(impl->raster_no_cull.Get());
+            set_blend(impl->blend_opaque);
+            for (const ModShadow& s : impl->mod_shadows) {
+                const D3D11_VIEWPORT cell{static_cast<float>(s.cell_x), static_cast<float>(s.cell_y), static_cast<float>(s.resolution),
+                                          static_cast<float>(s.resolution), 0.0f, 1.0f};
+                ctx->RSSetViewports(1, &cell);
+                set_matrix(uniforms.sun_view_proj, s.subject_matrix);  // shadow_vertex projects with it
+                if (s.kind == ModShadow::Kind::Enemy) {
+                    const auto& bot = active_scene.enemies[s.index];
+                    set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
+                    push_uniforms();
+                    draw_enemy_mesh(s.index);
+                } else if (s.kind == ModShadow::Kind::Mesh) {
+                    const auto& mesh = active_scene.meshes[s.index];
+                    if (!impl->cached_mesh_buffers[s.index]) continue;
+                    apply_scene_mesh_model(s.index);
+                    push_uniforms();
+                    set_scene_vertices(impl->cached_mesh_buffers[s.index].Get());
+                    if (mesh.sections.empty()) {
+                        impl->draw(static_cast<UINT>(mesh.vertices.size()), 0);
+                        continue;
+                    }
+                    const auto& sflags = impl->cached_section_flags[s.index];
+                    for (size_t si = 0; si < mesh.sections.size(); ++si) {
+                        const auto& sec = mesh.sections[si];
+                        if (!section_in_range(mesh, sec) || (sflags[si] & Impl::kSecShadowCaster) == 0) continue;
+                        impl->draw(sec.vertex_count, sec.first_vertex);
+                    }
+                } else {
+                    // The first-person body, which is posed in the view's own frame (x to the left,
+                    // y ahead, z up).
+                    impl->build_faith_viewmodel(telemetry);
+                    impl->viewmodel_built = true;
+                    if (impl->faith_viewmodel_mesh.empty()) continue;
+                    Mat4 body;
+                    const Vec3 axes[3] = {right * -1.0f, fwd, up};
+                    for (int c = 0; c < 3; ++c) {
+                        body.m[c * 4 + 0] = axes[c].x;
+                        body.m[c * 4 + 1] = axes[c].y;
+                        body.m[c * 4 + 2] = axes[c].z;
+                    }
+                    body.m[12] = cam_pos.x;
+                    body.m[13] = cam_pos.y;
+                    body.m[14] = cam_pos.z;
+                    set_matrix(uniforms.model, body);
+                    push_uniforms();
+                    draw_scene_vertices(impl->faith_viewmodel_mesh);
+                }
+            }
+            std::memcpy(uniforms.sun_view_proj, sun_vp_saved, sizeof(sun_vp_saved));
+            set_matrix(uniforms.model, identity);
+        }
     }
 
     prof(Impl::kProfShadows);
@@ -2085,9 +2207,16 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         auto bind_scene_mesh = [&](size_t i) {
             uniforms.is_runner_vision = active_scene.meshes[i].is_runner_vision ? 1.0f : 0.0f;
             apply_scene_mesh_model(i);
+            if (active_scene.meshes[i].dynamic_lit && !in_main_menu) {
+                const LightEnvLighting lighting = impl->light_envs.mesh(active_scene, i, telemetry.sim_time);
+                set_light_env(&lighting, Vec3(0.0f, 0.0f, 0.0f));
+            } else {
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+            }
             set_scene_vertices(impl->cached_mesh_buffers[i].Get());
             push_uniforms();
         };
+        bool decal_bias = false;  // what is being drawn is a decal buffer (MeshBuffer::is_decal)
         // Switches to a material's pipeline: its pixel shader on the shared material vertex stage.
         auto use_material_pipeline = [&](ID3D11PixelShader* ps, const MaterialShader& sh, const SceneMaterial& m, bool cull) {
             ctx->IASetInputLayout(impl->mat_input_layout.Get());
@@ -2099,7 +2228,8 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 case MatBlendMode::Modulate: set_blend(impl->blend_modulate); break;
                 default: set_blend(impl->blend_opaque); break;
             }
-            ctx->RSSetState(cull ? impl->raster_cull_back.Get() : impl->raster_no_cull.Get());
+            ctx->RSSetState(decal_bias ? impl->raster_decal.Get()
+                                       : (cull ? impl->raster_cull_back.Get() : impl->raster_no_cull.Get()));
             impl->bind_material(m, sh);
         };
 
@@ -2113,6 +2243,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl->cached_mesh_buffers[i]) continue;
+                decal_bias = mesh.is_decal;
                 bind_scene_mesh(i);
                 if (mesh.sections.empty()) {
                     use_world_pipeline();
@@ -2145,6 +2276,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     impl->draw(s.vertex_count, s.first_vertex);
                 }
             }
+            decal_bias = false;
             set_matrix(uniforms.model, identity);
             uniforms.is_runner_vision = 0.0f;
         }
@@ -2164,8 +2296,10 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = Float3(1.0f, 1.0f, 1.0f);
                 push_uniforms();
+                set_light_env(&impl->light_envs.enemy(active_scene, ei, telemetry.sim_time), Vec3(0.0f, 0.0f, 0.0f));
                 draw_enemy_mesh(ei);
             }
+            set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
             set_matrix(uniforms.model, identity);
         }
 
@@ -2197,6 +2331,32 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         prof(Impl::kProfScene);
+
+        // The dynamic objects' shadows multiply the lit scene, before fog and translucency (mod_shadow.hpp).
+        if (!impl->mod_shadows.empty()) {
+            ModShadowUniformsGPU shadow_constants;
+            fill_mod_shadow_uniforms(impl->mod_shadows, shadow_constants);
+            impl->update_constants(impl->cb_post, &shadow_constants, sizeof(shadow_constants));
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_post.GetAddressOf());
+            ctx->OMSetRenderTargets(1, &scene_rtv, nullptr);  // the depth buffer is read, not tested
+            impl->unbind_shader_resources();
+            ctx->PSSetShaderResources(1, 1, impl->depth_srv.GetAddressOf());
+            bind_shadow_map();
+            impl->bind_static_samplers(impl->builtin_shaders);
+            ctx->OMSetDepthStencilState(impl->depth_disabled_state.Get(), 0);
+            ctx->RSSetState(impl->raster_no_cull.Get());
+            set_blend(impl->blend_modulate);
+            set_viewport(fw, fh, 0.0f, 1.0f);
+            use_program(impl->mod_shadow_program);
+            push_uniforms();
+            impl->draw(3, 0);
+            impl->unbind_shader_resources();
+            set_blend(impl->blend_opaque);
+            ctx->OMSetRenderTargets(1, &scene_rtv, impl->depth_dsv.Get());
+            set_viewport(fw, fh, 0.05f, 1.0f);
+            bind_shadow_map();
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_material.GetAddressOf());
+        }
 
         // Height fog over the opaque scene, before anything translucent is drawn on it
         // (HeightFogPixelShader.usf): scene * scattering + fog, read off the depth buffer.
@@ -2237,9 +2397,13 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
             ctx->OMSetDepthStencilState(impl->depth_test_only_state.Get(), 0);
             if (impl->material_shaders) impl->bind_static_samplers(*impl->material_shaders);
+            // The decals first: they belong to the opaque surfaces they lie on.
+            for (int decals = 1; decals >= 0; --decals)
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || mesh.sections.empty() || !impl->cached_mesh_buffers[i]) continue;
+                if (mesh.is_decal != (decals == 1)) continue;
+                decal_bias = mesh.is_decal;
                 bool mesh_bound = false;
                 for (const auto& s : mesh.sections) {
                     if (!section_in_range(mesh, s)) continue;
@@ -2262,11 +2426,57 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             impl->bind_static_samplers(impl->builtin_shaders);
         }
 
+        decal_bias = false;
+        // B4. Lens flares (lens_flare.hpp): additive quads over the world, under the first-person mesh.
+        if (!in_main_menu && !bink_video_active && impl->material_shaders && !active_scene.lens_flares.empty()) {
+            LensFlareView flare_view;
+            flare_view.position = cam_pos;
+            flare_view.forward = fwd;
+            flare_view.right = right;
+            flare_view.up = up;
+            flare_view.proj_x = proj.m[0];
+            flare_view.proj_y = proj.m[5];
+            flare_view.width = fw;
+            flare_view.height = fh;
+            flare_view.near_plane = near_plane;
+            build_lens_flare_quads(active_scene, flare_view, impl->flare_quads);
+            if (!impl->flare_quads.empty()) {
+                const FrameUniformsGPU kept = uniforms;
+                std::memcpy(&uniforms.view_proj, identity.m, sizeof(float) * 16);
+                std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                push_uniforms();
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+                ctx->OMSetDepthStencilState(impl->depth_test_only_state.Get(), 0);
+                impl->bind_static_samplers(*impl->material_shaders);
+                for (const LensFlareQuad& q : impl->flare_quads) {
+                    MeshSection section;
+                    section.material = q.material;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    ID3D11PixelShader* ps = impl->section_shader(section, &sh, &m);
+                    if (!ps) continue;
+                    use_material_pipeline(ps, *sh, *m, false);
+                    std::memcpy(impl->scene_constants.flare_color, q.color, sizeof(q.color));
+                    const float inputs[4] = {q.radial_distance, q.source_distance, q.occlusion, q.intensity};
+                    std::memcpy(impl->scene_constants.flare_inputs, inputs, sizeof(inputs));
+                    impl->scene_constants.flare_ray[0] = q.ray_distance;
+                    impl->update_constants(impl->cb_scene, &impl->scene_constants, sizeof(impl->scene_constants));
+                    lens_flare_vertices(q, impl->flare_vertices);
+                    draw_scene_vertices(impl->flare_vertices);
+                }
+                uniforms = kept;
+                push_uniforms();
+                set_blend(impl->blend_opaque);
+                ctx->RSSetState(impl->raster_no_cull.Get());
+                impl->bind_static_samplers(impl->builtin_shaders);
+            }
+        }
+
         prof(Impl::kProfTranslucent);
 
         // C. Draw First-Person Faith Viewmodel (CH_Faith_1P in DPG_Foreground depth range [0.0, 0.05])
         if (!impl->menu_open && !bink_video_active) {
-            impl->build_faith_viewmodel(telemetry);
+            if (!impl->viewmodel_built) impl->build_faith_viewmodel(telemetry);
             if (!impl->faith_viewmodel_mesh.empty()) {
                 set_viewport(fw, fh, 0.0f, 0.05f);
                 use_program(impl->viewmodel_program);
@@ -2274,6 +2484,8 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 set_matrix(uniforms.view_proj, vm_vp);
                 set_matrix(uniforms.model, identity);
                 uniforms.camera_pos = Float3(0.0f, 0.0f, 0.0f);
+                // Its lights are given around the eye, as the mesh is.
+                set_light_env(&impl->light_envs.first_person(active_scene, telemetry.position, telemetry.sim_time), cam_pos);
                 uniforms.is_runner_vision = 0.0f;
                 uniforms.actor_tint = Float3(1.0f, 1.0f, 1.0f);
 
@@ -2343,11 +2555,14 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         const bool view_jumped = (cam_pos - impl->exposure_view_pos).length_sq() > 300.0f * 300.0f;
         const bool still = !opening && (new_level || fresh || post_dt == 0.0f || post_dt >= 0.5f || view_jumped);
         impl->exposure_view_pos = cam_pos;
+        // TdMotionBlur's amount, from how the camera itself moved since the last frame.
+        const float motion_amount = impl->motion_blur.update(cam_pos, fwd, post_dt, still || opening);
         fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
         post.fade[0] = telemetry.fade_color.x;
         post.fade[1] = telemetry.fade_color.y;
         post.fade[2] = telemetry.fade_color.z;
         post.fade[3] = telemetry.fade_amount;
+        post.motion[0] = motion_amount;
         impl->exposure_sim_time = telemetry.sim_time;
         impl->exposure_map = active_scene.map_name;
         auto push_post = [&]() { impl->update_constants(impl->cb_post, &post, sizeof(post)); };
@@ -2394,13 +2609,88 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         post_pass(impl->exposure_program, impl->exposure[impl->exposure_current],
                   {impl->meter[kMeterSteps - 1].srv.Get(), impl->exposure[previous].srv.Get()});
 
+        // A material effect of the chain: its material over the whole target, through the material
+        // vertex stage with nothing to transform, reading `source` as the scene colour.
+        auto effect_pass = [&](const PostEffectInfo& fx, const ScreenEffect* state, ID3D11ShaderResourceView* source,
+                               const Impl::ColorTarget& target) -> bool {
+            MeshSection section;
+            section.material = fx.material;
+            const MaterialShader* sh = nullptr;
+            const SceneMaterial* m = nullptr;
+            ID3D11PixelShader* ps = impl->section_shader(section, &sh, &m);
+            if (!ps) return false;
+            ID3D11RenderTargetView* rtv = target.rtv.Get();
+            ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            set_viewport(static_cast<float>(target.w), static_cast<float>(target.h), 0.0f, 1.0f);
+            impl->unbind_shader_resources();
+            ctx->IASetInputLayout(impl->mat_input_layout.Get());
+            ctx->VSSetShader(impl->mat_vertex_shader.Get(), nullptr, 0);
+            ctx->PSSetShader(ps, nullptr, 0);
+            if (impl->material_shaders) impl->bind_static_samplers(*impl->material_shaders);
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_material.GetAddressOf());
+            impl->bind_material(*m, *sh);
+            ID3D11ShaderResourceView* seen[2] = {source, impl->depth_srv.Get()};
+            ctx->PSSetShaderResources(matbind::kSceneColorTexture, 2, seen);
+            ctx->PSSetSamplers(matbind::kSceneSampler, 1, impl->scene_copy_sampler.GetAddressOf());
+            if (sh->num_uniforms > 0 && state && !state->params.empty()) {
+                std::vector<std::array<float, 4>> values = m->uniforms;
+                values.resize(static_cast<size_t>(sh->num_uniforms), {0.0f, 0.0f, 0.0f, 0.0f});
+                for (const auto& [name, value] : state->params) {
+                    const int at = m->uniform_index(name);
+                    if (at >= 0 && static_cast<size_t>(at) < values.size()) values[static_cast<size_t>(at)] = value;
+                }
+                impl->set_material_uniforms(values, sh->num_uniforms);
+            }
+            const FrameUniformsGPU kept = uniforms;
+            std::memcpy(&uniforms.view_proj, identity.m, sizeof(float) * 16);
+            std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            push_uniforms();
+            draw_scene_vertices(screen_quad_vertices());
+            uniforms = kept;
+            push_uniforms();
+            // back to the chain's own passes
+            ctx->PSSetConstantBuffers(1, 1, impl->cb_post.GetAddressOf());
+            ctx->PSSetSamplers(0, 1, impl->linear_sampler.GetAddressOf());
+            impl->bind_static_samplers(impl->builtin_shaders);
+            return true;
+        };
+        const auto effect_state = [&](const PostEffectInfo& fx) -> const ScreenEffect* {
+            for (const ScreenEffect& e : telemetry.screen_effects) {
+                if (e.name == fx.name) return &e;
+            }
+            return nullptr;
+        };
+
+        // The effects that stand before the tone mapper work on the scene itself.
+        ID3D11ShaderResourceView* scene_for_tone = impl->scene_hazed.srv.Get();
+        for (const PostEffectInfo& fx : active_scene.post_effects) {
+            if (fx.after_tone_mapping) continue;
+            const ScreenEffect* state = effect_state(fx);
+            if (!state) continue;
+            // one such effect at a time is all the game ever shows; a second would need a third buffer
+            if (scene_for_tone != impl->scene_hazed.srv.Get()) break;
+            if (effect_pass(fx, state, scene_for_tone, impl->scene_effect)) scene_for_tone = impl->scene_effect.srv.Get();
+        }
+
+        // The tone-mapped picture, then the passes that work on it in turn; the last writes the frame.
+        post_pass(impl->tonemap_program, impl->picture[0],
+                  {scene_for_tone, impl->depth_srv.Get(), impl->filter_a.srv.Get(),
+                   impl->exposure[impl->exposure_current].srv.Get()});
+        int picture_now = 0;
+        for (const PostEffectInfo& fx : active_scene.post_effects) {
+            if (!fx.after_tone_mapping) continue;
+            const ScreenEffect* state = effect_state(fx);
+            if (!state) continue;
+            if (effect_pass(fx, state, impl->picture[picture_now].srv.Get(), impl->picture[1 - picture_now])) {
+                picture_now = 1 - picture_now;
+            }
+        }
+
         ctx->OMSetRenderTargets(1, &final_rtv, nullptr);
         set_viewport(fw, fh, 0.0f, 1.0f);
         impl->unbind_shader_resources();
-        ID3D11ShaderResourceView* tonemap_inputs[4] = {impl->scene_hazed.srv.Get(), impl->depth_srv.Get(), impl->filter_a.srv.Get(),
-                                                       impl->exposure[impl->exposure_current].srv.Get()};
-        ctx->PSSetShaderResources(0, 4, tonemap_inputs);
-        use_program(impl->tonemap_program);
+        ctx->PSSetShaderResources(0, 1, impl->picture[picture_now].srv.GetAddressOf());
+        use_program(impl->finish_program);
         push_post();
         impl->draw(3, 0);
         ctx->PSSetConstantBuffers(1, 1, impl->cb_material.GetAddressOf());

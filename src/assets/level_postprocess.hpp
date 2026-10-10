@@ -25,7 +25,11 @@
 
 namespace me {
 
+class PackageManager;
 class UPKPackage;
+
+// The material effects of the chain the game runs (FX_PostProcess.FX_PostProcess), in its order.
+void extract_post_chain(PackageManager& pm, std::vector<PostEffectInfo>& out);
 
 void extract_level_postprocess(const UPKPackage& persistent_level, const std::vector<std::shared_ptr<UPKPackage>>& packages,
                                LevelScene& out);
