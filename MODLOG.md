@@ -1057,3 +1057,62 @@ has none: the only body its Matinees animate is Celeste's.
 - `--level Maps/SP00/Tutorial_p.me1 --max-frames 1150 --trace`: first frame yaw -54.95°, pitch -23.8° (the line from the camera to the target: computed -54.95°, -23.8°); `A_VO_SP00_Opening_1_1_Merc_Cue` at frame 0; fade 0 → 1 over the first second (the restart), 1 → 0 from 14.5 to 15.0 s, hand-over at 15.0 s to (-4813, -7903) eye 5926, yaw 0, fade 0 → 1 over the next 0.5 s; final frame fade 1.00, `MOVE_Walking`.
 - `./build/mirrorsedge_macos --verify-all`: ALL SYSTEMS PASS (16 stages), the ten first-person intros unchanged (`LevelIntro=sp01_intro`).
 - Not measured: retail's pan itself (the training level cannot be booted at a checkpoint by `tools/retail`); the numbers above are the cooked data through the native evaluation.
+
+---
+
+## 22. The startup sound: a placeholder chord, and music one transition behind on macOS (`agent/fix-startup-sound`, 2026-10-10)
+
+User issue: "A weird sound plays when the binary is first started."
+
+### 22.1 What played
+Traced on `main` (`dd15b8b`), default boot (the front end), 90 frames, with a scratch `DYLD_INSERT_LIBRARIES` shim
+over Apple's OpenAL that logs every buffer upload, bind, play, stop and gain change (listener muted):
+- Right after the renderer comes up (0.9 and 2.1 s after launch in two runs), music stem 0 starts a 5.000 s stereo
+  buffer at gain 1.0, looping: `Stem_0`, the chord `synthesize_fallback_clips()` builds from sines at 220, 261.63,
+  329.63 and 440.5 Hz, which `init_openal()` bound and started through `rebind_music_stem_buffers()` before any
+  package was loaded. It looped at full gain (2.2x the stems' level, 0.45, which `update()` only applies from the
+  first frame) through `load_stock_audio()` and the Training Area's load: 2.2 and 3.6 s, until
+  `load_level_audio()` stopped the stems.
+- The Prologue's `ambience_01` (64.4 s) then started at gain 1.0 and stayed on in the front end (22.2).
+- Nothing else plays before the first frame: no voice line (the Training Area's opening line plays at CONTINUE).
+- Every chapter's music bank has real tracks for all four stems (`strings` over `A_M_*.upk`), so `Stem_0` to
+  `Stem_3` are only ever heard before the first bank loads, which is at start-up.
+
+### 22.2 Apple's OpenAL applies a bind made just after a stop late
+In the same trace the menu theme (110.782 s) was bound when the front end opened, and the stem restarted the
+64.4 s chapter track; at CONTINUE the chapter track was bound and the menu theme played. A standalone test
+(`alSourcePlay`, 200 ms, `alSourceStop`, `alSourcei(AL_BUFFER, b)`) on macOS: no AL error, the source reports
+`AL_STOPPED` and reads back the old buffer, also after `alSourceRewind` or polling `AL_SOURCE_STATE`; 20 ms later
+it reads back the new one without another bind; a source that never played takes the bind at once. An
+`alSourcePlay` in between restarts the old buffer. `rebind_music_stem_buffers()` stopped, bound and played in one
+go, so on macOS the music has been one transition behind: the chapter track in the front end, the menu theme in
+the level after CONTINUE, swapped again on every pause and resume. The run wind source likewise never moved from
+the synthesized `FX_RunWind` to `CharacterRunWind`. Detaching (buffer 0) is not affected: no buffer delete
+failed in any run.
+
+### 22.3 Changes
+- `src/audio/audio_engine.*`:
+  - The stem sources start at gain 0 and `current_stem_vols_` at 0; `init_openal()` no longer binds or starts them.
+  - `playback_started_`: no stem or wind source starts before the first `update()`, so nothing plays while the
+    packages and the first level load. By then the track for the screen is bound (the menu theme on a default
+    boot) and it fades in from silence with the stems' existing volume lerp.
+  - `bind_source_buffer()` checks that a bind took; `sync_music_stem()` binds a stem's wanted buffer and plays it
+    only once the source holds it. `update()` calls it for every stem each frame, so a bind that has not taken
+    yet is picked up a frame later. The wind source binds through the same check (`update()` already calls back
+    while it is not playing).
+- `src/main.cpp`: the level loaded behind the front end at boot no longer begins play there
+  (`load_chapter_or_level(..., defer_begin_play)`); `begin_level_play()` runs when the menu closes into it
+  (CONTINUE). A chapter chosen from a menu is loaded before the menu closes, so closing it does not first begin the
+  deferred level.
+- `TODO.md`: the user issue and the audit's start-up items (`Stem_0`, play beginning behind the front end) removed;
+  the three other stop-then-bind paths (`play_vo`, a stolen pool source, an ambient slot) added.
+
+### 22.4 Results
+- Default boot, 90 frames, same shim: no source starts before the main loop. The first is stem 0 with the menu theme
+  (110.782 s) at gain 0, rising to 0.43 over the first 2.8 s of front-end frames; the wind source holds
+  `CharacterRunWind` (5.096 s, mono) at gain 0.
+- A scratch driver linked against the build's `me_game_objs` objects took the real `AudioEngine` through boot,
+  front end, CONTINUE, pause, resume and a chapter change (Stormdrain) on OpenAL. `main`: chapter track, menu
+  theme, chapter track, menu theme. This branch: menu theme, chapter track (19 ms after the switch), menu theme
+  (20 ms), chapter track (23 ms), Stormdrain's stems (bound at once, 2 s after their stop); no failed deletes.
+- `./build/mirrorsedge_macos --verify-all`: ALL SYSTEMS PASS (16 stages).

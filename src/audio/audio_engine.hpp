@@ -164,6 +164,10 @@ private:
     void invalidate_cached_buffer(const std::string& key);
     void clear_chapter_music_clips();
     void rebind_music_stem_buffers();
+    // Binds `buf` to `src`, stopping it first; false while the bind has not taken yet (Apple's OpenAL
+    // applies a bind made just after stopping a playing source a moment later), to be checked again.
+    bool bind_source_buffer(uint32_t src, uint32_t buf);
+    void sync_music_stem(int i);
     void stitch_concatenator_cues();
 
     bool load_package_audio_and_cues(const std::string& pkg_path,
@@ -205,6 +209,7 @@ private:
 
     bool initialized_ = false;
     bool headless_ = false;
+    bool playback_started_ = false;
     bool play_log_on_ = false;
     std::unordered_set<std::string> cue_banks_tried_;
     std::vector<PlayEvent> play_log_;
@@ -227,7 +232,7 @@ private:
     uint32_t music_stem_sources_[4] = {0};
     uint32_t music_stem_buffers_[4] = {0};
     std::string music_stem_clip_names_[4] = {"Stem_0", "Stem_1", "Stem_2", "Stem_3"};
-    float current_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float current_stem_vols_[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float target_stem_vols_[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 
     // Dedicated continuous TdSoundNodeVelocity source for 1P RunWind + max-speed wind surge

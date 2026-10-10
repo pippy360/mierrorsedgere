@@ -138,6 +138,7 @@ void AudioEngine::shutdown() {
     sound_cues_.clear();
     ambient_emitters_.clear();
     al_buffers_.clear();
+    playback_started_ = false;
     initialized_ = false;
 }
 
@@ -170,7 +171,7 @@ bool AudioEngine::init_openal() {
         sources_[i] = src;
     }
 
-    // Create 4 dynamic music stem sources
+    // Create 4 dynamic music stem sources (gain starts at 0.0f until update() fades them in)
     for (int i = 0; i < 4; ++i) {
         ALuint src = 0;
         alGenSources(1, &src);
@@ -178,10 +179,10 @@ bool AudioEngine::init_openal() {
         alSourcei(src, AL_LOOPING, AL_TRUE);
         alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
         alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
-        alSourcef(src, AL_GAIN, (i == 0) ? 1.0f : 0.0f);
+        alSourcef(src, AL_GAIN, 0.0f);
     }
 
-    // Create dedicated continuous TdSoundNodeVelocity (RunWind) loop source before rebind
+    // Create dedicated continuous TdSoundNodeVelocity (RunWind) loop source
     {
         ALuint wsrc = 0;
         alGenSources(1, &wsrc);
@@ -191,8 +192,6 @@ bool AudioEngine::init_openal() {
         alSource3f(wsrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
         alSourcef(wsrc, AL_GAIN, 0.0f);
     }
-
-    rebind_music_stem_buffers();
 
     // Create dedicated non-stealable 2D VO source (DialogueRadio / DialogueFaith / DialogueOther)
     {
@@ -462,14 +461,12 @@ void AudioEngine::rebind_music_stem_buffers() {
         std::string new_name = !chosen[i]->full_path.empty() ? chosen[i]->full_path : chosen[i]->name;
         uint32_t buf = get_or_create_buffer(*chosen[i], false);
         if (!buf) continue;
-        if (new_name == music_stem_clip_names_[i] && music_stem_buffers_[i] == buf) {
-            continue;
+        if (new_name != music_stem_clip_names_[i] || music_stem_buffers_[i] != buf) {
+            music_stem_clip_names_[i] = new_name;
+            music_stem_buffers_[i] = buf;
+            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * 0.45f);
         }
-        music_stem_clip_names_[i] = new_name;
-        music_stem_buffers_[i] = buf;
-        alSourceStop(music_stem_sources_[i]);
-        alSourcei(music_stem_sources_[i], AL_BUFFER, static_cast<ALint>(buf));
-        alSourcePlay(music_stem_sources_[i]);
+        sync_music_stem(i);
     }
 
     // Bind RunWind (TdSoundNodeVelocity) preferring CharacterRunWind or dedicated FX_RunWind fallback
@@ -479,14 +476,16 @@ void AudioEngine::rebind_music_stem_buffers() {
             uint32_t wbuf = get_or_create_buffer(*wind_clip, false);
             if (wbuf) {
                 ALint cur_buf = 0;
-                ALint cur_state = 0;
                 alGetSourcei(run_wind_source_, AL_BUFFER, &cur_buf);
+                bool bound = static_cast<uint32_t>(cur_buf) == wbuf;
+                if (!bound) {
+                    alSourcef(run_wind_source_, AL_GAIN, current_wind_vol_ * sfx_bus_gain_);
+                    // Not bound yet: update() calls back here while the wind source is not playing.
+                    bound = bind_source_buffer(run_wind_source_, wbuf);
+                }
+                ALint cur_state = 0;
                 alGetSourcei(run_wind_source_, AL_SOURCE_STATE, &cur_state);
-                if (static_cast<uint32_t>(cur_buf) != wbuf) {
-                    alSourceStop(run_wind_source_);
-                    alSourcei(run_wind_source_, AL_BUFFER, static_cast<ALint>(wbuf));
-                    alSourcePlay(run_wind_source_);
-                } else if (cur_state != AL_PLAYING) {
+                if (bound && playback_started_ && cur_state != AL_PLAYING) {
                     alSourcePlay(run_wind_source_);
                 }
             }
@@ -494,6 +493,47 @@ void AudioEngine::rebind_music_stem_buffers() {
     }
 #else
     (void)chosen;
+#endif
+}
+
+// Apple's OpenAL applies an AL_BUFFER change made right after alSourceStop on a playing source only
+// once the stop has gone through: no AL error, the source reports AL_STOPPED but still holds the old
+// buffer, and an alSourcePlay in between restarts the old one (measured on macOS: an immediate bind
+// reads back the old buffer, also after alSourceRewind or polling AL_SOURCE_STATE; 20 ms later it
+// reads back the new one). So a bind is checked, and a caller whose bind has not taken yet looks
+// again on a later frame instead of playing the old buffer.
+bool AudioEngine::bind_source_buffer(uint32_t src, uint32_t buf) {
+#ifndef ME_NO_OPENAL
+    ALint state = 0;
+    alGetSourcei(src, AL_SOURCE_STATE, &state);
+    if (state == AL_PLAYING || state == AL_PAUSED) alSourceStop(src);
+    alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
+    ALint bound = 0;
+    alGetSourcei(src, AL_BUFFER, &bound);
+    return static_cast<uint32_t>(bound) == buf;
+#else
+    (void)src; (void)buf;
+    return false;
+#endif
+}
+
+// Stem i's source holds music_stem_buffers_[i] (bound now if it can be, see bind_source_buffer)
+// and, once playback has started, plays it. Called by rebind_music_stem_buffers() and every frame
+// by update(), so a bind that had not taken yet is picked up on a later frame.
+void AudioEngine::sync_music_stem(int i) {
+#ifndef ME_NO_OPENAL
+    const uint32_t src = music_stem_sources_[i];
+    const uint32_t want = music_stem_buffers_[i];
+    if (!src || !want) return;
+    ALint bound = 0;
+    alGetSourcei(src, AL_BUFFER, &bound);
+    if (static_cast<uint32_t>(bound) != want && !bind_source_buffer(src, want)) return;
+    if (!playback_started_) return;
+    ALint state = 0;
+    alGetSourcei(src, AL_SOURCE_STATE, &state);
+    if (state != AL_PLAYING) alSourcePlay(src);
+#else
+    (void)i;
 #endif
 }
 
@@ -665,6 +705,11 @@ void AudioEngine::update(float dt,
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
 
+    if (!playback_started_) {
+        playback_started_ = true;
+        rebind_music_stem_buffers();
+    }
+
     // 1. Update 3D OpenAL listener position & orientation (1 UU = 0.01m)
     ALfloat pos[3] = {listener_pos.x * 0.01f, listener_pos.y * 0.01f, listener_pos.z * 0.01f};
     alListenerfv(AL_POSITION, pos);
@@ -707,6 +752,7 @@ void AudioEngine::update(float dt,
         current_stem_vols_[i] += (target_stem_vols_[i] - current_stem_vols_[i]) * stem_lerp;
         if (music_stem_sources_[i]) {
             alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * 0.45f);
+            sync_music_stem(i);
         }
     }
 
