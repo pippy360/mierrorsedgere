@@ -376,6 +376,7 @@ MoveCamera move_camera(EMovement m) {
         case EMovement::MOVE_Coil:             return lim(-5000, 30000, -32768, 32768, false);
         case EMovement::MOVE_MeleeWallrun:     return lim(-3000, 16000, -8000, 8000, false);
         case EMovement::MOVE_SkillRoll:        return lim(-2000, 32768, -5000, 5000, true);
+        case EMovement::MOVE_SoftLanding:      return lim(-16384, 16384, -5000, 5000, true);
         default:                               return MoveCamera{};
     }
 }
@@ -2565,15 +2566,16 @@ bool ParkourController::try_initiate_dodge_jump(const InputFrame& input) {
 // only) or a plain landing. Landing a plain jump caps the speed at PreJumpMomentum -
 // LandingSpeedReduction (SubtractLandingSpeed). Out of a 180 in the air you land on your back.
 bool ParkourController::is_soft_landing_surface(const FloorHit& floor, const LevelScene& scene) const {
+    if (floor.normal.z <= 0.9f) return false;
     if (floor.actor_index >= 0 && floor.actor_index < static_cast<int32_t>(scene.actors.size())) {
         if (scene.actors[floor.actor_index].is_soft_landing) return true;
     }
     const Vec3 foot(m_telemetry.position.x, m_telemetry.position.y, floor.z);
     for (const auto& act : scene.actors) {
         if (!act.is_soft_landing) continue;
-        if (foot.x >= act.world_bounds.min_pt.x - 650.0f && foot.x <= act.world_bounds.max_pt.x + 650.0f &&
-            foot.y >= act.world_bounds.min_pt.y - 650.0f && foot.y <= act.world_bounds.max_pt.y + 650.0f &&
-            foot.z >= act.world_bounds.min_pt.z - 650.0f && foot.z <= act.world_bounds.max_pt.z + 650.0f) {
+        if (foot.x >= act.world_bounds.min_pt.x - 50.0f && foot.x <= act.world_bounds.max_pt.x + 50.0f &&
+            foot.y >= act.world_bounds.min_pt.y - 50.0f && foot.y <= act.world_bounds.max_pt.y + 50.0f &&
+            foot.z >= act.world_bounds.min_pt.z - 50.0f && foot.z <= act.world_bounds.max_pt.z + 60.0f) {
             return true;
         }
     }
@@ -2585,23 +2587,24 @@ bool ParkourController::has_soft_landing_below(const LevelScene& scene) const {
     const Vec3 vel = m_telemetry.velocity;
     const float gravity = std::max(100.0f, m_config.gravity);
 
+    // Native UTdPhysicsMove::Tick (0x1206df0) + 0x11f9970: 2.0s ballistic parabola trace onto a
+    // surface with bEnableSoftLanding == True more than 2 * CylinderHeight (180 uu) below the pawn.
     for (const auto& act : scene.actors) {
-        if (!act.is_soft_landing && !act.is_fall_height_volume) continue;
+        if (!act.is_soft_landing) continue;
         const float top_z = act.world_bounds.max_pt.z;
         const float dz = pos.z - top_z;
-        if (dz < -650.0f || dz > 3800.0f) continue;
+        if (dz < -60.0f || dz > 3800.0f) continue;
 
-        // Check both instantaneous XY footprint and ballistic touchdown XY projection.
-        const float disc = std::max(0.0f, vel.z * vel.z + 2.0f * gravity * std::max(0.0f, dz));
-        const float t_fall = std::clamp((vel.z + std::sqrt(disc)) / gravity, 0.0f, 3.0f);
+        const float dz_pos = std::max(0.0f, dz);
+        const float disc = std::max(0.0f, vel.z * vel.z + 2.0f * gravity * dz_pos);
+        const float t_fall = std::clamp((vel.z + std::sqrt(disc)) / gravity, 0.0f, 2.0f);
         const Vec3 pred(pos.x + vel.x * t_fall, pos.y + vel.y * t_fall, top_z);
 
-        const float pad = 750.0f;
-        const bool over_now = (pos.x >= act.world_bounds.min_pt.x - pad && pos.x <= act.world_bounds.max_pt.x + pad &&
-                               pos.y >= act.world_bounds.min_pt.y - pad && pos.y <= act.world_bounds.max_pt.y + pad);
-        const bool over_pred = (pred.x >= act.world_bounds.min_pt.x - pad && pred.x <= act.world_bounds.max_pt.x + pad &&
-                                pred.y >= act.world_bounds.min_pt.y - pad && pred.y <= act.world_bounds.max_pt.y + pad);
-        if (over_now || over_pred) return true;
+        const float pad = 120.0f;
+        if (pred.x >= act.world_bounds.min_pt.x - pad && pred.x <= act.world_bounds.max_pt.x + pad &&
+            pred.y >= act.world_bounds.min_pt.y - pad && pred.y <= act.world_bounds.max_pt.y + pad) {
+            return true;
+        }
     }
     return false;
 }
@@ -2641,13 +2644,12 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
     m_fall_peak_z = floor.z;
 
     // TdPlayerPawn.TakeFallingDamage / TdMove_Landing.LandOnSoftObject:
-    // Landing on a soft object (cardboard landing cushion, mattress, airbag, trash container)
-    // cancels all fall damage and lethal fall death regardless of drop height and plays the full
-    // 1.50 s FallingLandSoftLanding cushion sink + get-up animation.
+    // Landing on a soft object cancels all fall damage and lethal fall death regardless of drop
+    // height and plays FallingLandSoftLanding in MOVE_Landing (with ResetCameraLook(0.3)).
     if (soft_surface && fall >= c.hard_landing_min_fall) {
         m_telemetry.falling_to_death = false;
         m_telemetry.fall_death_impact = false;
-        m_telemetry.move_state = EMovement::MOVE_SoftLanding;
+        m_telemetry.move_state = EMovement::MOVE_Landing;
         m_landing_timer = 1.50f;
         m_state_timer = 0.0f;
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
@@ -2870,9 +2872,12 @@ void ParkourController::update_air_locomotion(const InputFrame& input, float dt,
         m_telemetry.falling_to_death = false;
         m_telemetry.camera_roll_deg *= std::max(0.0f, 1.0f - 8.0f * dt);
     }
-    if (soft_below && fall_dist >= 240.0f && m_telemetry.velocity.z < -250.0f && st != EMovement::MOVE_SoftLanding) {
+    const bool check_soft = (st == EMovement::MOVE_Falling || st == EMovement::MOVE_180TurnInAir);
+    if (check_soft && soft_below && fall_dist >= c.soft_landing_min_fall &&
+        m_telemetry.ground_distance > 180.0f && m_telemetry.velocity.z < -400.0f) {
         st = EMovement::MOVE_SoftLanding;
-    } else if (!soft_below && fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
+    } else if (st != EMovement::MOVE_SoftLanding && !soft_below &&
+               fall_dist >= c.uncontrolled_fall && m_telemetry.velocity.z < -200.0f) {
         if (!m_telemetry.falling_to_death) {
             m_telemetry.falling_to_death = true;
             st = EMovement::MOVE_Falling;

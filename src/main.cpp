@@ -1188,8 +1188,8 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     {
         std::cout << "[Oracle Stage 15] Testing Zipline Shift Drop, Swing Bar & Ledge Walk..." << std::endl;
         // 15A. Zipline Shift Drop: attach to zipline in sim_scene, press Shift (crouch=true),
-        // verify immediate drop to MOVE_Falling AND survival + MOVE_SoftLanding when dropping onto
-        // the high soft-landing cushion (S_CardboardBoxes_02 at (-2662, -3256, 3988), >1250 uu drop).
+        // verify immediate drop to MOVE_Falling AND survival + MOVE_Landing (FallingLandSoftLanding)
+        // when dropping onto the Tutorial soft-landing cushion (S_ConstructionTent_01 at (-4500, -3700, 4251), >1250 uu drop).
         bool zip_drop_ok = false;
         for (const auto& act : sim_scene.actors) {
             if (!act.is_zipline) continue;
@@ -1198,8 +1198,8 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
             const Vec3 high_pt = (zs.z >= ze.z) ? zs : ze;
             const Vec3 low_pt  = (zs.z >= ze.z) ? ze : zs;
             const Vec3 seg = low_pt - high_pt;
-            // Position along the zipline directly above the Tutorial soft-landing cushion (~t=0.69)
-            const Vec3 start_pos = high_pt + seg * 0.69f - Vec3(0.0f, 0.0f, 110.0f);
+            // Position along the zipline directly above the Tutorial soft-landing tent (~t=0.48)
+            const Vec3 start_pos = high_pt + seg * 0.48f - Vec3(0.0f, 0.0f, 110.0f);
             controller.reset(start_pos, 20.0f);
             InputFrame in_idle{};
             bool attached = false;
@@ -1224,7 +1224,8 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                         any_death_state = true;
                     }
                     if (controller.is_grounded()) {
-                        landed_soft = (controller.get_move_state() == EMovement::MOVE_SoftLanding ||
+                        landed_soft = (controller.get_move_state() == EMovement::MOVE_Landing ||
+                                       controller.get_move_state() == EMovement::MOVE_SoftLanding ||
                                        controller.get_move_state() == EMovement::MOVE_Walking) &&
                                       controller.get_telemetry().health >= 99.0f;
                         break;

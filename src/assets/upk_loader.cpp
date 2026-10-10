@@ -1610,23 +1610,20 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         );
 
         a.is_soft_landing =
-            low_mesh.find("cardboardbox") != std::string::npos ||
-            low_mesh.find("cardboardtrash") != std::string::npos ||
+            low_mesh.find("constructiontent") != std::string::npos ||
+            low_mesh.find("constructionpackage") != std::string::npos ||
+            (low_mesh.find("cardboardbox") != std::string::npos &&
+             low_mesh.find("cardboardtrash") == std::string::npos) ||
             low_mesh.find("mattress") != std::string::npos ||
             low_mesh.find("softlanding") != std::string::npos ||
             low_mesh.find("airbag") != std::string::npos ||
-            low_mesh.find("garbagebag") != std::string::npos ||
-            low_mesh.find("trashbin_02") != std::string::npos ||
-            low_mesh.find("trashbin_05") != std::string::npos ||
-            low_mesh.find("trashbin_06") != std::string::npos ||
             low_obj.find("softlanding") != std::string::npos;
         if (!a.is_soft_landing) {
             for (const auto& mat : a.material_overrides) {
                 std::string low_mat = mat;
                 std::transform(low_mat.begin(), low_mat.end(), low_mat.begin(), ::tolower);
-                if (low_mat.find("cardboard") != std::string::npos ||
-                    low_mat.find("softlanding") != std::string::npos ||
-                    low_mat.find("mattress") != std::string::npos) {
+                if (low_mat.find("softlanding") != std::string::npos ||
+                    low_mat.find("constructiontent") != std::string::npos) {
                     a.is_soft_landing = true;
                     break;
                 }
