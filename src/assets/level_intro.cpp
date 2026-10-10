@@ -186,10 +186,14 @@ void collect_sounds(const Packages& packages, const UPKPackage& pkg, const UProp
 }
 
 // The screen fades an output of a Kismet op leads to: SeqAct_TdFadeEffect actions linked to it
-// directly, behind a SeqAct_Delay, or behind another fade (the action is latent: its Completed
-// output fires when the fade has run). `link` empty = every output.
-void collect_fades(const UPKPackage& pkg, const UPropertyList& op_props, const std::string& link, float time,
-                   LevelIntroSequence& out, int depth) {
+// directly, behind a SeqAct_Delay, behind another fade (the action is latent: its Completed
+// output fires when the fade has run), behind a remote event it activates (in any of the
+// level's packages), or behind an op that passes the impulse straight on (the player-input
+// switches). A SeqAct_TdStartMovementChallenge is followed to the SeqEvt_TdMovementChallengeStarted
+// events of its challenge: the training area's challenge manager fires them as the challenge
+// starts, and that is where its opening pan's FadeIn sits. `link` empty = every output.
+void collect_fades(const Packages& packages, const UPKPackage& pkg, const UPropertyList& op_props, const std::string& link,
+                   float time, LevelIntroSequence& out, int depth) {
     const UProperty* outputs = find_prop(op_props, "OutputLinks");
     if (!outputs || depth > 6) return;
     for (const auto& output : outputs->elements) {
@@ -201,7 +205,9 @@ void collect_fades(const UPKPackage& pkg, const UPropertyList& op_props, const s
             const int32_t op = prop_object(l, "LinkedOp");
             const int32_t input = prop_int(l, "InputLinkIdx", 0);
             const std::string cls = class_of(pkg, op);
-            if (input != 0 || (cls != "SeqAct_TdFadeEffect" && cls != "SeqAct_Delay")) continue;
+            const bool relays = cls == "SeqAct_ActivateRemoteEvent" || cls == "SeqAct_TdStartMovementChallenge";
+            const bool passes = cls == "SeqAct_TdEnablePlayerInput" || cls == "SeqAct_TdDisablePlayerInput";
+            if (input != 0 || (cls != "SeqAct_TdFadeEffect" && cls != "SeqAct_Delay" && !relays && !passes)) continue;
             UPropertyList props;
             parse_export_properties(pkg, op, props);
             float at = time + prop_float(output, "ActivateDelay", 0.0f);
@@ -210,7 +216,33 @@ void collect_fades(const UPKPackage& pkg, const UPropertyList& op_props, const s
                 at += prop_float(inputs->elements[0], "ActivateDelay", 0.0f);
             }
             if (cls == "SeqAct_Delay") {
-                collect_fades(pkg, props, "Finished", at + prop_float(props, "Duration", 0.0f), out, depth + 1);
+                collect_fades(packages, pkg, props, "Finished", at + prop_float(props, "Duration", 0.0f), out, depth + 1);
+                continue;
+            }
+            if (passes) {
+                collect_fades(packages, pkg, props, "Out", at, out, depth + 1);
+                continue;
+            }
+            if (relays) {
+                // The events the op fires, in any package: remote events by EventName; the
+                // challenge-started events by challenge (the action spells its property
+                // "MovementChallege" in the cooked data).
+                const bool challenge = cls == "SeqAct_TdStartMovementChallenge";
+                std::string name = to_lower(prop_name(props, challenge ? "MovementChallege" : "EventName"));
+                if (challenge && name.empty()) name = to_lower(prop_name(props, "MovementChallenge"));
+                if (name.empty()) continue;
+                const char* event_class = challenge ? "SeqEvt_TdMovementChallengeStarted" : "SeqEvent_RemoteEvent";
+                const char* event_field = challenge ? "MovementChallenge" : "EventName";
+                for (const auto& other : packages) {
+                    const auto& exports = other->get_exports();
+                    for (size_t i = 0; i < exports.size(); ++i) {
+                        if (other->get_export_class(exports[i]) != event_class) continue;
+                        UPropertyList ev_props;
+                        parse_export_properties(*other, static_cast<int32_t>(i) + 1, ev_props);
+                        if (to_lower(prop_name(ev_props, event_field)) != name) continue;
+                        collect_fades(packages, *other, ev_props, "", at, out, depth + 1);
+                    }
+                }
                 continue;
             }
             IntroFadeEvent ev;
@@ -228,7 +260,26 @@ void collect_fades(const UPKPackage& pkg, const UPropertyList& op_props, const s
             }
             if (known) continue;
             out.fades.push_back(ev);
-            collect_fades(pkg, props, "Completed", at + std::max(ev.duration, 0.0166f), out, depth + 1);
+            collect_fades(packages, pkg, props, "Completed", at + std::max(ev.duration, 0.0166f), out, depth + 1);
+        }
+    }
+}
+
+// What the Matinee's Completed output stops (input 1 of a sound action): the long tracks it
+// started, which must not play on when the intro is skipped.
+void collect_stop_cues(const UPKPackage& pkg, const UPropertyList& interp_props, LevelIntroSequence& out) {
+    const UProperty* outputs = find_prop(interp_props, "OutputLinks");
+    if (!outputs) return;
+    for (const auto& output : outputs->elements) {
+        if (to_lower(prop_string(output, "LinkDesc")) != "completed") continue;
+        const UProperty* links = find_prop(output, "Links");
+        if (!links) continue;
+        for (const auto& l : links->elements) {
+            const int32_t op = prop_object(l, "LinkedOp");
+            if (prop_int(l, "InputLinkIdx", 0) != 1 || class_of(pkg, op).find("PlaySound") == std::string::npos) continue;
+            UPropertyList op_props;
+            parse_export_properties(pkg, op, op_props);
+            if (const int32_t cue = prop_object(op_props, "PlaySound")) out.stop_cues.push_back(cue_name(pkg, cue));
         }
     }
 }
@@ -264,7 +315,7 @@ void collect_start_fades(const Packages& packages, const UPKPackage& pkg, int32_
     for (int32_t feeder : feeders_of(pkg, target)) {
         UPropertyList props;
         parse_export_properties(pkg, feeder, props);
-        collect_fades(pkg, props, "", 0.0f, out, 0);
+        collect_fades(packages, pkg, props, "", 0.0f, out, 0);
         collect_start_fades(packages, pkg, feeder, out, depth + 1);
         if (class_of(pkg, feeder) != "SeqEvent_RemoteEvent") continue;
         const std::string event = to_lower(prop_name(props, "EventName"));
@@ -280,6 +331,37 @@ void collect_start_fades(const Packages& packages, const UPKPackage& pkg, int32_
             }
         }
     }
+}
+
+// Whether the level starts this op by itself as it loads: a SeqEvent_LevelLoaded or a checkpoint's
+// loaded event feeds it, directly or through the ops between and the remote events they activate
+// (TdSPStoryGame.TriggerEventsOnLevelReload fires those events). A few steps back at most.
+bool started_at_level_load(const Packages& packages, const UPKPackage& pkg, int32_t target, int depth = 0) {
+    if (depth > 4) return false;
+    const std::vector<int32_t> feeders = feeders_of(pkg, target);
+    for (int32_t feeder : feeders) {
+        const std::string cls = class_of(pkg, feeder);
+        if (cls == "SeqEvent_LevelLoaded" || cls == "SeqEvt_TdCheckpointLoaded" || cls == "SeqEvt_TdCheckpointActivated") return true;
+    }
+    for (int32_t feeder : feeders) {
+        if (started_at_level_load(packages, pkg, feeder, depth + 1)) return true;
+        if (class_of(pkg, feeder) != "SeqEvent_RemoteEvent") continue;
+        UPropertyList props;
+        parse_export_properties(pkg, feeder, props);
+        const std::string event = to_lower(prop_name(props, "EventName"));
+        if (event.empty()) continue;
+        for (const auto& other : packages) {
+            const auto& exports = other->get_exports();
+            for (size_t i = 0; i < exports.size(); ++i) {
+                if (other->get_export_class(exports[i]) != "SeqAct_ActivateRemoteEvent") continue;
+                UPropertyList activate;
+                parse_export_properties(*other, static_cast<int32_t>(i) + 1, activate);
+                if (to_lower(prop_name(activate, "EventName")) != event) continue;
+                if (started_at_level_load(packages, *other, static_cast<int32_t>(i) + 1, depth + 1)) return true;
+            }
+        }
+    }
+    return false;
 }
 
 // The doors a Matinee's movement tracks turn: for each group whose actor is an InterpActor, its
@@ -393,8 +475,8 @@ void collect_matinee(const Packages& packages, const UPKPackage& pkg, const UPro
                         for (const auto& k : keys->elements) {
                             collect_sounds(packages, pkg, interp_props, prop_name(k, "EventName"),
                                            time + prop_float(k, "Time", 0.0f) / rate, out, depth);
-                            collect_fades(pkg, interp_props, prop_name(k, "EventName"), time + prop_float(k, "Time", 0.0f) / rate,
-                                          out, depth);
+                            collect_fades(packages, pkg, interp_props, prop_name(k, "EventName"),
+                                          time + prop_float(k, "Time", 0.0f) / rate, out, depth);
                         }
                     }
                 } else if (cls.find("InterpTrackSound") != std::string::npos) {
@@ -411,7 +493,7 @@ void collect_matinee(const Packages& packages, const UPKPackage& pkg, const UPro
     }
     collect_door_swings(pkg, interp_props, data_props, time, rate, out);
     collect_sounds(packages, pkg, interp_props, "Completed", time + prop_float(data_props, "InterpLength", 0.0f) / rate, out, depth);
-    collect_fades(pkg, interp_props, "Completed", time + prop_float(data_props, "InterpLength", 0.0f) / rate, out, depth);
+    collect_fades(packages, pkg, interp_props, "Completed", time + prop_float(data_props, "InterpLength", 0.0f) / rate, out, depth);
 }
 
 // The sounds the animation itself asks for: AnimNotify_Sound, AnimNotify_Footstep and
@@ -733,9 +815,9 @@ bool bake_pawn_matinee(const std::string& game_root, const Packages& packages, c
 
     for (const auto& [time, name] : events) {
         collect_sounds(packages, pkg, interp_props, name, time, out, 0);
-        collect_fades(pkg, interp_props, name, time, out, 0);
+        collect_fades(packages, pkg, interp_props, name, time, out, 0);
     }
-    collect_fades(pkg, interp_props, "Completed", prop_float(data_props, "InterpLength", 0.0f), out, 0);
+    collect_fades(packages, pkg, interp_props, "Completed", prop_float(data_props, "InterpLength", 0.0f), out, 0);
     for (size_t k = 0; k < baked.size(); ++k) {
         collect_notifies(pkg, baked[k].seq_export, baked[k].length, out.segments[k].start_sec, out.sounds);
     }
@@ -745,22 +827,7 @@ bool bake_pawn_matinee(const std::string& game_root, const Packages& packages, c
         std::stable_sort(swing.yaw_keys.begin(), swing.yaw_keys.end(),
                          [](const auto& a, const auto& b) { return a.first < b.first; });
     }
-    // What the Matinee's Completed output stops (input 1 of a sound action): the long tracks
-    // it started, which must not play on when the intro is skipped.
-    if (const UProperty* outputs = find_prop(interp_props, "OutputLinks")) {
-        for (const auto& output : outputs->elements) {
-            if (to_lower(prop_string(output, "LinkDesc")) != "completed") continue;
-            const UProperty* links = find_prop(output, "Links");
-            if (!links) continue;
-            for (const auto& l : links->elements) {
-                const int32_t op = prop_object(l, "LinkedOp");
-                if (prop_int(l, "InputLinkIdx", 0) != 1 || class_of(pkg, op).find("PlaySound") == std::string::npos) continue;
-                UPropertyList op_props;
-                parse_export_properties(pkg, op, op_props);
-                if (const int32_t cue = prop_object(op_props, "PlaySound")) out.stop_cues.push_back(cue_name(pkg, cue));
-            }
-        }
-    }
+    collect_stop_cues(pkg, interp_props, out);
     std::stable_sort(out.sounds.begin(), out.sounds.end(),
                      [](const IntroSoundEvent& a, const IntroSoundEvent& b) { return a.time < b.time; });
     collect_start_fades(packages, pkg, m.interp, out);
@@ -799,6 +866,307 @@ bool bake_pawn_matinee(const std::string& game_root, const Packages& packages, c
     return true;
 }
 
+// --- a Matinee seen through a placed camera ------------------------------------------------------
+//
+// The training area opens on one: no first-person animation, but a Matinee whose director track
+// cuts to a CameraActor's group as it starts, and whose movement track carries that camera across
+// the level. The view is the camera for the Matinee's length; the pawn stands where it spawned.
+
+struct DirectorMatinee {
+    const UPKPackage* pkg = nullptr;
+    int32_t interp = 0;      // SeqAct_Interp
+    int32_t data = 0;        // InterpData
+    std::string cam_group;   // the group the director cuts to at the start
+    int32_t camera = 0;      // its CameraActor
+};
+
+// The Matinee whose director cuts to a CameraActor as it starts, if this SeqAct_Interp is one.
+bool find_director_matinee(const UPKPackage& pkg, int32_t interp, const UPropertyList& interp_props, DirectorMatinee& m) {
+    m = DirectorMatinee{};
+    m.pkg = &pkg;
+    m.interp = interp;
+    const UProperty* var_links = find_prop(interp_props, "VariableLinks");
+    if (!var_links) return false;
+    for (const auto& link : var_links->elements) {
+        const UProperty* vars = find_prop(link, "LinkedVariables");
+        if (!vars) continue;
+        for (int32_t v : vars->ints) {
+            if (class_of(pkg, v) == "InterpData") m.data = v;
+        }
+    }
+    if (m.data <= 0) return false;
+    UPropertyList data_props;
+    parse_export_properties(pkg, m.data, data_props);
+    const UProperty* groups = find_prop(data_props, "InterpGroups");
+    if (!groups) return false;
+    // The director's first cut, which must come with the start.
+    float first_cut = 1.0e9f;
+    for (int32_t g : groups->ints) {
+        if (class_of(pkg, g) != "InterpGroupDirector") continue;
+        UPropertyList gp;
+        parse_export_properties(pkg, g, gp);
+        const UProperty* tracks = find_prop(gp, "InterpTracks");
+        if (!tracks) continue;
+        for (int32_t t : tracks->ints) {
+            if (class_of(pkg, t) != "InterpTrackDirector") continue;
+            UPropertyList tp;
+            parse_export_properties(pkg, t, tp);
+            const UProperty* cuts = find_prop(tp, "CutTrack");
+            if (!cuts) continue;
+            for (const auto& cut : cuts->elements) {
+                const float at = prop_float(cut, "Time", 0.0f);
+                if (at < first_cut) {
+                    first_cut = at;
+                    m.cam_group = prop_name(cut, "TargetCamGroup");
+                }
+            }
+        }
+    }
+    if (m.cam_group.empty() || first_cut > 0.05f) return false;
+    // The group's actor, through the variable link that carries the group's name.
+    for (const auto& link : var_links->elements) {
+        if (to_lower(prop_string(link, "LinkDesc")) != to_lower(m.cam_group)) continue;
+        const UProperty* vars = find_prop(link, "LinkedVariables");
+        if (!vars) continue;
+        for (int32_t v : vars->ints) {
+            if (class_of(pkg, v) != "SeqVar_Object") continue;
+            UPropertyList vp;
+            parse_export_properties(pkg, v, vp);
+            const int32_t obj = prop_object(vp, "ObjValue");
+            if (class_of(pkg, obj) == "CameraActor") m.camera = obj;
+        }
+    }
+    return m.camera > 0;
+}
+
+// A placed actor's frame, FRotationTranslationMatrix(Rotation, Location): the reference an
+// IMF_RelativeToInitial movement track moves in (UInterpTrackInstMove::CalcInitialTransform).
+struct ActorFrame {
+    Vec3 origin{0.0f, 0.0f, 0.0f};
+    Rotator rotation;
+    Vec3 x{1.0f, 0.0f, 0.0f};
+    Vec3 y{0.0f, 1.0f, 0.0f};
+    Vec3 z{0.0f, 0.0f, 1.0f};
+
+    void set(const UPropertyList& props) {
+        if (const UProperty* lp = find_prop(props, "Location")) origin = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+        if (const UProperty* rp = find_prop(props, "Rotation")) {
+            // Whole turns taken out (a cooked yaw can be several turns round), for the float trigonometry.
+            const auto wind = [](float v) { return std::remainder(v, 65536.0f); };
+            rotation = Rotator(wind(static_cast<float>(rp->vi[0])), wind(static_cast<float>(rp->vi[1])),
+                               wind(static_cast<float>(rp->vi[2])));
+        }
+        x = rotation.forward();
+        y = rotation.right();
+        z = rotation.up();
+    }
+    [[nodiscard]] Vec3 dir(const Vec3& v) const { return x * v.x + y * v.y + z * v.z; }
+    [[nodiscard]] Vec3 pos(const Vec3& v) const { return origin + dir(v); }
+};
+
+// One group's actor and the movement track that drives it, read the way
+// UInterpTrackMove::GetLocationAtTime evaluates them (MirrorsEdge.exe 0x00e41340): the track's
+// position and Euler rotation at the time, composed with the reference frame of its MoveFrame.
+struct MovingActor {
+    ActorFrame initial;
+    KeyedVector pos;        // PosTrack
+    KeyedVector euler;      // EulerTrack: roll, pitch, yaw in degrees
+    bool relative = false;  // IMF_RelativeToInitial; else IMF_World
+    bool look_at = false;   // IMR_LookAtGroup: the rotation is the line to another group's actor
+    std::string look_at_group;
+
+    [[nodiscard]] Vec3 position(float t) const {
+        if (pos.keys.empty()) return initial.origin;  // no keys: the actor stays where it is
+        const Vec3 rel = pos.at(t);
+        return relative ? initial.pos(rel) : rel;
+    }
+    void orientation(float t, Vec3& forward, Vec3& up) const {
+        if (euler.keys.empty()) {
+            forward = initial.x;
+            up = initial.z;
+            return;
+        }
+        const Vec3 e = euler.at(t);
+        const Rotator rel = Rotator::from_degrees(e.y, e.z, e.x);
+        forward = relative ? initial.dir(rel.forward()) : rel.forward();
+        up = relative ? initial.dir(rel.up()) : rel.up();
+    }
+};
+
+// Where the level's pawn spawns (TdSPStoryGame.FindPlayerStart): its default TdCheckpoint, else
+// its first, else a player start.
+bool find_player_start(const Packages& packages, Vec3& location, float& yaw_deg) {
+    int best = 0;  // 3 the default checkpoint, 2 a checkpoint, 1 a player start
+    for (const auto& pkg_ptr : packages) {
+        const UPKPackage& pkg = *pkg_ptr;
+        const auto& exports = pkg.get_exports();
+        for (size_t i = 0; i < exports.size(); ++i) {
+            const std::string cls = pkg.get_export_class(exports[i]);
+            int rank = cls == "TdCheckpoint" ? 2 : (cls == "PlayerStart" || cls == "TdTutorialStart") ? 1 : 0;
+            if (rank == 0 || rank < best) continue;
+            UPropertyList props;
+            parse_export_properties(pkg, static_cast<int32_t>(i) + 1, props);
+            if (rank == 2 && prop_bool(props, "DefaultCheckpoint", false)) rank = 3;
+            const UProperty* lp = find_prop(props, "Location");
+            if (rank <= best || !lp) continue;
+            best = rank;
+            location = Vec3(lp->v[0], lp->v[1], lp->v[2]);
+            yaw_deg = 0.0f;
+            if (const UProperty* rp = find_prop(props, "Rotation")) yaw_deg = Rotator(rp->vi[0], rp->vi[1], rp->vi[2]).to_degrees().y;
+        }
+    }
+    return best > 0;
+}
+
+// Bakes a director Matinee into `out`: the camera's position and view at 60 Hz through the
+// Matinee, the sounds and fades behind its event keys and its completion, and the pawn's place,
+// which does not change.
+bool bake_director_matinee(const Packages& packages, const DirectorMatinee& m, LevelIntroSequence& out) {
+    const UPKPackage& pkg = *m.pkg;
+    out = LevelIntroSequence{};
+    UPropertyList interp_props;
+    parse_export_properties(pkg, m.interp, interp_props);
+    UPropertyList data_props;
+    parse_export_properties(pkg, m.data, data_props);
+    const UProperty* groups = find_prop(data_props, "InterpGroups");
+    const UProperty* var_links = find_prop(interp_props, "VariableLinks");
+    const float length = prop_float(data_props, "InterpLength", 0.0f);
+    if (!groups || !var_links || length <= 0.0f) return false;
+
+    // Every group with an actor: the actor as placed and its movement track. The camera's group is
+    // one; the group it looks at, if any, another.
+    std::unordered_map<std::string, MovingActor> movers;  // by group name, lower case
+    std::vector<std::pair<float, std::string>> events;    // every group's event keys
+    for (int32_t g : groups->ints) {
+        if (!is_export(pkg, g)) continue;
+        UPropertyList gp;
+        parse_export_properties(pkg, g, gp);
+        const UProperty* tracks = find_prop(gp, "InterpTracks");
+        if (!tracks) continue;
+        const std::string group_name = to_lower(prop_name(gp, "GroupName"));
+        int32_t actor = 0;
+        for (const auto& vl : var_links->elements) {
+            if (to_lower(prop_string(vl, "LinkDesc")) != group_name) continue;
+            const UProperty* vars = find_prop(vl, "LinkedVariables");
+            if (!vars) continue;
+            for (int32_t v : vars->ints) {
+                if (class_of(pkg, v) != "SeqVar_Object") continue;
+                UPropertyList vp;
+                parse_export_properties(pkg, v, vp);
+                if (const int32_t obj = prop_object(vp, "ObjValue"); is_export(pkg, obj)) actor = obj;
+            }
+        }
+        MovingActor mover;
+        if (actor > 0) {
+            UPropertyList ap;
+            parse_export_properties(pkg, actor, ap);
+            mover.initial.set(ap);
+        }
+        bool moved = false;
+        for (int32_t t : tracks->ints) {
+            const std::string cls = class_of(pkg, t);
+            if (cls.empty()) continue;
+            UPropertyList tp;
+            parse_export_properties(pkg, t, tp);
+            if (cls == "InterpTrackEvent") {
+                if (const UProperty* keys = find_prop(tp, "EventTrack")) {
+                    for (const auto& k : keys->elements) {
+                        events.emplace_back(prop_float(k, "Time", 0.0f), prop_name(k, "EventName"));
+                    }
+                }
+            } else if (cls == "InterpTrackMove" && !moved) {
+                moved = true;
+                mover.pos = read_vector_curve(tp, "PosTrack");
+                mover.euler = read_vector_curve(tp, "EulerTrack");
+                mover.relative = to_lower(prop_name(tp, "MoveFrame")) == "imf_relativetoinitial";
+                mover.look_at = to_lower(prop_name(tp, "RotMode")) == "imr_lookatgroup";
+                mover.look_at_group = to_lower(prop_name(tp, "LookAtGroupName"));
+            }
+        }
+        if (actor > 0 && !group_name.empty()) movers[group_name] = std::move(mover);
+    }
+    const auto cam_it = movers.find(to_lower(m.cam_group));
+    if (cam_it == movers.end()) return false;
+    const MovingActor& cam = cam_it->second;
+    const MovingActor* target = nullptr;
+    if (cam.look_at) {
+        const auto it = movers.find(cam.look_at_group);
+        if (it != movers.end()) target = &it->second;
+    }
+
+    // The camera at 60 Hz. A look-at rotation is the line to the other actor, with no roll
+    // (FRotator from a direction); otherwise the Euler track's.
+    const size_t frame_count = static_cast<size_t>(std::lround(length * 60.0f)) + 1;
+    const float frame_dt = length / static_cast<float>(frame_count - 1);
+    Vec3 feet(0.0f, 0.0f, 0.0f);
+    float feet_yaw = 0.0f;
+    const bool spawn_known = find_player_start(packages, feet, feet_yaw);
+    out.cam_pos.reserve(frame_count);
+    for (size_t f = 0; f < frame_count; ++f) {
+        const float t = static_cast<float>(f) * frame_dt;
+        const Vec3 eye = cam.position(t);
+        Vec3 forward;
+        Vec3 up;
+        if (target) {
+            forward = (target->position(t) - eye).normalized();
+            const float yaw = std::atan2(forward.y, forward.x) * RAD2DEG;
+            const float pitch = std::asin(std::clamp(forward.z, -1.0f, 1.0f)) * RAD2DEG;
+            up = Rotator::from_degrees(pitch, yaw, 0.0f).up();
+        } else {
+            cam.orientation(t, forward, up);
+        }
+        out.cam_pos.push_back(eye);
+        out.cam_forward.push_back(forward);
+        out.cam_up.push_back(up);
+        out.root_pos.push_back(feet);
+    }
+
+    for (const auto& [time, name] : events) {
+        collect_sounds(packages, pkg, interp_props, name, time, out, 0);
+        collect_fades(packages, pkg, interp_props, name, time, out, 0);
+    }
+    collect_fades(packages, pkg, interp_props, "Completed", length, out, 0);
+    collect_door_swings(pkg, interp_props, data_props, 0.0f, 1.0f, out);
+    for (IntroDoorSwing& swing : out.door_swings) {
+        std::stable_sort(swing.yaw_keys.begin(), swing.yaw_keys.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+    }
+    collect_stop_cues(pkg, interp_props, out);
+    std::stable_sort(out.sounds.begin(), out.sounds.end(),
+                     [](const IntroSoundEvent& a, const IntroSoundEvent& b) { return a.time < b.time; });
+    collect_start_fades(packages, pkg, m.interp, out);
+    std::stable_sort(out.fades.begin(), out.fades.end(),
+                     [](const IntroFadeEvent& a, const IntroFadeEvent& b) { return a.time < b.time; });
+
+    out.valid = true;
+    out.seq_name = m.cam_group;
+    out.package_path = pkg.get_file_path();
+    out.anim_export_index_1 = 0;  // no first-person animation: the camera alone
+    out.actor_location = cam.initial.origin;
+    out.actor_yaw_deg = cam.initial.rotation.to_degrees().y;
+    out.start_offset_sec = 0.0f;
+    out.duration_sec = length;
+    out.matinee_length_sec = length;
+    out.start_feet_pos = feet;
+    out.end_feet_pos = feet;
+    out.end_yaw_deg = feet_yaw;
+    out.interp_package = to_lower(std::filesystem::path(pkg.get_file_path()).stem().string());
+    out.interp_export_index_1 = m.interp;
+    out.skippable = prop_bool(interp_props, "bIsSkippable", false);
+
+    int voices = 0;
+    for (const auto& s : out.sounds) voices += s.voice ? 1 : 0;
+    const Vec3& first = out.cam_pos.front();
+    const Vec3& last = out.cam_pos.back();
+    std::cout << "[Level] Level intro '" << out.seq_name << "' (" << length << " s camera pan of " << export_object_name(pkg, m.camera)
+              << (target ? ", looking at '" + cam.look_at_group + "'" : std::string()) << ", " << frame_count << " frames): camera ("
+              << int(first.x) << "," << int(first.y) << "," << int(first.z) << ") -> (" << int(last.x) << "," << int(last.y) << ","
+              << int(last.z) << "); pawn " << (spawn_known ? "at its start (" : "at (") << int(feet.x) << "," << int(feet.y) << ","
+              << int(feet.z) << "); " << out.sounds.size() << " sounds, " << voices << " of them voice lines, " << out.fades.size()
+              << " fades" << (out.skippable ? "" : ", not skippable") << std::endl;
+    return true;
+}
+
 }  // namespace
 
 void extract_level_intro(const std::string& game_root, const Packages& packages, LevelIntroSequence& out) {
@@ -815,6 +1183,25 @@ void extract_level_intro(const std::string& game_root, const Packages& packages,
             if (!find_pawn_matinee(pkg, static_cast<int32_t>(i) + 1, interp_props, m)) continue;
             LevelIntroSequence baked;
             if (bake_pawn_matinee(game_root, packages, m, /*intro_rule=*/true, baked)) out = std::move(baked);
+        }
+        if (out.valid) break;
+    }
+    if (out.valid) return;
+
+    // No first-person intro: the level may still open through a placed camera, a Matinee it starts
+    // by itself as it loads whose director cuts to a CameraActor (the training area's pan).
+    for (const auto& pkg_ptr : packages) {
+        const UPKPackage& pkg = *pkg_ptr;
+        const auto& exports = pkg.get_exports();
+        for (size_t i = 0; i < exports.size() && !out.valid; ++i) {
+            if (pkg.get_export_class(exports[i]) != "SeqAct_Interp") continue;
+            const int32_t interp = static_cast<int32_t>(i) + 1;
+            UPropertyList interp_props;
+            parse_export_properties(pkg, interp, interp_props);
+            DirectorMatinee m;
+            if (!find_director_matinee(pkg, interp, interp_props, m) || !started_at_level_load(packages, pkg, interp)) continue;
+            LevelIntroSequence baked;
+            if (bake_director_matinee(packages, m, baked)) out = std::move(baked);
         }
         if (out.valid) break;
     }

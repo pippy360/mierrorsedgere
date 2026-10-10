@@ -1358,6 +1358,9 @@ struct PlayerTelemetry {
 
     // Cooked level intro Matinee / 1P skeletal animation playback state
     bool intro_active = false;
+    // The cutscene is seen through a placed CameraActor (a Matinee director cut: the training
+    // area's pan across the roofs), not through the pawn: there is no first-person body in it.
+    bool intro_camera_only = false;
     std::string intro_anim_name;
     std::string intro_pkg_path;
     int32_t intro_anim_exp_1 = 0;

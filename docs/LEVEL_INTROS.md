@@ -27,7 +27,27 @@ stand-in the level designers animated against.
 | Kate | `convoy_p` | `Convoy_Roof_Spt` | `sp08_intro` | 3.27 s | 3.27 s | `Kates_convoy` |
 | The Shard | `Scraper_p` | `Scraper_Out_Spt` | `sp09_intro` | 12.70 s | 12.70 s | `Scraper_Start` |
 
-The training level (`Tutorial_p`) has none: the only body its opening Matinee animates is Celeste's.
+The training level (`Tutorial_p`) has no first-person intro: the only body its Matinees animate is Celeste's. It opens
+on a camera instead. `SeqEvent_LevelLoaded` in `Tutorial_p` disables the player's input and fires the remote event
+`tutorial_pan`; in `Tutorial_Spt` that plays `SeqAct_Interp_0` (`InterpData_0`, 15.0 s, `bIsSkippable` off):
+
+- **`InterpGroupDirector`**: one cut at 0 s to the group `Tutorial_Intro_Pan`.
+- **`Tutorial_Intro_Pan`**, linked to `CameraActor_0` (placed at (-7583, 2660, 8306), pitched -22.9°, yaw 298.3°):
+  an `InterpTrackMove` with `MoveFrame = IMF_RelativeToInitial` and `RotMode = IMR_LookAtGroup` towards `cam_target`.
+  Its `PosTrack` has three keys, (0, 0, 0) at 0 s, (6009.6, -2622.3, 1380.2) at 7 s with a user tangent of
+  (1232.5, 4.0, 244.7) per second, and (10633.4, -2611.6, 2015.6) at 15 s, in the camera's own placed frame
+  (`FRotationTranslationMatrix(Rotation, Location)`, `UInterpTrackInstMove::CalcInitialTransform`). An
+  `InterpTrackEvent` key `FadeOut` at 14.5 s; an empty `FOVAngle` track (the camera keeps its 90°).
+- **`cam_target`**, linked to `Trigger_0` at (-2720, -4272, 4571): an `InterpTrackMove` from (0, 0, 0) to
+  (0, -3680, 1415), relative, over the 15 s.
+
+The camera starts high over the north of the course and comes down to (-4866, -7895, 6034) looking at
+(-2720, -7952, 5986): Faith's start roof, `TdCheckpoint_1` (`start`, the default checkpoint) at (-4813, -7966, 5810).
+`FadeOut` runs `SeqAct_TdFadeEffect_2` (white, 0.5 s); its `Completed`, at 15.0 s, fires `pan_complete`, which in
+`Tutorial_p` enables the input, starts the `EMC_ButtonTest` challenge, and that challenge's
+`SeqEvt_TdMovementChallengeStarted` fades the picture back in (`SeqAct_TdFadeEffect_0`, white, 0.5 s) over the first
+tutorial message. Merc's opening line (`A_VO_SP00_Opening_1_1_Merc_Cue`) is `Tutorial_Aud`'s own `SeqEvent_LevelLoaded`,
+and plays over the pan.
 
 The group's tracks:
 
@@ -96,6 +116,18 @@ A level without an intro in its data plays none after its movie. The camera fly-
 every chapter start is kept only for the EXTRAS menu and the cutscene keys, where a scene without an intro
 still has something to show. A level whose Kismet does not reach its intro (none of the ten does this)
 plays it directly and says so in the log.
+
+A level with no first-person intro gets the camera kind, if it has one: `extract_level_intro()` looks for a
+`SeqAct_Interp` the level starts as it loads (a `SeqEvent_LevelLoaded` or checkpoint event behind it, through remote
+events) whose director cuts to a `CameraActor` group at 0 s, and bakes that camera at 60 Hz the way
+`UInterpTrackMove::GetLocationAtTime` (`MirrorsEdge.exe` 0x00e41340) places it: the position track in the actor's
+placed frame for `IMF_RelativeToInitial`, the view down the line to the look-at group's actor, moved by its own
+track, with no roll. The pawn's place through it is the level's start. The cutscene player plays it as any intro;
+the first-person body is not drawn (`PlayerTelemetry::intro_camera_only`), the pan is not skippable
+(`bIsSkippable` off), and when it ends the player stands at the start with the picture fading back in from white.
+The fade collector follows the Kismet from the `FadeOut` key through the fade's `Completed`, the remote event, the
+input switch and the challenge start to the `SeqEvt_TdMovementChallengeStarted` that fades in, since the port does
+not run the training area's challenge system itself ([TODO.md](../TODO.md)).
 
 ## 4. The measurement
 

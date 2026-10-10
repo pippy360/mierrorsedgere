@@ -1660,6 +1660,9 @@ void AnimSystem::evaluate_faith_1p(const PlayerTelemetry& telemetry, std::vector
     out_triangles.clear();
     if (!loaded_ || !faith_upper_.is_valid()) return;
     const FirstPersonUse fp_use = tick_first_person(telemetry);
+    // A cutscene seen through a placed CameraActor (the training area's opening pan): the view is
+    // not the pawn's, and no body is in the picture.
+    if (telemetry.intro_active && telemetry.intro_camera_only) return;
     const bool use_tree = fp_use.body;
 
     const AnimSetAsset* active_set = &faith_unarmed_set_;

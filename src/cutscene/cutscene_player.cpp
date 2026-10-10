@@ -684,6 +684,7 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             mode_ = ECutsceneMode::None;
             letterbox_amount_ = 0.0f;
             io_telemetry.intro_active = false;
+            io_telemetry.intro_camera_only = false;
             io_telemetry.camera_roll_deg = 0.0f;
             return;
         }
@@ -722,6 +723,8 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             io_telemetry.grounded = (std::abs(step.z) < frame_dt * 260.0f);
             io_telemetry.move_state = io_telemetry.grounded ? EMovement::MOVE_Walking : EMovement::MOVE_Falling;
             io_telemetry.intro_active = true;
+            // A Matinee seen through a placed CameraActor animates no first-person body.
+            io_telemetry.intro_camera_only = intro.anim_export_index_1 <= 0;
             io_telemetry.intro_anim_name = intro.seq_name;
             io_telemetry.intro_pkg_path = intro.package_path;
             io_telemetry.intro_anim_exp_1 = intro.anim_export_index_1;
@@ -746,6 +749,7 @@ void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& 
             mode_ = ECutsceneMode::None;
             letterbox_amount_ = 0.0f;
             io_telemetry.intro_active = false;
+            io_telemetry.intro_camera_only = false;
             return;
         }
 

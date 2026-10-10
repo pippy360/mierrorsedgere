@@ -11,6 +11,11 @@
 // own notifies carry the footsteps, clothing and foley. The view is the animated
 // camera joint of the first-person skeleton, carried on the pawn's root.
 //
+// The training area opens differently: a Matinee the level starts as it loads,
+// whose director track cuts to a placed CameraActor that a movement track carries
+// across the roofs (Tutorial_Intro_Pan). A level without a first-person intro
+// gets that kind: the camera is baked the same way, and the pawn stays at its start.
+//
 // extract_level_intro() reads all of that into LevelScene::level_intro: the camera
 // baked per animation frame in world space, every sound with its time, and the
 // doors the intro swings. What retail does with the data, and how the result was
