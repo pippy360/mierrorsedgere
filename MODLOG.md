@@ -1186,6 +1186,40 @@ sections 8 to 12 have what retail does, with the addresses.
 
 ### 23.3 Still missing
 Particles (surveyed and specified in the ignored `build/re/notes/particles.md`, not drawn), and the smaller
-differences listed in `docs/RENDERING_RE.md` section 15 and in `TODO.md`: the player's shadow comes from the
+differences listed in `docs/RENDERING_RE.md` ("What is still a stand-in, or missing") and in `TODO.md`: the player's shadow comes from the
 first-person body, Kismet-switched and moving lens flares, decals with no stored receiver and dynamic decals,
 the material effects nothing drives yet.
+
+## 24. Particle systems: the levels' sprite emitters (agent/particles, 2026-10-10)
+
+The last entry of section 14's list. The levels' `Emitter` actors were not drawn at all: no vent smoke on the
+roofs, no warning lights on The Shard's towers, no drips. `docs/RENDERING_RE.md` section 13 has the data
+layout, the module semantics and the sprite maths.
+
+### 24.1 Changes
+- **The loader** (`src/assets/level_particles.*`, new): `Emitter` placements and their `ParticleSystem`
+  templates from the level packages; each emitter's first LOD level (required module, spawn module, modules).
+  Cooked values are differences from the module classes' default objects, which the loader now hands out
+  (`script_default_chain`). PhysX-only placements are left out as the game leaves them out without the card.
+- **The simulation** (`src/renderer/particles.hpp`, new): the emitter tick, sixteen module classes, raw
+  distributions with the engine's random sequence, warm-up, and the sprite quads (square, rectangle and
+  velocity alignment, sub-image flipbooks with their cross-fade).
+- **The material translator:** a particle material's vertex colour is the particle's, and `ParticleSubUV`
+  blends the two sub-images.
+- **All three renderers** draw the batches in the translucency pass, with the emitters' own materials.
+- `ME_NO_PARTICLES`, `ME_PARTICLE_DEBUG`.
+
+### 24.2 Results
+- **Loaded:** Heat's opening area 87 systems, 96 emitters run, 38 left out; The Shard's 260 systems, 959 run,
+  251 left out. What is left out is listed by `ME_PARTICLE_DEBUG=1`: mesh emitters first.
+- **Pictures** (with and without, same frames): vent smoke drifting across the glass tower in Heat's opening
+  pan; in The Shard's the red warning lights on the towers, the lamps' glow and steam against the sky.
+- **Against retail's pictures** over the ten level intros: 30.0 (30.0 before). Per chapter: unchanged to a tenth except New Eden 30.0 (29.9) and The Shard 13.1 (12.8), where the port now draws a little more light than retail's frames hold (its first LOD level out to range).
+- **Direct3D against OpenGL:** a mean difference of 0.1 to 0.15 of 255 on the same frames.
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS; the tracked screenshots are regenerated.
+- **macOS:** the app compiles and links on `macos-15` and both Metal shader sources compile. Not run.
+
+### 24.3 Still missing
+Mesh emitters (the far smoke columns, the flying paper: 35% of the placements have one), `Orbit` and
+`LocationEmitter` (birds, bats), the systems Kismet switches on, the ones spawned at run time (bullet impacts,
+breaking glass), LOD levels past the first. In `TODO.md`.

@@ -5,6 +5,7 @@
 #include "lens_flare.hpp"
 #include "light_environment.hpp"
 #include "mod_shadow.hpp"
+#include "particles.hpp"
 #include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
@@ -322,6 +323,7 @@ struct D3D11Renderer::Impl {
     SceneLightEnvironments light_envs;   // of the dynamic objects, kept between frames
     std::vector<LensFlareQuad> flare_quads;  // this frame's
     std::vector<ModShadow> mod_shadows;      // this frame's dynamic shadows (mod_shadow.hpp)
+    ParticleWorld particles;                 // the level's particle systems, kept between frames
     std::vector<uint8_t> mod_enemy_ready;
     bool viewmodel_built = false;            // the first-person body is already posed for this frame
     std::vector<Vertex> flare_vertices;
@@ -1839,8 +1841,28 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             }
         }
     }
-    const bool has_translucent = impl->cached_has_translucent;
-    const bool needs_scene_copies = impl->cached_needs_scene_copies;
+    // The level's particle systems, run up to this frame (particles.hpp). Their sprites are drawn
+    // with the translucent surfaces.
+    bool particle_copies = false;
+    if (!in_main_menu && !scene_hidden && !bink_video_active && !active_scene.particle_systems.empty()) {
+        LensFlareView particle_view;
+        particle_view.position = cam_pos;
+        particle_view.forward = fwd;
+        particle_view.right = right;
+        particle_view.up = up;
+        impl->particles.update(active_scene, particle_view, telemetry.sim_time);
+        for (const ParticleBatch& b : impl->particles.batches()) {
+            MeshSection section;
+            section.material = b.material;
+            const MaterialShader* sh = nullptr;
+            const SceneMaterial* m = nullptr;
+            if (impl->section_shader(section, &sh, &m) && sh && (sh->uses_scene_color || sh->uses_scene_depth)) particle_copies = true;
+        }
+    } else {
+        impl->particles.rest();
+    }
+    const bool has_translucent = impl->cached_has_translucent || !impl->particles.batches().empty();
+    const bool needs_scene_copies = impl->cached_needs_scene_copies || particle_copies;
 
     prof(Impl::kProfPrepare);
 
@@ -2418,6 +2440,25 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     use_material_pipeline(ps, *sh, *m, impl->mat_cull_enabled && !sh->two_sided);
                     impl->bind_lightmap(s.lightmap);
                     impl->draw(s.vertex_count, s.first_vertex);
+                }
+            }
+            // The particle systems' sprites, the far systems first.
+            if (!impl->particles.batches().empty()) {
+                decal_bias = false;
+                set_matrix(uniforms.model, identity);
+                uniforms.is_runner_vision = 0.0f;
+                push_uniforms();
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+                for (const ParticleBatch& b : impl->particles.batches()) {
+                    MeshSection section;
+                    section.material = b.material;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    ID3D11PixelShader* ps = impl->section_shader(section, &sh, &m);
+                    if (!ps) continue;
+                    use_material_pipeline(ps, *sh, *m, false);
+                    impl->bind_lightmap(-1);
+                    draw_scene_vertices(b.vertices);
                 }
             }
             set_matrix(uniforms.model, identity);

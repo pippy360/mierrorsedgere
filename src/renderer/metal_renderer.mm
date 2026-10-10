@@ -4,6 +4,7 @@
 #include "lens_flare.hpp"
 #include "light_environment.hpp"
 #include "mod_shadow.hpp"
+#include "particles.hpp"
 #include "post_process.hpp"
 #include "render_common.hpp"
 #include "sun_shadow.hpp"
@@ -176,6 +177,7 @@ struct MetalRenderer::Impl {
     SceneLightEnvironments light_envs;             // of the dynamic objects, kept between frames
     std::vector<LensFlareQuad> flare_quads;        // this frame's
     std::vector<ModShadow> mod_shadows;            // this frame's dynamic shadows (mod_shadow.hpp)
+    ParticleWorld particles;                       // the level's particle systems, kept between frames
     std::vector<uint8_t> mod_enemy_ready;
     bool viewmodel_built = false;                  // the first-person body is already posed for this frame
     std::vector<Vertex> flare_vertices;
@@ -1493,8 +1495,30 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 }
             }
         }
-        const bool has_translucent = impl_->cached_has_translucent;
-        const bool needs_scene_copies = impl_->cached_needs_scene_copies;
+        // The level's particle systems, run up to this frame (particles.hpp). Their sprites are drawn
+        // with the translucent surfaces.
+        bool particle_copies = false;
+        const bool film_showing = impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing() &&
+                                  impl_->cutscene_player->get_mode() == ECutsceneMode::BinkVideo;
+        if (!in_main_menu && !film_showing && !active_scene.particle_systems.empty()) {
+            LensFlareView particle_view;
+            particle_view.position = cam_pos;
+            particle_view.forward = fwd;
+            particle_view.right = right;
+            particle_view.up = up;
+            impl_->particles.update(active_scene, particle_view, telemetry.sim_time);
+            for (const ParticleBatch& b : impl_->particles.batches()) {
+                MeshSection section;
+                section.material = b.material;
+                const MaterialShader* sh = nullptr;
+                const SceneMaterial* m = nullptr;
+                if (impl_->section_pipeline(section, &sh, &m) && sh && (sh->uses_scene_color || sh->uses_scene_depth)) particle_copies = true;
+            }
+        } else {
+            impl_->particles.rest();
+        }
+        const bool has_translucent = impl_->cached_has_translucent || !impl_->particles.batches().empty();
+        const bool needs_scene_copies = impl_->cached_needs_scene_copies || particle_copies;
 
         // Pose active SWAT/CPF enemies once per frame and share between Pass 0 (Shadow) and Pass 1 (World).
         // Enemies are independent (evaluate_enemy_swat_indexed is const and keeps its scratch buffers thread_local),
@@ -2088,6 +2112,26 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [enc setCullMode:MTLCullModeNone];
             [enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+            // The particle systems' sprites, the far systems first.
+            if (!impl_->particles.batches().empty()) {
+                uniforms.is_runner_vision = 0.0f;
+                [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+                set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
+                for (const ParticleBatch& b : impl_->particles.batches()) {
+                    MeshSection section;
+                    section.material = b.material;
+                    const MaterialShader* sh = nullptr;
+                    const SceneMaterial* m = nullptr;
+                    id<MTLRenderPipelineState> ps = impl_->section_pipeline(section, &sh, &m);
+                    if (!ps) continue;
+                    [enc setRenderPipelineState:ps];
+                    impl_->bind_material(enc, *m, *sh);
+                    impl_->bind_lightmap(enc, -1);
+                    bind_vertex_bytes_or_buffer(enc, b.vertices.data(), b.vertices.size() * sizeof(Vertex), 0);
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:b.vertices.size()];
+                }
+            }
         }
 
         const bool cutscene_active = (impl_->cutscene_player != nullptr && impl_->cutscene_player->is_playing());

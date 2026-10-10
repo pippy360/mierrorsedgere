@@ -3,13 +3,13 @@
 How Mirror's Edge lights and finishes a frame, worked out from the game's own files, and what the port
 does with that. It covers the baked lighting, the fog, the post-process chain (haze, bloom, exposure, tone
 mapping, the material effects, the screen fade, the motion blur), the light and the shadows of what is not
-level geometry, lens flares and decals. Materials themselves are in
+level geometry, lens flares, decals and particles. Materials themselves are in
 [`MATERIAL_SYSTEM.md`](MATERIAL_SYSTEM.md).
 
-The work was measured against retail pictures taken from the same camera (section 14). Over the ten level
+The work was measured against retail pictures taken from the same camera (section 15). Over the ten level
 intros the difference between the two games' pictures fell from 68.5 to 30.0 on the scale described there,
 and what is left is mostly things other than lighting and tone: the first-person body where retail's is out
-of view, objects the port does not draw, particles.
+of view, and objects the port does not draw.
 
 ## 1. Where the knowledge comes from
 
@@ -35,8 +35,9 @@ The user's `TdEngine.ini [SystemSettings]` on the machine the recordings were ma
    level geometry takes the lights its light environment makes for it (section 9).
 2. **The dynamic objects' shadows**, multiplied into scene colour (section 10).
 3. **Height fog**, a full-screen pass that reads the depth buffer.
-4. **Decals** (section 12), **translucency** with the lens flares in it (section 11), then the first-person
-   body in its own depth range. Translucent surfaces take the fog in their own shaders.
+4. **Decals** (section 12), **translucency** with the particles (section 13) and the lens flares (section 11)
+   in it, then the first-person body in its own depth range. Translucent surfaces take the fog in their own
+   shaders.
 5. **The post-process chain** of `FX_PostProcess.FX_PostProcess`, in this order (effects marked off are
    `bShowInGame=False` until script turns them on):
 
@@ -487,25 +488,92 @@ triangle's depth, slope 1), unculled, casting no shadow, and before the other tr
 the 440 placed decals that store no receiver (retail may compute them when the level loads), a decal's own
 `FLightMap1D`, per-decal bias, and the decals of bullet holes and footsteps.
 
-## 13. In the port
+## 13. Particles
+
+1783 `Emitter` actors are placed in the ten chapters. 134 of them exist only with hardware PhysX
+(`bPhysXMutatable`, `Group` "PhysXOnly": `Actor.PreBeginPlay` shuts them down when the `PhysXEnhanced` setting
+is off); of the other 1649, 1299 run from the start and 1242 of those are never touched by Kismet. They are
+what a player sees standing still: rooftop vent smoke (about 470 placements), far smoke columns (about 300),
+the warning lights of The Boat's and The Shard's skyscrapers (about 200), flying paper (88), water drips (63),
+heat haze, birds. There is no beam, trail or ribbon emitter in any story map.
+
+**A template** (`ParticleSystem`, cooked into the level packages that place it) is a list of emitters. An
+emitter's first LOD level has a required module (material, `ScreenAlignment`, loops, the sub-image grid), a
+spawn module (rate and bursts) and a list of modules; a module with `bEnabled=False` is not there. Every value
+is a raw distribution baked into a lookup table (section 11), saved as a difference from the module's class
+default object in `Engine.u`: a table, or just its operation or chunk size, that the level does not save is
+the class's. The operation says how an entry is read (`FRawDistribution::GetValue1`, `0x011699d0`): 1 a plain
+value; 2 uniformly between the entry's minimum and maximum, by the engine's `appSRand()`
+(`seed = seed * 196314165 + 907633515`, one sequence for everything); 3 one of the two. A module that acts
+when a particle is spawned reads at the emitter's time, one that acts every frame at the particle's relative
+time (0 at birth, 1 at death).
+
+**A frame of an emitter** (the engine's emitter tick): the emitter's clock moves on, looping at
+`EmitterDuration`; particles past the end of their life go; new ones are spawned at the spawn module's rate
+(and its bursts), each run through the spawn modules; every particle's velocity, size, rotation rate and colour
+go back to their base values and its relative time moves on by `dt / lifetime`; the per-frame modules run;
+position and rotation are integrated. A lifetime of 0 never ends (`ParticleModuleLifetime::Spawn`,
+`0x00d70340`): the steady flares are that. A system with `WarmupTime` (15 s on all vent smoke) has already run
+that long when it is first seen.
+
+| Module | What it does |
+|---|---|
+| `Lifetime`, `Size`, `Velocity` (+ radial), `Rotation`, `RotationRate`, `Color`, `Location`, `Acceleration`, `LocationPrimitiveSphere`, `LocationPrimitiveCylinder` | set at spawn (rotations in turns) |
+| `ColorOverLife` | sets colour and alpha from curves over the particle's life |
+| `SizeMultiplyLife`, `RotationRateMultiplyLife`, `VelocityOverLifetime` | scale by a curve over the life |
+| `AccelerationOverLifetime` | adds to the velocity |
+| `SubUV` | the sub-image index over the life |
+
+**A sprite** is a quad around the particle (`ParticleSpriteVertexFactory.usf`, and the code that sets its
+constants, `0x0109c930`). With `R` and `U` the world directions of screen right and up and `a` the rotation:
+
+```
+PSA_Square, PSA_Rectangle   Right = cos(a) R - sin(a) U     Up = -sin(a) R - cos(a) U
+PSA_Velocity                Right = normalize(cross(to the camera, travel))     Up = -travel
+corner (cx, cy)             P + Size.x (cx - 0.5) Right + Size.y (cy - 0.5) Up
+```
+
+The quad is parallel to the view plane, and a square's height is its width. A sub-image emitter
+(`SubImages_Horizontal` x `SubImages_Vertical`) gives the material two texture coordinate sets, the current
+image and the next, and their blend; the material node `ParticleSubUV` is the blend of the two samples. Vent
+smoke is a 4 x 4 flipbook cross-fading from image 8 to 13 over a puff's life. The particle's colour (linear,
+unclamped) is the material's vertex colour. Every placed template is unlit.
+
+**In the port** (`src/assets/level_particles.*`, `src/renderer/particles.hpp`): the templates and placements
+are read as above; the systems within 20,000 uu of the view are run each frame and their sprites drawn with
+their own translated materials in the translucency pass, a batch an emitter, far systems first. The sprites
+are ordinary scene vertices: the colour rides where a mesh vertex has its light map's first coefficient, the
+alpha and the sub-image blend beside it.
+
+What runs is the sprite emitters and the sixteen module classes of the table. Left out, each emitter whole:
+**mesh emitters** (`ParticleModuleTypeDataMesh`: the far smoke columns and the flying paper, 35% of the
+placements have one), `Orbit` and `LocationEmitter` (bird flocks, bat swarms), `OrientationAxisLock`,
+`ColorScaleOverLife`, attractors, collision, and PhysX. In The Shard's opening area that is 959 emitters run
+and 251 left out; in Heat's, 96 and 38. Also not done: the systems a level's Kismet switches on (410
+placements wait), the ones spawned at run time (bullet impacts, breaking glass, footsteps), LOD levels past the
+first (the port draws the first out to its range, where retail thins the far ones), and sorting against other
+translucent surfaces. The emitter tick's order is stock Unreal Engine 3's of that year, not read out of the
+executable. `ME_NO_PARTICLES=1` draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why.
+
+## 14. In the port
 
 | File | What |
 |---|---|
 | `src/assets/level_lightmaps.*` | Light maps: components, BSP elements, the texture sets |
 | `src/assets/level_postprocess.*` | `WorldInfo` settings, `PostProcessVolume`s, `HeightFog` actors, the chain's material effects |
 | `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
-| `src/assets/level_lensflares.*`, `level_decals.*` | Lens-flare templates and sources; decals |
+| `src/assets/level_lensflares.*`, `level_decals.*`, `level_particles.*` | Lens-flare templates and sources; decals; particle templates and placements |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
 | `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
 | `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
-| `src/renderer/light_environment.hpp`, `mod_shadow.hpp`, `lens_flare.hpp` | Sections 9, 10 and 11 |
+| `src/renderer/light_environment.hpp`, `mod_shadow.hpp`, `lens_flare.hpp`, `particles.hpp` | Sections 9, 10, 11 and 13 |
 | `src/renderer/scene_shading_msl.hpp` | The scene block and the light-environment arithmetic every shader shares |
 | `src/renderer/builtin_shaders_msl.hpp`, section 4 | The passes: `fog_fragment`, `mod_shadow_fragment`, `haze_fragment`, `bloom_gather_fragment`, `filter_fragment`, `meter_scene_fragment`, `meter_fragment`, `exposure_fragment`, `tonemap_fragment`, `finish_fragment` |
 | `src/assets/material_system.cpp` | The light-map lookup and transfer, the environment's light, fog on translucency, the lens-flare inputs, in the material prelude |
 | `src/renderer/d3d11_renderer.cpp`, `opengl_renderer.cpp`, `metal_renderer.mm` | The targets and the pass sequence |
 
 The passes of a frame: sun shadow cascades and the dynamic shadows' depth maps → scene (opaque) → dynamic
-shadows → fog → decals, translucency, lens flares, then the first-person body → haze → bloom gather → blur
+shadows → fog → decals, translucency, particles, lens flares, then the first-person body → haze → bloom gather → blur
 across → blur down → metering (512, 128, 32, 8, 2, 1) → exposure step → the material effects that come before
 tone mapping → blend and tone mapping → the material effects after it → fade and motion blur into the back
 buffer → HUD. Targets: scene and hazed scene RGBA16F, two quarter-size RGBA16F, six RGBA16 fixed-point
@@ -535,9 +603,10 @@ Options for looking at things:
 | `ME_SCREEN_EFFECT="Name:Param=v,.."` | Switches a material effect of the chain on by hand, e.g. `HealthEffect:Health=0.3` |
 | `ME_SHOT_LOOK="pitch,yaw"` | With `--intro-shots`: turns the view by hand (degrees), to look at something the intro does not |
 | `ME_LIGHT_ENV_DEBUG=1`, `ME_LENS_FLARE_DEBUG=1` | Sections 9 and 11 |
-| `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1` | A picture without them |
+| `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1` | A picture without them |
+| `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why |
 
-## 14. Measured against retail
+## 15. Measured against retail
 
 The level intros are matched cameras: the port's intro camera is retail's to within a unit
 ([`LEVEL_INTROS.md`](LEVEL_INTROS.md)), and the recordings hold a retail back buffer for every second of each.
@@ -555,12 +624,12 @@ exposure, colour and where light falls.
 | Jacknife (`stormdrain_p`) | 7 | 37.4 | 138 / 137 |
 | Heat (`cranes_p`) | 10 | 19.1 | 144 / 146 |
 | Ropeburn (`subway_p`) | 13 | 16.4 | 176 / 181 |
-| New Eden (`mall_p`) | 10 | 29.9 | 138 / 139 |
+| New Eden (`mall_p`) | 10 | 30.0 | 138 / 139 |
 | Pirandello Kruger (`factory_p`) | 6 | 30.7 | 188 / 188 |
 | The Boat (`boat_p`) | 10 | 16.6 | 83 / 89 |
 | Kate (`convoy_p`) | 1 | 60.3 | 214 / 205 |
-| The Shard (`scraper_p`) | 7 | 12.8 | 35 / 37 |
-| **All ten** | 110 | **30.0** (was **68.5**; 31.9 before sections 8 to 12) | 139 / 140 |
+| The Shard (`scraper_p`) | 7 | 13.1 | 35 / 38 |
+| **All ten** | 110 | **30.0** (was **68.5**; 31.9 before sections 8 to 13) | 139 / 140 |
 
 The 68.5 is the renderer as it was: a forward sun with shadow cascades and a hemisphere standing in for the
 light maps, a filmic curve and screen-space ambient occlusion standing in for the chain. Its pictures had a
@@ -569,16 +638,16 @@ Along the way: light maps and the chain 50.8, BSP light maps 43.0, the fog's sla
 volumes 33.5, fades 31.9.
 
 What the remaining difference is made of, from the pictures: the first-person body (drawn where retail's is
-out of view, or posed a frame apart), objects the port does not draw (particles, banners, screens), and the
+out of view, or posed a frame apart), objects the port does not draw (banners, screens, mesh particles), and the
 single Kate frame, which falls inside its opening fade. The intros hold little of what sections 9 to 12 add
 (in the Prologue's and New Eden's matched frames the sun is off screen, and the player's shadow shows in
 few), so those were checked picture by picture (`MODLOG.md` section 23). The Boat and Ropeburn moved most (27.3 and 20.6 before); other
 work on the intros reached the port in between, so not all of that is this work's.
 
-## 15. What is still a stand-in, or missing
+## 16. What is still a stand-in, or missing
 
-- **Particles.** No `ParticleSystemComponent` is drawn: rooftop vent smoke, far smoke columns, flying paper,
-  water drips, birds. 1783 emitters are placed in the ten chapters, 1299 of them running from the start.
+- **Particles:** mesh emitters (the far smoke columns, the flying paper), `Orbit` and `LocationEmitter` (birds,
+  bats), the systems Kismet switches on or spawns, LOD levels past the first (section 13).
 - **Level geometry with no light map.** Drawn with what it emits only. The cooked light maps list no lights
   (their GUID arrays are empty), so which lights retail lets fall on such a mesh dynamically is not known from
   the data; none was seen in the pictures checked.
@@ -593,14 +662,14 @@ work on the intros reached the port in between, so not all of that is this work'
 - **Metal.** The Metal renderer has the same passes, written without a Mac to run them on: the app and both
   shader sources compile there (`--dump-shaders`), and that is all that was checked.
 
-## 16. Scratch
+## 17. Scratch
 
 The scripts behind this page are outside git, in the main checkout's ignored `build/re/`: `lm_scan.py`
 (component light maps), `bsp_scan.py` and `bsp_verts.py` (BSP elements and their coordinates), `light_scan.py`
 and `unbaked_scan.py` (lights, meshes with no light map), `ppv_scan.py` (volumes), `fade_scan.py` (every
 `SeqAct_TdFadeEffect` and what fires it), and for the executable `exestr.py` (where a string is used),
 `execonst.py` (where a float constant is read) and `exegrep.py` (search a disassembled range), on top of
-`build/re/fpanim/exe.py`. The notes each of sections 8 to 12 was written from, with the disassembly and the
+`build/re/fpanim/exe.py`. The notes each of sections 8 to 13 was written from, with the disassembly and the
 data surveys behind them, are in `build/re/notes/` (`posteffects.md`, `motionblur.md`, `lightenv.md`,
-`modshadow.md`, `lensflare.md`, `decals.md`, and `particles.md` for what is not drawn yet), with their
+`modshadow.md`, `lensflare.md`, `decals.md`, `particles.md`), with their
 scripts in `build/re/<topic>/`.

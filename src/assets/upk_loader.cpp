@@ -4,6 +4,7 @@
 #include "level_decals.hpp"
 #include "level_lensflares.hpp"
 #include "level_lights.hpp"
+#include "level_particles.hpp"
 #include "level_postprocess.hpp"
 #include "material_system.hpp"
 #include "package_manager.hpp"
@@ -3515,6 +3516,10 @@ bool valid_box(const AABB& b) { return b.min_pt.x <= b.max_pt.x && b.min_pt.y <=
 
 } // namespace
 
+std::vector<const std::vector<UProperty>*> script_default_chain(const std::string& key) {
+    return ScriptDefaults::instance().chain(key);
+}
+
 void append_actor_collision(const LevelActor& a, int32_t actor_index, const StaticMeshAsset* sm, CollisionWorld& out) {
     uint8_t actor_channels = 0;
     if (a.is_collidable) actor_channels |= COLL_BlockNonZeroExtent;
@@ -5255,6 +5260,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     extract_level_postprocess(*master_pkg, loaded_packages, out_scene);
     extract_level_lights(loaded_packages, out_scene.lights);
     extract_level_lens_flares(loaded_packages, out_scene, material_paths);
+    if (pm) extract_level_particles(loaded_packages, out_scene, material_paths);
     // The chain's material effects are materials like any other: they join the level's library.
     if (pm) {
         extract_post_chain(*pm, out_scene.post_effects);

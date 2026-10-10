@@ -31,6 +31,7 @@ RawDistribution read_distribution(const UProperty* p) {
     d.start_time = prop_float(f, "LookupTableStartTime", 0.0f);
     // Op 1 is a constant or a curve; nothing else is used by a lens flare (and Op 0 gives 0).
     d.valid = prop_int(f, "Op", 0) == 1 && d.table.size() >= static_cast<size_t>(2 + d.chunk);
+    d.op = d.valid ? 1 : 0;
     return d;
 }
 

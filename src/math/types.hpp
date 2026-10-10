@@ -1561,7 +1561,71 @@ struct RawDistribution {
     int32_t chunk = 1;
     float time_scale = 0.0f;
     float start_time = 0.0f;
-    bool valid = false;  // a constant or a curve; otherwise the value is 0
+    bool valid = false;  // a constant or a curve (op 1); a lens flare's are all that
+    // RawDistributionOperation: 0 nothing (the value is 0), 1 a plain value, 2 uniform between the
+    // entry's minimum and maximum halves, 3 one of the two.
+    int32_t op = 0;
+};
+
+// A particle emitter's module (assets/level_particles.hpp): what it does to a particle, when it
+// is spawned, every frame, or both. `a`, `b`, `c` and `flag` are the module's own properties, in
+// the order level_particles.cpp names them.
+struct ParticleModuleInfo {
+    enum class Kind : uint8_t {
+        Lifetime, Size, Velocity, Rotation, RotationRate, Color, ColorOverLife, SizeMultiplyLife, SubUV,
+        AccelerationOverLifetime, Acceleration, Location, VelocityOverLifetime, RotationRateMultiplyLife,
+        LocationSphere, LocationCylinder,
+    };
+    Kind kind = Kind::Lifetime;
+    RawDistribution a, b, c;
+    bool flag[3] = {false, false, false};
+};
+
+struct ParticleBurst {
+    float count = 0.0f;
+    float count_low = -1.0f;  // below 0: always `count`
+    float time = 0.0f;        // of the emitter's duration, 0..1
+};
+
+// A sprite emitter: its first LOD level.
+struct ParticleEmitterInfo {
+    std::string name;
+    int32_t material = -1;         // scene material
+    uint8_t screen_alignment = 0;  // 0 PSA_Square, 1 PSA_Rectangle, 2 PSA_Velocity
+    bool local_space = false;      // bUseLocalSpace: the particles move with the emitter
+    float duration = 1.0f;         // EmitterDuration, seconds a loop
+    int32_t loops = 0;             // EmitterLoops, 0: for ever
+    float delay = 0.0f;
+    bool delay_first_loop_only = false;
+    uint8_t interpolation = 0;     // sub-images: 0 none, 1 linear, 2 linear blend, 3 random, 4 random blend
+    int32_t sub_images_h = 1;
+    int32_t sub_images_v = 1;
+    int32_t max_draw_count = 500;  // 0: no limit
+    RawDistribution rate;          // particles a second
+    RawDistribution rate_scale;
+    bool process_rate = true;
+    bool process_bursts = true;
+    std::vector<ParticleBurst> bursts;
+    std::vector<ParticleModuleInfo> modules;  // the enabled ones, in the level's order
+};
+
+struct ParticleSystemTemplate {
+    std::string path;
+    float warmup_time = 0.0f;  // seconds run before it is first seen
+    std::vector<ParticleEmitterInfo> emitters;
+    int32_t emitters_left_out = 0;  // mesh or PhysX emitters, or a module the port does not run
+};
+
+// An Emitter actor.
+struct ParticleSystemPlacement {
+    std::string name;
+    int32_t template_index = -1;
+    Vec3 location{0.0f, 0.0f, 0.0f};
+    Vec3 axis_x{1.0f, 0.0f, 0.0f};  // the actor's axes in the world
+    Vec3 axis_y{0.0f, 1.0f, 0.0f};
+    Vec3 axis_z{0.0f, 0.0f, 1.0f};
+    Vec3 scale{1.0f, 1.0f, 1.0f};   // DrawScale * DrawScale3D
+    bool active = true;             // bAutoActivate; off: waits for the level's script
 };
 
 // One quad of a lens flare (LensFlareElement), assets/level_lensflares.hpp.
@@ -1628,6 +1692,8 @@ struct LevelScene {
     std::vector<LevelLight> lights;                   // what lights the dynamic objects
     std::vector<LensFlareTemplate> lens_flare_templates;
     std::vector<LensFlareSourceInfo> lens_flares;
+    std::vector<ParticleSystemTemplate> particle_templates;
+    std::vector<ParticleSystemPlacement> particle_systems;
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)
