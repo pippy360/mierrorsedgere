@@ -145,6 +145,8 @@ void extract_level_lens_flares(const std::vector<std::shared_ptr<UPKPackage>>& p
 
             LensFlareSourceInfo source;
             source.name = package_name_of(pkg) + "." + exports[i].object_name;
+            source.package = to_lower(package_name_of(pkg));
+            source.export_index = static_cast<int32_t>(i) + 1;
             const std::string path = to_lower(object_canonical_path(pkg, template_ref));
             auto known = template_by_path.find(path);
             if (known == template_by_path.end()) {

@@ -1,4 +1,5 @@
 #include "parkour_controller.hpp"
+#include "../game/impact_effects.hpp"
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -5279,6 +5280,9 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
         }
     }
 
+    // What the bullets leave where they land (game/impact_effects.hpp)
+    update_impact_effects(scene, dt, m_telemetry.position);
+
     // Update 3D bullet tracers in the level scene
     for (auto it = scene.active_tracers.begin(); it != scene.active_tracers.end();) {
         it->timer -= dt;
@@ -5624,6 +5628,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.max_time = 0.09f;
             tr.hit_enemy = (hit_bot != nullptr);
             tr.from_player = true;
+            tr.ammo = pellets > 1 ? 3 : (ws.is_heavy ? 1 : 0);
             scene.active_tracers.push_back(tr);
         }
 
@@ -5922,6 +5927,11 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.max_time = 0.085f;
                 tr.hit_enemy = false;
                 tr.from_player = false;
+                {
+                    const auto has = [&](const char* part) { return bot.weapon_name.find(part) != std::string::npos; };
+                    tr.ammo = (has("Remington") || has("Neostead")) ? 3
+                              : (has("G36") || has("SCAR") || has("Minimi") || has("M95") || has("Barret")) ? 1 : 0;
+                }
                 scene.active_tracers.push_back(tr);
 
                 // Emit 3D gunshot report from AI weapon muzzle
@@ -6094,6 +6104,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.max_time = 0.09f;
                 tr.hit_enemy = false;
                 tr.from_player = false;
+                tr.ammo = 2;  // the helicopter's gun
                 scene.active_tracers.push_back(tr);
 
                 // SequenceFrame_30 [Reduce Gunner Accuracy During Slide] + high-speed parkour evasion

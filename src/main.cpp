@@ -25,6 +25,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "cutscene/cutscene_player.hpp"
 #include "cutscene/screen_fade.hpp"
 #include "game/screen_effects.hpp"
+#include "game/impact_effects.hpp"
 #include "game/level_script.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
@@ -1825,6 +1826,12 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     float look_pitch = 0.0f, look_yaw = 0.0f;
     const char* look_spec = std::getenv("ME_SHOT_LOOK");
     const bool look = look_spec && std::sscanf(look_spec, "%f,%f", &look_pitch, &look_yaw) == 2;
+    // ME_SHOT_FIRE="ammo" (0 a light weapon, 1 a heavy one, 2 a helicopter's gun, 3 a shotgun): a fifth
+    // of a second before each picture five shots are fired from the view along it, to see what
+    // they leave where they land (game/impact_effects.hpp).
+    const char* fire_spec = std::getenv("ME_SHOT_FIRE");
+    const int fire_ammo = fire_spec ? std::clamp(std::atoi(fire_spec), 0, 3) : -1;
+    float fire_at = -1.0f;
     auto frame = [&](float dt) {
         cutscene.update(dt, scene, tel);
         if (look) {
@@ -1832,6 +1839,29 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             tel.yaw_deg = look_yaw;
             tel.camera_roll_deg = 0.0f;
         }
+        if (fire_ammo >= 0 && fire_at >= 0.0f && now + dt >= fire_at && scene.collision) {
+            fire_at = -1.0f;
+            Vec3 eye;
+            Rotator rot;
+            renderer.player_camera(tel, eye, rot);
+            static const float kSpread[5][2] = {{0.0f, 0.0f}, {-0.09f, 0.05f}, {0.09f, 0.05f}, {-0.05f, -0.07f}, {0.06f, -0.06f}};
+            for (const auto& s : kSpread) {
+                const Vec3 dir = (rot.forward() + rot.right() * s[0] + rot.up() * s[1]).normalized();
+                const CollisionHit hit = scene.collision->line_check(eye, eye + dir * 8000.0f, COLL_BlockZeroExtent);
+                if (!hit.hit) continue;
+                BulletTracer tr;
+                tr.start_pos = eye + dir * 30.0f;
+                tr.end_pos = hit.location;
+                tr.ammo = static_cast<uint8_t>(fire_ammo);
+                scene.active_tracers.push_back(tr);
+            }
+            const size_t effects = scene.spawned_effects.size(), holes = scene.dynamic_decals.size();
+            update_impact_effects(scene, 0.0f, tel.position);
+            std::cout << "[Shots] fired " << scene.active_tracers.size() << " shots: " << scene.spawned_effects.size() - effects
+                      << " impact effects, " << scene.dynamic_decals.size() - holes << " bullet holes" << std::endl;
+            scene.active_tracers.clear();
+        }
+        update_impact_effects(scene, dt, tel.position);
         now += dt;
         (void)cutscene.take_intro_sounds();
         for (const IntroFadeEvent& ev : cutscene.take_intro_fades()) fade.apply(ev);
@@ -1847,6 +1877,7 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
     };
     frame(0.0f);
     for (float t : wanted) {
+        fire_at = std::max(t - 0.2f, 0.0f);
         const int steps = std::max(1, static_cast<int>(std::ceil((t - now) * 30.0f)));
         const float dt = (t - now) / static_cast<float>(steps);
         for (int i = 0; i < steps && dt > 0.0f; ++i) frame(dt);
@@ -2205,6 +2236,35 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         host.line_clear = [&](const Vec3& from, const Vec3& to) {
             Vec3 hit, normal;
             return !controller.leg_line_check(from, to, active_scene, hit, normal);
+        };
+        // The level's script switches an emitter or a lens flare on or off, or hides it.
+        host.toggle_effect = [&](const ScriptActor& sa, int action) {
+            for (ParticleSystemPlacement& p : active_scene.particle_systems) {
+                if (p.export_index != sa.export_index || p.package != lower(sa.package)) continue;
+                const bool on = action == 0 || (action == 2 && !p.active);
+                if (on) ++p.activations;  // a system that has run out starts again
+                p.active = on;
+            }
+            for (LensFlareSourceInfo& f : active_scene.lens_flares) {
+                if (f.export_index != sa.export_index || f.package != lower(sa.package)) continue;
+                f.active = action == 0 || (action == 2 && !f.active);
+            }
+        };
+        host.spawn_effect = [&](const std::string& package, int32_t factory_export, const ScriptActor& at) {
+            for (const EffectFactory& f : active_scene.effect_factories) {
+                if (f.export_index != factory_export || f.package != lower(package)) continue;
+                const float yaw = at.yaw_deg * 0.01745329252f, pitch = at.pitch_deg * 0.01745329252f;
+                spawn_effect(active_scene, f.template_index, at.location,
+                             Vec3(std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)), true);
+            }
+        };
+        host.hide_effect = [&](const ScriptActor& sa, bool hidden) {
+            for (ParticleSystemPlacement& p : active_scene.particle_systems) {
+                if (p.export_index == sa.export_index && p.package == lower(sa.package)) p.active = !hidden && p.active;
+            }
+            for (LensFlareSourceInfo& f : active_scene.lens_flares) {
+                if (f.export_index == sa.export_index && f.package == lower(sa.package)) f.hidden = hidden;
+            }
         };
         host.change_collision = [&](const ScriptActor& sa, bool collide_actors, bool block_actors) {
             for (size_t ai = 0; ai < active_scene.actors.size(); ++ai) {

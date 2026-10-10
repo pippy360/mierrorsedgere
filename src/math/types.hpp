@@ -794,6 +794,8 @@ struct LevelActor {
     std::string source_package;
     ActorLightMap lightmap;
     int32_t component_export = 0;  // its mesh component, a 1-based export of source_package (decals name their receivers by it)
+    bool accepts_decals = true;    // the component's bAcceptsDecals
+    bool accepts_decals_in_game = true;  // its bAcceptsDecalsDuringGameplay: a bullet hole needs both
     bool dynamic_class = false;  // an InterpActor, a KActor...: never light-mapped
     DynamicLighting lighting;    // how it is lit then
     Vec3 end_point{0.0f, 0.0f, 0.0f};
@@ -807,6 +809,8 @@ struct LevelActor {
     Vec3 move_direction{0.0f, 0.0f, 0.0f};
     // StaticMeshComponent.Materials overrides (full object paths, "" = use the mesh element's material)
     std::vector<std::string> material_overrides;
+    // By mesh element, the physical material of its material (LevelScene::physical_materials, -1 none).
+    std::vector<int16_t> element_physical;
     // BlockingVolume BrushComponent.BrushAggGeom hulls, world space, 3 vertices per triangle.
     std::vector<Vec3> brush_triangles;
     // TdTutorialStart.BelongToChallenge (EMovementChallenge names, e.g. "EMC_SlideOne").
@@ -868,6 +872,10 @@ struct BulletTracer {
     float max_time = 0.08f;
     bool hit_enemy = false;
     bool from_player = true;
+    // What fired it, for the mark it leaves (game/impact_effects.hpp): 0 a light weapon, 1 a heavy
+    // one, 2 a helicopter's gun, 3 a shotgun's pellet.
+    uint8_t ammo = 0;
+    bool impact_done = false;  // its impact effect and its bullet hole have been made
 };
 
 struct DroppedWeapon {
@@ -1604,11 +1612,18 @@ struct ParticleModuleInfo {
     enum class Kind : uint8_t {
         Lifetime, Size, Velocity, Rotation, RotationRate, Color, ColorOverLife, SizeMultiplyLife, SubUV,
         AccelerationOverLifetime, Acceleration, Location, VelocityOverLifetime, RotationRateMultiplyLife,
-        LocationSphere, LocationCylinder,
+        LocationSphere, LocationCylinder, ColorScaleOverLife,
+        MeshRotation, MeshRotationRate, MeshRotationRateMultiplyLife,  // a mesh particle's three-axis rotation
+        Orbit,            // an offset turning about the particle's path
+        LocationEmitter,  // spawned where another emitter's particles are
+        AxisLock,         // the sprite's up axis held to an axis of the world
     };
     Kind kind = Kind::Lifetime;
     RawDistribution a, b, c;
     bool flag[3] = {false, false, false};
+    std::string name;   // LocationEmitter: the emitter whose particles it follows (lower case)
+    int32_t link = 0;   // LocationEmitter: 1 picks its source in turn, 0 at random. AxisLock: 1..6 = +X +Y +Z -X -Y -Z
+    float scale = 1.0f; // LocationEmitter: InheritSourceVelocityScale
 };
 
 struct ParticleBurst {
@@ -1637,11 +1652,28 @@ struct ParticleEmitterInfo {
     bool process_bursts = true;
     std::vector<ParticleBurst> bursts;
     std::vector<ParticleModuleInfo> modules;  // the enabled ones, in the level's order
+    bool enabled = true;              // this LOD level's bEnabled: off, it spawns nothing
+    bool kill_on_deactivate = false;  // its particles go at once when the system is switched off
+    // A mesh emitter (ParticleModuleTypeDataMesh) draws a static mesh a particle.
+    int32_t mesh = -1;                    // LevelScene::particle_meshes
+    std::vector<int32_t> mesh_materials;  // ParticleModuleMeshMaterial, by mesh section; -1: the mesh's own
+    // The LOD levels after the first, each a whole emitter of its own values; the system's distance
+    // from the view picks one (ParticleSystemTemplate::lod_distances).
+    std::vector<ParticleEmitterInfo> lower_lods;
+};
+
+// A static mesh a mesh emitter draws, in its own space.
+struct ParticleMeshInfo {
+    std::string path;
+    std::vector<Vertex> vertices;       // a triangle list
+    std::vector<MeshSection> sections;  // by material
 };
 
 struct ParticleSystemTemplate {
     std::string path;
     float warmup_time = 0.0f;  // seconds run before it is first seen
+    std::vector<float> lod_distances;  // LODDistances: level i from this far
+    float lod_check_time = 0.25f;      // seconds between looks at the distance
     std::vector<ParticleEmitterInfo> emitters;
     int32_t emitters_left_out = 0;  // mesh or PhysX emitters, or a module the port does not run
 };
@@ -1656,6 +1688,56 @@ struct ParticleSystemPlacement {
     Vec3 axis_z{0.0f, 0.0f, 1.0f};
     Vec3 scale{1.0f, 1.0f, 1.0f};   // DrawScale * DrawScale3D
     bool active = true;             // bAutoActivate; off: waits for the level's script
+    // The level's script switches it by its actor (game/level_script.hpp): the package's stem in
+    // lower case and the actor's export. Each "turn on" counts, so that a system that has run out
+    // starts again.
+    std::string package;
+    int32_t export_index = 0;
+    uint32_t activations = 0;
+};
+
+// A bullet hole's template: a DecalComponent of a physical material's lists (assets/level_impacts.hpp).
+struct ImpactDecalInfo {
+    int32_t material = -1;     // the scene's material
+    float width = 16.0f;
+    float height = 16.0f;
+    float rotation = -360.0f;  // DecalRotation: 360 any angle, -360 along the bullet's way, else that angle
+    bool no_clip = false;
+};
+
+// A surface's physical material, as far as a bullet's impact reads it.
+struct PhysicalMaterialInfo {
+    std::string path;
+    int32_t parent = -1;
+    // TdPhysicalMaterialImpactEffects: the particle template by ammunition (BulletTracer::ammo), -1 none.
+    int32_t effects[4] = {-1, -1, -1, -1};
+    // TdPhysicalMaterialDecals, by the weapon's decal type: light, heavy, shotgun.
+    bool has_decals = false;
+    float critical_angle = 0.0f;  // degrees from the surface's normal: under it an impact, over it a ricochet
+    std::vector<ImpactDecalInfo> impact[3];
+    std::vector<ImpactDecalInfo> ricochet[3];
+};
+
+// A particle system made while the game runs: a bullet's impact, an actor factory's emitter.
+struct SpawnedEffect {
+    uint32_t id = 0;  // never used twice in a level
+    ParticleSystemPlacement at;
+    float life = 0.0f;     // seconds left
+    bool forever = false;  // an actor factory's: it stays
+};
+
+// A decal made while the game runs (a bullet hole), already clipped to what it lies on.
+struct DynamicDecal {
+    int32_t material = -1;
+    float life = 30.0f;  // DecalManager.DecalLifeSpan
+    std::vector<Vertex> vertices;
+};
+
+// An emitter an actor factory of the level's script makes (ActorFactoryEmitter).
+struct EffectFactory {
+    std::string package;       // the package's stem in lower case
+    int32_t export_index = 0;  // the factory object
+    int32_t template_index = -1;
 };
 
 // One quad of a lens flare (LensFlareElement), assets/level_lensflares.hpp.
@@ -1698,6 +1780,8 @@ struct LensFlareSourceInfo {
     bool active = true;     // bAutoActivate; off: waits for the level's script
     bool hidden = false;
     bool has_base = false;  // rides something that moves
+    std::string package;    // as ParticleSystemPlacement's: how the level's script names it
+    int32_t export_index = 0;
 };
 
 struct ScriptGraph;
@@ -1724,6 +1808,15 @@ struct LevelScene {
     std::vector<LensFlareSourceInfo> lens_flares;
     std::vector<ParticleSystemTemplate> particle_templates;
     std::vector<ParticleSystemPlacement> particle_systems;
+    std::vector<ParticleMeshInfo> particle_meshes;
+    // What a bullet leaves where it lands (assets/level_impacts.hpp, game/impact_effects.hpp).
+    std::vector<PhysicalMaterialInfo> physical_materials;
+    int32_t default_physical = -1;         // TdWeapon.DefaultImpactMaterial
+    ImpactDecalInfo default_impact_decal;  // TdWeapon.InitDefaultDecalProperties
+    std::vector<EffectFactory> effect_factories;
+    std::vector<SpawnedEffect> spawned_effects;
+    uint32_t next_effect_id = 1;
+    std::vector<DynamicDecal> dynamic_decals;
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)

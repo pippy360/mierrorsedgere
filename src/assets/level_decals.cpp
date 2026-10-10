@@ -142,7 +142,7 @@ bool read_receivers(const UPKPackage& pkg, size_t tail, size_t end, std::vector<
 
 void extract_level_decals(const std::vector<std::shared_ptr<UPKPackage>>& packages, std::vector<LevelDecal>& out) {
     out.clear();
-    size_t unread = 0, triangles = 0, without_receiver = 0;
+    size_t unread = 0, triangles = 0, without_receiver = 0, to_compute = 0;
     for (const auto& pkg_ptr : packages) {
         if (!pkg_ptr) continue;
         const UPKPackage& pkg = *pkg_ptr;
@@ -192,19 +192,37 @@ void extract_level_decals(const std::vector<std::shared_ptr<UPKPackage>>& packag
             decal.hit_binormal = vec("HitBinormal", Vec3(0.0f, 0.0f, 0.0f));
             decal.sort_order = prop_int(c, "SortOrder", 0);
             decal.hidden = prop_bool(actor, "bHidden", false) || prop_bool(c, "HiddenGame", false);
+            decal.width = prop_float(c, "Width", 200.0f);
+            decal.height = prop_float(c, "Height", 200.0f);
+            decal.near_plane = prop_float(c, "NearPlane", 0.0f);
+            decal.far_plane = prop_float(c, "FarPlane", 300.0f);
+            decal.tile_x = prop_float(c, "TileX", 1.0f);
+            decal.tile_y = prop_float(c, "TileY", 1.0f);
+            decal.offset_x = prop_float(c, "OffsetX", 0.0f);
+            decal.offset_y = prop_float(c, "OffsetY", 0.0f);
+            decal.backface_angle = prop_float(c, "BackfaceAngle", 0.001f);
+            decal.project_on_backfaces = prop_bool(c, "bProjectOnBackfaces", false);
+            decal.flip_backface_direction = prop_bool(c, "bFlipBackfaceDirection", false);
+            decal.project_on_bsp = prop_bool(c, "bProjectOnBSP", true);
+            decal.project_on_static_meshes = prop_bool(c, "bProjectOnStaticMeshes", true);
             size_t own = 0;
             for (const DecalReceiver& r : decal.receivers) own += r.indices.size() / 3;
             if (own == 0) {
-                ++without_receiver;  // nothing was clipped onto anything for it
-                continue;
+                if (!decal.receivers.empty() || decal.width <= 0.0f || decal.height <= 0.0f) {
+                    ++without_receiver;  // its stored receivers are empty: nothing was clipped onto anything for it
+                    continue;
+                }
+                decal.compute_receivers = true;  // none stored: the level's builder clips it
+                ++to_compute;
             }
             triangles += own;
             out.push_back(std::move(decal));
         }
     }
     if (!out.empty() || unread > 0) {
-        std::cout << "[Level] Decals: " << out.size() << " placed with " << triangles << " triangles (" << without_receiver
-                  << " with none stored, " << unread << " not read)" << std::endl;
+        std::cout << "[Level] Decals: " << out.size() << " placed, " << triangles << " stored triangles; " << to_compute
+                  << " store no receiver and are clipped here (" << without_receiver << " with empty receivers left out, " << unread
+                  << " not read)" << std::endl;
     }
 }
 

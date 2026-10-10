@@ -180,6 +180,7 @@ struct MetalRenderer::Impl {
     ParticleWorld particles;                       // the level's particle systems, kept between frames
     std::vector<uint8_t> mod_enemy_ready;
     bool viewmodel_built = false;                  // the first-person body is already posed for this frame
+    std::vector<Vertex> head_vertices;             // the head and torso her shadow is given (mod_shadow.hpp)
     std::vector<Vertex> flare_vertices;
     int exposure_current = 0;
     float exposure_sim_time = -1.0f;               // telemetry.sim_time the exposure was last moved at
@@ -1812,6 +1813,12 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         bind_vertex_bytes_or_buffer(cellEnc, impl_->faith_viewmodel_mesh.data(),
                                                     impl_->faith_viewmodel_mesh.size() * sizeof(Vertex), 0);
                         [cellEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->faith_viewmodel_mesh.size()];
+                        // The head and the torso that body lacks.
+                        player_body_stand_in(cam_pos, telemetry.position, fwd, right, up, impl_->head_vertices);
+                        std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
+                        [cellEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                        bind_vertex_bytes_or_buffer(cellEnc, impl_->head_vertices.data(), impl_->head_vertices.size() * sizeof(Vertex), 0);
+                        [cellEnc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->head_vertices.size()];
                     }
                 }
                 [cellEnc endEncoding];
@@ -2128,11 +2135,16 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     id<MTLRenderPipelineState> ps = impl_->section_pipeline(section, &sh, &m);
                     if (!ps) continue;
                     [enc setRenderPipelineState:ps];
+                    // A bullet hole lies in its surface.
+                    [enc setDepthBias:(b.decal ? static_cast<float>(kDecalDepthBias) : 0.0f)
+                           slopeScale:(b.decal ? kDecalSlopeBias : 0.0f)
+                                clamp:0.0f];
                     impl_->bind_material(enc, *m, *sh);
                     impl_->bind_lightmap(enc, -1);
                     bind_vertex_bytes_or_buffer(enc, b.vertices.data(), b.vertices.size() * sizeof(Vertex), 0);
                     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:b.vertices.size()];
                 }
+                [enc setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
             }
         }
 

@@ -116,6 +116,7 @@ struct StaticMeshAsset {
     bool use_simple_line_collision = true;
     std::vector<Vec3> simple_collision;   // KConvexElem / KBoxElem / KSphereElem / KSphylElem
     std::vector<Vec3> complex_collision;  // kDOP triangles
+    std::vector<uint16_t> complex_collision_element;  // by kDOP triangle, the element it belongs to
 };
 
 // Appends the triangles of a UE3 KAggregateGeom struct (RB_BodySetup.AggGeom or

@@ -5,6 +5,7 @@
 #include "level_lensflares.hpp"
 #include "level_lights.hpp"
 #include "level_particles.hpp"
+#include "level_impacts.hpp"
 #include "level_postprocess.hpp"
 #include "material_system.hpp"
 #include "package_manager.hpp"
@@ -1243,6 +1244,8 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
             bool seen_scale3d = false;
             bool seen_trans = false;
             bool seen_rot = false;
+            bool seen_accepts_decals = false;
+            bool seen_accepts_in_game = false;
             int32_t cur_comp = comp_idx;
             int c_guard = 0;
             while (cur_comp > 0 && static_cast<size_t>(cur_comp) <= exports_.size() && c_guard++ < 8) {
@@ -1263,6 +1266,14 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                     }
                     if (auto it = cprops.find("HiddenGame"); it != cprops.end() && it->second.bool_val) {
                         b_hidden = true;
+                    }
+                    if (auto it = cprops.find("bAcceptsDecals"); it != cprops.end() && !seen_accepts_decals) {
+                        a.accepts_decals = it->second.bool_val;
+                        seen_accepts_decals = true;
+                    }
+                    if (auto it = cprops.find("bAcceptsDecalsDuringGameplay"); it != cprops.end() && !seen_accepts_in_game) {
+                        a.accepts_decals_in_game = it->second.bool_val;
+                        seen_accepts_in_game = true;
                     }
                     if (!seen_scale) {
                         if (auto it = cprops.find("Scale"); it != cprops.end() && it->second.float_val > 0.0f) {
@@ -2706,6 +2717,7 @@ void UPKPackage::extract_static_meshes(std::unordered_map<std::string, StaticMes
                     std::memcpy(&p, rem + pos_data_off + static_cast<size_t>(tri[k]) * 12, 12);
                     asset.complex_collision.push_back(p);
                 }
+                asset.complex_collision_element.push_back(tri[3]);
             }
         }
 
@@ -3506,6 +3518,89 @@ public:
         }
     }
 
+    // A decal that stores no receivers, clipped onto triangles (the engine's GenerateDecalRenderData):
+    // `tris` is a triangle list, in `xf`'s space when one is given and in the world's otherwise.
+    // Returns the triangles made.
+    size_t project_decal(const LevelDecal& decal, const std::vector<Vertex>& tris, const ActorTransform* xf,
+                         std::map<int32_t, std::vector<Vertex>>& bins, AABB& box) {
+        const Vec3 o = decal.hit_location, t = decal.hit_tangent, b = decal.hit_binormal, n = decal.hit_normal;
+        // The box's six planes, as (direction, limit): inside when dot(P - O, direction) <= limit.
+        const std::pair<Vec3, float> planes[6] = {
+            {t, decal.width * 0.5f},   {t * -1.0f, decal.width * 0.5f},
+            {b, decal.height * 0.5f},  {b * -1.0f, decal.height * 0.5f},
+            {n * -1.0f, decal.far_plane}, {n, -decal.near_plane},
+        };
+        Vec3 inv_scale(1.0f, 1.0f, 1.0f);
+        if (xf) {
+            auto safe_inv = [](float s) { return (std::abs(s) > 1e-12f) ? 1.0f / s : 0.0f; };
+            inv_scale = Vec3(safe_inv(xf->scale.x), safe_inv(xf->scale.y), safe_inv(xf->scale.z));
+        }
+        std::vector<Vertex>* dst = nullptr;
+        size_t made = 0;
+        struct Corner {
+            Vec3 p;
+            Vec3 normal;
+        };
+        std::vector<Corner> poly, next;
+        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
+            poly.clear();
+            Vec3 face(0.0f, 0.0f, 0.0f);
+            for (size_t k = 0; k < 3; ++k) {
+                const Vertex& v = tris[i + k];
+                Corner c;
+                if (xf) {
+                    c.p = xf->apply(v.position);
+                    c.normal = xf->axis_x * (v.normal.x * inv_scale.x) + xf->axis_y * (v.normal.y * inv_scale.y) +
+                               xf->axis_z * (v.normal.z * inv_scale.z);
+                } else {
+                    c.p = v.position;
+                    c.normal = v.normal;
+                }
+                c.normal = c.normal.length_sq() > 1e-20f ? c.normal.normalized() : Vec3(0.0f, 0.0f, 1.0f);
+                face = face + c.normal;
+                poly.push_back(c);
+            }
+            // Only what faces the decal, unless it is told to mark backs too.
+            const float facing = face.dot(n) / 3.0f * (decal.flip_backface_direction ? -1.0f : 1.0f);
+            if (!decal.project_on_backfaces && facing <= decal.backface_angle) continue;
+            for (const auto& [dir, limit] : planes) {
+                next.clear();
+                for (size_t k = 0; k < poly.size(); ++k) {
+                    const Corner& a = poly[k];
+                    const Corner& c = poly[(k + 1) % poly.size()];
+                    const float da = (a.p - o).dot(dir) - limit;
+                    const float dc = (c.p - o).dot(dir) - limit;
+                    if (da <= 0.0f) next.push_back(a);
+                    if ((da < 0.0f && dc > 0.0f) || (da > 0.0f && dc < 0.0f)) {
+                        const float s = da / (da - dc);
+                        next.push_back(Corner{a.p + (c.p - a.p) * s, a.normal + (c.normal - a.normal) * s});
+                    }
+                }
+                poly.swap(next);
+                if (poly.size() < 3) break;
+            }
+            if (poly.size() < 3) continue;
+            if (!dst) dst = &bins[bin_key(material_id(decal.material_path), -1)];
+            const auto emit = [&](const Corner& c) {
+                Vertex wv;
+                wv.position = c.p;
+                wv.normal = c.normal.length_sq() > 1e-20f ? c.normal.normalized() : n;
+                wv.tangent = t;
+                wv.u = wv.u2 = 0.5f + decal.offset_x - decal.tile_x * (c.p - o).dot(t) / decal.width;
+                wv.v = wv.v2 = 0.5f + decal.offset_y - decal.tile_y * (c.p - o).dot(b) / decal.height;
+                dst->push_back(wv);
+                box.expand(c.p);
+            };
+            for (size_t k = 1; k + 1 < poly.size(); ++k) {
+                emit(poly[0]);
+                emit(poly[k]);
+                emit(poly[k + 1]);
+                ++made;
+            }
+        }
+        return made;
+    }
+
     static void flush(MeshBuffer& mb, std::map<int32_t, std::vector<Vertex>>& bins) {
         size_t total = mb.vertices.size();
         for (const auto& [mat, verts] : bins) total += verts.size();
@@ -3596,7 +3691,13 @@ void append_actor_collision(const LevelActor& a, int32_t actor_index, const Stat
         }
     };
     emit(sm->simple_collision, simple_ch);
-    emit(sm->complex_collision, complex_ch | COLL_ShadowCast);
+    // The mesh's own triangles keep their element: what a bullet hits there has that element's material.
+    const std::vector<Vec3>& own = sm->complex_collision;
+    const bool elements = sm->complex_collision_element.size() * 3 == own.size();
+    for (size_t i = 0; i + 2 < own.size(); i += 3) {
+        out.add_triangle(xf.apply(own[i]), xf.apply(own[i + 1]), xf.apply(own[i + 2]), actor_index,
+                         static_cast<uint8_t>(complex_ch | COLL_ShadowCast), elements ? sm->complex_collision_element[i / 3] : uint16_t{0});
+    }
 }
 
 void build_level_geometry(std::vector<LevelActor>& actors,
@@ -3737,9 +3838,107 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         }
         std::map<int32_t, std::map<int32_t, std::vector<Vertex>>> by_order;
         AABB decal_box(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
-        size_t placed = 0, triangles = 0, orphaned = 0;
+        size_t placed = 0, triangles = 0, orphaned = 0, computed = 0, computed_triangles = 0;
+        static const bool no_computed = std::getenv("ME_NO_COMPUTED_DECALS") != nullptr;  // to see a picture without them
+        std::vector<Vertex> decal_scratch;
+        // What lies in a decal's box, found and clipped: the level's static meshes and BSP.
+        const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box) {
+            const Vec3 o = decal.hit_location;
+            const float reach = std::sqrt(decal.width * decal.width + decal.height * decal.height) * 0.5f +
+                                std::max(std::abs(decal.far_plane), std::abs(decal.near_plane));
+            const AABB around(o - Vec3(reach, reach, reach), o + Vec3(reach, reach, reach));
+            const auto overlaps = [&around](const AABB& b) {
+                return b.min_pt.x <= around.max_pt.x && b.max_pt.x >= around.min_pt.x && b.min_pt.y <= around.max_pt.y &&
+                       b.max_pt.y >= around.min_pt.y && b.min_pt.z <= around.max_pt.z && b.max_pt.z >= around.min_pt.z;
+            };
+            size_t made = 0;
+            if (decal.project_on_static_meshes) {
+                for (const LevelActor& a : actors) {
+                    if (a.is_hidden || a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0 || !a.accepts_decals ||
+                        !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
+                        continue;
+                    }
+                    const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
+                    // The engine clips what the mesh's collision tree holds (its kDOP triangles): a mesh
+                    // without one takes no decal. Their geometric normal says which way each faces; the
+                    // tree's winding makes it -(p1 - p0) x (p2 - p0), turned over by a mirroring placement.
+                    if (!sm || sm->complex_collision.empty()) continue;
+                    const ActorTransform xf = ActorTransform::of(a);
+                    const float flip = xf.scale.x * xf.scale.y * xf.scale.z < 0.0f ? 1.0f : -1.0f;
+                    decal_scratch.resize(sm->complex_collision.size());
+                    for (size_t k = 0; k + 2 < decal_scratch.size(); k += 3) {
+                        const Vec3 p0 = xf.apply(sm->complex_collision[k]);
+                        const Vec3 p1 = xf.apply(sm->complex_collision[k + 1]);
+                        const Vec3 p2 = xf.apply(sm->complex_collision[k + 2]);
+                        Vec3 n = (p1 - p0).cross(p2 - p0);
+                        n = n.length_sq() > 1e-20f ? n.normalized() * flip : Vec3(0.0f, 0.0f, 1.0f);
+                        decal_scratch[k].position = p0;
+                        decal_scratch[k + 1].position = p1;
+                        decal_scratch[k + 2].position = p2;
+                        decal_scratch[k].normal = decal_scratch[k + 1].normal = decal_scratch[k + 2].normal = n;
+                    }
+                    made += emitter.project_decal(decal, decal_scratch, nullptr, bins, box);
+                }
+            }
+            if (decal.project_on_bsp && bsp_render_bins) {
+                for (const BspRenderBin& bin : *bsp_render_bins) made += emitter.project_decal(decal, bin.vertices, nullptr, bins, box);
+            }
+            return made;
+        };
+        // ME_DECAL_SELFCHECK=1: the same clipping run on the decals that do store their triangles,
+        // and the area it makes held against the area stored.
+        static const bool selfcheck = std::getenv("ME_DECAL_SELFCHECK") != nullptr;
+        const auto area_of = [](const std::map<int32_t, std::vector<Vertex>>& bins) {
+            double area = 0.0;
+            for (const auto& [key, verts] : bins) {
+                for (size_t i = 0; i + 2 < verts.size(); i += 3) {
+                    area += 0.5 * static_cast<double>((verts[i + 1].position - verts[i].position).cross(verts[i + 2].position - verts[i].position).length());
+                }
+            }
+            return area;
+        };
+        double check_stored = 0.0, check_clipped = 0.0;
+        size_t check_count = 0, check_close = 0;
         for (const LevelDecal& decal : *decals) {
             if (decal.hidden) continue;
+            if (decal.compute_receivers) {
+                // No receiver is stored: what lies in its box is found and clipped now.
+                if (no_computed) continue;
+                const size_t made = clip_onto_level(decal, by_order[decal.sort_order], decal_box);
+                computed += made > 0 ? 1 : 0;
+                computed_triangles += made;
+                continue;
+            }
+            if (selfcheck) {
+                std::map<int32_t, std::vector<Vertex>> stored, clipped;
+                AABB scratch(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+                for (const DecalReceiver& rec : decal.receivers) {
+                    if (rec.indices.size() < 3) continue;
+                    const LevelActor* receiver = nullptr;
+                    if (!rec.on_bsp) {
+                        const auto it = owners.find({decal.package, rec.component});
+                        if (it == owners.end()) continue;
+                        receiver = &actors[it->second];
+                    }
+                    emitter.emit_decal(decal, rec, receiver, stored, scratch);
+                }
+                clip_onto_level(decal, clipped, scratch);
+                const double a = area_of(stored), b = area_of(clipped);
+                if (a > 1.0) {
+                    check_stored += a;
+                    check_clipped += b;
+                    ++check_count;
+                    check_close += (b > a * 0.8 && b < a * 1.25) ? 1 : 0;
+                    if (b > a * 1.25 || b < a * 0.8) {
+                        size_t on_bsp = 0, on_mesh = 0;
+                        for (const DecalReceiver& rec : decal.receivers) (rec.on_bsp ? on_bsp : on_mesh) += rec.indices.size() / 3;
+                        std::cout << "[Level]   decal " << decal.package << " " << decal.material_path << " " << decal.width << " x "
+                                  << decal.height << " near " << decal.near_plane << " far " << decal.far_plane << ": stored " << a
+                                  << " (bsp tris " << on_bsp << ", mesh tris " << on_mesh << "), clipped " << b << " normal ("
+                                  << decal.hit_normal.x << ", " << decal.hit_normal.y << ", " << decal.hit_normal.z << ")" << std::endl;
+                    }
+                }
+            }
             bool any = false;
             for (const DecalReceiver& rec : decal.receivers) {
                 if (rec.indices.size() < 3) continue;
@@ -3772,7 +3971,13 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             out_meshes.push_back(std::move(mb));
         }
         std::cout << "[Level] " << placed << " decals drawn: " << triangles << " triangles in " << decal_sections
-                  << " material sections (" << orphaned << " receivers left out: hidden, moving or not loaded)" << std::endl;
+                  << " material sections (" << orphaned << " receivers left out: hidden, moving or not loaded); " << computed
+                  << " more clipped here, " << computed_triangles << " triangles" << std::endl;
+        if (selfcheck && check_count > 0) {
+            std::cout << "[Level] Decal self-check: clipping the " << check_count << " decals that store their triangles gives "
+                      << check_clipped / check_stored << " of the stored area; within 0.8..1.25 for " << check_close << " of them"
+                      << std::endl;
+        }
     }
 }
 
@@ -5299,7 +5504,57 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     extract_level_postprocess(*master_pkg, loaded_packages, out_scene);
     extract_level_lights(loaded_packages, out_scene.lights);
     extract_level_lens_flares(loaded_packages, out_scene, material_paths);
-    if (pm) extract_level_particles(loaded_packages, out_scene, material_paths);
+    if (pm) {
+        // A mesh emitter's static mesh, kept in its own space for the particles to place.
+        out_scene.particle_meshes.clear();
+        std::unordered_map<std::string, int32_t> particle_mesh_of;
+        const auto particle_mesh = [&](const std::string& path, const std::string& name) -> int32_t {
+            const std::string key = to_lower(path);
+            if (auto it = particle_mesh_of.find(key); it != particle_mesh_of.end()) return it->second;
+            const StaticMeshAsset* sm = find_mesh(mesh_library, path);
+            if (!sm) sm = find_mesh(mesh_library, name);
+            if (!sm) sm = find_mesh(mesh_library, name.substr(name.find_last_of('.') + 1));
+            int32_t index = -1;
+            if (sm && !sm->triangles.empty()) {
+                ParticleMeshInfo mesh;
+                mesh.path = path;
+                mesh.vertices = sm->triangles;
+                for (const auto& el : sm->elements) {
+                    if (el.vertex_count == 0) continue;
+                    MeshSection s;
+                    s.first_vertex = el.first_vertex;
+                    s.vertex_count = el.vertex_count;
+                    const std::string mkey = to_lower(el.material);
+                    size_t at = 0;
+                    while (at < material_paths.size() && to_lower(material_paths[at]) != mkey) ++at;
+                    if (at == material_paths.size()) material_paths.push_back(el.material);
+                    s.material = static_cast<int32_t>(at);
+                    mesh.sections.push_back(s);
+                }
+                index = static_cast<int32_t>(out_scene.particle_meshes.size());
+                out_scene.particle_meshes.push_back(std::move(mesh));
+            }
+            particle_mesh_of.emplace(key, index);
+            return index;
+        };
+        extract_level_particles(loaded_packages, out_scene, material_paths, particle_mesh);
+
+        // What a bullet leaves on each surface, and the emitters the script makes.
+        ImpactLibrary impacts(*pm, out_scene, material_paths, particle_mesh);
+        for (LevelActor& a : out_scene.actors) {
+            const StaticMeshAsset* sm = find_mesh(mesh_library, a);
+            if (!sm || sm->complex_collision.empty()) continue;
+            a.element_physical.assign(sm->elements.size(), int16_t{-1});
+            for (size_t e = 0; e < sm->elements.size(); ++e) {
+                const bool overridden = e < a.material_overrides.size() && !a.material_overrides[e].empty();
+                a.element_physical[e] =
+                    static_cast<int16_t>(impacts.physical_of_material(overridden ? a.material_overrides[e] : sm->elements[e].material));
+            }
+        }
+        impacts.read_weapon_defaults();
+        impacts.read_factories(loaded_packages);
+        impacts.report();
+    }
     // The chain's material effects are materials like any other: they join the level's library.
     if (pm) {
         extract_post_chain(*pm, out_scene.post_effects);
