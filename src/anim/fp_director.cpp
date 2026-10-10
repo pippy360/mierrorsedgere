@@ -34,6 +34,7 @@ bool is_airborne(EMovement m) {
         case EMovement::MOVE_SwingJump:
         case EMovement::MOVE_AirBarge:
         case EMovement::MOVE_FallingUncontrolled:
+        case EMovement::MOVE_SoftLanding:
         case EMovement::MOVE_IntoGrab:  // reaching for a ledge she may miss: the fall goes on
             return true;
         default:
@@ -616,11 +617,6 @@ void Director::update_walking_state(const PawnFrame& frame) {
 // An animation the move names, played the way its script plays it: at the rate the move worked out
 // (`rate` > 0, TdMove_Barge's AnimPlayRate), else at the script's constant one.
 bool Director::play_named(const std::string& name, float rate) {
-    if (lower(name) == "fallinglandsoftlanding") {
-        tree_.play_custom_anim(Slot::FullBody, "FallingLandSoftLanding", 1.0f, 0.08f, 0.2f, false, true, true);
-        set_animation_state(EMovement::MOVE_Walking, 0.2f);
-        return true;
-    }
     const MoveAnim* a = find_move_anim(name);
     if (!a) return false;
     Slot slot = a->slot;
@@ -876,12 +872,10 @@ void Director::start_move(EMovement move, EMovement old, const PawnFrame& frame)
             set_animation_state(EMovement::MOVE_Walking, 0.2f);
             break;
         case EMovement::MOVE_SoftLanding:
-            if (lower(frame.move_anim) == "fallinglandsoftlanding") {
-                tree_.play_custom_anim(Slot::FullBody, "FallingLandSoftLanding", 1.0f, 0.08f, 0.2f, false, true, true);
-                set_animation_state(EMovement::MOVE_Walking, 0.2f);
-            } else {
+            if (old == EMovement::MOVE_180TurnInAir) {
                 set_animation_state(EMovement::MOVE_180TurnInAir);
-                tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.25f, 0.1f, true, true, true);
+            } else {
+                tree_.play_custom_anim(Slot::FullBody, "fallinglandintosoftlanding", 1.0f, 0.6f, 0.2f, true, true, false);
             }
             break;
         case EMovement::MOVE_Swing:

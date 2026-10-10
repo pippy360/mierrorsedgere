@@ -909,3 +909,33 @@ Resolved ten user-reported retail parity gaps across movement, first-person anim
 - Built Release (`cmake --build build -j`) on macOS arm64 with zero warnings/errors.
 - `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS** (all 16 verification & screenshot oracle stages green).
 
+---
+
+## 18. Retail Landing Animation & Soft-Landing Cushion Parity (`agent/fix-landing-legs`, 2026-10-10)
+
+### 18.1 Root Cause of First-Person Legs Shooting Up on Landing
+- **Mid-air false-positive `MOVE_SoftLanding` transitions (`src/physics/parkour_controller.cpp`):**
+  - `has_soft_landing_below(scene)` previously matched every `TdFallHeightVolume` (`is_fall_height_volume`) as well as ordinary props (`garbagebag`, `cardboardtrash`, `trashbin_02`/`05`/`06`, and generic `cardboard` material overrides) across a `750 uu` XY and `-650..+3800 uu` Z search box, while `update_air_locomotion()` entered `MOVE_SoftLanding` whenever `fall_dist >= 240.0f && velocity.z < -250.0f`.
+  - Consequently, ordinary jumps and medium rooftop drops near any prop or fall-height volume entered `MOVE_SoftLanding` mid-flight right before ground contact.
+- **Unconditional `MOVE_180TurnInAir` base state in `Director::start_move(MOVE_SoftLanding)` (`src/anim/fp_director.cpp`):**
+  - In retail `TdGame.u`, `TdMove_SoftLanding.StartMove` only switches `SetAnimationMovementState(MOVE_180TurnInAir)` when `OldMovementState == MOVE_180TurnInAir` (`JumpTurnFlyEnd` -> `FallingLandSoftLandingBack`). Otherwise it leaves `MOVE_Falling` active on `TdAnimNodeMovementState` and plays `fallinglandintosoftlanding` (`PlayMoveAnim(CNT_FullBody, 'fallinglandintosoftlanding', 1.0, 0.6, 0.2, false)`).
+  - Our port previously called `set_animation_state(EMovement::MOVE_180TurnInAir)` unconditionally in `Director::start_move(EMovement::MOVE_SoftLanding)` and omitted `MOVE_SoftLanding` from `is_airborne()`, kicking `LeftFoot` forward to `X = +86.0 uu` (`+0.86 m` in front of Faith's eyes) and `RightFoot` to `X = +57.7 uu` (`jumpturnflyend` back-landing pose) right before snapping to `MOVE_Walking`.
+
+### 18.2 Retail Binary (`MirrorsEdge.exe`) & Bytecode (`TdGame.u`) Fixes
+1. **Airborne & Ground Soft-Landing State Machine (`src/physics/parkour_controller.cpp`):**
+   - Matched native `UTdPhysicsMove::Tick` (`0x1206df0`) + `0x11f9970`: `has_soft_landing_below(scene)` checks only actual `is_soft_landing` cushion actors (`120 uu` XY ballistic projection margin over `t_fall = clamp((vel.z + sqrt(vel.z^2 + 2*g*dz)) / g, 0, 2.0)`), excluding `TdFallHeightVolume`s (which are handled by `update_fall_height_volumes()`).
+   - Restricted `MOVE_SoftLanding` mid-air entry to `st == MOVE_Falling || st == MOVE_180TurnInAir` (`bCheckForSoftLanding = True`), `fall_dist >= c.soft_landing_min_fall` (`300 uu`), `ground_distance > 180.0f` (`2 * CylinderHeight`), and `velocity.z < -400.0f`.
+   - Tightened `is_soft_landing_surface()` to require `floor.normal.z > 0.9f` and direct `floor.actor_index` hit or `[-50, +50]` XY / `[-50, +60]` Z cushion footprint contact, routing cushion touchdowns into `MOVE_Landing` (`TdMove_Landing.LandOnSoftObject`: `set_move_anim("FallingLandSoftLanding")`, `1.50 s`, `camera_ignore_look(-1.0f)` + `camera_reset_look(0.3f)`).
+   - Added retail `Default__TdMove_SoftLanding` look limits (`MinViewPitch = -16384`, `MaxViewPitch = 16384`, `MinViewYaw = -5000`, `MaxViewYaw = 5000`, `bUseCameraCollision = True`) to `move_camera(EMovement::MOVE_SoftLanding)`.
+2. **First-Person Animation Graph (`src/anim/fp_director.cpp`):**
+   - Added `EMovement::MOVE_SoftLanding` to `is_airborne()` (`PawnPhysics = PHYS_Falling`).
+   - Updated `Director::start_move(EMovement::MOVE_SoftLanding)` to preserve `MOVE_Falling` unless `old == EMovement::MOVE_180TurnInAir`, and removed the non-retail `root_motion = true` / `set_animation_state(MOVE_Walking)` override for `FallingLandSoftLanding` in `Director::play_named()`.
+3. **Soft-Landing Asset Classification (`src/assets/upk_loader.cpp`, `src/main.cpp`):**
+   - Restricted `a.is_soft_landing` to true cushion assets (`constructiontent`, `constructionpackage`, `cardboardbox` excluding `cardboardtrash`, `mattress`, `softlanding`, `airbag`), excluding `garbagebag`, `cardboardtrash`, `trashbin_02`/`05`/`06`, and generic `cardboard` materials.
+   - Updated Stage 15A (`src/main.cpp`) to drop onto the Tutorial soft-landing cushion (`S_ConstructionTent_01` at `(-4500, -3700, 4251)`, `t = 0.48`).
+
+### 18.3 Verification
+- `me_anim` bone trajectory verification across `landing_medium`, `landing_hard`, `landing_soft`, and jump-landing transitions: `LeftFoot` stays tucked at `X = 15.3..32.6 uu` beneath Faith (`+86.0 uu` upward leg kick completely eliminated).
+- `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS (`exit code 0`)** across all 16 stages (`Stage 1`–`Stage 16`), including Stage 6 (`Mid-Air Coil & Skill Roll`), Stage 15 (`ZiplineDrop=OK`, `SwingBar=OK`, `LedgeWalk=OK`), and Stage 16 (`Per-Move Camera Constraints`).
+
+
