@@ -1223,3 +1223,30 @@ layout, the module semantics and the sprite maths.
 Mesh emitters (the far smoke columns, the flying paper: 35% of the placements have one), `Orbit` and
 `LocationEmitter` (birds, bats), the systems Kismet switches on, the ones spawned at run time (bullet impacts,
 breaking glass), LOD levels past the first. In `TODO.md`.
+
+---
+
+## 25. Slide-Kick Door Barging (`TdMove_MeleeSlide` / `MOVE_MeleeSlide`, `agent/slide-kick-barge`, 2026-10-10)
+
+### 25.1 Root Cause Analysis
+Slide-kicking a closed bargeable door (`MOVE_Slide` -> `MOVE_MeleeSlide`, or simultaneous Crouch + Melee approaching a door) previously failed to open the door or aborted the slide kick prematurely due to four interacting issues in `src/physics/parkour_controller.cpp`:
+1. **No door-barging handler in `update_slide()`:** `open_barge_door()` was only invoked from `MOVE_Barge` (`update_barge()`) and the standing/airborne/crouch fallback in `update_combat_and_weapons()` (which explicitly skipped `MOVE_MeleeSlide` and was gated by `m_melee_cooldown`).
+2. **Substep velocity-abort race in `update_slide()`:** `ParkourController::step()` executes two `1/120 s` substeps per `60 Hz` frame. When a sliding pawn swept into a closed door leaf on Substep 1, `walk_move()` zeroed horizontal velocity on contact; on Substep 2 of the very same frame, `update_slide()` applied `TdMove_Slide`'s `speed < c.slide_abort_speed` (`250 uu/s`) check to `MOVE_MeleeSlide` and immediately exited to `MOVE_Crouch` before a single frame of `MeleeSlide` could play or reach `TriggerDamage` (`0.33 s`).
+3. **`update_barge_doors()` hijacking Crouch + Melee:** `update_barge_doors()` ran before `update_ground_locomotion()` and initiated standing `MOVE_Barge` whenever `input.melee` was pressed, even when `input.crouch` / `m_crouch_pressed` was active.
+4. **Standing-only raycast height in `find_barge_door()`:** `find_barge_door()` only traced at `0.5f * kPawnHeight` (`+85 uu`), whereas a crouched/sliding cylinder center sits at `0.5f * kCrouchHeight` (`+50 uu`).
+
+### 25.2 Implementation (`src/physics/parkour_controller.cpp`, `src/main.cpp`)
+- **Retail `AS_C1P_Unarmed.MeleeSlide` timing & sound notifies:** Added `kMeleeSlideLength = 0.666667f` (`20` frames at `30 fps`), `kMeleeSlideBargeTime = 0.33f`, and retail `kMeleeSlideNotifies` (`0.0000s` `Cloth.Run`, `0.2513s` `Oral_Strain.Medium`, `0.2584s` `Foot_Swoosh`, `0.2693s` `Cloth.Run`).
+- **Slide-kick door barge (`update_slide()`):**
+  - Added `find_slide_barge_door` (checking both zero-extent ray trace along slide/camera direction and horizontal bounding-box proximity to closed barge doors in front of the sliding pawn) and `barge_slide_door` (emitting `"Wood._11_Female_FootStepAttack"`, calling `open_barge_door(door, body, true, scene)`, and preserving slide momentum `max(speed, max(m_barge_speed * 0.80f, c.slide_abort_speed + 50.0f))` through the doorway).
+  - Triggered `barge_slide_door` immediately when `MOVE_MeleeSlide` contacts a closed door (before or after `walk_move()`, re-sweeping the remaining substep distance once the doorway opens) or when `m_state_timer` crosses `kMeleeSlideBargeTime`.
+  - Exempted `MOVE_MeleeSlide` from `TdMove_Slide`'s `speed < c.slide_abort_speed` and `uncrouch` mid-move aborts so `MeleeSlide` always plays its full `0.6667 s` animation (`TdMove_MeleeSlide.OnCustomAnimEnd`), and granted `MOVE_Slide` a `0.65 s` grace window when blocked by a closed barge door so the player can press melee after sliding into the door.
+- **Crouch + Melee & `find_barge_door()` parity:**
+  - Updated `find_barge_door()` to trace from both standing (`0.5f * kPawnHeight`) and crouched (`0.5f * kCrouchHeight`) cylinder centers.
+  - Guarded `update_barge_doors()` with `!input.crouch && !m_crouch_pressed` so Crouch + Melee enters `MOVE_Slide` -> `MOVE_MeleeSlide` on the same substep instead of standing `MOVE_Barge`.
+- **Oracle Stage 12E (`src/main.cpp`):** Added automated verification in Stage 12 testing sprinting into a slide (`MOVE_Slide`), pressing melee (`MOVE_MeleeSlide`), verifying the door swings open to `-103.755 deg`, Faith slides through past `X = -4300.0f` (`endX = -4318.96`), and all 6 expected sound cues (`Cloth.Run`, `Oral_Strain.Medium`, `Foot_Swoosh`, `Wood._11_Female_FootStepAttack`, `Doors.Door_Barge`, `Doors.Door_Hit`) fire.
+
+### 25.3 Verification
+- `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS (`exit code 0`)**, Stage 12 output:
+  `SlideKick=OK (swing -103.755 deg, endX -4318.96), SlideKickSounds=OK`
+

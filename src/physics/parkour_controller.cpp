@@ -95,6 +95,9 @@ constexpr float kBargeOutLeftLength = 1.066667f;
 constexpr float kMeleeKickObjectLength = 0.866667f;
 constexpr float kBargeKickHitTime = 0.3272f;
 constexpr float kBargeKickIgnoreInput = 0.6f;
+// TdMove_MeleeSlide (AS_C1P_Unarmed.MeleeSlide): 20 frames at 30 fps (0.6667 s), OnFindBargeTargetTimer at 0.33 s.
+constexpr float kMeleeSlideLength = 0.666667f;
+constexpr float kMeleeSlideBargeTime = 0.33f;
 
 // Sound notifies on the move's animations. FootDown notifies resolve through the floor's
 // TdPhysicalMaterialFootSteps: the walk / run slots of the default material (PM_Concrete), and the
@@ -123,6 +126,12 @@ constexpr AnimSoundNotify kMeleeKickObjectNotifies[] = {
     {0.3624f, "Wood._11_Female_FootStepAttack"},
     {0.6071f, "Cloth.Run"},
     {0.7845f, "Concrete._02_Female_FootStepWalk"},
+};
+constexpr AnimSoundNotify kMeleeSlideNotifies[] = {
+    {0.0000f, "Cloth.Run"},
+    {0.2513f, "Oral_Strain.Medium"},
+    {0.2584f, "Foot_Swoosh"},
+    {0.2693f, "Cloth.Run"},
 };
 
 // The barge doors' Kismet (SP00 SPT_OnewayDoor_Seq): SeqEvent_TakeDamage turns the doorway slab's
@@ -792,6 +801,9 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             case EMovement::MOVE_AutoStepUp:
             case EMovement::MOVE_180Turn:
                 update_ground_locomotion(input, step_dt, scene);
+                if (m_telemetry.move_state == EMovement::MOVE_Slide && input.melee) {
+                    update_slide(input, 0.0f, scene);
+                }
                 break;
 
             case EMovement::MOVE_SoftLanding:
@@ -2805,8 +2817,9 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
     }
 
     // Crouch press (TdPlayerMoveManager: Slide when TdMove_Slide.CanDoMove, else Crouch).
-    if (m_crouch_pressed && !combat && !turning && !crouched) {
-        m_crouch_pressed = false;
+    if ((m_crouch_pressed || (crouched && input.melee && m_melee_cooldown <= 0.0f)) && !combat && !turning) {
+        const bool was_crouch_press = m_crouch_pressed && !crouched;
+        if (was_crouch_press) m_crouch_pressed = false;
         const Vec3 fwd = facing_forward();
         const float along = m_telemetry.velocity.dot(fwd);
         FloorHit floor;
@@ -2819,11 +2832,28 @@ void ParkourController::update_ground_locomotion(const InputFrame& input, float 
                 steep = (-(floor.normal.dot(d)) / std::max(floor.normal.z, 0.1f)) > 0.5f;
             }
         }
-        if (along >= c.slide_min_speed && !steep) {
+        bool door_slide_kick = false;
+        if (input.melee && m_melee_cooldown <= 0.0f && (along >= 40.0f || input.forward > 0.1f) && !steep) {
+            Vec3 hit_pt;
+            const Vec3 h_vel = horiz(m_telemetry.velocity);
+            const Vec3 move_dir = (h_vel.length_sq() > 1.0f) ? h_vel.normalized() : fwd;
+            if (find_barge_door(scene, move_dir, 220.0f, hit_pt) >= 0 ||
+                find_barge_door(scene, fwd, 220.0f, hit_pt) >= 0) {
+                door_slide_kick = true;
+                if (along < c.slide_min_speed) {
+                    m_telemetry.velocity.x = move_dir.x * c.slide_min_speed;
+                    m_telemetry.velocity.y = move_dir.y * c.slide_min_speed;
+                }
+            }
+        }
+        if ((was_crouch_press && along >= c.slide_min_speed && !steep) || door_slide_kick) {
             st = EMovement::MOVE_Slide;
             m_slide_timer = 0.0f;
             m_state_timer = 0.0f;
             m_slide_yaw = yaw_of(horiz(m_telemetry.velocity));
+            m_barge_speed = m_telemetry.velocity.length_xy();
+            m_barge_dealt_damage = false;
+            m_melee_cooldown = 0.0f;
             set_stance(kEyeHeightSlide);
             return;
         }
@@ -3426,14 +3456,23 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
     const MovementConfig& c = m_config;
     m_slide_timer += dt;
     EMovement& st = m_telemetry.move_state;
+    m_barge_speed = std::max(m_barge_speed, m_telemetry.velocity.length_xy());
 
-    // Slide Melee Kick (`MeleeSlide`: sweeps enemies off their feet with `HitMeleeSlide`)
+    // Slide Melee Kick (`MeleeSlide`: sweeps enemies off their feet with `HitMeleeSlide`
+    // and barges closed doors via TdMove_MeleeSlide.FindBargeTarget / BargeObject)
     if (input.melee && st != EMovement::MOVE_MeleeSlide && m_melee_cooldown <= 0.0f) {
         st = EMovement::MOVE_MeleeSlide;
         m_state_timer = 0.0f;
         m_telemetry.combat_anim_time = 0.0f;
-        m_telemetry.combat_anim_duration = 0.55f;
-        m_melee_cooldown = 0.55f;
+        m_telemetry.combat_anim_duration = kMeleeSlideLength;
+        m_melee_cooldown = kMeleeSlideLength;
+        m_barge_dealt_damage = false;
+        m_barge_speed = std::max(m_barge_speed, std::max(m_telemetry.velocity.length_xy(), c.slide_abort_speed + 100.0f));
+        for (const AnimSoundNotify& notify : kMeleeSlideNotifies) {
+            if (notify.time <= 0.0f) {
+                emit_sound(notify.cue, m_telemetry.position, true);
+            }
+        }
 
         for (auto& bot : scene.enemies) {
             if (bot.alive && m_telemetry.position.distance(bot.position) < 200.0f) {
@@ -3455,6 +3494,17 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
                 }
             }
         }
+        if (dt <= 0.0f) return;
+    }
+
+    if (st == EMovement::MOVE_MeleeSlide && dt > 0.0f) {
+        const float prev_pos = std::max(0.0f, m_state_timer - dt);
+        const float cur_pos = m_state_timer;
+        for (const AnimSoundNotify& notify : kMeleeSlideNotifies) {
+            if (notify.time > prev_pos && notify.time <= cur_pos) {
+                emit_sound(notify.cue, m_telemetry.position, true);
+            }
+        }
     }
 
     // Move input is ignored for the whole slide (DisableMovementTime -1). The body turns toward
@@ -3472,26 +3522,92 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
     // CalcVelocity brakes it with GroundFriction x FrictionModifier.
     calc_velocity(Vec3(0.0f, 0.0f, 0.0f), dt, 1.0f, c.ground_friction * c.slide_friction);
     speed = m_telemetry.velocity.length_xy();
+    m_barge_speed = std::max(m_barge_speed, speed);
 
-    // It aborts into a crouch below SlideAbortSpeed, after SlideAbortTime, or when you pull back;
-    // letting go of crouch ends it into a walk (a crouch with no room), but not inside the first
-    // 0.5 s (the request waits for StartMove's timer). Jump does nothing in a slide.
-    const bool abort = hint_down || speed < c.slide_abort_speed || m_slide_timer >= c.slide_max_duration;
-    const bool uncrouch = !input.crouch && m_slide_timer >= c.slide_min_duration;
-    if (abort || uncrouch) {
-        // StopMove halves the velocity, however the slide ends.
-        m_telemetry.velocity.x *= 0.5f;
-        m_telemetry.velocity.y *= 0.5f;
-        const bool stand = !input.crouch && has_room(kPawnHeight, scene);
-        st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
-        set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
-        m_sprint_energy = std::max(0.0f, m_telemetry.velocity.length_xy() - c.speed_max_base_velocity);
-        m_accel_time = 1.0f;
-        return;
+    auto find_slide_barge_door = [&](float trace_dist) -> int {
+        Vec3 hit_point;
+        int door = find_barge_door(scene, body, trace_dist, hit_point);
+        if (door < 0) {
+            const Vec3 facing = Rotator::from_degrees(0.0f, m_pawn_yaw, 0.0f).forward();
+            door = find_barge_door(scene, facing, trace_dist, hit_point);
+        }
+        if (door < 0) {
+            door = find_barge_door(scene, facing_forward(), trace_dist, hit_point);
+        }
+        return door;
+    };
+
+    auto barge_slide_door = [&](int door) {
+        m_barge_dealt_damage = true;
+        emit_sound("Wood._11_Female_FootStepAttack", m_telemetry.position, true);
+        open_barge_door(door, body, true, scene);
+        const float retain = std::max(speed, std::max(m_barge_speed * 0.80f, c.slide_abort_speed + 50.0f));
+        m_telemetry.velocity.x = body.x * retain;
+        m_telemetry.velocity.y = body.y * retain;
+        speed = retain;
+    };
+
+    if (st == EMovement::MOVE_MeleeSlide) {
+        // TdMove_MeleeSlide.OnFindBargeTargetTimer (0.33s) -> FindBargeTarget -> BargeObject.
+        // Also fire if the pawn already slid up against a closed door.
+        if (!m_barge_dealt_damage && (m_state_timer >= kMeleeSlideBargeTime || speed < c.slide_abort_speed)) {
+            const int door = find_slide_barge_door(125.0f);
+            if (door >= 0) {
+                barge_slide_door(door);
+            }
+        }
+        // TdMove_MeleeSlide ends via OnCustomAnimEnd -> SetMove(MOVE_Crouch) (or MOVE_Walking if uncrouched).
+        if (m_state_timer >= kMeleeSlideLength) {
+            m_telemetry.velocity.x *= 0.5f;
+            m_telemetry.velocity.y *= 0.5f;
+            const bool stand = !input.crouch && has_room(kPawnHeight, scene);
+            st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
+            set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
+            m_sprint_energy = std::max(0.0f, m_telemetry.velocity.length_xy() - c.speed_max_base_velocity);
+            m_accel_time = 1.0f;
+            return;
+        }
+    } else {
+        // It aborts into a crouch below SlideAbortSpeed, after SlideAbortTime, or when you pull back;
+        // letting go of crouch ends it into a walk (a crouch with no room), but not inside the first
+        // 0.5 s (the request waits for StartMove's timer). Jump does nothing in a slide.
+        // If sliding into a closed barge door inside the first 0.65 s, allow a brief window for a melee
+        // kick input before aborting on low speed.
+        const bool blocked_by_closed_door = (speed < c.slide_abort_speed && m_slide_timer < 0.65f &&
+                                             find_slide_barge_door(100.0f) >= 0);
+        const bool abort = hint_down || (speed < c.slide_abort_speed && !blocked_by_closed_door) ||
+                           m_slide_timer >= c.slide_max_duration;
+        const bool uncrouch = !input.crouch && m_slide_timer >= c.slide_min_duration;
+        if (abort || uncrouch) {
+            // StopMove halves the velocity, however the slide ends.
+            m_telemetry.velocity.x *= 0.5f;
+            m_telemetry.velocity.y *= 0.5f;
+            const bool stand = !input.crouch && has_room(kPawnHeight, scene);
+            st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
+            set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
+            m_sprint_energy = std::max(0.0f, m_telemetry.velocity.length_xy() - c.speed_max_base_velocity);
+            m_accel_time = 1.0f;
+            return;
+        }
     }
 
     // Low (crouch-height) swept move: passes under ducts, steps over seams, glances off walls.
+    const Vec3 pos_before_walk = m_telemetry.position;
     walk_move(horiz(m_telemetry.velocity) * dt, kCrouchHeight, scene);
+
+    // If a slide kick swept into a closed barge door during walk_move, barge the door open immediately
+    // on contact and carry the remaining slide step through the doorway.
+    if (st == EMovement::MOVE_MeleeSlide && !m_barge_dealt_damage && m_walk_blocked) {
+        const int door = find_slide_barge_door(125.0f);
+        if (door >= 0) {
+            barge_slide_door(door);
+            const float moved_xy = horiz(m_telemetry.position - pos_before_walk).length();
+            const float rem_dt = std::max(0.0f, dt - moved_xy / std::max(speed, 1.0f));
+            if (rem_dt > 1e-5f) {
+                walk_move(horiz(m_telemetry.velocity) * rem_dt, kCrouchHeight, scene);
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -5440,6 +5556,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
     // 4. Context-Sensitive Unarmed Melee Strikes (`input.melee`: Combo Punch/Kick, Crouch Uppercut, Jump Kick, Barge)
     if (input.melee && m_melee_cooldown <= 0.0f && (!ws.equipped || ws.drop_timer > 0.0f) &&
         !(m_against_wall != 0 && m_telemetry.move_state == EMovement::MOVE_Walking) &&  // TdMove_Melee.CanDoMove
+        m_telemetry.move_state != EMovement::MOVE_Slide &&
         m_telemetry.move_state != EMovement::MOVE_MeleeSlide &&
         m_telemetry.move_state != EMovement::MOVE_MeleeWallrun &&
         m_telemetry.move_state != EMovement::MOVE_Barge) {
@@ -6221,23 +6338,26 @@ void ParkourController::emit_sound(const char* cue, const Vec3& location, bool a
 int ParkourController::find_barge_door(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const {
     // TdMove_Barge.CalcBargeDamage: PawnOwner.Trace(.., bTraceActors, zero extent, TRACEFLAG_Bullet)
     // from the pawn's Location (the cylinder's centre). The first thing hit has to be interactable;
-    // a wall or the door frame in the way means no barge.
-    const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * kPawnHeight);
-    const TraceHit hit = trace_ray(start, start + dir * dist, scene, COLL_BlockZeroExtent);
-    if (!hit.hit || hit.actor_index < 0 || static_cast<size_t>(hit.actor_index) >= scene.actors.size()) return -1;
-    const int door = scene.actors[static_cast<size_t>(hit.actor_index)].barge_door;
-    if (door < 0 || static_cast<size_t>(door) >= scene.barge_doors.size()) return -1;
-    if (scene.barge_doors[static_cast<size_t>(door)].state != DoorState::Closed) return -1;
-    hit_point = hit.point;
-    return door;
+    // a wall or the door frame in the way means no barge. Check both standing and crouched cylinder centres.
+    const float heights[2] = {0.5f * kPawnHeight, 0.5f * kCrouchHeight};
+    for (float hz : heights) {
+        const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, hz);
+        const TraceHit hit = trace_ray(start, start + dir * dist, scene, COLL_BlockZeroExtent);
+        if (!hit.hit || hit.actor_index < 0 || static_cast<size_t>(hit.actor_index) >= scene.actors.size()) continue;
+        const int door = scene.actors[static_cast<size_t>(hit.actor_index)].barge_door;
+        if (door < 0 || static_cast<size_t>(door) >= scene.barge_doors.size()) continue;
+        if (scene.barge_doors[static_cast<size_t>(door)].state != DoorState::Closed) continue;
+        hit_point = hit.point;
+        return door;
+    }
+    return -1;
 }
 
 bool ParkourController::try_initiate_barge(const LevelScene& scene) {
     const EMovement st = m_telemetry.move_state;
     const bool walking = m_telemetry.grounded &&
-                         (st == EMovement::MOVE_Walking || st == EMovement::MOVE_Crouch ||
-                          st == EMovement::MOVE_StepUp || st == EMovement::MOVE_AutoStepUp ||
-                          st == EMovement::MOVE_SoftLanding);
+                         (st == EMovement::MOVE_Walking || st == EMovement::MOVE_StepUp ||
+                          st == EMovement::MOVE_AutoStepUp || st == EMovement::MOVE_SoftLanding);
     if (!walking || m_melee_cooldown > 0.0f) return false;
 
     // TdMove_Barge.CanDoMove: no running barge with a heavy weapon; the trace reaches as far as
@@ -6454,8 +6574,9 @@ bool ParkourController::door_encroaches_pawn(const BargeDoorInstance& door, floa
 void ParkourController::update_barge_doors(const InputFrame& input, float dt, LevelScene& scene) {
     if (scene.barge_doors.empty()) return;
 
-    // Melee at a closed door in reach barges it (TdMove_Barge); otherwise the press is a punch.
-    if (input.melee && m_telemetry.move_state != EMovement::MOVE_Barge) {
+    // Melee at a closed door in reach barges it (TdMove_Barge) when standing; crouched / sliding melee
+    // is handled by TdMove_MeleeSlide / TdMove_MeleeCrouch.
+    if (input.melee && !input.crouch && !m_crouch_pressed && m_telemetry.move_state != EMovement::MOVE_Barge) {
         try_initiate_barge(scene);
     }
 
