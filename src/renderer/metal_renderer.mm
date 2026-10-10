@@ -1620,6 +1620,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         vertexCount:impl_->frame_enemy_draws[ei].corner_count];
         };
 
+        // A buffer of one actor that the level's script has hidden (a broken pane, a pane's twin in waiting).
+        auto mesh_hidden = [&](const MeshBuffer& mesh) {
+            return mesh.actor >= 0 && static_cast<size_t>(mesh.actor) < active_scene.actors.size() &&
+                   active_scene.actors[static_cast<size_t>(mesh.actor)].is_hidden;
+        };
         auto section_in_range = [](const MeshBuffer& mesh, const MeshSection& s) {
             return s.vertex_count > 0 &&
                    static_cast<size_t>(s.first_vertex) + static_cast<size_t>(s.vertex_count) <= mesh.vertices.size();
@@ -1679,6 +1684,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                     const auto& mesh = active_scene.meshes[i];
                     if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                    if (mesh_hidden(mesh)) continue;
                     if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
                     if (mesh.is_decal) continue;
                     bool moved = apply_scene_mesh_model(i);
@@ -1914,6 +1920,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                if (mesh_hidden(mesh)) continue;
                 // The level's decals lie in their receivers' surfaces (render_common.hpp).
                 [enc setDepthBias:(mesh.is_decal ? static_cast<float>(kDecalDepthBias) : 0.0f)
                        slopeScale:(mesh.is_decal ? kDecalSlopeBias : 0.0f)
@@ -2096,6 +2103,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             for (size_t i = 0; i < active_scene.meshes.size(); ++i) {
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || mesh.sections.empty() || !impl_->cached_mesh_buffers[i]) continue;
+                if (mesh_hidden(mesh)) continue;
                 if (mesh.is_decal != (decals == 1)) continue;
                 [enc setDepthBias:(mesh.is_decal ? static_cast<float>(kDecalDepthBias) : 0.0f)
                        slopeScale:(mesh.is_decal ? kDecalSlopeBias : 0.0f)

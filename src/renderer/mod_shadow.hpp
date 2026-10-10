@@ -269,6 +269,8 @@ inline void collect_mod_shadows(const LevelScene& scene, SceneLightEnvironments&
             !mb.lighting.cast_shadows) {
             continue;
         }
+        // What the level's script has hidden casts nothing.
+        if (mb.actor >= 0 && static_cast<size_t>(mb.actor) < scene.actors.size() && scene.actors[static_cast<size_t>(mb.actor)].is_hidden) continue;
         Vec3 center;
         float radius = 1.0f;
         const ShadowLight light = envs.mesh_shadow(scene, i, now, center, radius);

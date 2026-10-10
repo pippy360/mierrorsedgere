@@ -144,6 +144,10 @@ struct ScriptGraph {
         int matinee = -1;   // SeqAct_Interp: index into matinees
         int actor = -1;     // SeqVar_Object: the actor it names, when it is one of `actors`
         std::vector<std::string> level_names;  // SeqAct_MultiLevelStreaming / SeqAct_LevelStreaming
+        // SeqEvent_TakeDamage: DamageTypes and IgnoreDamageTypes; SeqAct_CauseDamage: DamageType (the
+        // first entry). Class names in lower case.
+        std::vector<std::string> damage_types;
+        std::vector<std::string> ignore_damage_types;
         std::vector<int> stat_links;           // not used yet
     };
 
@@ -152,6 +156,7 @@ struct ScriptGraph {
     std::vector<ScriptActor> actors;
     std::vector<ScriptMatinee> matinees;
     std::unordered_map<std::string, std::vector<int>> remote_events;  // lower-case EventName -> SeqEvent_RemoteEvent nodes
+    std::vector<int> damage_events;  // the SeqEvent_TakeDamage nodes that listen on an actor
 
     // Reads the Main_Sequence of every package. `cutscene_of` maps "package:export" of a
     // SeqAct_Interp to its baked LevelScene::cutscenes index.
@@ -222,6 +227,9 @@ struct ScriptHost {
     // 1 off, 2 the other way. And one hidden or shown (SeqAct_ToggleHidden, SeqAct_Destroy).
     std::function<void(const ScriptActor& actor, int action)> toggle_effect;
     std::function<void(const ScriptActor& actor, bool hidden)> hide_effect;
+    // SeqAct_ToggleHidden / SeqAct_Destroy on any other actor (a pane of glass and its broken twin):
+    // 0 hide, 1 show, 2 the other way, 3 destroyed (hidden for good; its collision goes too).
+    std::function<void(const ScriptActor& actor, int action)> hide_actor;
     // SeqAct_ActorFactory with an ActorFactoryEmitter: the factory (its package's stem in lower
     // case and its export) makes its particle system at a spawn point.
     std::function<void(const std::string& package, int32_t factory_export, const ScriptActor& at)> spawn_effect;
@@ -266,6 +274,11 @@ public:
     void into_cutscene_finished();
     // TdUIScene.ActivateLevelEvent and SeqAct_ActivateRemoteEvent: every SeqEvent_RemoteEvent of that name.
     void fire_remote_event(const std::string& name);
+    // An actor of the level took damage (Actor.TakeDamage -> SeqEvent_TakeDamage.HandleDamage).
+    // `package` is the actor's package stem in lower case, `damage_type` the damage class in lower
+    // case ("tddmgtype_bullet", "tddmgtype_barge", "tddmgtype_melee"). True when an event listening
+    // on the actor fired.
+    bool damage_actor(const std::string& package, const std::string& name, float amount, bool by_player, const std::string& damage_type);
 
     [[nodiscard]] bool input_move_disabled() const { return input_move_disabled_; }
     [[nodiscard]] bool input_look_disabled() const { return input_look_disabled_; }
@@ -292,6 +305,8 @@ private:
         float f = 0.0f;
         int i = 0;
         bool b = false;
+        // SeqEvent_TakeDamage: CurrentDamage
+        float damage = 0.0f;
         // SeqAct_Delay
         float remaining = 0.0f;
         bool delay_running = false;

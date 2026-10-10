@@ -43,6 +43,7 @@ ImpactLibrary::ImpactLibrary(PackageManager& pm, LevelScene& scene, std::vector<
     scene_.effect_factories.clear();
     scene_.spawned_effects.clear();
     scene_.dynamic_decals.clear();
+    scene_.actor_damage.clear();
 }
 
 ImpactLibrary::Ref ImpactLibrary::by_path(const std::string& path) {

@@ -29,7 +29,7 @@ The engine fuses five specialized native subsystems into a single executable (`m
      - **Crouch Slide & Coil**: Sprint-initiated low-friction slides under ventilation ducts, mid-air leg coils (+60 unit clearance), and Skill Rolls that play `fallinglandroll`'s root motion while the camera somersaults with the animation.
      - **Combat & Disarm**: Interactive weapon snatch (`MOVE_Snatch`) against patrol cops/SWAT bots, firearm ballistics, and Reaction Time slow-motion (0.25x time dilation with cool blue tint).
 
-   **The level's own script (`src/game/level_script.*`)**: each chapter's Kismet, read from its cooked packages and run with the engine's ordering. The trigger volumes (their real cylinders and brush hulls), remote events across the streamed sublevels, delays, gates and switches; the checkpoints (`SeqAct_TdCheckpoint`), the cutscenes the triggers start (every pawn Matinee is baked like the intro, and the Matinee's event keys fire its Kismet as it plays), input locks, fades, the voice lines, the text retail puts on the screen (the district and time of day, the training area's cards, a sign's writing when it is looked at, the hint cards) and the chapter's end (`SeqAct_TdLevelCompleted` to the next map at its checkpoint, behind its loading movie). [`docs/GAMEPLAY_SCRIPTING_RE.md`](docs/GAMEPLAY_SCRIPTING_RE.md).
+   **The level's own script (`src/game/level_script.*`)**: each chapter's Kismet, read from its cooked packages and run with the engine's ordering. The trigger volumes (their real cylinders and brush hulls), remote events across the streamed sublevels, delays, gates and switches; the checkpoints (`SeqAct_TdCheckpoint`), the cutscenes the triggers start (every pawn Matinee is baked like the intro, and the Matinee's event keys fire its Kismet as it plays), input locks, fades, the voice lines, the text retail puts on the screen (the district and time of day, the training area's cards, a sign's writing when it is looked at, the hint cards) and the chapter's end (`SeqAct_TdLevelCompleted` to the next map at its checkpoint, behind its loading movie). Glass breaks through it too: the panes' damage events crack a pane on a first bullet and shatter it on a second, with the level's own cracking and breaking effects, and a barge, a jump kick or a slide kick goes straight through. [`docs/GAMEPLAY_SCRIPTING_RE.md`](docs/GAMEPLAY_SCRIPTING_RE.md).
 
 3. **Apple Metal 3.0 Graphics Engine (`src/renderer/metal_renderer.*`)**:
    - Native Apple Metal shader pipelines written in Metal Shading Language (MSL):
@@ -160,6 +160,8 @@ Usage:
 
 Options:
   --verify-all             Run deterministic headless oracle verification suite
+  --verify-script          Run only its level-script stage: a real level's Kismet against breakable
+                           glass, emitter factories and toggles (docs/GAMEPLAY_SCRIPTING_RE.md)
   --intro-shots <map> <t,t,..> <dir>
                            Play the level's intro headless and save the picture at those Matinee
                            times (docs/RENDERING_RE.md compares them with retail's)

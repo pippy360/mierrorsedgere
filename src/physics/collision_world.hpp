@@ -54,15 +54,22 @@ public:
         int32_t actor = -1;
         uint8_t channels = COLL_BlockAll;
         uint16_t element = 0;  // a mesh's own triangle: the mesh element it belongs to
+        // What the triangle is there for, whatever its actor collides with at the moment: a hull's
+        // triangles and a mesh's own each take the checks their mesh gives them
+        // (UseSimpleBoxCollision / UseSimpleLineCollision), and only a mesh's own cast shadows.
+        uint8_t role = COLL_BlockAll;
     };
 
     void clear();
     void reserve(size_t triangle_count);
     // Adds a world-space triangle; degenerate (zero-area) triangles are dropped.
+    // `role` is what the triangle may ever be asked for (set_actor_channels); by default what it is now.
     void add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element = 0);
+    void add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element, uint8_t role);
     // Builds the bounding volume hierarchy. Must be called before querying.
     void build();
-    // Updates the blocking channel mask of all triangles belonging to `actor`.
+    // The actor now blocks `channels` (0: nothing): each of its triangles takes the part of that its
+    // role covers, and a mesh's own triangles cast shadows again while the actor blocks anything.
     void set_actor_channels(int32_t actor, uint8_t channels);
 
     [[nodiscard]] bool empty() const { return tris_.empty(); }

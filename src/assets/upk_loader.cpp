@@ -1211,6 +1211,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
 
         bool b_hidden = false;
         if (const auto* p = get_prop("bHidden")) b_hidden = p->bool_val;
+        if (const auto* p = get_prop("bInteractable")) a.interactable = p->bool_val;
 
         // InterpActor (elevators, doors, buttons, moving platforms) frequently stores its
         // mesh reference in ReplicatedMesh on the Actor / Archetype.
@@ -3658,12 +3659,13 @@ void append_actor_collision(const LevelActor& a, int32_t actor_index, const Stat
     uint8_t actor_channels = 0;
     if (a.is_collidable) actor_channels |= COLL_BlockNonZeroExtent;
     if (a.blocks_traces) actor_channels |= COLL_BlockZeroExtent;
-    if (actor_channels == 0) return;
+    // What collides with nothing has no triangles, unless the level's script may switch it on.
+    if (actor_channels == 0 && !a.script_collision) return;
 
     // BlockingVolume brush hulls are already in world space.
     for (size_t i = 0; i + 2 < a.brush_triangles.size(); i += 3) {
         out.add_triangle(a.brush_triangles[i], a.brush_triangles[i + 1], a.brush_triangles[i + 2], actor_index,
-                         actor_channels);
+                         actor_channels, 0, COLL_BlockAll);
     }
     if (!sm) return;
 
@@ -3680,23 +3682,27 @@ void append_actor_collision(const LevelActor& a, int32_t actor_index, const Stat
     uint8_t complex_ch = 0;
     (use_hull_extent ? simple_ch : complex_ch) |= COLL_BlockNonZeroExtent;
     (use_hull_zero ? simple_ch : complex_ch) |= COLL_BlockZeroExtent;
+    // Each set's role is what the mesh gives it; what it blocks now is the part of that the actor has on.
+    const uint8_t simple_role = simple_ch;
+    const uint8_t complex_role = static_cast<uint8_t>(complex_ch | COLL_ShadowCast);
     simple_ch &= actor_channels;
     complex_ch &= actor_channels;
 
     const ActorTransform xf = ActorTransform::of(a);
-    auto emit = [&](const std::vector<Vec3>& tris, uint8_t channels) {
-        if (channels == 0) return;
-        for (size_t i = 0; i + 2 < tris.size(); i += 3) {
-            out.add_triangle(xf.apply(tris[i]), xf.apply(tris[i + 1]), xf.apply(tris[i + 2]), actor_index, channels);
+    if (simple_role != 0) {
+        const std::vector<Vec3>& hull = sm->simple_collision;
+        for (size_t i = 0; i + 2 < hull.size(); i += 3) {
+            if (simple_ch == 0 && !a.script_collision) break;
+            out.add_triangle(xf.apply(hull[i]), xf.apply(hull[i + 1]), xf.apply(hull[i + 2]), actor_index, simple_ch, 0, simple_role);
         }
-    };
-    emit(sm->simple_collision, simple_ch);
+    }
     // The mesh's own triangles keep their element: what a bullet hits there has that element's material.
     const std::vector<Vec3>& own = sm->complex_collision;
     const bool elements = sm->complex_collision_element.size() * 3 == own.size();
+    const uint8_t own_now = actor_channels != 0 ? static_cast<uint8_t>(complex_ch | COLL_ShadowCast) : uint8_t{0};
     for (size_t i = 0; i + 2 < own.size(); i += 3) {
-        out.add_triangle(xf.apply(own[i]), xf.apply(own[i + 1]), xf.apply(own[i + 2]), actor_index,
-                         static_cast<uint8_t>(complex_ch | COLL_ShadowCast), elements ? sm->complex_collision_element[i / 3] : uint16_t{0});
+        out.add_triangle(xf.apply(own[i]), xf.apply(own[i + 1]), xf.apply(own[i + 2]), actor_index, own_now,
+                         elements ? sm->complex_collision_element[i / 3] : uint16_t{0}, complex_role);
     }
 }
 
@@ -3746,19 +3752,22 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         append_actor_collision(a, static_cast<int32_t>(i), sm, out_collision);
         if (!sm) continue;
 
-        if (a.is_hidden || sm->triangles.empty()) {
+        // What the level's script shows and hides is built whether or not it starts hidden.
+        const bool switched = a.script_switched && emitter.use_materials();
+        if ((a.is_hidden && !switched) || sm->triangles.empty()) {
             a.world_bounds = transformed_mesh_bounds(a, *sm);
             ++hidden_meshes;
             continue;
         }
         ++placed_meshes;
-        if (a.dynamic_class && emitter.use_materials()) {
-            // A buffer of its own, so that it can be given its own light.
+        if ((a.dynamic_class || switched) && emitter.use_materials()) {
+            // A buffer of its own, so that it can be given its own light, or left out while hidden.
             MeshBuffer mb;
             mb.name = "UE3_Dynamic_" + a.source_package + "_" + a.unique_name;
             mb.is_runner_vision = a.is_runner_vision;
-            mb.dynamic_lit = true;
+            mb.dynamic_lit = a.dynamic_class;
             mb.lighting = a.lighting;
+            mb.actor = switched ? static_cast<int32_t>(i) : -1;
             std::map<int32_t, std::vector<Vertex>> bins;
             const AABB own_box = emitter.emit(a, *sm, bins, mb.vertices);
             MeshEmitter::flush(mb, bins);
@@ -3769,8 +3778,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                 overall.expand(own_box.min_pt);
                 overall.expand(own_box.max_pt);
             }
-            ++dynamic_modes[static_cast<size_t>(a.lighting.mode)];
-            if (std::getenv("ME_LIGHT_ENV_DEBUG")) {
+            if (a.dynamic_class) ++dynamic_modes[static_cast<size_t>(a.lighting.mode)];
+            if (a.dynamic_class && std::getenv("ME_LIGHT_ENV_DEBUG")) {
                 static const char* kModes[3] = {"environment", "direct", "unlit"};
                 std::cout << "[LightEnv] " << a.class_name << " " << a.source_package << "." << a.unique_name << " (" << a.mesh_name
                           << "): " << kModes[static_cast<size_t>(a.lighting.mode)] << ", channels " << a.lighting.channels
@@ -5483,6 +5492,54 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     // while the geometry is emitted: this translates the graphs once, without their textures.
     std::unique_ptr<MaterialUVResolver> material_uvs;
     if (pm) material_uvs = std::make_unique<MaterialUVResolver>(*pm);
+    // What the level's script will hide, show or destroy (the panes of glass and their broken twins),
+    // and what it listens on for damage.
+    if (out_scene.script) {
+        const ScriptGraph& graph = *out_scene.script;
+        std::unordered_map<std::string, size_t> by_name;
+        for (size_t i = 0; i < out_scene.actors.size(); ++i) {
+            by_name.emplace(to_lower(out_scene.actors[i].source_package) + ":" + out_scene.actors[i].unique_name, i);
+        }
+        const auto actor_of = [&](int script_actor) -> LevelActor* {
+            if (script_actor < 0) return nullptr;
+            const ScriptActor& sa = graph.actors[static_cast<size_t>(script_actor)];
+            const auto it = by_name.find(sa.package + ":" + sa.name);
+            return it == by_name.end() ? nullptr : &out_scene.actors[it->second];
+        };
+        size_t switched = 0, hidden = 0, listening = 0, bargeable = 0;
+        for (const ScriptGraph::Node& n : graph.nodes) {
+            const bool hides = n.cls == "SeqAct_ToggleHidden" || n.cls == "SeqAct_Destroy";
+            if (!hides && n.cls != "SeqAct_ChangeCollision") continue;
+            for (const ScriptGraph::VarLink& link : n.vars) {
+                if (to_lower(link.desc) != "target") continue;
+                for (int v : link.vars) {
+                    if (v < 0 || static_cast<size_t>(v) >= graph.nodes.size()) continue;
+                    LevelActor* a = actor_of(graph.nodes[static_cast<size_t>(v)].actor);
+                    if (!a || a->elevator >= 0 || a->barge_door >= 0) continue;
+                    a->script_collision = true;
+                    if (!hides || a->mesh_name.empty() || a->script_switched) continue;
+                    a->script_switched = true;
+                    ++switched;
+                    hidden += a->is_hidden ? 1 : 0;
+                }
+            }
+        }
+        for (int ev : graph.damage_events) {
+            LevelActor* a = actor_of(graph.nodes[static_cast<size_t>(ev)].originator);
+            if (!a || a->script_damage) continue;
+            a->script_damage = true;
+            ++listening;
+            bargeable += a->interactable ? 1 : 0;
+        }
+        for (LevelActor& a : out_scene.actors) {
+            a.initial_hidden = a.is_hidden;
+            a.initial_collidable = a.is_collidable;
+            a.initial_blocks_traces = a.blocks_traces;
+        }
+        std::cout << "[Level] Script-driven actors: " << switched << " meshes the script hides, shows or destroys (" << hidden
+                  << " start hidden), " << listening << " actors with damage events (" << bargeable << " of them interactable)"
+                  << std::endl;
+    }
     std::vector<LevelDecal> decals;
     if (pm) extract_level_decals(loaded_packages, decals);
     build_level_geometry(out_scene.actors, out_scene.meshes, *collision, mesh_library, pm ? &material_paths : nullptr,
