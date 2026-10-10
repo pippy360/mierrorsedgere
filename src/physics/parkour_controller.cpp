@@ -648,6 +648,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_jump_consumed = false;
     m_barge_kick = false;
     m_barge_door = -1;
+    m_barge_actor = -1;
     m_barge_anim = 0;
     m_barge_anim_pos = 0.0f;
     m_barge_anim_elapsed = 0.0f;
@@ -3838,6 +3839,14 @@ void ParkourController::update_slide(const InputFrame& input, float dt, LevelSce
             if (rem_dt > 1e-5f) {
                 walk_move(horiz(m_telemetry.velocity) * rem_dt, kCrouchHeight, scene);
             }
+        } else {
+            // TdMove_MeleeSlide.BargeObject on anything else interactable (a pane of glass).
+            Vec3 at;
+            const int other = find_barge_actor(scene, body, 125.0f, at);
+            if (other >= 0) {
+                m_barge_dealt_damage = true;
+                scene.actor_damage.push_back(ActorDamage{other, 100.0f, true, 1});
+            }
         }
     }
 }
@@ -5736,6 +5745,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.hit_enemy = (hit_bot != nullptr);
             tr.from_player = true;
             tr.ammo = pellets > 1 ? 3 : (ws.is_heavy ? 1 : 0);
+            tr.damage = ws.damage;
             scene.active_tracers.push_back(tr);
         }
 
@@ -5820,6 +5830,9 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             const int door_ahead = find_barge_door(scene, fwd, 185.0f, door_hit);
             if (door_ahead >= 0) {
                 open_barge_door(door_ahead, fwd, true, scene);
+            } else if (const int other = find_barge_actor(scene, fwd, 185.0f, door_hit); other >= 0) {
+                // TdMove_AirBarge / TdMove_MeleeAir / TdMove_MeleeCrouch: the same 100 of barge damage.
+                scene.actor_damage.push_back(ActorDamage{other, 100.0f, true, 1});
             }
         }
 
@@ -6212,6 +6225,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.hit_enemy = false;
                 tr.from_player = false;
                 tr.ammo = 2;  // the helicopter's gun
+                tr.damage = 25.0f;
                 scene.active_tracers.push_back(tr);
 
                 // SequenceFrame_30 [Reduce Gunner Accuracy During Slide] + high-speed parkour evasion
@@ -6788,6 +6802,20 @@ int ParkourController::find_barge_door(const LevelScene& scene, const Vec3& dir,
     return -1;
 }
 
+int ParkourController::find_barge_actor(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const {
+    const float heights[2] = {0.5f * kPawnHeight, 0.5f * kCrouchHeight};
+    for (float hz : heights) {
+        const Vec3 start = m_telemetry.position + Vec3(0.0f, 0.0f, hz);
+        const TraceHit hit = trace_ray(start, start + dir * dist, scene, COLL_BlockZeroExtent);
+        if (!hit.hit || hit.actor_index < 0 || static_cast<size_t>(hit.actor_index) >= scene.actors.size()) continue;
+        const LevelActor& a = scene.actors[static_cast<size_t>(hit.actor_index)];
+        if (!a.interactable || !a.script_damage || a.is_hidden || a.barge_door >= 0) continue;
+        hit_point = hit.point;
+        return hit.actor_index;
+    }
+    return -1;
+}
+
 bool ParkourController::try_initiate_barge(const LevelScene& scene) {
     const EMovement st = m_telemetry.move_state;
     const bool walking = m_telemetry.grounded &&
@@ -6811,12 +6839,16 @@ bool ParkourController::try_initiate_barge(const LevelScene& scene) {
     Vec3 hit_point;
     int door = find_barge_door(scene, facing, trace_dist, hit_point);
     if (door < 0) door = find_barge_door(scene, cam_fwd, trace_dist, hit_point);
-    if (door < 0) return false;
+    int other = -1;
+    if (door < 0) other = find_barge_actor(scene, facing, trace_dist, hit_point);
+    if (door < 0 && other < 0) other = find_barge_actor(scene, cam_fwd, trace_dist, hit_point);
+    if (door < 0 && other < 0) return false;
 
     // TdMove_Barge.StartMove / StartBargin.
     m_telemetry.move_state = EMovement::MOVE_Barge;
     m_state_timer = 0.0f;
     m_barge_door = door;
+    m_barge_actor = other;
     m_barge_dealt_damage = false;
     m_barge_anim_pos = 0.0f;
     m_barge_anim_elapsed = 0.0f;
@@ -6923,6 +6955,8 @@ void ParkourController::update_barge(const InputFrame& input, float dt, LevelSce
             m_telemetry.velocity.x = m_barge_dir.x * retain;
             m_telemetry.velocity.y = m_barge_dir.y * retain;
             open_barge_door(m_barge_door, m_barge_dir, true, scene);
+            // HitObject: Victim.TakeDamage(100, .., TdDmgType_Barge) on anything else it was thrown at.
+            if (m_barge_door < 0 && m_barge_actor >= 0) scene.actor_damage.push_back(ActorDamage{m_barge_actor, 100.0f, true, 1});
         }
         if (m_barge_anim_pos >= 0.12f) {
             m_barge_anim = 2;
@@ -6937,6 +6971,7 @@ void ParkourController::update_barge(const InputFrame& input, float dt, LevelSce
         // The kick's BargeHitNotify: HitObject on the door.
         m_barge_dealt_damage = true;
         open_barge_door(m_barge_door, m_barge_dir, true, scene);
+        if (m_barge_door < 0 && m_barge_actor >= 0) scene.actor_damage.push_back(ActorDamage{m_barge_actor, 100.0f, true, 1});
     }
 
     // OnCustomAnimEnd: StopCustomAnim, SetMove(MOVE_Walking).

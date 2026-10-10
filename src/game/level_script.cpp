@@ -316,6 +316,34 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                     n.player_touches = player;
                 }
             }
+            if (c == "SeqEvent_TakeDamage" || c == "SeqEvent_Death") {
+                // What the event does not save is its class's (Engine.u).
+                const auto defaults = script_default_chain("Default__" + c);
+                const auto saved_or_default = [&](const char* name) -> const UProperty* {
+                    if (const UProperty* p = find_prop(props, name)) return p;
+                    for (const auto* list : defaults) {
+                        if (const UProperty* p = find_prop(*list, name)) return p;
+                    }
+                    return nullptr;
+                };
+                if (const UProperty* p = saved_or_default("bPlayerOnly")) n.player_only = p->b;
+                if (const UProperty* p = saved_or_default("MaxTriggerCount")) n.max_trigger = p->i;
+                n.f = 100.0f;  // DamageThreshold
+                n.f2 = 0.0f;   // MinDamageAmount
+                if (const UProperty* p = saved_or_default("DamageThreshold")) n.f = p->f;
+                if (const UProperty* p = saved_or_default("MinDamageAmount")) n.f2 = p->f;
+                const auto class_names = [&](const char* name, std::vector<std::string>& out) {
+                    const UProperty* list = find_prop(props, name);
+                    if (!list) return;
+                    for (int32_t ref : list->ints) {
+                        const std::string path = to_lower(object_full_path(pkg, ref));
+                        out.push_back(path.substr(path.rfind('.') == std::string::npos ? 0 : path.rfind('.') + 1));
+                    }
+                };
+                class_names("DamageTypes", n.damage_types);
+                class_names("IgnoreDamageTypes", n.ignore_damage_types);
+                if (c == "SeqEvent_TakeDamage" && n.originator >= 0) damage_events.push_back(static_cast<int>(ni));
+            }
             if (c == "SeqEvent_LOS") {
                 // Engine.SeqEvent_LOS defaults
                 n.los_distance = prop_float(props, "TriggerDistance", 2048.0f);
@@ -429,6 +457,10 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
             n.f = prop_float(props, "VolumeMultiplier", 1.0f);
         } else if (c == "SeqAct_CauseDamage") {
             n.f = prop_float(props, "DamageAmount", 0.0f);
+            if (const int32_t type = prop_object(props, "DamageType")) {
+                const std::string path = to_lower(object_full_path(pkg, type));
+                n.damage_types.push_back(path.substr(path.rfind('.') == std::string::npos ? 0 : path.rfind('.') + 1));
+            }
         } else if (c == "SeqAct_MultiLevelStreaming") {
             if (const UProperty* levels = find_prop(props, "Levels")) {
                 for (const auto& el : levels->elements) {
@@ -732,6 +764,33 @@ bool LevelScript::check_activate(int event) {
     s.last_trigger = time_;
     queue(event, false);
     return true;
+}
+
+// Actor.TakeDamage: every SeqEvent_TakeDamage on the actor adds the damage up and fires when it
+// reaches its threshold (SeqEvent_TakeDamage.HandleDamage, IsValidDamageType).
+bool LevelScript::damage_actor(const std::string& package, const std::string& name, float amount, bool by_player,
+                               const std::string& damage_type) {
+    if (!graph_) return false;
+    // ClassIsChildOf: the classes the game deals here (bullet, barge, blow) each stand right under DamageType's line.
+    const auto is_a = [&](const std::string& cls) { return cls == damage_type || cls == "damagetype" || cls == "tddamagetype"; };
+    bool fired = false;
+    for (int ev : graph_->damage_events) {
+        const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(ev)];
+        const ScriptActor& a = graph_->actors[static_cast<size_t>(n.originator)];
+        if (a.name != name || a.package != package) continue;
+        State& s = state_[static_cast<size_t>(ev)];
+        if (!n.damage_types.empty() && std::none_of(n.damage_types.begin(), n.damage_types.end(), is_a)) continue;
+        if (std::any_of(n.ignore_damage_types.begin(), n.ignore_damage_types.end(), is_a)) continue;
+        if (!s.enabled || amount < n.f2 || (n.player_only && !by_player)) continue;
+        s.damage += amount;
+        if (s.damage < n.f) continue;
+        if (!check_activate(ev)) continue;
+        for (int v : linked_vars(ev, "Damage Taken")) state_[static_cast<size_t>(v)].f = s.damage;
+        log("[Script] " + a.name + " took " + std::to_string(static_cast<int>(s.damage)) + " damage -> " + n.name);
+        s.damage = n.f <= 0.0f ? 0.0f : s.damage - n.f;
+        fired = true;
+    }
+    return fired;
 }
 
 void LevelScript::fire_remote_event(const std::string& name) {
@@ -1520,8 +1579,19 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
         s.out = all_outputs;
     } else if (c == "SeqAct_CauseDamage") {
         bool player = false;
-        for (int t : linked_vars(node, "Target")) player = player || var_is_player(t);
-        if (player && host_.damage_player) host_.damage_player(read_float(node, "Amount", n.f));
+        const float amount = read_float(node, "Amount", n.f);
+        for (int t : linked_vars(node, "Target")) {
+            if (var_is_player(t)) {
+                player = true;
+                continue;
+            }
+            // Any other actor: its own damage events hear of it (a pane breaks its broken twin).
+            const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
+            if (actor < 0) continue;
+            const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
+            damage_actor(sa.package, sa.name, amount, false, n.damage_types.empty() ? std::string("damagetype") : n.damage_types.front());
+        }
+        if (player && host_.damage_player) host_.damage_player(amount);
         s.out = all_outputs;
     } else if (c == "SeqAct_ShowLoading" || c == "SeqAct_HideLoading") {
         if (host_.loading_indicator) host_.loading_indicator(c == "SeqAct_ShowLoading");
@@ -1538,12 +1608,22 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
         }
         if (!fired && n.outputs.size() > 1) s.out |= 1u << (n.outputs.size() - 1);
     } else if (c == "SeqAct_ToggleHidden" || c == "SeqAct_Destroy") {
-        // Hide / UnHide / Toggle, or gone for good: followed for the emitters and lens flares.
+        // Hide / UnHide / Toggle, or gone for good: an emitter or a lens flare stops, any other actor
+        // (a pane of glass, its broken twin) is no longer drawn.
         for (int t : linked_vars(node, "Target")) {
             const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
-            if (actor < 0 || !host_.hide_effect) continue;
+            if (actor < 0) continue;
             const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
-            if (sa.cls.find("Emitter") == std::string::npos && sa.cls != "LensFlareSource") continue;
+            if (sa.cls.find("Emitter") == std::string::npos && sa.cls != "LensFlareSource") {
+                if (!host_.hide_actor) continue;
+                const int action = c == "SeqAct_Destroy" ? 3 : (s.impulses & 1u) ? 0 : (s.impulses & 2u) ? 1 : (s.impulses & 4u) ? 2 : -1;
+                if (action < 0) continue;
+                host_.hide_actor(sa, action);
+                static const char* const kWhat[4] = {"hidden", "shown", "hidden or shown", "destroyed"};
+                log("[Script] " + sa.name + " " + kWhat[action] + " (" + n.name + ")");
+                continue;
+            }
+            if (!host_.hide_effect) continue;
             if (c == "SeqAct_Destroy" || (s.impulses & 1u)) {
                 host_.hide_effect(sa, true);
             } else if (s.impulses & 2u) {

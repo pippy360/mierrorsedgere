@@ -183,13 +183,38 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
     for (BulletTracer& tracer : scene.active_tracers) {
         if (tracer.impact_done) continue;
         tracer.impact_done = true;
-        if (tracer.hit_enemy || !scene.collision || physical.empty()) continue;
+        if (tracer.hit_enemy || !scene.collision) continue;
         Vec3 ray = tracer.end_pos - tracer.start_pos;
         const float length = ray.length();
         if (length < 1.0f) continue;
         ray = ray * (1.0f / length);
+        // The first thing on the bullet's last stretch that is there to be hit: what the level's
+        // script has hidden (a pane's broken twin, waiting) is passed through.
+        const auto first_shown = [&](uint8_t channels) {
+            Vec3 from = tracer.end_pos - ray * std::min(16.0f, length);
+            const Vec3 to = tracer.end_pos + ray * 16.0f;
+            CollisionHit found;
+            for (int tries = 0; tries < 4; ++tries) {
+                found = scene.collision->line_check(from, to, channels);
+                if (!found.hit || found.actor < 0 || static_cast<size_t>(found.actor) >= scene.actors.size() ||
+                    !scene.actors[static_cast<size_t>(found.actor)].is_hidden) {
+                    break;
+                }
+                from = found.location + ray * 0.25f;
+                found = CollisionHit{};
+                if ((to - from).dot(ray) <= 0.0f) break;
+            }
+            return found;
+        };
+        // Actor.TakeDamage: the level actor it struck, for the script's damage events.
+        const CollisionHit struck = first_shown(COLL_BlockZeroExtent | COLL_ShadowCast);
+        if (struck.hit && struck.actor >= 0 && static_cast<size_t>(struck.actor) < scene.actors.size() &&
+            scene.actors[static_cast<size_t>(struck.actor)].script_damage) {
+            scene.actor_damage.push_back(ActorDamage{struck.actor, tracer.damage, tracer.from_player, 0});
+        }
+        if (physical.empty()) continue;
         // The surface the bullet stopped at: a mesh's own triangles there (its hull has no materials).
-        const CollisionHit hit = scene.collision->line_check(tracer.end_pos - ray * std::min(16.0f, length), tracer.end_pos + ray * 16.0f, COLL_ShadowCast);
+        const CollisionHit hit = first_shown(COLL_ShadowCast);
         if (!hit.hit) continue;
         if (!tracer.from_player && (hit.location - player).length() > kImpactEffectDistance) continue;
         const Vec3 n = hit.normal;

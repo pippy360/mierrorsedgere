@@ -222,6 +222,11 @@ void CollisionWorld::clear() {
 void CollisionWorld::reserve(size_t triangle_count) { tris_.reserve(triangle_count); }
 
 void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element) {
+    add_triangle(a, b, c, actor, channels, element, channels);
+}
+
+void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels, uint16_t element,
+                                  uint8_t role) {
     const Vec3 n = (b - a).cross(c - a);
     const float len2 = n.length_sq();
     if (!(len2 > 1e-8f) || !std::isfinite(len2)) return;
@@ -233,13 +238,15 @@ void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, i
     t.actor = actor;
     t.channels = channels;
     t.element = element;
+    t.role = role;
     tris_.push_back(t);
 }
 
 void CollisionWorld::set_actor_channels(int32_t actor, uint8_t channels) {
     if (actor < 0) return;
     for (Triangle& t : tris_) {
-        if (t.actor == actor) t.channels = channels;
+        if (t.actor != actor) continue;
+        t.channels = static_cast<uint8_t>((channels & COLL_BlockAll & t.role) | (channels != 0 ? (t.role & COLL_ShadowCast) : 0));
     }
 }
 

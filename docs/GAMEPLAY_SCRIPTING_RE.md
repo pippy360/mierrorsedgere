@@ -160,13 +160,20 @@ downwards. `SeqAct_TdLevelCompleted` was read and never acted on. The HUD showed
   (-8213, -2392, 5725), 5 s after `Trigger_2` (-7486, -2208, 5796) r 174: the triggers and delays
   the port now runs.
 
+- Flight, loaded at `Office` (oracle stage 21, `--verify-script`; section 8): a bullet at a display
+  case's glass fires `SeqEvent_TakeDamage_5`, which hides the pane, turns its collision off, shows the
+  twin and makes the cracking emitter; a second bullet shatters the twin. 100 of barge damage on an office
+  glass wall runs both of its events and the `SeqAct_CauseDamage` that breaks the twin with it. The player
+  run at a glass wall with the melee key down goes into `MOVE_Barge` on the pane and comes out 457 uu past
+  it. The remote event `R1_Streamed` reaches a `SeqAct_Toggle` that switches an emitter.
+
 ## 7. Not done
 
 - The training area: its Kismet hangs on the movement-challenge system
   (`SeqAct_TdStartMovementChallenge`, `SeqEvt_TdMovementChallenge*`, `SeqEvt_TdTutorialEvent`), which
   the port does not run, so `Tutorial_p` keeps the port's staged tutorial and its own text. (The
   runtime reads a `TdTutorialCheckpoint` as completed when the pawn reaches it, for when it is.)
-- AI factories, AI directives, lights, emitters, material parameters, physics props, stats and music
+- AI factories, AI directives, lights, material parameters, physics props, stats and music
   actions finish at once through their `Out` / `Finished` / `Spawned` outputs; a factory's `All Dead`
   never fires, so a checkpoint or door that waits for a squad to die does not come (Jacknife's pillar
   room, the Mall's and the Boat's lifts). The port's bots are not the script's yet.
@@ -181,3 +188,58 @@ downwards. `SeqAct_TdLevelCompleted` was read and never acted on. The HUD showed
   its animation's root, which is what the retail recordings of the other chapters show.
 - `SeqEvent_LOS` is read as a cone test against the trigger's location (`ScreenCenterDistance` in
   pixels of a 1280-wide picture); the engine's own test was not traced.
+
+## 8. Damage events and breakable glass
+
+The story maps hold 1,734 `SeqEvent_TakeDamage` events bound to an actor (1,651 on `InterpActor`s) and no
+bound `SeqEvent_Death`. They are how glass breaks, how a door is barged, and how the Shard's servers are
+shot out.
+
+**The event** (`Actor.TakeDamage` -> `SeqEvent_TakeDamage.HandleDamage`, `Engine.u`): the damage has to be at
+least `MinDamageAmount`, of a class in `DamageTypes` when that list is not empty and of none in
+`IgnoreDamageTypes`, and from a player when `bPlayerOnly`. It is added to `CurrentDamage`; at
+`DamageThreshold` (100 by class, 1 on 1,622 of the events) the event fires if it may (`MaxTriggerCount`,
+`ReTriggerDelay`), writes `Damage Taken`, and takes the threshold off again.
+
+**A pane of glass** is two `InterpActor`s in one place, the pane and its broken twin (a mesh named
+`.._Broken`), the twin hidden. Each has an event with threshold 1:
+
+```
+the pane   SeqEvent_TakeDamage -> SeqAct_ActorFactory (ActorFactoryEmitter: the cracking effect)
+                               -> SeqAct_TdPlaySound
+                               -> SeqAct_ToggleHidden (Hide, the pane) -> SeqAct_ChangeCollision (none)
+                                  -> SeqAct_ToggleHidden (UnHide, the twin)
+the twin   SeqEvent_TakeDamage -> SeqAct_ActorFactory (the breaking effect), SeqAct_TdPlaySound,
+                                  SeqAct_ToggleHidden, SeqAct_Destroy
+```
+
+A first hit cracks it, a second shatters it. Most panes carry a second event for `TdDmgType_Barge` alone,
+which runs the same chain and also sends `SeqAct_CauseDamage` (100, `TdDmgType_Bullet`) to the twin: a
+barge goes straight through.
+
+**Who deals damage.** A weapon's instant hit (`Victim.TakeDamage` with the weapon's damage). And 100 of
+`TdDmgType_Barge` from `TdMove_Barge` (`BargeHitNotify`, or the shoulder's first contact), `TdMove_AirBarge`
+and `TdMove_MeleeAir` (`Bump` / `HitWall`), `TdMove_MeleeCrouch` and `TdMove_MeleeSlide`, each on what its
+trace found with `bInteractable` (`TdMove_Barge.CalcBargeDamage`: a zero-extent trace from the pawn's
+location along its facing, `max(BargeMinTraceDistance, BargeSpeed * BargeTraceTime)` long when it runs
+forward).
+
+**In the port** (`src/game/level_script.*`, `src/game/script_effects.hpp`, `src/game/impact_effects.hpp`,
+`src/physics/parkour_controller.cpp`): the events are read with their class defaults and run by the rule
+above (`LevelScript::damage_actor`). A bullet tracer tells the script of the level actor it struck; the
+barge, the airborne and crouched blow and the slide kick find an interactable actor with a damage event
+the way they find a door, and deal their 100. `SeqAct_ToggleHidden`, `SeqAct_Destroy` and
+`SeqAct_ChangeCollision` act on the mesh actors: an actor the script can hide is built into a mesh buffer of
+its own at load, hidden or not (`LevelActor::script_switched`, `MeshBuffer::actor`), which the three
+renderers leave out while it is hidden, shadows included; its collision goes with `SeqAct_ChangeCollision`
+and `SeqAct_Destroy`. Some twins wait with no collision and are given it as they are shown (the office
+glass walls'): an actor whose collision the script changes has its triangles in the collision world from
+the start, switched off, and each triangle keeps its role (the hull's or the mesh's own) for when they are
+switched on. A hidden actor that does collide (a display case's twin, waiting) is passed through by a
+bullet's damage and its mark. `SeqAct_CauseDamage` reaches any actor's events, not only the player. When a
+checkpoint is reloaded the panes are whole again (`restore_script_actors`).
+
+Not as the game: the damage classes are told apart as bullet, barge and blow only (a class filter naming
+another subclass is not met); a punch or kick on the ground deals none; the glass has no physics (no
+shards beyond the particle effects); a door the port opens itself (`LevelScene::barge_doors`) does not run
+its sequence.

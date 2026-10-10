@@ -1461,3 +1461,66 @@ User report (third time, after the two attempts in §17): the camera is too low 
 - `SmoothOffset` (walking) needs `m_base_actor < 0`, and every static-mesh floor has an actor index, so steps are smoothed only on BSP.
 - The port's walking feet stand on the floor, while retail's capsule hovers about 2 uu over it, so after the heave the port's eye is about 2 uu lower than retail's.
 
+---
+
+## 31. The level script's damage events: breakable glass, and an oracle stage that runs a level's Kismet (agent/breakable-glass, 2026-10-10)
+
+Section 29 left two things open: glass did not break (nothing sent the damage events the panes' sequences
+wait for, and the script could hide or destroy only emitters), and no test ran a level's script at all, so
+the script-driven switching of section 29 was unchecked. `docs/GAMEPLAY_SCRIPTING_RE.md` section 8 has what
+the data and the engine's script say.
+
+### 31.1 Changes
+- **Damage events** (`src/game/level_script.*`): `SeqEvent_TakeDamage` with its class defaults,
+  `DamageThreshold`, `MinDamageAmount`, `DamageTypes` / `IgnoreDamageTypes`, `bPlayerOnly`, run by
+  `SeqEvent_TakeDamage.HandleDamage`'s rule (`LevelScript::damage_actor`). `SeqAct_CauseDamage` reaches any
+  actor's events, not only the player. `SeqAct_ToggleHidden` and `SeqAct_Destroy` act on mesh actors
+  (`ScriptHost::hide_actor`).
+- **The scene's side** (`src/game/script_effects.hpp`, new): the callbacks through which the script acts on
+  the scene (emitters, lens flares, hide and show, collision, emitter factories) and the hand-over of damage
+  to the script, shared by the game loop and the oracle; `restore_script_actors` puts the panes back when a
+  checkpoint is reloaded.
+- **Who deals damage:** a bullet tracer carries its weapon's damage to the level actor it strikes
+  (`src/game/impact_effects.hpp`; what the script has hidden is passed through). The barge, the airborne and
+  crouched blow and the slide kick find an interactable actor with a damage event as they find a door
+  (`ParkourController::find_barge_actor`) and deal `TdMove_Barge`'s 100 of `TdDmgType_Barge`.
+- **The loader** (`src/assets/upk_loader.cpp`): `bInteractable`; from the script graph, the actors it hides,
+  shows or destroys (`script_switched`: a mesh buffer of their own, built whether or not they start hidden),
+  the ones it listens on for damage, and the ones whose collision it changes (`script_collision`: their
+  triangles are in the collision world even when they start with none, as a pane's broken twin does).
+- **The collision world:** a triangle keeps its role (a hull's or a mesh's own, for extent checks, line
+  checks or shadows), so that switching an actor's collision on gives each set its own part back.
+- **All three renderers** leave a hidden actor's buffer out of the scene and of the shadow maps.
+- **The oracle:** stage 21 (`oracle_script_effects`), also alone as `--verify-script`; `ME_SCRIPT_DEBUG=1`
+  prints the script's log, `ME_SCRIPT_SHOTS=<dir>` pictures a pane whole, cracked and gone.
+  `ME_START_CHECKPOINT=<name>` starts a `--level` run at a checkpoint.
+
+### 31.2 Results
+- **Flight, loaded:** 423 meshes the script hides, shows or destroys (216 start hidden), 416 actors with
+  damage events (374 interactable), 381 emitter factories (379 with a spawn point).
+- **Stage 21**, Flight's Kismet at its `Office` checkpoint:
+  - *Shots:* 4 of 4 kinds of pane (a display case's glass, an office glass wall, two door-frame panes) are
+    cracked by one bullet (the pane hidden, its twin shown and solid, the cracking emitter made) and
+    shattered by the next, after which neither is on the bullet's line.
+  - *Barge:* 100 of barge damage on an office glass wall runs both of its events and the `SeqAct_CauseDamage`
+    on its twin: both gone, the way clear.
+  - *RunAndBarge:* the controller run at `InterpActor_118` with the melee key down goes into `MOVE_Barge`
+    on the pane, breaks it and comes out 457 uu past it.
+  - *Toggle:* the remote event `R1_Streamed` reaches a `SeqAct_Toggle` and an emitter of the scene changes
+    state.
+- **The game itself**, windowed, started at `Office` (`ME_START_CHECKPOINT`) in front of the same glass wall
+  with W and the melee key posted to its window: the script's log has the pane's damage, its twin shown,
+  broken by the `SeqAct_CauseDamage` and destroyed, and the frames show her through it.
+- **Pictures** (`ME_SCRIPT_SHOTS`): a display case's glass whole, then its cracked twin with the cracking
+  effect, then shards in the air, then nothing. Direct3D against OpenGL on the four: a mean difference of
+  0.11 to 0.16 of 255.
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS, 19 stages; the tracked screenshots come out unchanged.
+- **Against retail's pictures** over the ten level intros: 30.0, every chapter as in section 29 (the panes'
+  own buffers change no picture).
+- **macOS:** the app compiles and links on `macos-15` and both Metal shader sources compile. Not run.
+
+### 31.3 Not done
+The damage classes are bullet, barge and blow only; a ground punch or kick deals none to level actors; the
+`GameBreakableActor`s' `SeqEvent_Destroyed` (exploding barrels) are not run; a pane has no shards beyond its
+particle effects. Nothing here was played by hand: the run at a pane is the controller's, in the oracle. In
+`TODO.md`.

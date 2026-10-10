@@ -569,6 +569,9 @@ struct MeshBuffer {
     // drawn with a depth bias, after what they lie on and before the other translucent surfaces, and
     // cast no shadow.
     bool is_decal = false;
+    // The one actor it draws, when the level's script can hide that actor (LevelActor::script_switched):
+    // not drawn, and casting no shadow, while LevelScene::actors[actor].is_hidden.
+    int32_t actor = -1;
 };
 
 struct SoundSubtitleLine {
@@ -797,6 +800,18 @@ struct LevelActor {
     bool accepts_decals = true;    // the component's bAcceptsDecals
     bool accepts_decals_in_game = true;  // its bAcceptsDecalsDuringGameplay: a bullet hole needs both
     bool dynamic_class = false;  // an InterpActor, a KActor...: never light-mapped
+    // The level's script hides, shows or destroys it (SeqAct_ToggleHidden, SeqAct_Destroy): it is
+    // drawn from a mesh buffer of its own (MeshBuffer::actor), whether or not it starts hidden.
+    bool script_switched = false;
+    bool script_damage = false;  // a SeqEvent_TakeDamage of the level's script listens on it
+    // The script changes its collision (SeqAct_ChangeCollision, SeqAct_Destroy): its triangles are in
+    // the collision world even when it starts with none (a pane's broken twin). And how it started,
+    // for a checkpoint's reload.
+    bool script_collision = false;
+    bool initial_hidden = false;
+    bool initial_collidable = false;
+    bool initial_blocks_traces = false;
+    bool interactable = false;   // Actor.bInteractable: what a barge can be thrown at
     DynamicLighting lighting;    // how it is lit then
     Vec3 end_point{0.0f, 0.0f, 0.0f};
     Vec3 wall_normal{0.0f, 0.0f, 0.0f};
@@ -876,6 +891,7 @@ struct BulletTracer {
     // one, 2 a helicopter's gun, 3 a shotgun's pellet.
     uint8_t ammo = 0;
     bool impact_done = false;  // its impact effect and its bullet hole have been made
+    float damage = 20.0f;      // what it does to the level actor it hits (the level's script hears of it)
 };
 
 struct DroppedWeapon {
@@ -1726,6 +1742,14 @@ struct SpawnedEffect {
     bool forever = false;  // an actor factory's: it stays
 };
 
+// What a bullet did to a level actor, for the level's script (SeqEvent_TakeDamage, SeqEvent_Death).
+struct ActorDamage {
+    int32_t actor = -1;  // LevelScene::actors
+    float amount = 0.0f;
+    bool by_player = false;
+    uint8_t type = 0;    // 0 a bullet (TdDmgType_Bullet), 1 a barge (TdDmgType_Barge), 2 a blow (TdDmgType_Melee)
+};
+
 // A decal made while the game runs (a bullet hole), already clipped to what it lies on.
 struct DynamicDecal {
     int32_t material = -1;
@@ -1817,6 +1841,7 @@ struct LevelScene {
     std::vector<SpawnedEffect> spawned_effects;
     uint32_t next_effect_id = 1;
     std::vector<DynamicDecal> dynamic_decals;
+    std::vector<ActorDamage> actor_damage;  // since the script was last told (game/script_effects.hpp)
     Vec3 sun_direction{-0.4f, 0.6f, 0.7f};  // world-space direction towards the sun (level DirectionalLight)
     Vec3 sun_color{2.0f, 1.96f, 1.9f};       // linear RGB * Brightness of the level's DirectionalLight
     // Reverse-engineered ambient & hemisphere lighting (SkyLightComponent + DirectionalLight.ModShadowColor + WorldInfo.SkyColor)

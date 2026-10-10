@@ -119,6 +119,9 @@ private:
     // TdMove_Barge (MOVE_Barge). CanDoMove: a zero-extent trace from the pawn's centre along `dir`
     // for `dist`; returns the closed door it hits first (-1 = none) and the hit point.
     int find_barge_door(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const;
+    // The same trace for what else a barge can be thrown at: an interactable actor the level's script
+    // listens on for damage (a pane of glass). Its place in LevelScene::actors, -1 none.
+    int find_barge_actor(const LevelScene& scene, const Vec3& dir, float dist, Vec3& hit_point) const;
     // Melee pressed: CanDoMove + StartBargin (the run at the door, or the kick below
     // BargeKickThresholdSpeed). False when no closed door is in reach.
     bool try_initiate_barge(const LevelScene& scene);
@@ -384,6 +387,7 @@ private:
     // TdMove_Barge
     bool m_barge_kick = false;             // below BargeKickThresholdSpeed / not moving forward: the kick
     int m_barge_door = -1;                 // BargeActorList: the door CanDoMove's trace found
+    int m_barge_actor = -1;                // or the other interactable actor it found (a pane of glass)
     int m_barge_anim = 0;                  // custom anim: 1 BargeInLeft, 2 BargeOutLeft, 3 MeleeKickObject
     float m_barge_anim_pos = 0.0f;         // sequence position (s)
     float m_barge_anim_elapsed = 0.0f;     // real seconds since PlayMoveAnim (blend-in)

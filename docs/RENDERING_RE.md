@@ -634,8 +634,8 @@ What runs is sprite and mesh emitters with the module classes of the table: in t
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
 attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
 the player (the game also asks whether the shooter was drawn lately); a bullet that hits a pawn leaves
-nothing; a pane of glass does not break, because nothing sends the damage event its script waits for, so
-the factories behind it never fire; sprites are not sorted against other translucent surfaces. The emitter
+nothing; sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
+the pane is broken: [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
 `ME_IMPACT_DEBUG=1` says what every bullet hit and what it left.
@@ -739,7 +739,7 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 ## 16. What is still a stand-in, or missing
 
 - **Particles:** PhysX emitters, attractors and collision modules; sorting against other translucent
-  surfaces; glass panes do not break, so the effects behind them never play (section 13).
+  surfaces (section 13).
 - **Level geometry with no light map.** Drawn with what it emits only. The cooked light maps list no lights
   (their GUID arrays are empty), so which lights retail lets fall on such a mesh dynamically is not known from
   the data; none was seen in the pictures checked.

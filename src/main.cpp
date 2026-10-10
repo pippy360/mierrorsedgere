@@ -26,6 +26,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include "cutscene/screen_fade.hpp"
 #include "game/screen_effects.hpp"
 #include "game/impact_effects.hpp"
+#include "game/script_effects.hpp"
 #include "game/level_script.hpp"
 #include "physics/collision_world.hpp"
 #include "physics/parkour_controller.hpp"
@@ -103,6 +104,366 @@ static std::string platform_upper() {
 // -----------------------------------------------------------------------------
 // Deterministic Headless Oracle & Multi-Stage Parkour Verification Suite
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// The level's script acting on the scene (game/script_effects.hpp), checked on a real level: Flight's
+// Kismet is run against a pane of glass (SeqEvent_TakeDamage -> SeqAct_ActorFactory,
+// SeqAct_ToggleHidden, SeqAct_ChangeCollision, SeqAct_Destroy) with real bullets and with a barge, and
+// against a trigger whose chain switches an emitter or a lens flare (SeqAct_Toggle). Oracle stage 21;
+// --verify-script runs it alone, ME_SCRIPT_DEBUG=1 prints the script's log, and with a renderer and a
+// directory (--verify-script with ME_SCRIPT_SHOTS=<dir>) the pane is pictured whole, cracked and gone.
+// -----------------------------------------------------------------------------
+static bool oracle_script_effects(const std::string& game_root, me::Renderer* renderer = nullptr, const std::string& shot_dir = std::string()) {
+    using namespace me;
+    LevelScene scene;
+    const bool loaded = load_level_scene(game_root, "Maps/SP01/Escape_p.me1", scene) && scene.script && scene.script->valid() &&
+                        scene.collision;
+    int toggles = 0, spawns = 0, hides = 0, collisions = 0;
+    std::vector<std::string> script_log;
+    LevelScript script;
+    ScriptPlayerState ps;
+    float now = 0.0f;
+    const auto tick = [&](int frames) {
+        for (int i = 0; i < frames; ++i) {
+            update_impact_effects(scene, 1.0f / 30.0f, ps.position);
+            deliver_actor_damage(script, scene);
+            script.update(1.0f / 30.0f, ps);
+            now += 1.0f / 30.0f;
+        }
+    };
+    // A picture of `look_at` from `from`, for looking at what the script did.
+    const auto snap = [&](const Vec3& look_at, const Vec3& from, const char* name) {
+        if (!renderer || shot_dir.empty()) return;
+        PlayerTelemetry tel{};
+        const Vec3 d = (look_at - from).normalized();
+        tel.position = from - Vec3(0.0f, 0.0f, tel.eye_height);
+        tel.yaw_deg = std::atan2(d.y, d.x) * 57.29578f;
+        tel.pitch_deg = std::asin(std::clamp(d.z, -1.0f, 1.0f)) * 57.29578f;
+        tel.sim_time = now;
+        tel.exposure_reset = true;
+        tel.screen_effects = screen_effects_from_environment();
+        renderer->render_frame(scene, tel);
+        renderer->save_screenshot_png(shot_dir + "/" + name + ".png");
+    };
+    const auto lower_of = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v;
+    };
+    // The thin side of an actor's bounds: the way through a pane.
+    const auto pane_axis = [&](const LevelActor& a) {
+        const Vec3 size = a.world_bounds.max_pt - a.world_bounds.min_pt;
+        return (size.x <= size.y && size.x <= size.z) ? Vec3(1.0f, 0.0f, 0.0f) : (size.y <= size.z ? Vec3(0.0f, 1.0f, 0.0f) : Vec3(0.0f, 0.0f, 1.0f));
+    };
+    // What a bullet through the middle of an actor's bounds meets first, hidden things passed through
+    // as a bullet passes them (-1 nothing, -2 the BSP).
+    const auto first_on_line = [&](const LevelActor& a) {
+        const Vec3 centre = (a.world_bounds.min_pt + a.world_bounds.max_pt) * 0.5f;
+        const Vec3 n = pane_axis(a);
+        Vec3 from = centre + n * 60.0f;
+        const Vec3 to = centre - n * 60.0f;
+        for (int tries = 0; tries < 6; ++tries) {
+            const CollisionHit hit = scene.collision->line_check(from, to, COLL_BlockZeroExtent);
+            if (!hit.hit) return -1;
+            if (hit.actor < 0) return -2;
+            if (!scene.actors[static_cast<size_t>(hit.actor)].is_hidden) return static_cast<int>(hit.actor);
+            from = hit.location - n * 0.25f;
+            if ((to - from).dot(n * -1.0f) <= 0.0f) break;
+        }
+        return -1;
+    };
+    bool shot_ok = false, barge_ok = false, toggle_ok = false, run_ok = false;
+    std::string shot_note = "no pane found", barge_note = "no pane found", toggle_note = "no trigger found", run_note = "no pane found";
+    std::string checkpoint_name;
+    if (loaded) {
+        // Play starts at the checkpoint that has the most panes of glass streamed in (the offices).
+        size_t best = 0;
+        int best_checkpoint = 0;
+        for (size_t c = 0; c < scene.checkpoint_infos.size(); ++c) {
+            size_t n = 0;
+            for (const LevelActor& a : scene.actors) {
+                if (!a.script_damage || !a.script_switched || a.is_hidden) continue;
+                for (const std::string& level : scene.checkpoint_infos[c].streaming_levels) n += lower_of(level) == lower_of(a.source_package) ? 1 : 0;
+            }
+            if (n > best) {
+                best = n;
+                best_checkpoint = static_cast<int>(c);
+            }
+        }
+        stream_level_to_checkpoint(game_root, scene, best_checkpoint);
+        if (!scene.checkpoint_infos.empty()) checkpoint_name = scene.checkpoint_infos[static_cast<size_t>(best_checkpoint)].checkpoint_name;
+        ScriptHost host;
+        bind_scene_effects(host, scene);
+        const auto count = [](auto inner, int* counter) {
+            return [inner, counter](auto&&... args) {
+                ++*counter;
+                inner(args...);
+            };
+        };
+        host.toggle_effect = count(host.toggle_effect, &toggles);
+        host.spawn_effect = count(host.spawn_effect, &spawns);
+        host.hide_actor = count(host.hide_actor, &hides);
+        host.change_collision = count(host.change_collision, &collisions);
+        host.line_clear = [&](const Vec3& from, const Vec3& to) { return !scene.collision->line_check(from, to, COLL_BlockZeroExtent).hit; };
+        host.stream_levels = [&](const std::vector<std::string>& levels, bool load) {
+            auto& streamed_in = scene.loaded_sublevel_packages;
+            for (const std::string& l : levels) {
+                auto it = std::find_if(streamed_in.begin(), streamed_in.end(), [&](const std::string& s) { return lower_of(s) == lower_of(l); });
+                if (load && it == streamed_in.end()) streamed_in.push_back(l);
+                if (!load && it != streamed_in.end()) streamed_in.erase(it);
+            }
+            script.set_loaded_packages(streamed_in);
+        };
+        const bool debug = std::getenv("ME_SCRIPT_DEBUG") != nullptr;
+        host.log = [&script_log, debug](const std::string& line) {
+            script_log.push_back(line);
+            if (debug) std::cout << "    " << line << std::endl;
+        };
+        script.init(scene.script, host);
+        script.set_loaded_packages(scene.loaded_sublevel_packages);
+        script.begin_play(checkpoint_name);
+        ps.position = scene.player_spawn_pos;
+        ps.eye = ps.position + Vec3(0.0f, 0.0f, 64.0f);
+        tick(3);
+
+        // The panes: in a sublevel that is streamed in, shown, listening for damage, hidden by the
+        // script, and the first thing a bullet at their middle meets.
+        const auto streamed = [&](const std::string& package) {
+            const std::string want = lower_of(package);
+            for (const std::string& p : script.loaded_packages()) {
+                if (lower_of(p) == want) return true;
+            }
+            return false;
+        };
+        std::vector<int> panes;
+        size_t listening = 0;
+        for (size_t i = 0; i < scene.actors.size(); ++i) {
+            const LevelActor& a = scene.actors[i];
+            if (!a.script_damage || !a.script_switched || a.is_hidden || a.barge_door >= 0 || !streamed(a.source_package)) continue;
+            ++listening;
+            if (first_on_line(a) == static_cast<int>(i)) panes.push_back(static_cast<int>(i));
+        }
+        if (debug) std::cout << "    " << listening << " shown panes with damage events in the streamed sublevels, " << panes.size() << " that a bullet reaches" << std::endl;
+        const auto shown_switched = [&]() {
+            int n = 0;
+            for (const LevelActor& a : scene.actors) n += (a.script_switched && !a.is_hidden) ? 1 : 0;
+            return n;
+        };
+
+        // A: two bullets, on a pane of every kind of glass there is here (up to six). The first cracks
+        // it (the pane is hidden, its twin shown and solid, the cracking emitter made); the second
+        // shatters the twin, and neither is on the line any more.
+        {
+            std::vector<std::string> kinds;
+            int passed = 0;
+            std::string failed;
+            for (size_t k = 0; k < panes.size() && kinds.size() < 6; ++k) {
+                LevelActor& pane = scene.actors[static_cast<size_t>(panes[k])];
+                // Glass only: a door with a damage event (it is barged) is no pane.
+                if (lower_of(pane.mesh_name).find("glass") == std::string::npos) continue;
+                if (pane.is_hidden || std::find(kinds.begin(), kinds.end(), pane.mesh_name) != kinds.end()) continue;
+                kinds.push_back(pane.mesh_name);
+                const Vec3 centre = (pane.world_bounds.min_pt + pane.world_bounds.max_pt) * 0.5f;
+                const Vec3 n = pane_axis(pane);
+                const int spawns_before = spawns;
+                const size_t effects_before = scene.spawned_effects.size();
+                const auto fire = [&]() {
+                    // The weapon's own trace, to where the bullet stops.
+                    const CollisionHit hit = scene.collision->line_check(centre + n * 60.0f, centre - n * 60.0f, COLL_BlockZeroExtent);
+                    if (!hit.hit) return false;
+                    BulletTracer tr;
+                    tr.start_pos = centre + n * 60.0f;
+                    tr.end_pos = hit.location;
+                    tr.damage = 45.0f;
+                    scene.active_tracers.push_back(tr);
+                    tick(4);
+                    scene.active_tracers.clear();
+                    return true;
+                };
+                // Seen from a little to the side of the way through it.
+                const Vec3 side = std::abs(n.z) > 0.5f ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 0.0f, 1.0f);
+                const Vec3 view_from = centre + n * 150.0f + side * 110.0f;
+                const bool pictured = kinds.size() == 1;
+                if (pictured) snap(centre, view_from, "glass_0_whole");
+                fire();
+                if (pictured) snap(centre, view_from, "glass_1_cracked");
+                const bool cracked = pane.is_hidden;
+                const int twin = first_on_line(pane);
+                const bool twin_shown = twin >= 0 && twin != panes[k] && scene.actors[static_cast<size_t>(twin)].script_switched;
+                const int first_spawns = spawns - spawns_before;
+                bool shattered = false;
+                if (cracked && twin_shown) {
+                    fire();
+                    if (pictured) snap(centre, view_from, "glass_2_shattered");
+                    tick(12);
+                    if (pictured) snap(centre, view_from, "glass_3_after");
+                    const int after = first_on_line(pane);
+                    shattered = scene.actors[static_cast<size_t>(twin)].is_hidden && after != twin && after != panes[k];
+                }
+                const bool ok = cracked && twin_shown && shattered && first_spawns >= 1 && spawns - spawns_before >= 2 &&
+                                scene.spawned_effects.size() >= effects_before + 2;
+                passed += ok ? 1 : 0;
+                if (!ok) {
+                    failed += " " + pane.unique_name + " (" + pane.mesh_name + "): cracked " + (cracked ? "yes" : "no") + ", twin there " +
+                              (twin_shown ? "yes" : "no") + ", shattered " + (shattered ? "yes" : "no") + ", emitters " +
+                              std::to_string(spawns - spawns_before) + ";";
+                }
+                if (debug) {
+                    std::cout << "    " << pane.unique_name << " (" << pane.mesh_name << ") at (" << centre.x << ", " << centre.y << ", " << centre.z
+                              << "): " << (ok ? "cracked, then shattered" : "FAILED") << std::endl;
+                }
+            }
+            shot_note = std::to_string(passed) + " of " + std::to_string(kinds.size()) + " kinds of pane cracked by one bullet and shattered by the next" +
+                        (failed.empty() ? std::string() : ";" + failed);
+            shot_ok = kinds.size() >= 2 && passed == static_cast<int>(kinds.size());
+        }
+
+        // B: a barge (100 of TdDmgType_Barge on an interactable pane) goes straight through: the pane is
+        // hidden and no script-driven mesh is left on the line.
+        int tried = 0;
+        for (size_t k = 0; k < panes.size() && !barge_ok && tried < 12; ++k) {
+            LevelActor& pane = scene.actors[static_cast<size_t>(panes[k])];
+            if (pane.is_hidden || !pane.interactable) continue;
+            ++tried;
+            const int shown_before = shown_switched();
+            scene.actor_damage.push_back(ActorDamage{panes[k], 100.0f, true, 1});
+            tick(6);
+            const int after = first_on_line(pane);
+            const bool through = pane.is_hidden && (after < 0 || !scene.actors[static_cast<size_t>(after)].script_switched);
+            barge_note = pane.unique_name + " (" + pane.mesh_name + "): pane hidden " + (pane.is_hidden ? "yes" : "no") + ", way clear " +
+                         (through ? "yes" : "no") + ", shown script meshes " + std::to_string(shown_before) + " -> " + std::to_string(shown_switched());
+            barge_ok = through && shown_switched() < shown_before;
+        }
+
+        // D (before C moves the player about): the same barge thrown by the player. She runs at a standing
+        // pane, the melee key down as she nears it: TdMove_Barge starts on the pane, its hit breaks it,
+        // and she comes out on the other side.
+        {
+            MovementConfig move_cfg;
+            load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+            ParkourController runner(move_cfg);
+            tried = 0;
+            for (size_t k = 0; k < panes.size() && !run_ok && tried < 10; ++k) {
+                LevelActor& pane = scene.actors[static_cast<size_t>(panes[k])];
+                const Vec3 n = pane_axis(pane);
+                if (pane.is_hidden || !pane.interactable || std::abs(n.z) > 0.5f) continue;
+                const Vec3 centre = (pane.world_bounds.min_pt + pane.world_bounds.max_pt) * 0.5f;
+                for (float side : {1.0f, -1.0f}) {
+                    if (pane.is_hidden) break;
+                    // A floor to run on, 260 uu out, and nothing between her and the pane.
+                    const Vec3 out = centre + n * (side * 260.0f);
+                    const CollisionHit floor = scene.collision->line_check(out, out - Vec3(0.0f, 0.0f, 500.0f), COLL_BlockNonZeroExtent);
+                    if (!floor.hit || floor.normal.z < 0.9f) continue;
+                    const Vec3 feet = floor.location + Vec3(0.0f, 0.0f, 2.0f);
+                    const Vec3 chest = feet + Vec3(0.0f, 0.0f, 90.0f);
+                    const CollisionHit ahead = scene.collision->line_check(chest, chest - n * (side * 400.0f), COLL_BlockZeroExtent);
+                    if (!ahead.hit || ahead.actor != panes[k]) continue;
+                    ++tried;
+                    runner.reset(feet, std::atan2(-n.y * side, -n.x * side) * 57.29578f);
+                    bool saw_barge = false;
+                    float far_side = 1.0e9f;
+                    for (int step = 0; step < 240; ++step) {
+                        InputFrame in{};
+                        in.forward = 1.0f;
+                        in.sprint = true;
+                        const float to_pane = (runner.get_position() - centre).dot(n * side);
+                        in.melee = to_pane <= 185.0f && !saw_barge && !pane.is_hidden;
+                        runner.step(in, 1.0f / 60.0f, scene);
+                        ps.position = runner.get_position();
+                        if (step % 2 == 1) tick(1);
+                        saw_barge = saw_barge || runner.get_telemetry().move_state == EMovement::MOVE_Barge;
+                        far_side = std::min(far_side, (runner.get_position() - centre).dot(n * side));
+                    }
+                    run_note = pane.unique_name + " (" + pane.mesh_name + "): MOVE_Barge " + (saw_barge ? "yes" : "no") + ", pane broken " +
+                               (pane.is_hidden ? "yes" : "no") + ", she got " + std::to_string(static_cast<int>(-far_side)) + " uu past it";
+                    run_ok = saw_barge && pane.is_hidden && far_side < -40.0f;
+                    if (debug) {
+                        std::cout << "    the run started at (" << feet.x << ", " << feet.y << ", " << feet.z << ") facing "
+                                  << std::atan2(-n.y * side, -n.x * side) * 57.29578f << " degrees" << std::endl;
+                    }
+                    if (run_ok) break;
+                }
+            }
+        }
+
+        // C: a trigger in a streamed sublevel whose chain reaches a SeqAct_Toggle on an emitter or a lens
+        // flare: the player is put in it and the script run until the toggle arrives.
+        const ScriptGraph& graph = *scene.script;
+        const auto reaches_effect_toggle = [&](int event) {
+            std::vector<int> front{event}, seen;
+            for (int depth = 0; depth < 8 && !front.empty(); ++depth) {
+                std::vector<int> next;
+                for (int node : front) {
+                    if (std::find(seen.begin(), seen.end(), node) != seen.end()) continue;
+                    seen.push_back(node);
+                    const ScriptGraph::Node& n = graph.nodes[static_cast<size_t>(node)];
+                    if (n.cls == "SeqAct_Toggle") {
+                        for (const ScriptGraph::VarLink& link : n.vars) {
+                            for (int v : link.vars) {
+                                if (v < 0 || graph.nodes[static_cast<size_t>(v)].actor < 0) continue;
+                                const std::string& cls = graph.actors[static_cast<size_t>(graph.nodes[static_cast<size_t>(v)].actor)].cls;
+                                if (cls.find("Emitter") != std::string::npos || cls == "LensFlareSource") return true;
+                            }
+                        }
+                    }
+                    for (const ScriptGraph::Output& o : n.outputs) {
+                        for (const ScriptGraph::Link& l : o.links) next.push_back(l.op);
+                    }
+                }
+                front.swap(next);
+            }
+            return false;
+        };
+        // What the scene's emitters and lens flares are switched to, as one number.
+        const auto effects_state = [&]() {
+            size_t h = 0;
+            for (const ParticleSystemPlacement& p : scene.particle_systems) h = h * 31u + (p.active ? 1u : 0u) + p.activations * 2u;
+            for (const LensFlareSourceInfo& f : scene.lens_flares) h = h * 31u + (f.active ? 1u : 0u) + (f.hidden ? 2u : 0u);
+            return h;
+        };
+        // An event that the test can cause: a trigger the player can stand in, or a remote event.
+        tried = 0;
+        int candidates = 0;
+        for (size_t i = 0; i < graph.nodes.size() && !toggle_ok && tried < 40; ++i) {
+            const ScriptGraph::Node& n = graph.nodes[i];
+            const bool touch = (n.cls == "SeqEvent_Touch" || n.cls == "SeqEvent_TdTouch") && n.originator >= 0 && n.player_touches;
+            const bool remote = n.cls == "SeqEvent_RemoteEvent" && !n.label.empty();
+            if ((!touch && !remote) || !n.enabled || !reaches_effect_toggle(static_cast<int>(i))) continue;
+            ++candidates;
+            ++tried;
+            // Its sublevel is streamed in, as the level's own script would have by the time the player is there.
+            const std::string& package = graph.packages[static_cast<size_t>(n.package)];
+            if (!streamed(package)) host.stream_levels({package}, true);
+            const int before = toggles;
+            const size_t state_before = effects_state();
+            std::string what;
+            if (touch) {
+                const ScriptActor& trigger = graph.actors[static_cast<size_t>(n.originator)];
+                ps.position = (trigger.bounds.min_pt + trigger.bounds.max_pt) * 0.5f;
+                ps.eye = ps.position + Vec3(0.0f, 0.0f, 64.0f);
+                what = "standing in " + trigger.name;
+            } else {
+                script.fire_remote_event(n.label);
+                what = "remote event '" + n.label + "'";
+            }
+            for (int f = 0; f < 300 && toggles == before; ++f) tick(1);
+            toggle_note = what + " (" + package + ", " + n.name + "): " + std::to_string(toggles - before) + " effect(s) switched (try " +
+                          std::to_string(tried) + ")";
+            toggle_ok = toggles > before && effects_state() != state_before;
+        }
+        if (debug) std::cout << "    " << candidates << " events tried that lead to a toggle of an emitter or a lens flare" << std::endl;
+    }
+    const bool pass = loaded && shot_ok && barge_ok && toggle_ok && run_ok;
+    std::cout << "  -> Stage 21 Result: " << (pass ? "PASS" : "FAIL") << " (Level=" << (loaded ? "OK" : "FAIL") << " at '" << checkpoint_name << "', Shots="
+              << (shot_ok ? "OK" : "FAIL") << " [" << shot_note << "], Barge=" << (barge_ok ? "OK" : "FAIL") << " [" << barge_note
+              << "], RunAndBarge=" << (run_ok ? "OK" : "FAIL") << " [" << run_note << "], Toggle=" << (toggle_ok ? "OK" : "FAIL") << " ["
+              << toggle_note << "], calls: " << hides << " hide/show, "
+              << collisions << " collision, " << spawns << " emitter, " << toggles << " toggle)" << std::endl;
+    if (!pass) {
+        const size_t from = script_log.size() > 16 ? script_log.size() - 16 : 0;
+        for (size_t i = from; i < script_log.size(); ++i) std::cout << "     " << script_log[i] << std::endl;
+    }
+    return pass;
+}
+
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
@@ -1800,8 +2161,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     }
 
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, electric fence stage 19, and ledge pull-up stage 20
+    // Stage 21: the level's script acting on the scene (oracle_script_effects above).
+    std::cout << "[Oracle Stage 21] Testing the Level Script's Effects (breakable glass, emitter factories, toggles)..." << std::endl;
+    const bool s21_pass = oracle_script_effects(game_root);
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -2337,55 +2703,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             Vec3 hit, normal;
             return !controller.leg_line_check(from, to, active_scene, hit, normal);
         };
-        // The level's script switches an emitter or a lens flare on or off, or hides it.
-        host.toggle_effect = [&](const ScriptActor& sa, int action) {
-            for (ParticleSystemPlacement& p : active_scene.particle_systems) {
-                if (p.export_index != sa.export_index || p.package != lower(sa.package)) continue;
-                const bool on = action == 0 || (action == 2 && !p.active);
-                if (on) ++p.activations;  // a system that has run out starts again
-                p.active = on;
-            }
-            for (LensFlareSourceInfo& f : active_scene.lens_flares) {
-                if (f.export_index != sa.export_index || f.package != lower(sa.package)) continue;
-                f.active = action == 0 || (action == 2 && !f.active);
-            }
-        };
-        host.spawn_effect = [&](const std::string& package, int32_t factory_export, const ScriptActor& at) {
-            for (const EffectFactory& f : active_scene.effect_factories) {
-                if (f.export_index != factory_export || f.package != lower(package)) continue;
-                const float yaw = at.yaw_deg * 0.01745329252f, pitch = at.pitch_deg * 0.01745329252f;
-                spawn_effect(active_scene, f.template_index, at.location,
-                             Vec3(std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), std::sin(pitch)), true);
-            }
-        };
-        host.hide_effect = [&](const ScriptActor& sa, bool hidden) {
-            for (ParticleSystemPlacement& p : active_scene.particle_systems) {
-                if (p.export_index == sa.export_index && p.package == lower(sa.package)) p.active = !hidden && p.active;
-            }
-            for (LensFlareSourceInfo& f : active_scene.lens_flares) {
-                if (f.export_index == sa.export_index && f.package == lower(sa.package)) f.hidden = hidden;
-            }
-        };
-        host.change_collision = [&](const ScriptActor& sa, bool collide_actors, bool block_actors) {
-            for (size_t ai = 0; ai < active_scene.actors.size(); ++ai) {
-                LevelActor& a = active_scene.actors[ai];
-                if (lower(a.source_package) == lower(sa.package) && a.unique_name == sa.name) {
-                    a.is_collidable = collide_actors && block_actors;
-                    a.blocks_traces = collide_actors && block_actors;
-                    if (!collide_actors) {
-                        a.is_electric_volume = false;
-                        a.is_barbed_wire_volume = false;
-                        a.is_movement_exclusion_volume = false;
-                    }
-                    if (active_scene.collision) {
-                        uint8_t ch = 0;
-                        if (a.is_collidable) ch |= COLL_BlockNonZeroExtent;
-                        if (a.blocks_traces) ch |= COLL_BlockZeroExtent;
-                        active_scene.collision->set_actor_channels(static_cast<int32_t>(ai), ch);
-                    }
-                }
-            }
-        };
+        // What it does to the level's actors and effects (game/script_effects.hpp).
+        bind_scene_effects(host, active_scene);
         return host;
     };
 
@@ -2524,8 +2843,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return true;
     };
 
+    // ME_START_CHECKPOINT="Name": play starts at that checkpoint of the level instead of its first (a
+    // test aid, with --level: the sublevels the checkpoint streams in are the ones whose script runs).
+    const char* start_checkpoint_env = std::getenv("ME_START_CHECKPOINT");
     if (!load_chapter_or_level(current_chapter_idx, custom_level, /*play_intro=*/!start_in_main_menu,
-                               std::string(), /*defer_begin_play=*/start_in_main_menu)) {
+                               start_checkpoint_env ? std::string(start_checkpoint_env) : std::string(),
+                               /*defer_begin_play=*/start_in_main_menu)) {
         std::cerr << "[Game ERROR] No playable level (check --game-root / --level)." << std::endl;
         if (game_controller) SDL_GameControllerClose(game_controller);
         destroy_surface();
@@ -3159,6 +3482,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         }
                         controller.get_telemetry().tutorial_text.clear();
                         controller.get_telemetry().sign_text.clear();
+                        restore_script_actors(active_scene);
                         script.reload_checkpoint();
                     }
                 } else if (key == SDLK_r) {
@@ -3396,6 +3720,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     t.sign_text.clear();
                     cutscene_player.stop();
                     t.intro_active = false;
+                    restore_script_actors(active_scene);  // the panes are whole again
                     script.reload_checkpoint();
                 }
                 ScriptPlayerState ps;
@@ -3445,6 +3770,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         script.skip_cutscene();
                     }
                 }
+                deliver_actor_damage(script, active_scene);  // the bullets' and the barges', for its damage events
                 script.update(dt, ps);
                 if (t.supers_time_left > 0.0f) t.supers_time_left -= dt;
                 if (t.sign_time_left > 0.0f) t.sign_time_left -= dt;
@@ -3767,6 +4093,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 int main(int argc, char* argv[]) {
     std::string game_root = me::default_game_root();
     bool verify_all = false;
+    bool verify_script = false;  // the level script's stage of the oracle, alone
     std::string shots_map, shots_times, shots_dir;
     std::string script_json = "";
     int initial_chapter = 0;
@@ -3792,6 +4119,8 @@ int main(int argc, char* argv[]) {
             std::ofstream(dir + "/material_check.metal", std::ios::binary) << me::material_check_msl();
             std::cout << "Wrote builtin.metal and material_check.metal to " << dir << std::endl;
             return 0;
+        } else if (arg == "--verify-script") {
+            verify_script = true;
         } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
@@ -3825,6 +4154,7 @@ int main(int argc, char* argv[]) {
                       << "Options:\n"
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
+                      << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
@@ -3847,6 +4177,16 @@ int main(int argc, char* argv[]) {
 
     if (!shots_map.empty()) {
         return run_intro_shots(game_root, shots_map, shots_times, shots_dir);
+    }
+    if (verify_script) {
+        // ME_SCRIPT_SHOTS=<dir>: with pictures of the pane it breaks.
+        const char* shots = std::getenv("ME_SCRIPT_SHOTS");
+        if (!shots) return oracle_script_effects(game_root) ? 0 : 1;
+        me::Renderer renderer;
+        renderer.set_game_root(game_root);
+        if (!renderer.init_headless(1280, 720)) return 1;
+        me::ensure_dir(shots);
+        return oracle_script_effects(game_root, &renderer, shots) ? 0 : 1;
     }
     if (verify_all) {
         return run_oracle_verification(game_root, script_json);
