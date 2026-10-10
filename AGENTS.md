@@ -6,7 +6,7 @@ All agents working in this repository **must** use isolated **Git Worktrees** fo
 
 ## 1. Mandatory Rule: Use Git Worktrees for All Work
 
-- **Never edit files or run builds directly in the shared root workspace (`/Users/tomnom/git/mierrorsedgere`) while working on a task.**
+- **Never edit files or run builds directly in the shared root workspace (`/Users/tomnom/git/mierrorsedgere`) while working on a task.** The one exception is rebuilding `main`'s binary there right after you merge (Step 4).
 - Before making any code, documentation, or build changes, create a dedicated Git worktree on a task-specific branch.
 - When invoking subagents (`invoke_subagent`), either pass `Workspace: "share"` / `Workspace: "branch"` or instruct the subagent to create its own `git worktree`.
 
@@ -44,8 +44,8 @@ git -C /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name> add -A
 git -C /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name> commit -m "<clear description of changes>"
 ```
 
-### Step 4: Merge Back to `main`, Commit, Push, and Clean Up
-When your task is complete, merge your worktree branch back into `main`, push to the remote repository, and remove the temporary worktree:
+### Step 4: Merge Back to `main`, Rebuild `main`, Push, and Clean Up
+When your task is complete, merge your worktree branch back into `main`, rebuild `main`'s binary in the primary repository, push to the remote repository, and remove the temporary worktree:
 
 ```bash
 # 1. Switch/update main in the primary repository and merge your branch
@@ -53,13 +53,23 @@ git -C /Users/tomnom/git/mierrorsedgere checkout main
 git -C /Users/tomnom/git/mierrorsedgere pull --rebase origin main || true
 git -C /Users/tomnom/git/mierrorsedgere merge --no-ff agent/<task-name> -m "Merge agent/<task-name> into main"
 
-# 2. Push main to remote
+# 2. Rebuild the binary on main in the primary repository
+cmake -B /Users/tomnom/git/mierrorsedgere/build \
+      -S /Users/tomnom/git/mierrorsedgere \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build /Users/tomnom/git/mierrorsedgere/build -j
+
+# 3. Push main to remote
 git -C /Users/tomnom/git/mierrorsedgere push origin main
 
-# 3. Remove the worktree and delete the temporary branch
+# 4. Remove the worktree and delete the temporary branch
 git -C /Users/tomnom/git/mierrorsedgere worktree remove /Users/tomnom/git/mierrorsedgere/.worktrees/<task-name>
 git -C /Users/tomnom/git/mierrorsedgere branch -d agent/<task-name>
 ```
+
+- **Always do step 2 after every merge.** `/Users/tomnom/git/mierrorsedgere/build/mirrorsedge_macos` (what `./play_macos.sh` launches) must match `main`, so the user plays what was just merged and not an old binary.
+- **If the rebuild fails, do not push.** Fix the build in your worktree, commit, merge again, and rebuild before pushing.
+- Only build there (no `--verify-all`: it rewrites the tracked `screenshots/` in the primary repository). Verification runs in your worktree (Step 2).
 
 ---
 
@@ -75,5 +85,5 @@ git -C /Users/tomnom/git/mierrorsedgere branch -d agent/<task-name>
 
 1. **No Proprietary Game Assets in Git**: Never commit `.me1`, `.upk`, `.u`, `.bik`, `.exe`, or `.dll` files from `/Users/tomnom/mirrorsedge`.
 2. **Resolve Merge Conflicts Before Pushing**: If `main` has advanced while you were working in your worktree, rebase your `agent/<task-name>` branch onto `main` inside your worktree, re-run `./build/mirrorsedge_macos --verify-all` to confirm nothing broke, and then merge into `main` and push.
-3. **Always Leave `main` Buildable**: Every merge to `main` must compile cleanly on macOS `arm64` (`clang++ -std=c++20 -fobjc-arc`) and pass `--verify-all`.
+3. **Always Leave `main` Buildable**: Every merge to `main` must compile cleanly on macOS `arm64` (`clang++ -std=c++20 -fobjc-arc`) and pass `--verify-all`. The post-merge rebuild of `main` (Step 4, step 2) checks the merged tree compiles before it is pushed, and leaves the primary repository's binary up to date.
 
