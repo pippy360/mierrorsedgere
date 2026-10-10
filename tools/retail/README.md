@@ -91,7 +91,7 @@ On non-Apple platforms CMake builds only `me_replay`; the Metal app stays macOS-
 ## How a window is replayed
 
 * **One step per retail frame.** Frame *k* of a window anchored on sample *i0* is stepped with `dt = t[i0+k] - t[i0+k-1]`. It gets the keys that frame took and the view it turned to (sample *i0+k*'s), so port frame *k* and retail sample *i0+k* are the same moment. The view arrives as a mouse delta, because the controller's turn damping reads one.
-* **The anchor** is the retail frame's feet (`pz - 93`, or `- 64` on the 122 uu short capsule), lifted 3 uu to settle. With it go the velocity, the view, and `ParkourController::anchor`'s state. Windows prefer to anchor where retail is walking, because a wall run or a grab has state an anchor cannot hand over.
+* **The anchor** is the retail frame's capsule bottom (`pz - 90`, or `- 61` on the 122 uu short capsule): the port's feet hover over a floor as retail's capsule does (`kPawnFloorHover`), so nothing is lifted or settled. With it go the velocity, the view, and `ParkourController::anchor`'s state. Windows prefer to anchor where retail is walking, because a wall run or a grab has state an anchor cannot hand over.
 * **No coordinate conversion.** This engine works in UE units in the level's own space, as retail does.
 * Key bits: W S A D, jump, crouch (left shift), Q and the left button (the barge). A jump pressed and released inside one frame still counts as a press there; Q and the left button are presses, never holds.
 

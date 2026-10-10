@@ -28,8 +28,9 @@ tools/retail/trace.py is):
 
 There is no coordinate conversion: this engine works in UE units in the
 level's own space, as retail does. Retail's pawn Location is the capsule
-centre and this engine's position is the feet, so the anchor is
-pz - trace.centre_above_feet(sample), lifted ANCHOR_LIFT_UU to settle.
+centre and this engine's position is the feet (the capsule's bottom, which
+hovers over a floor as retail's does), so the anchor is
+pz - trace.centre_above_feet(sample).
 """
 import argparse
 import bisect
@@ -48,7 +49,7 @@ from tools.retail.trace import (FRAME_EPS, KEYS, PULSES, UE_PHYS_WALKING,  # noq
                                 centre_above_feet, held_from_start)
 
 ROOT = paths.repo_root()
-ANCHOR_LIFT_UU = 3.0
+ANCHOR_LIFT_UU = 0.0
 DIVERGE_UU = 50.0           # the gap that counts as "parted"
 FELL_UU = 300.0             # port below retail by this much = fell through
 

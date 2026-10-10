@@ -1652,3 +1652,49 @@ The hover is drawn, not simulated: the controller's feet are still on the floor,
 capsule bottom, so jump reach and the heights measured from the feet are that much under retail's. The
 blend from the reference pose is imitated by the lift, not by the tree; the view's pitch does not glide
 from 0 to 0.11 degrees with it. In `TODO.md`.
+
+---
+
+## 35. The capsule's hover is the controller's (agent/capsule-hover, 2026-10-10)
+
+Section 34 drew the eye and the first-person mesh 3.15 uu higher on a floor and left the physics where it
+was: the controller's feet stood on the floor, 3.15 uu under retail's capsule bottom, and with them jump
+reach and every height measured from the feet. Now the controller hovers as `physWalking` does.
+
+### 35.1 Changes
+- `ParkourController::check_ground` gives the place the feet rest at: `kPawnFloorHover` (3.15 uu,
+  `parkour_controller.hpp`) over where the capsule meets the floor, probing that much further. Everything
+  that stands, lands or steps goes through it (the walk's floor check, the hand-over, the bottom of a climb),
+  so a floor now carries the feet 3.15 uu over it; hangs, bars, cables and pipes keep the place their
+  geometry gives them. The drawn hover of section 34 is gone (`camera_mesh_offset.z` is `SmoothOffset` and a
+  hand-over's lift again).
+- A leaf she has just barged open does not block her while it swings open (`sweep_capsule`,
+  `DoorState::Opening` with `barged`): hovering, she no longer scrapes up the doorway's 8 uu sill, reaches
+  the leaf three units sooner, and the box test against the leaf's slow hinge side stopped her dead in the
+  doorway (298 uu/s to 4). It had cost her most of her speed before, a few frames later.
+- `tools/retail`: a recording's capsule centre is 90 over the port's feet (`CENTRE_ABOVE_FEET`, was 93), and
+  an anchor is not lifted to settle (`ANCHOR_LIFT_UU` 0, was 3).
+- The oracle expects her at her hover: stages 1, 3 and 8 (a roof, a landing, a lift's floor) and stage 20's
+  rise onto the roof (182.8 + 3.15).
+
+### 35.2 Results
+- **`--verify-all`** on Windows (Direct3D 11): ALL SYSTEMS PASS, 20 stages. Against the same build without
+  the hover, 17 stages gave the same verdict before any expectation was touched; the figures that moved are
+  the floor heights (+3.15), the vault's landing (5.6 uu further), the zip line's ride (5.8 uu longer) and
+  the door stage (through the doorway faster: the barge ends 144 uu further on after the same time, the
+  slide kick 62).
+- **The hand-over** (oracle stage 22, and the windowed game's trace in New Eden): as section 34, and her feet
+  rest at 2467.15, which is retail's capsule centre (2557.15) less 90.
+- **Against a retail recording** (`tools.retail.replay`, `20260920_185901_escape_overlay_session`, 27
+  four-second windows): 11 reproduce with the hover and 11 without, the gaps within 4 uu of each other; in
+  the walking windows the port's feet and retail's capsule bottom are the same height to the unit (11983 on
+  the roof at 11980). A second recording (`20260929_214813`): 29 of 45.
+- **macOS:** the app compiles and links on `macos-15` and both Metal shader sources compile. Not run.
+- **The tracked screenshots** are regenerated: the posed views of stages 9 and 10, which place the telemetry by hand,
+  are back where they were before section 34's drawn hover; the played ones move by a few pixels.
+
+### 35.3 Not done
+Retail leaves the capsule alone between 2.9 and 3.4 uu over the floor; the port always puts it at 3.15.
+Her speed up ramps and stairs changed with this (she is lifted at full horizontal speed where she used to
+slide along the slope and lose some): retail's was not measured. Whether retail's leaf blocks her as it
+opens was not measured. In `TODO.md`.
