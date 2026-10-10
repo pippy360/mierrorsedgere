@@ -91,6 +91,9 @@ public:
         m_telemetry.pitch_deg = pitch;
         m_telemetry.camera_roll_deg = roll;
     }
+    // ATdPlayerPawn::TakeDamage -> PlayHitCameraShake (0x012b0d60) + UTdHudEffectManager::DisplayHit (0x01264410)
+    // dmt: 0 = Bullet (TdDmgType_Bullet), 1 = Melee (TdDmgType_Melee), 2 = FallDamage (DmgType_Fell)
+    void apply_damage(float amount, int dmt = 0, const Vec3& hit_dir_world = Vec3(0.0f, 0.0f, 0.0f));
 
 private:
     // Core Subsystems
@@ -285,9 +288,29 @@ private:
         m_telemetry.move_anim_rate = rate;
         ++m_telemetry.move_anim_serial;
     }
+    void set_camera_anim(const char* name) {
+        m_telemetry.camera_anim = name;
+        ++m_telemetry.camera_anim_serial;
+    }
     [[nodiscard]] bool can_skill_roll() const;
     [[nodiscard]] bool jump_pressed() const { return m_jump_buffer > 0.0f; }
     void consume_jump() { m_jump_buffer = 0.0f; }
+
+    // 3-phase fade-in / hold / fade-out envelope (UTdHudEffectManager::ActivateEffect)
+    struct HudEffectEnvelope {
+        int phase = 0;  // 0 = inactive, 1 = fade_in, 2 = hold, 3 = fade_out
+        float timer = 0.0f;
+        float fade_in = 0.05f;
+        float hold = 0.15f;
+        float fade_out = 0.25f;
+        float start_val = 0.0f;
+        float peak_val = 0.0f;
+        float current_val = 0.0f;
+
+        void trigger(float target_peak, float in_s, float hold_s, float out_s);
+        void reset();
+        float step(float dt);
+    };
 
     // Internal Simulation State
     MovementConfig m_config;
@@ -325,6 +348,12 @@ private:
     float m_landing_timer = 0.0f;
     Vec3 m_roll_dir{1.0f, 0.0f, 0.0f};  // TdMove_SkillRoll root motion direction: the body's facing at touchdown
     float m_damage_cooldown = 0.0f;
+    float m_hit_spazz_cooldown = 0.0f;   // DefaultHudEffects.ini SpazzThrottle = 0.2s
+    uint32_t m_bullet_hit_counter = 0;   // Ring buffer sequence counter for PS_FX_FullScreenFX_BulletHit_01
+    HudEffectEnvelope m_env_health_desat;
+    HudEffectEnvelope m_env_blur;
+    HudEffectEnvelope m_env_melee;
+    HudEffectEnvelope m_env_fall;
     float m_air_fall_start_z = 0.0f;
     float m_fall_peak_z = 0.0f;
     float m_melee_cooldown = 0.0f;

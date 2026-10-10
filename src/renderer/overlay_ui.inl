@@ -34,6 +34,16 @@
         verts.push_back(v0); verts.push_back(v2); verts.push_back(v3);
     }
 
+    void draw_ui_rotated_quad(std::vector<HUDVertex>& verts, float cx, float cy, float hw, float hh,
+                              float cos_a, float sin_a, UIColor color) {
+        HUDVertex v0 = {{cx - hw * cos_a + hh * sin_a, cy - hw * sin_a - hh * cos_a}, color};
+        HUDVertex v1 = {{cx + hw * cos_a + hh * sin_a, cy + hw * sin_a - hh * cos_a}, color};
+        HUDVertex v2 = {{cx + hw * cos_a - hh * sin_a, cy + hw * sin_a + hh * cos_a}, color};
+        HUDVertex v3 = {{cx - hw * cos_a - hh * sin_a, cy - hw * sin_a + hh * cos_a}, color};
+        verts.push_back(v0); verts.push_back(v1); verts.push_back(v2);
+        verts.push_back(v0); verts.push_back(v2); verts.push_back(v3);
+    }
+
     void add_ui_tex_quad(std::vector<UITextureBatch>& batches, UITexture tex,
                          float x, float y, float w, float h,
                          float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f,
@@ -497,6 +507,88 @@
             }
         }
         // (A long fall's own picture is the chain's UncontrolledFallingEffect, drawn by the renderer.)
+
+        // UTdHudEffectManager::TriggerHitParticles (0x01262550) -> PS_FX_FullScreenFX_BulletHit_01
+        // Renders directional crimson blood mist (M_FX_BloodSmoke_01), blood droplets (M_FX_BloodDrops_02),
+        // and incoming shooter direction arc on the 16:9 screen periphery.
+        const float ui_scale = h / 720.0f;
+        if (telemetry.damage_flash_timer > 0.0f) {
+            float flash_a = std::clamp(telemetry.damage_flash_timer / 0.35f, 0.0f, 1.0f);
+            float bw = w * 0.065f;
+            float bh = h * 0.075f;
+            UIColor fcol = ui_color(0.75f, 0.03f, 0.03f, flash_a * 0.32f);
+            draw_ui_quad(verts, 0.0f, 0.0f, w, bh, fcol);
+            draw_ui_quad(verts, 0.0f, h - bh, w, bh, fcol);
+            draw_ui_quad(verts, 0.0f, bh, bw, h - 2.0f * bh, fcol);
+            draw_ui_quad(verts, w - bw, bh, bw, h - 2.0f * bh, fcol);
+        }
+        for (int slot = 0; slot < 4; ++slot) {
+            float rem = telemetry.bullet_hit_timers[slot];
+            if (rem <= 0.0f) continue;
+            float age = std::clamp(0.25f - rem, 0.0f, 0.25f);
+            float env = (age < 0.05f) ? (age / 0.05f) : std::clamp((0.25f - age) / 0.20f, 0.0f, 1.0f);
+            float angle_rad = telemetry.bullet_hit_angles[slot] * 6.2831853f;
+            float dir_x = std::sin(angle_rad);
+            float dir_y = -std::cos(angle_rad);
+
+            // Screen-space periphery ellipse placement matching TriggerHitParticles (0x01262550)
+            float bx = cx + dir_x * (w * 0.34f);
+            float by = cy + dir_y * (h * 0.34f);
+
+            // Directional crimson indicator arc toward shooter
+            float arc_r = std::min(w, h) * 0.32f;
+            for (int seg = -3; seg <= 3; ++seg) {
+                float sa = angle_rad + static_cast<float>(seg) * 0.11f;
+                float sx = std::sin(sa);
+                float sy = -std::cos(sa);
+                float seg_fade = 1.0f - std::abs(static_cast<float>(seg)) * 0.22f;
+                draw_ui_rotated_quad(verts,
+                                     cx + sx * arc_r,
+                                     cy + sy * arc_r,
+                                     4.5f * ui_scale,
+                                     18.0f * ui_scale,
+                                     sx, sy,
+                                     ui_color(0.86f, 0.05f, 0.05f, env * seg_fade * 0.78f));
+            }
+
+            uint32_t seed = telemetry.bullet_hit_seeds[slot] * 747796405u + 2891336453u;
+            auto next_rand = [&]() -> float {
+                seed = seed * 747796405u + 2891336453u;
+                return static_cast<float>((seed >> 8) & 0xFFFFu) / 65535.0f;
+            };
+
+            // Emitter 0: M_FX_BloodSmoke_01 fine crimson mist cloud
+            for (int m = 0; m < 6; ++m) {
+                float rx = (next_rand() * 2.0f - 1.0f) * 68.0f * ui_scale;
+                float ry = (next_rand() * 2.0f - 1.0f) * 68.0f * ui_scale;
+                float drift = (18.0f + 85.0f * (age / 0.25f)) * ui_scale;
+                float mx = bx + rx + dir_x * drift * 0.45f;
+                float my = by + ry + dir_y * drift * 0.45f;
+                float rad = (32.0f + next_rand() * 30.0f + 26.0f * (age / 0.25f)) * ui_scale;
+                float ang = next_rand() * 3.14159f;
+                draw_ui_rotated_quad(verts, mx, my, rad, rad * 0.78f, std::cos(ang), std::sin(ang),
+                                     ui_color(0.55f, 0.02f, 0.02f, env * 0.24f));
+            }
+
+            // Emitter 1: M_FX_BloodDrops_02 radial blood droplets and streaks
+            for (int p = 0; p < 18; ++p) {
+                float spread = (next_rand() * 2.0f - 1.0f) * 1.35f;
+                float p_ang = angle_rad + spread;
+                float vx = std::sin(p_ang);
+                float vy = -std::cos(p_ang);
+                float spd = (55.0f + next_rand() * 210.0f) * ui_scale;
+                float travel = spd * std::pow(age / 0.25f, 0.65f);
+                float jx = (next_rand() * 2.0f - 1.0f) * 36.0f * ui_scale;
+                float jy = (next_rand() * 2.0f - 1.0f) * 36.0f * ui_scale;
+                float px = bx + jx + vx * travel;
+                float py = by + jy + vy * travel;
+                float drop_w = (3.2f + next_rand() * 6.8f) * ui_scale;
+                float drop_l = drop_w * (1.35f + next_rand() * 1.75f);
+                float shade = 0.42f + next_rand() * 0.38f;
+                draw_ui_rotated_quad(verts, px, py, drop_l, drop_w, vx, vy,
+                                     ui_color(shade, 0.015f, 0.015f, env * 0.85f));
+            }
+        }
 
         if (telemetry.hit_marker_timer > 0.0f) {
             float alpha = std::clamp(telemetry.hit_marker_timer / 0.22f, 0.0f, 1.0f);

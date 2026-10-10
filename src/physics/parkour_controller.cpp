@@ -490,6 +490,18 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.disarm_prompt_visible = false;
     m_telemetry.hit_marker_timer = 0.0f;
     m_telemetry.damage_flash_timer = 0.0f;
+    m_telemetry.health_desat = 0.0f;
+    m_telemetry.hit_blur = 0.0f;
+    m_telemetry.hit_focus_distance = 1600.0f;
+    m_telemetry.melee_damage_strength = 0.0f;
+    m_telemetry.melee_hit_dir = 0.0f;
+    m_telemetry.fall_damage_strength = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        m_telemetry.bullet_hit_angles[i] = 0.0f;
+        m_telemetry.bullet_hit_timers[i] = 0.0f;
+        m_telemetry.bullet_hit_seeds[i] = 0;
+    }
+    m_telemetry.camera_anim.clear();
     m_telemetry.falling_to_death = false;
     m_telemetry.fall_death_impact = false;
     m_telemetry.death_anim_progress = 0.0f;
@@ -522,6 +534,12 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_landing_timer = 0.0f;
     m_roll_dir = Rotator::from_degrees(0.0f, spawn_yaw, 0.0f).forward();
     m_damage_cooldown = 0.0f;
+    m_hit_spazz_cooldown = 0.0f;
+    m_bullet_hit_counter = 0;
+    m_env_health_desat.reset();
+    m_env_blur.reset();
+    m_env_melee.reset();
+    m_env_fall.reset();
     m_air_fall_start_z = spawn_pos.z;
     m_fall_peak_z = spawn_pos.z;
     m_melee_cooldown = 0.0f;
@@ -2748,10 +2766,7 @@ void ParkourController::land(const FloorHit& floor, const LevelScene& scene) {
         m_telemetry.move_state = EMovement::MOVE_Landing;
         m_landing_timer = c.hard_landing_time;
         m_state_timer = 0.0f;
-        m_telemetry.health = std::max(1.0f, m_telemetry.health - 15.0f);
-        ++m_telemetry.fall_hit_count;  // TdPlayerPawn.TakeFallingDamage: HardLandingDamage
-        m_telemetry.fall_hit_damage = 15.0f;
-        m_damage_cooldown = c.health_regen_delay;
+        apply_damage(15.0f, 2, Vec3(0.0f, 0.0f, 0.0f));
         m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
         m_sprint_energy = 0.0f;
         set_stance(kEyeHeightCrouch);
@@ -5786,6 +5801,9 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 tr.from_player = false;
                 scene.active_tracers.push_back(tr);
 
+                // Emit 3D gunshot report from AI weapon muzzle
+                emit_sound("BerettaM93R_Fire", bot_muzzle, false);
+
                 // Deal damage if line-of-sight is clear and Faith isn't actively evading or in a cutscene
                 bool evading = (m_telemetry.intro_active ||
                                 m_telemetry.move_state == EMovement::MOVE_Slide ||
@@ -5796,9 +5814,9 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                                 m_telemetry.move_state == EMovement::MOVE_Snatch ||
                                 m_telemetry.speed_2d > 540.0f);
                 if (!los.hit && !evading) {
-                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 10.0f);
-                    m_telemetry.damage_flash_timer = 0.25f;
-                    m_damage_cooldown = m_config.health_regen_delay;
+                    apply_damage(10.0f, 0, bot_muzzle - target_pt);
+                } else if (!los.hit) {
+                    emit_sound("BulletBy.9mm_BulletBy", target_pt, false);
                 }
             }
         } else {
@@ -5818,19 +5836,7 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 bot.anim_timer = 0.0f;
                 bot.anim_state = EEnemyAnimState::MeleeStrike;
                 if (m_telemetry.move_state != EMovement::MOVE_Snatch && !m_telemetry.intro_active) {
-                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 22.0f);
-                    {
-                        // where the blow came from against where she looks, in turns
-                        const Vec3 to_bot = bot.position - m_telemetry.position;
-                        const float bearing = std::atan2(to_bot.y, to_bot.x) * RAD2DEG - m_telemetry.yaw_deg;
-                        float turns = bearing / 360.0f;
-                        turns -= std::floor(turns);
-                        ++m_telemetry.melee_hit_count;
-                        m_telemetry.melee_hit_damage = 22.0f;
-                        m_telemetry.melee_hit_turns = turns;
-                    }
-                    m_telemetry.damage_flash_timer = 0.35f;
-                    m_damage_cooldown = m_config.health_regen_delay;
+                    apply_damage(22.0f, 1, bot.position - m_telemetry.position);
                 }
             }
         }
@@ -5975,9 +5981,9 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                                 m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
                                 m_telemetry.speed_2d > 480.0f);
                 if (!los.hit && !evading) {
-                    m_telemetry.health = std::max(0.0f, m_telemetry.health - 4.5f);
-                    m_telemetry.damage_flash_timer = 0.20f;
-                    m_damage_cooldown = m_config.health_regen_delay;
+                    apply_damage(4.5f, 0, gun_muzzle - aim_pt);
+                } else if (!los.hit) {
+                    emit_sound("BulletBy.9mm_BulletBy", aim_pt, false);
                 }
             }
         }
@@ -6012,24 +6018,212 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
             tr.hit_enemy = false;
             tr.from_player = false;
             scene.active_tracers.push_back(tr);
+            emit_sound("BerettaM93R_Fire", bar.origin, false);
+            emit_sound("BulletBy.9mm_BulletBy", tr.end_pos, false);
             bar.shots_fired++;
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// Health Regeneration Subsystem
+// UTdHudEffectManager + ATdPlayerPawn::TakeDamage / PlayHitCameraShake
+// (Reverse-engineered from MirrorsEdge.exe 0x01264410, 0x01261330, 0x01261e00,
+//  0x01262550, 0x01262930, 0x012b0d60 & DefaultHudEffects.ini)
+// -----------------------------------------------------------------------------
+void ParkourController::HudEffectEnvelope::trigger(float target_peak, float in_s, float hold_s, float out_s) {
+    fade_in = std::max(0.001f, in_s);
+    hold = std::max(0.0f, hold_s);
+    fade_out = std::max(0.001f, out_s);
+    start_val = current_val;
+    peak_val = std::max(current_val, target_peak);
+    phase = 1;
+    timer = 0.0f;
+}
+
+void ParkourController::HudEffectEnvelope::reset() {
+    phase = 0;
+    timer = 0.0f;
+    start_val = 0.0f;
+    peak_val = 0.0f;
+    current_val = 0.0f;
+}
+
+float ParkourController::HudEffectEnvelope::step(float dt) {
+    if (phase == 0) {
+        current_val = 0.0f;
+        return 0.0f;
+    }
+    timer += dt;
+    if (phase == 1) {
+        if (timer < fade_in) {
+            float a = timer / fade_in;
+            current_val = start_val + (peak_val - start_val) * a;
+            return current_val;
+        }
+        timer -= fade_in;
+        current_val = peak_val;
+        phase = 2;
+    }
+    if (phase == 2) {
+        if (timer < hold) {
+            current_val = peak_val;
+            return current_val;
+        }
+        timer -= hold;
+        phase = 3;
+    }
+    if (phase == 3) {
+        if (timer < fade_out) {
+            float a = timer / fade_out;
+            current_val = peak_val * (1.0f - a);
+            return current_val;
+        }
+        reset();
+    }
+    return current_val;
+}
+
+void ParkourController::apply_damage(float amount, int dmt, const Vec3& hit_dir_world) {
+    if (m_telemetry.intro_active || amount <= 0.0f) return;
+
+    if (dmt == 2) {
+        // Non-lethal hard landing fall damage clamps at 1 HP
+        m_telemetry.health = std::max(1.0f, m_telemetry.health - amount);
+    } else {
+        m_telemetry.health = std::max(0.0f, m_telemetry.health - amount);
+    }
+    m_damage_cooldown = m_config.health_regen_delay;
+
+    // UTdHudEffectManager::GetHitAngleNorm (0x01262930):
+    // Incoming direction in [0, 1) around camera yaw (0.0 = front, 0.25 = right, 0.5 = back, 0.75 = left)
+    float hit_angle_norm = 0.0f;
+    Vec3 d = horiz(hit_dir_world);
+    if (d.length_sq() > 1e-6f) {
+        d = d.normalized();
+        float fwd_dot = d.dot(facing_forward());
+        float right_dot = d.dot(facing_right());
+        float angle_rad = std::atan2(right_dot, fwd_dot);
+        hit_angle_norm = angle_rad / (2.0f * 3.14159265f);
+        if (hit_angle_norm < 0.0f) hit_angle_norm += 1.0f;
+    }
+
+    // 1. Directional 1P Camera Hit Shake (ATdPlayerPawn::PlayHitCameraShake, 0x012b0d60)
+    // Plays AS_F_1P_Unarmed gethitfront/gethitback/gethitleft/gethitright on CustomCameraNode (Slot::Camera)
+    if ((dmt == 0 || dmt == 1) && m_hit_spazz_cooldown <= 0.0f) {
+        m_hit_spazz_cooldown = 0.20f;  // DefaultHudEffects.ini SpazzThrottle = 0.2s
+        if (hit_angle_norm <= 0.125f || hit_angle_norm >= 0.875f) {
+            set_camera_anim("gethitfront");
+        } else if (hit_angle_norm < 0.375f) {
+            set_camera_anim("gethitright");
+        } else if (hit_angle_norm < 0.625f) {
+            set_camera_anim("gethitback");
+        } else {
+            set_camera_anim("gethitleft");
+        }
+    }
+
+    // 2. Health Desaturation (ActivateSaturationEffect 0x012624e0 + PPHealthSaturationSettings)
+    // FadeInDuration=0.06, Duration=0.5, FadeOutDuration=0.5
+    float missing_health = std::clamp((100.0f - m_telemetry.health) * 0.01f, 0.0f, 1.0f);
+    float desat_impulse = std::clamp(m_env_health_desat.current_val + std::max(0.32f, amount * 0.015f), 0.0f, 1.0f);
+    m_env_health_desat.trigger(std::max(desat_impulse, missing_health), 0.06f, 0.50f, 0.50f);
+    m_telemetry.health_desat = std::max(m_telemetry.health_desat, m_env_health_desat.peak_val);
+
+    // 3. Hit Blur + Type-Specific Post-Process & Screen-Space Particle Effects (DisplayHit 0x01264410)
+    if (dmt == 0) {
+        // TdHudEffect_Bullet:
+        // Blur=(FadeInDuration=0.03, Duration=0.25, FadeOutDuration=0.15)
+        // Particles=(FadeInDuration=0.05, Duration=0.2, FadeOutDuration=0.0) -> PS_FX_FullScreenFX_BulletHit_01
+        m_env_blur.trigger(1.0f, 0.03f, 0.25f, 0.15f);
+        m_telemetry.damage_flash_timer = std::max(m_telemetry.damage_flash_timer, 0.25f);
+
+        int slot = static_cast<int>(m_bullet_hit_counter % 4u);
+        ++m_bullet_hit_counter;
+        m_telemetry.bullet_hit_angles[slot] = hit_angle_norm;
+        m_telemetry.bullet_hit_timers[slot] = 0.25f;
+        m_telemetry.bullet_hit_seeds[slot] = m_bullet_hit_counter;
+
+        emit_sound("Faith.9mm_Faith_Impact", m_telemetry.position, true);
+        emit_sound("Oral_Impact.Hard", m_telemetry.position, true);
+    } else if (dmt == 1) {
+        // TdHudEffect_Melee:
+        // Blur=(FadeInDuration=0.05, Duration=0.15, FadeOutDuration=0.2)
+        // PP=(FadeInDuration=0.05, Duration=0.15, FadeOutDuration=0.4) -> M_FX_FullScreenFX_MeleeDamage_01
+        m_env_blur.trigger(1.0f, 0.05f, 0.15f, 0.20f);
+        m_env_melee.trigger(1.0f, 0.05f, 0.15f, 0.40f);
+        ++m_telemetry.melee_hit_count;
+        m_telemetry.melee_hit_damage = amount;
+        m_telemetry.melee_hit_turns = hit_angle_norm;
+        m_telemetry.melee_hit_dir = hit_angle_norm;
+        m_telemetry.melee_damage_strength = std::max(m_telemetry.melee_damage_strength, 0.35f);
+        m_telemetry.damage_flash_timer = std::max(m_telemetry.damage_flash_timer, 0.35f);
+
+        emit_sound("Punch_Hit", m_telemetry.position, true);
+        emit_sound("Oral_Impact.Hard", m_telemetry.position, true);
+    } else if (dmt == 2) {
+        // TdHudEffect_FallDamage:
+        // Blur=(FadeInDuration=0.05, Duration=0.1, FadeOutDuration=0.75)
+        // PP=(FadeInDuration=0.05, Duration=0.1, FadeOutDuration=0.75) -> M_FX_FullScreenFX_Falldamage_01
+        m_env_blur.trigger(1.0f, 0.05f, 0.10f, 0.75f);
+        m_env_fall.trigger(1.0f, 0.05f, 0.10f, 0.75f);
+        ++m_telemetry.fall_hit_count;
+        m_telemetry.fall_hit_damage = amount;
+        m_telemetry.fall_damage_strength = std::max(m_telemetry.fall_damage_strength, 0.35f);
+        m_telemetry.damage_flash_timer = std::max(m_telemetry.damage_flash_timer, 0.40f);
+
+        emit_sound("Oral_Impact.Hard", m_telemetry.position, true);
+    }
+    m_telemetry.hit_blur = std::max(m_telemetry.hit_blur, 0.35f);
+    m_telemetry.hit_focus_distance = -500.0f;
+}
+
+// -----------------------------------------------------------------------------
+// Health Regeneration & HUD Damage Envelopes Subsystem
 // -----------------------------------------------------------------------------
 void ParkourController::update_health_and_regen(float dt) {
     if (m_telemetry.intro_active) {
         m_telemetry.health = 100.0f;
         m_telemetry.damage_flash_timer = 0.0f;
+        m_telemetry.health_desat = 0.0f;
+        m_telemetry.hit_blur = 0.0f;
+        m_telemetry.hit_focus_distance = 1600.0f;
+        m_telemetry.melee_damage_strength = 0.0f;
+        m_telemetry.fall_damage_strength = 0.0f;
+        for (int i = 0; i < 4; ++i) m_telemetry.bullet_hit_timers[i] = 0.0f;
         return;
+    }
+    if (m_hit_spazz_cooldown > 0.0f) {
+        m_hit_spazz_cooldown = std::max(0.0f, m_hit_spazz_cooldown - dt);
     }
     if (m_damage_cooldown > 0.0f) {
         m_damage_cooldown -= dt;
     } else if (m_telemetry.health < 100.0f && m_telemetry.health > 0.0f) {
         m_telemetry.health = std::min(100.0f, m_telemetry.health + m_config.health_regen_rate * dt);
+    }
+
+    // Advance UTdHudEffectManager post-process and particle envelopes
+    float env_desat = m_env_health_desat.step(dt);
+    float low_health_desat = (m_telemetry.health > 0.0f)
+        ? std::clamp((100.0f - m_telemetry.health) / 85.0f, 0.0f, 1.0f)
+        : 1.0f;
+    m_telemetry.health_desat = std::max(env_desat, low_health_desat);
+
+    float blur_env = m_env_blur.step(dt);
+    // When health is critically low (< 40 HP), maintain subtle peripheral blur
+    float low_health_blur = (m_telemetry.health > 0.0f && m_telemetry.health < 40.0f)
+        ? ((40.0f - m_telemetry.health) / 40.0f) * 0.45f
+        : 0.0f;
+    float total_blur_env = std::max(blur_env, low_health_blur);
+    m_telemetry.hit_blur = total_blur_env * 0.95f;
+    m_telemetry.hit_focus_distance = 1600.0f + (-500.0f - 1600.0f) * total_blur_env;
+
+    m_telemetry.melee_damage_strength = m_env_melee.step(dt);
+    m_telemetry.fall_damage_strength = m_env_fall.step(dt);
+
+    for (int i = 0; i < 4; ++i) {
+        if (m_telemetry.bullet_hit_timers[i] > 0.0f) {
+            m_telemetry.bullet_hit_timers[i] = std::max(0.0f, m_telemetry.bullet_hit_timers[i] - dt);
+        }
     }
 }
 

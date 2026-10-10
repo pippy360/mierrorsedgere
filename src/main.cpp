@@ -1497,9 +1497,54 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", SkillRollLookLock=" << (roll_lock_ok ? "OK" : "FAIL") << " [turned " << roll_turn << "° in "
               << roll_frames << " frames])" << std::endl;
 
-    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15 and camera stage 16
+    // -------------------------------------------------------------------------
+    // Stage 17: UTdHudEffectManager + PlayHitCameraShake Damage Screen Effects
+    // -------------------------------------------------------------------------
+    std::cout << "\n[Oracle Stage 17] Verifying Player Damage Screen Effects & Directional Hit Camera Shake..." << std::endl;
+    LevelScene s17_scene = sim_scene;
+    s17_scene.enemies.clear();
+    s17_scene.helicopters.clear();
+    s17_scene.dummy_fire_barrages.clear();
+    controller.reset(Vec3(208.0f, -7790.0f, 5760.0f), 0.0f);
+    controller.get_telemetry().intro_active = false;
+    controller.get_telemetry().sound_events.clear();
+    controller.apply_damage(10.0f, 0, Vec3(100.0f, 0.0f, 0.0f));  // Front bullet hit
+    const bool hit_front_ok = controller.get_telemetry().camera_anim == "gethitfront" &&
+                              controller.get_telemetry().bullet_hit_timers[0] > 0.20f &&
+                              controller.get_telemetry().bullet_hit_angles[0] < 0.01f &&
+                              controller.get_telemetry().health_desat > 0.30f &&
+                              controller.get_telemetry().hit_blur > 0.30f &&
+                              controller.get_telemetry().hit_focus_distance == -500.0f &&
+                              !controller.get_telemetry().sound_events.empty();
+    for (int i = 0; i < 15; ++i) controller.step(InputFrame{}, kDt, s17_scene);  // clear 0.2s SpazzThrottle
+    controller.apply_damage(10.0f, 0, Vec3(0.0f, 100.0f, 0.0f));  // Right bullet hit
+    const bool hit_right_ok = controller.get_telemetry().camera_anim == "gethitright" &&
+                              std::abs(controller.get_telemetry().bullet_hit_angles[1] - 0.25f) < 0.01f;
+    for (int i = 0; i < 15; ++i) controller.step(InputFrame{}, kDt, s17_scene);
+    controller.apply_damage(10.0f, 0, Vec3(-100.0f, 0.0f, 0.0f));  // Back bullet hit
+    const bool hit_back_ok = controller.get_telemetry().camera_anim == "gethitback" &&
+                             std::abs(controller.get_telemetry().bullet_hit_angles[2] - 0.50f) < 0.01f;
+    for (int i = 0; i < 15; ++i) controller.step(InputFrame{}, kDt, s17_scene);
+    controller.apply_damage(22.0f, 1, Vec3(0.0f, -100.0f, 0.0f));  // Left melee strike
+    const bool hit_left_melee_ok = controller.get_telemetry().camera_anim == "gethitleft" &&
+                                   controller.get_telemetry().melee_damage_strength > 0.30f &&
+                                   std::abs(controller.get_telemetry().melee_hit_dir - 0.75f) < 0.01f;
+    controller.apply_damage(15.0f, 2, Vec3(0.0f, 0.0f, 0.0f));  // Fall damage
+    ScreenEffects s17_fx;
+    s17_fx.update(controller.get_telemetry(), kDt, controller.get_telemetry().screen_effects);
+    const bool hit_fall_ok = controller.get_telemetry().fall_damage_strength > 0.30f &&
+                             controller.get_telemetry().screen_effects.size() >= 3;
+    const bool s17_pass = hit_front_ok && hit_right_ok && hit_back_ok && hit_left_melee_ok && hit_fall_ok;
+    std::cout << "  -> Stage 17 Result: " << (s17_pass ? "PASS" : "FAIL")
+              << " (FrontBullet=" << (hit_front_ok ? "OK" : "FAIL")
+              << ", RightBullet=" << (hit_right_ok ? "OK" : "FAIL")
+              << ", BackBullet=" << (hit_back_ok ? "OK" : "FAIL")
+              << ", LeftMelee=" << (hit_left_melee_ok ? "OK" : "FAIL")
+              << ", FallDamage=" << (hit_fall_ok ? "OK" : "FAIL") << ")" << std::endl;
+
+    // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, and damage screen effects stage 17
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -1990,9 +2035,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         };
         host.damage_player = [&](float amount) {
             if (cutscene_player.is_playing() || into_cutscene_pending || script.cinematic_mode()) return;
-            PlayerTelemetry& t = controller.get_telemetry();
-            t.health = std::max(0.0f, t.health - amount);
-            t.damage_flash_timer = 0.45f;
+            controller.apply_damage(amount, 0, Vec3(0.0f, 0.0f, 0.0f));
         };
         host.stream_levels = [&](const std::vector<std::string>& levels, bool load) {
             auto& loaded = active_scene.loaded_sublevel_packages;

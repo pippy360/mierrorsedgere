@@ -38,6 +38,8 @@ struct PawnFrame {
     // "@reached" in move_anim: the move got to the place it was steering for (TdMove.ReachedPreciseLocation).
     // The rate the move worked out for move_anim (TdMove_Barge.StartBargin's AnimPlayRate); 0: its script's own.
     float move_anim_rate = 0.0f;
+    // ATdPlayerPawn::PlayHitCameraShake / PlayTaserCameraShake: 1P camera slot animation ("gethitfront", etc.).
+    std::string camera_anim;
     bool move_left = false;      // a sideways move going left (dodge jumps)
     bool accelerating = true;    // the player is pushing a direction (Acceleration is not zero)
     bool hanging_free = false;   // hanging with nothing for the feet (TdMove_Grab.bIsHangingFree)

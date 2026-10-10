@@ -1108,7 +1108,9 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
         "A_WP_Pistol_BerettaM93R.upk",
         "A_HUD.upk",
         "A_Ambience.upk",
-        "A_Props_Interactive.upk"  // door Kismet / matinee sounds (Doors.Door_Barge, Door_Hit, hatch.Squek)
+        "A_Props_Interactive.upk",  // door Kismet / matinee sounds (Doors.Door_Barge, Door_Hit, hatch.Squek)
+        "A_Effects_Bullet_Impacts.upk",
+        "A_Effects_Bullet_Bys.upk"
     };
 
     for (const char* bank : kStockBanks) {

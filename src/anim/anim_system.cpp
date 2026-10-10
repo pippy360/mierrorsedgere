@@ -1488,6 +1488,7 @@ struct AnimSystem::FirstPerson {
     EMovement last_move = EMovement::MOVE_None;
     fp::PawnFrame last_frame;
     uint32_t move_anim_serial = 0;
+    uint32_t camera_anim_serial = 0;
     // Mesh1p.AnimSets with the weapon in hand: [2] the weapon's own set, [1] the common armed set
     // of its kind, [0] the unarmed set; searched in that order.
     std::string weapon_name;
@@ -1596,11 +1597,18 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
         // The controller's blows: 0 right, 1 left, 2 the combo's third, 3 crouched.
         frame.melee_variant = telemetry.move_state == EMovement::MOVE_Melee ? telemetry.melee_variant : -1;
         frame.melee_hit = telemetry.melee_hit_confirmed;
-        if (restart) fp.move_anim_serial = telemetry.move_anim_serial;
+        if (restart) {
+            fp.move_anim_serial = telemetry.move_anim_serial;
+            fp.camera_anim_serial = telemetry.camera_anim_serial;
+        }
         if (telemetry.move_anim_serial != fp.move_anim_serial) {
             fp.move_anim_serial = telemetry.move_anim_serial;
             frame.move_anim = telemetry.move_anim;
             frame.move_anim_rate = telemetry.move_anim_rate;
+        }
+        if (telemetry.camera_anim_serial != fp.camera_anim_serial) {
+            fp.camera_anim_serial = telemetry.camera_anim_serial;
+            frame.camera_anim = telemetry.camera_anim;
         }
         // Called once a rendered frame, which can be several simulated ones (the headless oracle
         // steps without drawing). A move that started in the gap started `combat_anim_time` ago (the
@@ -1610,6 +1618,7 @@ AnimSystem::FirstPersonUse AnimSystem::tick_first_person(const PlayerTelemetry& 
             fp::PawnFrame before = fp.last_frame;
             before.dt = dt - in_move;
             before.move_anim.clear();
+            before.camera_anim.clear();
             fp.director.tick(before);
             frame.dt = in_move;
         }
