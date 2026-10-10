@@ -1278,7 +1278,18 @@ bool AudioEngine::next_ambient_voice(size_t slot, const AmbientEmitterInfo& em) 
     if (it == sound_cues_.end() || !it->second.looping || it->second.is_concatenator || it->second.nodes.empty()) return false;
     std::vector<CueVoice> voices;
     collect_cue_voices(it->second, 0, 0.0f, 1.0f, 1.0f, voices);
-    if (voices.empty() || voices[0].delay <= 0.0f) return false;
+    if (voices.empty()) {
+        // A round that draws nothing: a SoundNodeRandom input left empty (Birds.BirdsChirp has
+        // one) or a wave that is not loaded. In retail nothing in the graph is then playing, the
+        // component is stopped (UAudioComponent::UpdateWaveInstances) and the emitter is silent
+        // from there on. It must not fall back to looping one of the cue's waves end to end.
+        bool waits = false;
+        for (const SoundCueNode& n : it->second.nodes) waits = waits || (n.kind == SoundCueNode::Kind::Delay && n.max_value > 0.0f);
+        if (!waits) return false;
+        ambient_mode_[slot] = AmbientMode::Silent;
+        return true;
+    }
+    if (voices[0].delay <= 0.0f) return false;
     ambient_voice_[slot] = voices[0];
     ambient_mode_[slot] = AmbientMode::Waiting;
     return true;
