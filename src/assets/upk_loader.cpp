@@ -891,7 +891,7 @@ std::unordered_map<std::string, PropertyValue> UPKPackage::parse_properties(size
                     pv.enum_name = pv.str_val;
                 }
             }
-        } else if (prop_type == "ObjectProperty" && p_size == 4) {
+        } else if ((prop_type == "ObjectProperty" || prop_type == "ComponentProperty" || prop_type == "ClassProperty") && p_size == 4) {
             int32_t obj_ref = 0;
             std::memcpy(&obj_ref, val_ptr, 4);
             pv.obj_ref_index = obj_ref;
@@ -940,7 +940,7 @@ size_t UPKPackage::find_property_start(const FObjectExport& exp) const {
 
     static const std::set<std::string> kValidTypes = {
         "IntProperty", "FloatProperty", "BoolProperty", "ByteProperty",
-        "ObjectProperty", "ComponentProperty", "NameProperty", "StrProperty",
+        "ObjectProperty", "ComponentProperty", "ClassProperty", "NameProperty", "StrProperty",
         "StructProperty", "ArrayProperty", "DelegateProperty", "InterfaceProperty"
     };
 
@@ -1653,16 +1653,49 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         }
 
         a.is_fall_height_volume = (low_class.find("fallheightvolume") != std::string::npos);
-        if (a.is_fall_height_volume) {
-            Vec3 center = a.location;
-            if (const auto* pc = get_prop("Center"); pc && std::isfinite(pc->vec_val.z)) {
-                center = pc->vec_val;
+        a.is_movement_exclusion_volume = (low_class.find("movementexclusionvolume") != std::string::npos);
+        a.is_barbed_wire_volume = (low_class.find("barbedwirevolume") != std::string::npos);
+        if (low_class == "physicsvolume" && actor_bool("bPainCausing", false)) {
+            std::string dmg_type;
+            if (const auto* pdt = get_prop("DamageType"); pdt && pdt->obj_ref_index != 0) {
+                dmg_type = resolve_object_index(pdt->obj_ref_index).first;
             }
-            float offset = 0.0f;
-            if (const auto* po = get_prop("FallHeightOffset"); po && std::isfinite(po->float_val)) {
-                offset = po->float_val;
+            if (dmg_type.find("ElectricShock") != std::string::npos || dmg_type.find("BarbedWire") != std::string::npos) {
+                a.is_electric_volume = true;
             }
-            a.fall_height_target_z = center.z + offset;
+        }
+        if (a.is_movement_exclusion_volume) {
+            a.exclude_hand_moves = actor_bool("bExcludeHandMoves", true);
+            a.exclude_foot_moves = actor_bool("bExcludeFootMoves", true);
+        } else if (a.is_electric_volume || a.is_barbed_wire_volume) {
+            a.exclude_hand_moves = true;
+            a.exclude_foot_moves = true;
+            if (const auto* pdps = get_prop("DamagePerSec"); pdps && std::isfinite(pdps->float_val) && pdps->float_val > 0.0f) {
+                a.damage_per_sec = pdps->float_val;
+            } else {
+                a.damage_per_sec = 25.0f;
+            }
+        } else {
+            // Note: Engine.u Actor defines bExludeHandMoves / bExludeFootMoves (without 'c'),
+            // and Default__BlockingVolume sets both to true unless overridden to false on the instance.
+            a.exclude_hand_moves = actor_bool("bExludeHandMoves", a.is_blocking_volume) ||
+                                   actor_bool("bExcludeHandMoves", false);
+            a.exclude_foot_moves = actor_bool("bExludeFootMoves", a.is_blocking_volume) ||
+                                   actor_bool("bExcludeFootMoves", false);
+        }
+
+        if (a.is_fall_height_volume || a.is_movement_exclusion_volume || a.is_electric_volume || a.is_barbed_wire_volume) {
+            if (a.is_fall_height_volume) {
+                Vec3 center = a.location;
+                if (const auto* pc = get_prop("Center"); pc && std::isfinite(pc->vec_val.z)) {
+                    center = pc->vec_val;
+                }
+                float offset = 0.0f;
+                if (const auto* po = get_prop("FallHeightOffset"); po && std::isfinite(po->float_val)) {
+                    offset = po->float_val;
+                }
+                a.fall_height_target_z = center.z + offset;
+            }
 
             std::vector<UPropertyList> bchain;
             int32_t b_idx = find_brush_component_index();

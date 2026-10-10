@@ -60,6 +60,8 @@ public:
     void add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, int32_t actor, uint8_t channels);
     // Builds the bounding volume hierarchy. Must be called before querying.
     void build();
+    // Updates the blocking channel mask of all triangles belonging to `actor`.
+    void set_actor_channels(int32_t actor, uint8_t channels);
 
     [[nodiscard]] bool empty() const { return tris_.empty(); }
     [[nodiscard]] size_t triangle_count() const { return tris_.size(); }

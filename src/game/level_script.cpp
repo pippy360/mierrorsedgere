@@ -442,6 +442,22 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                     if (!name.empty()) n.level_names.push_back(name);
                 }
             }
+        } else if (c == "SeqAct_ChangeCollision") {
+            const std::string ctype = prop_name(props, "CollisionType");
+            bool collide = prop_bool(props, "bCollideActors", false);
+            bool block = prop_bool(props, "bBlockActors", false);
+            if (ctype == "COLLIDE_NoCollision") {
+                collide = false;
+                block = false;
+            } else if (ctype == "COLLIDE_BlockAll" || ctype == "COLLIDE_BlockAllButWeapons") {
+                collide = true;
+                block = true;
+            } else if (ctype == "COLLIDE_TouchAll" || ctype == "COLLIDE_TouchAllButWeapons") {
+                collide = true;
+                block = false;
+            }
+            n.b = collide;
+            n.b2 = block;
         }
     }
 
@@ -1366,7 +1382,8 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
         for (int t : linked_vars(node, "Target")) {
             const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
             if (actor < 0) continue;
-            const std::string& acls = graph_->actors[static_cast<size_t>(actor)].cls;
+            const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
+            const std::string& acls = sa.cls;
             if (acls.find("Trigger") == std::string::npos && acls.find("Volume") == std::string::npos) continue;
             for (size_t i = 0; i < graph_->nodes.size(); ++i) {
                 if (graph_->nodes[i].originator != actor) continue;
@@ -1374,6 +1391,25 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
                 if (s.impulses & 1u) es.enabled = true;
                 else if (s.impulses & 2u) es.enabled = false;
                 else if (s.impulses & 4u) es.enabled = !es.enabled;
+            }
+            if (acls.find("Volume") != std::string::npos && host_.change_collision) {
+                if (s.impulses & 1u) {
+                    host_.change_collision(sa, true, acls == "BlockingVolume");
+                } else if (s.impulses & 2u) {
+                    host_.change_collision(sa, false, false);
+                }
+            }
+        }
+        s.out = all_outputs;
+    } else if (c == "SeqAct_ChangeCollision") {
+        for (int t : linked_vars(node, "Target")) {
+            const int actor = graph_->nodes[static_cast<size_t>(t)].actor;
+            if (actor < 0) continue;
+            const ScriptActor& sa = graph_->actors[static_cast<size_t>(actor)];
+            log("[Script] change collision on " + sa.package + "." + sa.name +
+                " collide=" + (n.b ? "1" : "0") + " block=" + (n.b2 ? "1" : "0"));
+            if (host_.change_collision) {
+                host_.change_collision(sa, n.b, n.b2);
             }
         }
         s.out = all_outputs;

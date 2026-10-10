@@ -235,6 +235,13 @@ void CollisionWorld::add_triangle(const Vec3& a, const Vec3& b, const Vec3& c, i
     tris_.push_back(t);
 }
 
+void CollisionWorld::set_actor_channels(int32_t actor, uint8_t channels) {
+    if (actor < 0) return;
+    for (Triangle& t : tris_) {
+        if (t.actor == actor) t.channels = channels;
+    }
+}
+
 void CollisionWorld::build() {
     nodes_.clear();
     if (tris_.empty()) return;

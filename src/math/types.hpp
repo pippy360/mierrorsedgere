@@ -782,6 +782,12 @@ struct LevelActor {
     bool is_soft_landing = false;
     bool is_fall_height_volume = false;
     float fall_height_target_z = 0.0f;
+    bool is_movement_exclusion_volume = false;
+    bool is_electric_volume = false;
+    bool is_barbed_wire_volume = false;
+    bool exclude_hand_moves = false;
+    bool exclude_foot_moves = false;
+    float damage_per_sec = 0.0f;
     bool is_enemy = false;
     bool is_bag = false;
     bool is_elevator_part = false;
@@ -1734,7 +1740,7 @@ struct LevelScene {
     std::vector<MeshBuffer> meshes;
     // Static world collision built from the real UE3 data (StaticMesh BodySetup / kDOP triangles,
     // BlockingVolume brushes). Moving elevator parts carry their own CollisionWorld.
-    std::shared_ptr<const CollisionWorld> collision;
+    std::shared_ptr<CollisionWorld> collision;
     float kill_z = -1.0e30f;  // falling below this kills the player (WorldInfo.KillZ or geometry floor)
     std::vector<EnemyBot> enemies;
     std::vector<BulletTracer> active_tracers;
