@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 namespace me {
@@ -15,6 +16,10 @@ namespace {
 
 // TdWeapon's defaults (TdGame.u): what a surface without a physical material of its own is hit as.
 const char* const kDefaultImpactMaterial = "TDPhysicalMaterials.Concrete.PM_Concrete";
+// What a bullet meets in a bot: every bot's physics asset is CH_TKY_Cop_SWAT.Male3p_Physics (the
+// only one TdSpContent.u and TdSpBossContent.u import), whose bodies are PM_Character_Body, the
+// neck and the hands PM_Character_Head; the two have the same impact effect and the same sound.
+const char* const kCharacterMaterial = "TDPhysicalMaterials.Character.Body.PM_Character_Body";
 const char* const kDefaultDecalMaterial = "FX_ImpactEffects.Materials.M_FX_Decals_BulletImpacts_Generic_01";
 
 bool export_has_data(const UPKPackage& pkg, int32_t index) {
@@ -39,6 +44,7 @@ ImpactLibrary::ImpactLibrary(PackageManager& pm, LevelScene& scene, std::vector<
     : pm_(pm), scene_(scene), material_paths_(material_paths), mesh_for_(std::move(mesh_for)) {
     scene_.physical_materials.clear();
     scene_.default_physical = -1;
+    scene_.character_physical = -1;
     scene_.default_impact_decal = ImpactDecalInfo{};
     scene_.effect_factories.clear();
     scene_.spawned_effects.clear();
@@ -95,6 +101,31 @@ int32_t ImpactLibrary::effect(const Ref& from, int32_t ref) {
     return particle_template_for(*system.pkg, system.index, scene_, material_paths_, mesh_for_);
 }
 
+// The MaxRadius of a cue's SoundNodeAttenuation: where it has faded to nothing.
+float ImpactLibrary::cue_max_radius(const Ref& cue) {
+    UPropertyList props;
+    parse_export_properties(*cue.pkg, cue.index, props);
+    Ref node = by_ref(cue, prop_object(props, "FirstNode"));
+    for (int depth = 0; node && depth < 8; ++depth) {
+        UPropertyList np;
+        parse_export_properties(*node.pkg, node.index, np);
+        if (object_class_name(*node.pkg, node.index) == "SoundNodeAttenuation") {
+            if (const UProperty* p = find_prop(np, "MaxRadius")) {
+                if (const UProperty* table = find_prop(p->fields, "LookupTable"); table && table->ints.size() >= 2) {
+                    float hi = 0.0f;
+                    std::memcpy(&hi, &table->ints[1], sizeof(float));
+                    if (hi > 0.0f) return hi;
+                }
+            }
+            return 5000.0f;  // Default__SoundNodeAttenuation
+        }
+        const UProperty* children = find_prop(np, "ChildNodes");
+        if (!children || children->ints.empty()) break;
+        node = by_ref(node, children->ints[0]);
+    }
+    return 2000.0f;
+}
+
 void ImpactLibrary::decals(const Ref& from, const std::vector<int32_t>& refs, std::vector<ImpactDecalInfo>& out) {
     for (int32_t ref : refs) {
         const Ref component = by_ref(from, ref);
@@ -142,6 +173,20 @@ int32_t ImpactLibrary::physical(const Ref& r) {
             static const char* const kAmmo[4] = {"LightAmmo", "HeavyAmmo", "HeliAmmo", "ShotgunPellet"};
             for (int a = 0; a < 4; ++a) info.effects[a] = effect(fx, prop_object(fp, kAmmo[a]));
         }
+        if (const Ref snd = by_ref(property, prop_object(pp, "TdPhysicalMaterialImpactSounds"))) {
+            UPropertyList sp;
+            parse_export_properties(*snd.pkg, snd.index, sp);
+            if (const int32_t cue = prop_object(sp, "LightAmmo")) {
+                // "A_Effects_Bullet_Impacts.Concrete.9mm_Concrete_Impact": the package, then the cue.
+                const std::string cue_path = object_canonical_path(*snd.pkg, cue);
+                const size_t dot = cue_path.find('.');
+                if (dot != std::string::npos && dot + 1 < cue_path.size()) {
+                    info.impact_sound_package = cue_path.substr(0, dot);
+                    info.impact_sound = cue_path.substr(dot + 1);
+                    if (const Ref c = by_ref(snd, cue)) info.impact_sound_radius = cue_max_radius(c);
+                }
+            }
+        }
         if (const Ref dc = by_ref(property, prop_object(pp, "TdPhysicalMaterialDecals"))) {
             UPropertyList dp;
             parse_export_properties(*dc.pkg, dc.index, dp);
@@ -181,6 +226,7 @@ int32_t ImpactLibrary::physical_of_material(const std::string& material_path) {
 
 void ImpactLibrary::read_weapon_defaults() {
     scene_.default_physical = physical(by_path(kDefaultImpactMaterial));
+    scene_.character_physical = physical(by_path(kCharacterMaterial));
     // TdWeapon.InitDefaultDecalProperties
     ImpactDecalInfo d;
     d.material = by_path(kDefaultDecalMaterial) ? material(kDefaultDecalMaterial) : -1;

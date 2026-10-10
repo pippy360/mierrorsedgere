@@ -38,6 +38,7 @@
 // -----------------------------------------------------------------------------
 
 #include "../assets/level_lightmaps.hpp"
+#include "../game/impact_effects.hpp"
 #include "../math/types.hpp"
 #include "lens_flare.hpp"
 
@@ -580,7 +581,8 @@ public:
             batch.material = d.material;
             batch.distance = 3.0e38f;
             batch.decal = true;
-            batch.vertices = d.vertices;
+            // A hole in a lift's part or a door is where that is now.
+            if (!dynamic_decal_vertices(scene, d, batch.vertices)) continue;
             batches_.push_back(std::move(batch));
         }
         std::stable_sort(batches_.begin(), batches_.end(),

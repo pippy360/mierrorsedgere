@@ -69,6 +69,7 @@ private:
     int32_t physical(const Ref& r);
     int32_t material(const std::string& path);
     int32_t effect(const Ref& from, int32_t ref);
+    float cue_max_radius(const Ref& cue);
     void decals(const Ref& from, const std::vector<int32_t>& refs, std::vector<ImpactDecalInfo>& out);
 
     PackageManager& pm_;
