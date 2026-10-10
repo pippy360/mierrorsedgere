@@ -2,6 +2,8 @@
 
 #include "../math/types.hpp"
 #include "../assets/upk_loader.hpp"
+#include "../physics/body_shapes.hpp"
+#include <array>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -268,8 +270,31 @@ public:
     // Static triangle-list indices for evaluate_enemy_swat_indexed(): rebuilt by init_from_game_root().
     [[nodiscard]] const std::vector<std::vector<uint32_t>>& enemy_swat_index_lists() const { return enemy_swat_index_lists_; }
 
+    // The bodies a bullet meets in a bot (physics/body_shapes.hpp): the shapes of
+    // CH_TKY_Cop_SWAT.Male3p_Physics, the physics asset of every bot's third-person mesh, each placed
+    // in the world by its bone as evaluate_enemy_swat_indexed() poses the skeleton for the same bot,
+    // sim_time and reaction_disarm (UPhysicsAsset::LineCheck: SkelComp->GetBoneMatrix of the body's
+    // BoneName). It draws nothing and keeps nothing: it can be asked at any moment, a render frame
+    // or not. False, and out.valid false, without the character assets or for a skeleton with none
+    // of the bodies' bones.
+    bool pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) const;
+
+    // A body of the bots' physics asset as it is stored: an RB_BodySetup.
+    struct EnemyBodyTemplate {
+        std::string bone;      // BoneName
+        std::string material;  // PhysMaterial, by its path
+        ECharacterSurface surface = ECharacterSurface::Body;
+        std::vector<AggShape> shapes;  // AggGeom, in the bone's space
+    };
+    [[nodiscard]] const std::vector<EnemyBodyTemplate>& enemy_bodies() const { return enemy_bodies_; }
+    // ME_SHOW_BODIES=1: evaluate_combat_world_fx() draws, as lines, the bodies of every enemy a
+    // bullet can meet who is near the view: the head's material in the runner-vision red, the
+    // body's green.
+    [[nodiscard]] bool shows_enemy_bodies() const { return show_enemy_bodies_; }
+
     // Evaluate 3D dropped weapons on the ground and active ballistic tracers / impact sparks
-    void evaluate_combat_world_fx(const LevelScene& scene, float sim_time,
+    // (and, asked for, the enemies' bodies: shows_enemy_bodies(), as seen from view_pos)
+    void evaluate_combat_world_fx(const LevelScene& scene, const Vec3& view_pos, float sim_time, bool reaction_disarm,
                                   std::vector<Vertex>& out_world_tris,
                                   std::vector<Vertex>& out_rv_tris) const;
 
@@ -377,6 +402,21 @@ private:
     AnimSetAsset celeste_set_;
 
     std::vector<AnimBlendConfig> blend_configs_;
+
+    // The bones of a bot as he is at sim_time: his archetype, its skeleton, and every bone's place
+    // and rotation in the mesh's own space. The one pose both what is drawn
+    // (evaluate_enemy_swat_indexed) and what a bullet meets (pose_enemy_bodies) are made from.
+    bool pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyArchetypeId& out_arch,
+                             const SkeletalMeshAsset*& out_mesh, std::vector<Vec3>& out_comp_pos,
+                             std::vector<Quat4>& out_comp_quat) const;
+    // The bots' physics asset (init_from_game_root): its bodies, and for each archetype the bone of
+    // its skeleton that carries each body (-1: that skeleton has no bone of the name, and the body
+    // is left out, as USkeletalMeshComponent::MatchRefBone leaves it out).
+    void load_enemy_bodies(const UPKPackage& pkg);
+    void bind_enemy_bodies();
+    std::vector<EnemyBodyTemplate> enemy_bodies_;
+    std::array<std::vector<int32_t>, EnemyArch_Count> enemy_body_bones_{};
+    bool show_enemy_bodies_ = false;
 
     // evaluate_enemy_swat_indexed() support, built by build_enemy_swat_index_lists() once the meshes are loaded.
     void build_enemy_swat_index_lists();

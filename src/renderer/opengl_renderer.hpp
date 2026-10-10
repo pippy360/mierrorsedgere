@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../math/types.hpp"
+#include "../physics/body_shapes.hpp"
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -58,6 +59,9 @@ public:
     void player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const;
     // The level, as the first-person mesh's foot placement asks about it (AnimSystem::set_world_trace).
     void set_world_trace(std::function<bool(const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal)> trace);
+    // A bot's bodies as a bullet meets them, posed as render_frame() draws him at `sim_time`
+    // (AnimSystem::pose_enemy_bodies): what ParkourController::set_enemy_body_poser is given.
+    bool pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) const;
 
     // State inspection
     [[nodiscard]] bool is_initialized() const;

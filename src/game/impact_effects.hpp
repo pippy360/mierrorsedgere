@@ -15,7 +15,9 @@
 //                        else of its parents, else of the default material; made at the hit,
 //                        pointed along the ray mirrored in the surface and lifted from it:
 //                          R = D - 2 N (D . N);  R += (1 - R . N) 0.3 N
-//                        A bot's surface is a body of his physics asset: PM_Character_Body.
+//                        A bot's surface is a body of his physics asset (physics/body_shapes.hpp):
+//                        PM_Character_Body, or PM_Character_Head on the head and the hands; the
+//                        two name the same effect and the same sound.
 //   SpawnImpactDecal     AngleOfImpact = acos(-N . D). The material's impact list under its
 //                        CriticalAngle, its ricochet list over it, one of the list by chance;
 //                        else its parents'; else the default 16 x 16 decal.
@@ -35,8 +37,11 @@
 //
 // Not as the game: the surface is found by a short line check through the bullet's end
 // against the meshes' own triangles and the BSP (the BSP's surfaces count as the default
-// material); whether a bot's shot is relevant is only its distance from the player; a bot is
-// his pawn's cylinder, all of it the body's material, and takes no decal.
+// material); whether a bot's shot is relevant is only its distance from the player.
+//
+// A bot takes no decal, here as in the game. Where the bullet went into him, the surface's normal
+// there and its material come with the tracer (BulletTracer::pawn_normal, pawn_surface), from the
+// body of his that the controller's line met.
 // -----------------------------------------------------------------------------
 
 #include "../math/types.hpp"
@@ -385,7 +390,9 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         // only the sound on the player, and nothing else leaves anything.
         if (tracer.pawn_hit != 0 || tracer.hit_enemy) {
             if (physical.empty() || (tracer.pawn_hit != 1 && tracer.pawn_hit != 2)) continue;
-            const int32_t body = scene.character_physical;
+            // HitInfo.PhysMaterial: the material of the body the bullet went into.
+            const bool head = tracer.pawn_surface == ECharacterSurface::Head && valid(scene.character_head_physical);
+            const int32_t body = head ? scene.character_head_physical : scene.character_physical;
             int32_t effect = -1;
             if (tracer.pawn_hit == 1 && (tracer.end_pos - player).length() <= kImpactEffectDistance) {
                 effect = effect_of(body, ammo);
@@ -395,7 +402,8 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
             const std::string heard = play(body, tracer.end_pos);
             if (debug) {
                 std::cout << "[Impact] on " << (tracer.pawn_hit == 1 ? "a bot" : "the player") << " at (" << tracer.end_pos.x << ", " << tracer.end_pos.y
-                          << ", " << tracer.end_pos.z << "): effect "
+                          << ", " << tracer.end_pos.z << ") on " << (valid(body) ? physical[static_cast<size_t>(body)].path : std::string("no physical material"))
+                          << ", normal (" << tracer.pawn_normal.x << ", " << tracer.pawn_normal.y << ", " << tracer.pawn_normal.z << "): effect "
                           << (effect >= 0 ? scene.particle_templates[static_cast<size_t>(effect)].path : std::string("none")) << ", sound " << heard
                           << std::endl;
             }

@@ -1,6 +1,8 @@
 #include "anim_system.hpp"
 #include "fp_director.hpp"
 #include "fp_pose.hpp"
+#include "../assets/ue3_props.hpp"
+#include <cstdlib>
 #include <mutex>
 #include <fstream>
 #include <iostream>
@@ -165,6 +167,13 @@ void compute_skin_deltas(const SkeletalMeshAsset& mesh,
         out_delta_pos[b] = dp;
     }
 }
+
+// A point or a direction of an enemy's mesh space (raw component space: +X left, -Y up, +Z forward)
+// in the bot's own frame (+X forward, +Y right, +Z up), which the renderers then stand at
+// EnemyBot::position turned by its yaw. This is the turn the mesh's RotOrigin (0, -16384, 16384)
+// asks for (FRotationMatrix: X to -Y, Y to -Z, Z to X). Its Origin (0, 94, 0), which hangs retail's
+// mesh 94 under its component, is not applied: the port's bot stands on his position.
+inline Vec3 enemy_mesh_to_bot(const Vec3& p) { return Vec3(p.z, -p.x, -p.y); }
 
 } // namespace
 
@@ -1196,6 +1205,7 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                 break;
             }
         }
+        if (es.id == EnemyArch_SWAT) load_enemy_bodies(pkg_e);
         parse_dxt1_texture(pkg_e, es.tex_d, mdl.tex_diffuse);
         parse_dxt1_texture(pkg_e, es.tex_s, mdl.tex_specular);
         parse_dxt1_texture(pkg_e, es.tex_n, mdl.tex_normal);
@@ -1214,7 +1224,8 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
     swat_diffuse_tex_ = enemy_models_[EnemyArch_SWAT].tex_diffuse;
     swat_specular_tex_ = enemy_models_[EnemyArch_SWAT].tex_specular;
     swat_normal_tex_ = enemy_models_[EnemyArch_SWAT].tex_normal;
-
+    show_enemy_bodies_ = std::getenv("ME_SHOW_BODIES") != nullptr;
+    bind_enemy_bodies();
 
     // Load KrugerSec / CPF SWAT Blackhawk Helicopter Skeletal Mesh & Diffuse Texture (Vehicles/SWAT_Blackhawk.upk)
     {
@@ -1378,6 +1389,43 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                   << "  - AS_AI_PatrolCop_OneHanded: " << swat_set_.sequences.size() << " sequences\n"
                   << "  - AS_AI_Assault_TwoHanded: " << swat_2h_set_.sequences.size() << " sequences\n"
                   << "  - DefaultAnimation.ini CustomAnimNodes: " << blend_configs_.size() << std::endl;
+    }
+    if (!enemy_bodies_.empty()) {
+        size_t boxes = 0, capsules = 0, spheres = 0;
+        std::string heads;
+        for (const EnemyBodyTemplate& body : enemy_bodies_) {
+            for (const AggShape& s : body.shapes) ++(s.kind == AggShape::Box ? boxes : s.kind == AggShape::Capsule ? capsules : spheres);
+            if (body.surface == ECharacterSurface::Head) heads += (heads.empty() ? "" : ", ") + body.bone;
+        }
+        std::cout << "[AnimSystem] CH_TKY_Cop_SWAT.Male3p_Physics: " << enemy_bodies_.size() << " bodies (" << boxes << " boxes, "
+                  << capsules << " capsules, " << spheres << " spheres), PM_Character_Head on " << (heads.empty() ? "none" : heads)
+                  << "; bodies whose bone each skeleton has:";
+        for (const auto& es : kEnemySpecs) {
+            size_t bound = 0;
+            for (const int32_t b : enemy_body_bones_[es.id]) bound += b >= 0 ? 1 : 0;
+            std::cout << " " << es.skel_name << " " << bound << (enemy_models_[es.id].mesh.is_valid() ? "" : " (drawn as CH_TKY_Cop_SWAT)");
+        }
+        std::cout << std::endl;
+        if (show_enemy_bodies_) {
+            // The asset as read, to be held against a dump of the package.
+            std::ostringstream text;
+            text.precision(9);
+            const auto vec = [&](const char* name, const Vec3& v) { text << " " << name << " (" << v.x << ", " << v.y << ", " << v.z << ")"; };
+            for (size_t k = 0; k < enemy_bodies_.size(); ++k) {
+                const EnemyBodyTemplate& body = enemy_bodies_[k];
+                text << "[AnimSystem]   body " << k << " " << body.bone << " " << body.material << "\n";
+                for (const AggShape& s : body.shapes) {
+                    text << "[AnimSystem]     " << (s.kind == AggShape::Box ? "box" : s.kind == AggShape::Capsule ? "capsule" : "sphere");
+                    vec("half", s.half);
+                    vec("origin", s.rows[3]);
+                    vec("x", s.rows[0]);
+                    vec("y", s.rows[1]);
+                    vec("z", s.rows[2]);
+                    text << "\n";
+                }
+            }
+            std::cout << text.str() << std::flush;
+        }
     }
 
     build_enemy_swat_index_lists();
@@ -2802,15 +2850,16 @@ void AnimSystem::evaluate_enemy_swat(const EnemyBot& bot, float sim_time, bool r
     }
 }
 
-AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
-                                                                  Vertex* out_vertices) const {
-    EnemySwatDraw draw;
-    if (!loaded_ || !swat_mesh_.is_valid() || enemy_swat_index_lists_.empty()) return draw;
+bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyArchetypeId& out_arch,
+                                     const SkeletalMeshAsset*& out_mesh, std::vector<Vec3>& out_comp_pos,
+                                     std::vector<Quat4>& out_comp_quat) const {
+    if (!loaded_ || !swat_mesh_.is_valid()) return false;
 
     const EnemyArchetypeId arch_id = resolve_enemy_archetype(bot.archetype);
     const EnemyCharacterModel& char_model = enemy_models_[arch_id];
     const SkeletalMeshAsset& body_mesh = char_model.mesh.is_valid() ? char_model.mesh : swat_mesh_;
-    draw.archetype_id = arch_id;
+    out_arch = arch_id;
+    out_mesh = &body_mesh;
 
     bool two_handed = is_heavy_weapon_name(bot.weapon_name);
     const AnimSetAsset* active_set = (two_handed && !swat_2h_set_.sequences.empty()) ? &swat_2h_set_ : &swat_set_;
@@ -2903,10 +2952,10 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
     }
 
     // Ensure active_set owns seq_a for track mapping
-    const AnimSetAsset* owner_a = (active_set->find_sequence(seq_a->name) == seq_a) ? active_set : &swat_set_;
+    const AnimSetAsset* owner_a = (seq_a && active_set->find_sequence(seq_a->name) == seq_a) ? active_set : &swat_set_;
 
-    thread_local std::vector<Vec3> local_pos, local_pos_b, comp_pos, delta_pos, skinned_pos, skinned_norm;
-    thread_local std::vector<Quat4> local_quat, local_quat_b, comp_quat, delta_quat;
+    thread_local std::vector<Vec3> local_pos, local_pos_b;
+    thread_local std::vector<Quat4> local_quat, local_quat_b;
     sample_sequence_pose(body_mesh, *owner_a, seq_a, norm_time, local_pos, local_quat);
     if (seq_b && blend_alpha > 0.001f) {
         const AnimSetAsset* owner_b = (active_set->find_sequence(seq_b->name) == seq_b) ? active_set : &swat_set_;
@@ -2914,7 +2963,23 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
-    compute_skeleton_fk(body_mesh.bones, local_pos, local_quat, comp_pos, comp_quat);
+    compute_skeleton_fk(body_mesh.bones, local_pos, local_quat, out_comp_pos, out_comp_quat);
+    return true;
+}
+
+AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
+                                                                  Vertex* out_vertices) const {
+    EnemySwatDraw draw;
+    if (enemy_swat_index_lists_.empty()) return draw;
+
+    thread_local std::vector<Vec3> comp_pos, delta_pos, skinned_pos, skinned_norm;
+    thread_local std::vector<Quat4> comp_quat, delta_quat;
+    EnemyArchetypeId arch_id = EnemyArch_SWAT;
+    const SkeletalMeshAsset* posed_mesh = nullptr;
+    if (!pose_enemy_skeleton(bot, sim_time, reaction_disarm, arch_id, posed_mesh, comp_pos, comp_quat)) return draw;
+    const EnemyCharacterModel& char_model = enemy_models_[arch_id];
+    const SkeletalMeshAsset& body_mesh = *posed_mesh;
+    draw.archetype_id = arch_id;
     compute_skin_deltas(body_mesh, comp_pos, comp_quat, delta_pos, delta_quat);
 
     // Map raw component coordinates (X=Left, -Y=Up, +Z=Forward) to Unreal/Engine bot local space (+X=Forward, +Y=Right, +Z=Up)
@@ -2932,8 +2997,8 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
             p_acc += (delta_quat[b].rotate(sv.bind_pos) + delta_pos[b]) * w;
             n_acc += delta_quat[b].rotate(sv.bind_norm) * w;
         }
-        skinned_pos[i] = Vec3(p_acc.z, -p_acc.x, -p_acc.y);
-        skinned_norm[i] = Vec3(n_acc.z, -n_acc.x, -n_acc.y).normalized();
+        skinned_pos[i] = enemy_mesh_to_bot(p_acc);
+        skinned_norm[i] = enemy_mesh_to_bot(n_acc).normalized();
     }
 
     const SkeletalMeshAsset* bot_wmesh = !bot.disarm_weapon.empty() ? get_weapon_mesh(bot.disarm_weapon)
@@ -2986,8 +3051,8 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
             Vec3 p_comp = rw_pos + rw_quat.rotate(sv.bind_pos);
             Vec3 n_comp = rw_quat.rotate(sv.bind_norm);
             Vertex out_v{};
-            out_v.position = Vec3(p_comp.z, -p_comp.x, -p_comp.y);
-            out_v.normal = Vec3(n_comp.z, -n_comp.x, -n_comp.y).normalized();
+            out_v.position = enemy_mesh_to_bot(p_comp);
+            out_v.normal = enemy_mesh_to_bot(n_comp).normalized();
             out_v.tangent = Vec3(1.0f, 0.0f, 0.0f);
             out_v.u = sv.u;
             out_v.v = sv.v;
@@ -3003,16 +3068,16 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
         // Emit 3D Muzzle Flash at enemy weapon barrel tip when firing (its corners are the list's last indices)
         if (bot.muzzle_flash_timer > 0.0f && bot_wmesh->bones.size() > 3) {
             Vec3 flash_comp = rw_pos + rw_quat.rotate(bot_wmesh->bones[3].bind_pos);
-            Vec3 flash_local(flash_comp.z, -flash_comp.x, -flash_comp.y);
+            Vec3 flash_local = enemy_mesh_to_bot(flash_comp);
             Vec3 fwd_comp = rw_quat.rotate(Vec3(0.0f, 0.0f, 1.0f));
             Vec3 right_comp = rw_quat.rotate(Vec3(-1.0f, 0.0f, 0.0f));
             Vec3 up_comp = rw_quat.rotate(Vec3(0.0f, -1.0f, 0.0f));
             thread_local std::vector<Vertex> flash;
             flash.clear();
             append_muzzle_flash_mesh(flash, flash_local,
-                                     Vec3(fwd_comp.z, -fwd_comp.x, -fwd_comp.y).normalized(),
-                                     Vec3(right_comp.z, -right_comp.x, -right_comp.y).normalized(),
-                                     Vec3(up_comp.z, -up_comp.x, -up_comp.y).normalized(),
+                                     enemy_mesh_to_bot(fwd_comp).normalized(),
+                                     enemy_mesh_to_bot(right_comp).normalized(),
+                                     enemy_mesh_to_bot(up_comp).normalized(),
                                      9.0f, 16.0f);
             const size_t flash_vertices = std::min(flash.size(), kMuzzleFlashVertexCount);
             std::copy_n(flash.begin(), flash_vertices, out_vertices + draw.vertex_count);
@@ -3024,13 +3089,200 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
 }
 
 // -----------------------------------------------------------------------------
+// The bots' physics asset: what a bullet meets in an enemy (physics/body_shapes.hpp)
+// -----------------------------------------------------------------------------
+// A PhysicsAsset is tagged properties alone: BodySetup lists its RB_BodySetup objects, each with a
+// BoneName, a PhysMaterial and its shapes in AggGeom (a KAggregateGeom, read as a static mesh's
+// simple collision is: assets/upk_loader.hpp). UPhysicsAsset::LineCheck passes a body over when its
+// bBlockZeroExtent is off (on by the class's default, and no body of this asset saves one); it
+// looks at neither a body's bNoCollision nor a shape's bNoRBCollision.
+void AnimSystem::load_enemy_bodies(const UPKPackage& pkg) {
+    enemy_bodies_.clear();
+    const auto& exports = pkg.get_exports();
+    for (size_t i = 0; i < exports.size(); ++i) {
+        if (pkg.get_export_class(exports[i]) != "PhysicsAsset" || exports[i].object_name != "Male3p_Physics") continue;
+        UPropertyList asset;
+        parse_export_properties(pkg, static_cast<int32_t>(i) + 1, asset);
+        const UProperty* setups = find_prop(asset, "BodySetup");
+        if (!setups) break;
+        int convex = 0;
+        for (const int32_t ref : setups->ints) {
+            // A body that cannot be met keeps its place in the list with no shapes: a hit's Item is
+            // the body's place in the asset.
+            EnemyBodyTemplate body;
+            UPropertyList props;
+            if (ref > 0 && static_cast<size_t>(ref) <= exports.size()) parse_export_properties(pkg, ref, props);
+            body.bone = prop_name(props, "BoneName");
+            if (const int32_t material = prop_object(props, "PhysMaterial")) body.material = object_canonical_path(pkg, material);
+            // TdBotPawn.TakeDamage asks for the material's own name, not its path nor its parents.
+            const size_t dot = body.material.find_last_of('.');
+            if (to_lower_str(dot == std::string::npos ? body.material : body.material.substr(dot + 1)) == "pm_character_head") {
+                body.surface = ECharacterSurface::Head;
+            }
+            const UProperty* agg = find_prop(props, "AggGeom");
+            if (agg && prop_bool(props, "bBlockZeroExtent", true)) convex += read_agg_geom_shapes(pkg, *agg, body.shapes);
+            enemy_bodies_.push_back(std::move(body));
+        }
+        if (convex > 0) {
+            std::cout << "[AnimSystem] Male3p_Physics: " << convex << " convex elements are not tested" << std::endl;
+        }
+        break;
+    }
+}
+
+void AnimSystem::bind_enemy_bodies() {
+    for (uint32_t a = 0; a < EnemyArch_Count; ++a) {
+        // The skeleton the archetype is posed on (pose_enemy_skeleton).
+        const SkeletalMeshAsset& mesh = enemy_models_[a].mesh.is_valid() ? enemy_models_[a].mesh : swat_mesh_;
+        std::vector<int32_t>& bones = enemy_body_bones_[a];
+        bones.assign(enemy_bodies_.size(), -1);
+        for (size_t k = 0; k < enemy_bodies_.size(); ++k) {
+            if (enemy_bodies_[k].shapes.empty()) continue;
+            const auto it = mesh.bone_name_to_index.find(to_lower_str(enemy_bodies_[k].bone));
+            if (it != mesh.bone_name_to_index.end()) bones[k] = it->second;
+        }
+    }
+}
+
+bool AnimSystem::pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) const {
+    out.valid = false;
+    out.shapes.clear();
+    out.bodies.clear();
+    out.bound_centre = bot.position;
+    out.bound_radius = 0.0f;
+    if (enemy_bodies_.empty()) return false;
+
+    thread_local std::vector<Vec3> comp_pos;
+    thread_local std::vector<Quat4> comp_quat;
+    EnemyArchetypeId arch_id = EnemyArch_SWAT;
+    const SkeletalMeshAsset* mesh = nullptr;
+    if (!pose_enemy_skeleton(bot, sim_time, reaction_disarm, arch_id, mesh, comp_pos, comp_quat)) return false;
+
+    // Where the renderers stand the posed mesh: its model matrix.
+    const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+    const std::vector<int32_t>& bones = enemy_body_bones_[arch_id];
+    out.bodies.reserve(enemy_bodies_.size());
+    Vec3 sum(0.0f, 0.0f, 0.0f);
+    for (size_t k = 0; k < enemy_bodies_.size(); ++k) {
+        const EnemyBodyTemplate& body = enemy_bodies_[k];
+        out.bodies.push_back(EnemyBody{body.bone, body.surface});
+        const int32_t b = bones[k];
+        if (b < 0 || static_cast<size_t>(b) >= comp_pos.size()) continue;
+        for (const AggShape& shape : body.shapes) {
+            // FKAggregateGeom::LineCheck: the element's TM, then the bone's matrix.
+            BodyShape s;
+            s.kind = shape.kind == AggShape::Box ? EBodyShape::Box : EBodyShape::Capsule;  // a sphere is a capsule of no length
+            s.body = static_cast<uint8_t>(k);
+            s.centre = bot_model.transform_point(enemy_mesh_to_bot(comp_pos[b] + comp_quat[b].rotate(shape.rows[3])));
+            for (int i = 0; i < 3; ++i) {
+                s.axis[i] = bot_model.transform_vector(enemy_mesh_to_bot(comp_quat[b].rotate(shape.rows[i]))).normalized();
+            }
+            s.half = shape.kind == AggShape::Sphere ? Vec3(shape.half.x, shape.half.x, 0.0f) : shape.half;
+            sum += s.centre;
+            out.shapes.push_back(s);
+        }
+    }
+    if (out.shapes.empty()) return false;
+
+    out.bound_centre = sum * (1.0f / static_cast<float>(out.shapes.size()));
+    for (const BodyShape& s : out.shapes) {
+        const float reach = s.kind == EBodyShape::Box ? s.half.length() : s.half.x + s.half.z;
+        out.bound_radius = std::max(out.bound_radius, (s.centre - out.bound_centre).length() + reach);
+    }
+    out.valid = true;
+    return true;
+}
+
+namespace {
+
+// A line as one ribbon turned to face `view_pos`, with both of its faces.
+void append_wire_line(std::vector<Vertex>& out, const Vec3& a, const Vec3& b, const Vec3& view_pos, float half_width, uint32_t col) {
+    const Vec3 diff = b - a;
+    const float len = diff.length();
+    if (len < 1.0e-4f) return;
+    const Vec3 dir = diff * (1.0f / len);
+    // Across the line as the view sees it; a line seen end on gets any side.
+    const Vec3 to_line = (a + b) * 0.5f - view_pos;
+    Vec3 axis = dir.cross(to_line);
+    if (axis.length_sq() <= 1.0e-6f * to_line.length_sq()) {
+        axis = dir.cross((std::abs(dir.z) < 0.9f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f));
+    }
+    axis = axis.normalized();
+    const Vec3 n = dir.cross(axis);
+    const Vertex va{a - axis * half_width, n, {1, 0, 0}, 0.0f, 0.0f, 0.0f, 0.0f, col};
+    const Vertex vb{a + axis * half_width, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, col};
+    const Vertex vc{b + axis * half_width, n, {1, 0, 0}, 1.0f, 1.0f, 0.0f, 0.0f, col};
+    const Vertex vd{b - axis * half_width, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, col};
+    for (const Vertex* v : {&va, &vb, &vc, &va, &vc, &vd, &va, &vc, &vb, &va, &vd, &vc}) out.push_back(*v);
+}
+
+// A posed body shape's outline: a box's twelve edges; a capsule's rings at the ends of its
+// cylinder, four lines along it and two arcs over each end.
+void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, const Vec3& view_pos, float half_width, uint32_t col) {
+    const auto at = [&](float x, float y, float z) { return s.centre + s.axis[0] * x + s.axis[1] * y + s.axis[2] * z; };
+    const auto line = [&](const Vec3& a, const Vec3& b) { append_wire_line(out, a, b, view_pos, half_width, col); };
+    if (s.kind == EBodyShape::Box) {
+        Vec3 corner[8];
+        for (int k = 0; k < 8; ++k) {
+            corner[k] = at((k & 1) ? s.half.x : -s.half.x, (k & 2) ? s.half.y : -s.half.y, (k & 4) ? s.half.z : -s.half.z);
+        }
+        for (int k = 0; k < 8; ++k) {
+            for (const int bit : {1, 2, 4}) {
+                if ((k & bit) == 0) line(corner[k], corner[k | bit]);
+            }
+        }
+        return;
+    }
+    constexpr int kSeg = 16;
+    const float r = s.half.x, h = s.half.z;
+    for (int i = 0; i < kSeg; ++i) {
+        const float t0 = 2.0f * PI * static_cast<float>(i) / kSeg, t1 = 2.0f * PI * static_cast<float>(i + 1) / kSeg;
+        for (const float z : {-h, h}) {
+            line(at(r * std::cos(t0), r * std::sin(t0), z), at(r * std::cos(t1), r * std::sin(t1), z));
+        }
+        if (i % (kSeg / 4) == 0 && h > 0.0f) {
+            line(at(r * std::cos(t0), r * std::sin(t0), -h), at(r * std::cos(t0), r * std::sin(t0), h));
+        }
+    }
+    for (int i = 0; i < kSeg / 2; ++i) {
+        const float t0 = PI * static_cast<float>(i) / (kSeg / 2), t1 = PI * static_cast<float>(i + 1) / (kSeg / 2);
+        for (const float end : {-1.0f, 1.0f}) {
+            const float z0 = end * (h + r * std::sin(t0)), z1 = end * (h + r * std::sin(t1));
+            line(at(r * std::cos(t0), 0.0f, z0), at(r * std::cos(t1), 0.0f, z1));
+            line(at(0.0f, r * std::cos(t0), z0), at(0.0f, r * std::cos(t1), z1));
+        }
+    }
+}
+
+}  // namespace
+
+// -----------------------------------------------------------------------------
 // Evaluate 3D Dropped Weapons & Active Ballistic Bullet Tracers in World Space
 // -----------------------------------------------------------------------------
-void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float /*sim_time*/,
+void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, const Vec3& view_pos, float sim_time, bool reaction_disarm,
                                           std::vector<Vertex>& out_world_tris,
                                           std::vector<Vertex>& out_rv_tris) const {
     out_world_tris.clear();
     out_rv_tris.clear();
+
+    // ME_SHOW_BODIES: the shapes a bullet meets in each enemy it can meet, as pose_enemy_bodies()
+    // gives them to the controller, over the mesh they belong to. The bodies of the head's material
+    // go with what is drawn in the runner-vision red. Only the enemies near the view: a chapter has
+    // 29 to 71 of them and a bot's lines are some 9,000 vertices, made anew each frame; further off
+    // than this a line is under a fifth of a pixel wide in a picture 1280 across.
+    if (show_enemy_bodies_) {
+        constexpr float kShownWithin = 3000.0f, kHalfWidth = 0.45f;
+        const uint32_t body_col = pack_rgba8(0.55f, 1.0f, 0.15f), head_col = pack_rgba8(1.0f, 0.10f, 0.10f);
+        EnemyBodySet set;
+        for (const EnemyBot& bot : scene.enemies) {
+            if (!enemy_stops_bullets(bot) || (bot.position - view_pos).length_sq() > kShownWithin * kShownWithin) continue;
+            if (!pose_enemy_bodies(bot, sim_time, reaction_disarm, set)) continue;
+            for (const BodyShape& s : set.shapes) {
+                const bool head = s.body < set.bodies.size() && set.bodies[s.body].surface == ECharacterSurface::Head;
+                append_body_shape_wires(head ? out_rv_tris : out_world_tris, s, view_pos, kHalfWidth, head ? head_col : body_col);
+            }
+        }
+    }
 
     // 1. Render 3D Dropped Weapons on the ground / flying through air
     for (const auto& dw : scene.dropped_weapons) {
@@ -3112,8 +3364,9 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float /*sim_t
         add_quad(side);
         add_quad(ortho);
 
-        // Impact spark burst at end_pos
-        if (alpha > 0.3f) {
+        // Impact spark burst at end_pos; none in a bot who shows nothing of the bullet (pawn_hit 3:
+        // one dying or dead, the tutorial's: TdBotPawn.PreventWeaponImpactEffect)
+        if (alpha > 0.3f && tr.pawn_hit != 3) {
             append_muzzle_flash_mesh(tr.hit_enemy ? out_rv_tris : out_world_tris,
                                      tr.end_pos - dir * 3.0f,
                                      dir * -1.0f, side, ortho,

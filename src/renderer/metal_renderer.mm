@@ -1996,15 +1996,18 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         }
 
         // B2a. Render 3D Dropped Weapons on Ground & 3D Bullet Tracers / Impact Sparks
+        // (and, with ME_SHOW_BODIES, the lines of the enemies' bodies)
         if (!impl_->menu_open && impl_->anim_system.is_loaded() &&
-            (!active_scene.dropped_weapons.empty() || !active_scene.active_tracers.empty())) {
+            (!active_scene.dropped_weapons.empty() || !active_scene.active_tracers.empty() ||
+             impl_->anim_system.shows_enemy_bodies())) {
             std::string pickup_wname = !active_scene.dropped_weapons.empty()
                                            ? active_scene.dropped_weapons.front().weapon_name
                                            : "Colt1911";
             bind_world_char_wep_textures(pickup_wname);
             std::vector<Vertex> combat_fx_verts;
             std::vector<Vertex> combat_rv_verts;
-            impl_->anim_system.evaluate_combat_world_fx(active_scene, telemetry.sim_time, combat_fx_verts, combat_rv_verts);
+            impl_->anim_system.evaluate_combat_world_fx(active_scene, cam_pos, telemetry.sim_time, telemetry.reaction_active,
+                                                       combat_fx_verts, combat_rv_verts);
             if (!combat_fx_verts.empty()) {
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
                 uniforms.is_runner_vision = 0.0f;
@@ -2797,6 +2800,10 @@ bool MetalRenderer::save_screenshot_png(const std::string& path) {
 
 void MetalRenderer::set_world_trace(std::function<bool(const Vec3& from, const Vec3& to, Vec3& hit, Vec3& normal)> trace) {
     impl_->anim_system.set_world_trace(std::move(trace));
+}
+
+bool MetalRenderer::pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) const {
+    return impl_->anim_system.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
 }
 
 void MetalRenderer::player_camera(const PlayerTelemetry& telemetry, Vec3& out_pos, Rotator& out_rot) const {
