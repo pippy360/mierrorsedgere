@@ -821,6 +821,10 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     bool kick_ok = false;
     bool kick_sounds_ok = false;
     bool door_cycle_ok = false;
+    bool slide_kick_ok = false;
+    bool slide_kick_sounds_ok = false;
+    float slide_kick_end_x = 0.0f;
+    float slide_kick_door_deg = 0.0f;
     bool barge_camera_ok = false;  // the first-person tree's eye turns with BargeInLeft / BargeOutLeft
     bool kick_camera_ok = false;   // and lunges with MeleeKickObject
     bool cues_ok = true;           // every sound the simulation starts resolves to a loaded cue
@@ -1021,9 +1025,41 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                         close_delay > 3.5f && close_delay < 3.7f;
         print_heard("Close", close_heard);
 
+        // 12E: Slide-kicking a closed barge door (MOVE_Slide -> MOVE_MeleeSlide via TdMove_MeleeSlide):
+        // sprinting into a slide and pressing melee barges the door open and carries Faith through.
+        reset_door();
+        controller.reset(Vec3(-3960.0f, -6360.0f, 4224.0f), 180.0f);
+        std::set<std::string> slide_kick_heard;
+        bool saw_melee_slide = false;
+        for (int step = 0; step < 120; ++step) {
+            InputFrame sk_in{};
+            sk_in.forward = 1.0f;
+            sk_in.sprint = true;
+            const float dx = std::abs(controller.get_position().x - door.center_pos.x);
+            if (dx <= 160.0f) {
+                sk_in.crouch = true;
+            }
+            if (dx <= 140.0f && door.state == DoorState::Closed && !saw_melee_slide) {
+                sk_in.melee = true;
+            }
+            controller.step(sk_in, kDt, sp00_scene);
+            collect_sounds(slide_kick_heard);
+            if (controller.get_telemetry().move_state == EMovement::MOVE_MeleeSlide) {
+                saw_melee_slide = true;
+            }
+        }
+        slide_kick_door_deg = door.open_angle_rad * (180.0f / 3.14159265f);
+        slide_kick_end_x = controller.get_telemetry().position.x;
+        slide_kick_ok = saw_melee_slide && std::abs(std::abs(slide_kick_door_deg) - 103.755f) < 1.0f &&
+                        (slide_kick_end_x < -4300.0f);
+        slide_kick_sounds_ok = heard_all(slide_kick_heard,
+                                         {"Cloth.Run", "Oral_Strain.Medium", "Foot_Swoosh",
+                                          "Wood._11_Female_FootStepAttack", "Doors.Door_Barge", "Doors.Door_Hit"});
+        print_heard("SlideKick", slide_kick_heard);
+
         s12_pass = no_auto_barge && saw_move_barge && barge_anims_ok && barge_speed_ok && barge_swing_ok &&
                    (final_door_x < -4300.0f) && barge_sounds_ok && kick_ok && kick_sounds_ok && door_cycle_ok &&
-                   cues_ok;
+                   slide_kick_ok && slide_kick_sounds_ok && cues_ok;
     }
     // Both door cues are SoundNodeMixers of two layers; Door_Hit's waves are imports from A_CXP_Plaza.
     const size_t barge_layers = audio.count_sound_layers("Doors.Door_Barge");
@@ -1043,6 +1079,9 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
               << ", KickSounds=" << (kick_sounds_ok ? "OK" : "MISSING")
               << ", DoorClose=" << (door_cycle_ok ? "OK" : "FAIL") << " (at " << close_start_t
               << " s, overshoot " << close_overshoot_deg << " deg)"
+              << ", SlideKick=" << (slide_kick_ok ? "OK" : "FAIL") << " (swing " << slide_kick_door_deg
+              << " deg, endX " << slide_kick_end_x << ")"
+              << ", SlideKickSounds=" << (slide_kick_sounds_ok ? "OK" : "MISSING")
               << ", Cues=" << (cues_ok ? std::string("OK") : ("UNRESOLVED " + missing_cues))
               << ", DoorCueLayers=" << barge_layers << "/" << hit_layers
               << ", BargeCamera=" << (barge_camera_ok ? "OK" : "FAIL") << " [in yaw " << barge_in_yaw_max
