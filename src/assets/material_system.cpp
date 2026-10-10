@@ -542,8 +542,9 @@ private:
     Val input(const ExprInput& in);
     Val input(const UPropertyList& props, const char* name) { return input(read_input(props, name)); }
     Val compile_expr(const ExprNode& nd);
+    // `sub_uv`: a sprite's two sub-images, blended (the node ParticleSubUV on a particle material).
     Val texture_sample(const ExprNode& nd, int32_t tex_ref, const std::string& param, bool is_param, bool param_cube,
-                       const ExprInput& coords);
+                       const ExprInput& coords, bool sub_uv = false);
     int tex_slot(bool cube, bool is_param, const std::string& param, const std::string& path, TexDefault fb);
     int uniform_slot(bool vec, const std::string& name, const std::array<float, 4>& def);
     Val material_input(const char* name, int n, const std::array<float, 4>& def);
@@ -569,6 +570,9 @@ private:
     bool translucent_ = false;
     bool reads_scene_ = false;  // may sample the scene: translucent, or a full-screen effect's material
     bool lens_flare_ = false;   // bUsedWithLensFlare: its vertex colour and LensFlare* inputs are the quad's (the scene block)
+    // bUsedWithParticleSprites / bUsedWithParticleSubUV: its vertex colour is the particle's, which
+    // a sprite's vertices carry where a mesh's carry their light map (renderer/particles.hpp).
+    bool particle_ = false;
     std::unordered_map<int32_t, Val> cache_;
     std::unordered_set<int32_t> visiting_;
     std::unordered_map<std::string, int> tex_slot_keys_;
@@ -649,7 +653,7 @@ int GraphCompiler::uniform_slot(bool vec, const std::string& name, const std::ar
 }
 
 Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std::string& param, bool is_param,
-                                  bool param_cube, const ExprInput& coords) {
+                                  bool param_cube, const ExprInput& coords, bool sub_uv) {
     std::string path;
     std::string cls;
     if (tex_ref != 0) {
@@ -692,6 +696,11 @@ Val GraphCompiler::texture_sample(const ExprNode& nd, int32_t tex_ref, const std
     const std::string k = std::to_string(slot);
     std::string s = cube ? ("c" + k + ".sample(sc" + k + ", " + uv.code + ")")
                          : ("t" + k + ".sample(s" + k + ", " + uv.code + ")");
+    if (sub_uv && !cube && !c.ok()) {
+        // ParticleSpriteVertexFactory.usf: TexCoords[0] and [1] are the two sub-images, [2].x their blend.
+        out_.texcoord_mask |= 3u;
+        s = "mix(t" + k + ".sample(s" + k + ", P.uv0), t" + k + ".sample(s" + k + ", P.uv1), saturate(P.lm_uv.x))";
+    }
     float scale[4];
     float bias[4];
     bool identity = true;
@@ -765,7 +774,11 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
     if (c == "ReflectionVector") return {"P.trefl", 3};
     if (c == "CameraVector") return {"P.tcam", 3};
     if (c == "LightVector") return {"P.tlight", 3};
-    if (c == "VertexColor") return {lens_flare_ ? "S.flare_color" : "P.vcolor", 4};
+    if (c == "VertexColor") {
+        if (lens_flare_) return {"S.flare_color", 4};
+        if (particle_) return emit(4, "float4(P.lm0, P.lm_uv.y)");
+        return {"P.vcolor", 4};
+    }
     if (c == "MeshEmitterVertexColor") return {"float4(1.0)", 4};
     if (c == "ScreenPosition") {
         if (prop_bool(p, "ScreenAlign", false)) {
@@ -1055,7 +1068,8 @@ Val GraphCompiler::compile_expr(const ExprNode& nd) {
         const bool is_param = c.rfind("TextureSampleParameter", 0) == 0;
         const bool param_cube = c == "TextureSampleParameterCube";
         const std::string pname = is_param ? prop_name(p, "ParameterName", "None") : std::string();
-        return texture_sample(nd, prop_object(p, "Texture"), pname, is_param, param_cube, read_input(p, "Coordinates"));
+        return texture_sample(nd, prop_object(p, "Texture"), pname, is_param, param_cube, read_input(p, "Coordinates"),
+                              c == "ParticleSubUV" && particle_);
     }
 
     // ---- Scene color / depth (translucent materials only) -----------------
@@ -1143,6 +1157,7 @@ void GraphCompiler::run() {
     // lighting model they were left on.
     lens_flare_ = prop_bool(mp, "bUsedWithLensFlare", false);
     if (lens_flare_) lighting = MatLightingModel::Unlit;
+    particle_ = !lens_flare_ && (prop_bool(mp, "bUsedWithParticleSprites", false) || prop_bool(mp, "bUsedWithParticleSubUV", false));
     const bool is_masked_flag = prop_bool(mp, "bIsMasked", false);
     const bool masked = blend == MatBlendMode::Masked || is_masked_flag;
     if (blend == MatBlendMode::Opaque && is_masked_flag) blend = MatBlendMode::Masked;

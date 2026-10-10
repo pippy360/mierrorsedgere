@@ -229,6 +229,11 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 // (or an Elevator's mid-shaft SeqAct_MultiLevelStreaming transition).
 bool stream_level_to_checkpoint(const std::string& game_root, LevelScene& scene, int checkpoint_idx);
 
+// The saved properties of a script class's default object ("Default__Class") and of the defaults it
+// inherits, nearest first: what a cooked object that saves only its differences falls back on.
+// Empty before a level has been loaded, or for a class the script packages do not have.
+std::vector<const std::vector<struct UProperty>*> script_default_chain(const std::string& key);
+
 // Builds the level's render batches and appends the static collision triangles of every actor
 // (call CollisionWorld::build() afterwards) from the real extracted UStaticMesh geometry. Real
 // static meshes are emitted as per-material MeshSections whose `material` indexes into
