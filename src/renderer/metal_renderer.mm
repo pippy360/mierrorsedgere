@@ -2006,7 +2006,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             bind_world_char_wep_textures(pickup_wname);
             std::vector<Vertex> combat_fx_verts;
             std::vector<Vertex> combat_rv_verts;
-            impl_->anim_system.evaluate_combat_world_fx(active_scene, telemetry.sim_time, telemetry.reaction_active,
+            impl_->anim_system.evaluate_combat_world_fx(active_scene, cam_pos, telemetry.sim_time, telemetry.reaction_active,
                                                        combat_fx_verts, combat_rv_verts);
             if (!combat_fx_verts.empty()) {
                 std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);

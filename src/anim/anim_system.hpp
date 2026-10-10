@@ -287,13 +287,14 @@ public:
         std::vector<AggShape> shapes;  // AggGeom, in the bone's space
     };
     [[nodiscard]] const std::vector<EnemyBodyTemplate>& enemy_bodies() const { return enemy_bodies_; }
-    // ME_SHOW_BODIES=1: evaluate_combat_world_fx() draws every living enemy's bodies as lines, the
-    // head's material in the runner-vision red, the body's green.
+    // ME_SHOW_BODIES=1: evaluate_combat_world_fx() draws, as lines, the bodies of every enemy a
+    // bullet can meet who is near the view: the head's material in the runner-vision red, the
+    // body's green.
     [[nodiscard]] bool shows_enemy_bodies() const { return show_enemy_bodies_; }
 
     // Evaluate 3D dropped weapons on the ground and active ballistic tracers / impact sparks
-    // (and, asked for, the enemies' bodies: shows_enemy_bodies())
-    void evaluate_combat_world_fx(const LevelScene& scene, float sim_time, bool reaction_disarm,
+    // (and, asked for, the enemies' bodies: shows_enemy_bodies(), as seen from view_pos)
+    void evaluate_combat_world_fx(const LevelScene& scene, const Vec3& view_pos, float sim_time, bool reaction_disarm,
                                   std::vector<Vertex>& out_world_tris,
                                   std::vector<Vertex>& out_rv_tris) const;
 

@@ -660,7 +660,10 @@ afresh. Two things make systems while the game runs:
   (`CH_TKY_Cop_SWAT.Male3p_Physics`, the only one the bots' packages import): `PM_Character_Body`, the neck
   and the hands `PM_Character_Head`, both with `PS_FX_Impact_Character_Body_Light_01` (a shotgun's pellet:
   `..._Body_Shotgun_01`), a pale puff of dust. `TdBotPawn_Tutorial.PreventWeaponImpactEffect` returns true:
-  the Training Area's partner never shows an effect nor sounds one.
+  the Training Area's partner never shows an effect nor sounds one. A bot who is dying is still what the
+  trace meets, and nothing comes of it: `TdBotPawn.TakeDamage` does nothing to one already dead and
+  `TdBotPawn.PreventWeaponImpactEffect` returns true in the state `Dying` (the script's two branches are
+  read; that his mesh goes on colliding is inferred from them).
 - How a bullet finds a bot. A shot is a line with no extent (`Weapon.CalcWeaponFire`: `Trace(.., vect(0,0,0),
   HitInfo, TRACEFLAG_Bullet)`), and neither of a pawn's cylinders blocks one (`BlockZeroExtent` False on
   `TdPawn`'s `CollisionCylinder` and `ActorCollisionCylinder`): it can meet a pawn only through his
@@ -730,30 +733,40 @@ place that chooses a bot's sequences and works out his bones; the drawn mesh is 
 him with, so what is hit is what is seen. Nothing of it is kept between calls or belongs to a frame. The
 controller has no skeletons: it is given a callback (`ParkourController::set_enemy_body_poser`, the
 renderer's `pose_enemy_bodies` in the game, the oracle and `--intro-shots`). At a trigger pull it poses, once,
-each living bot that the pull's cone can reach (within 320 uu of where he stands, measured: no state the port
-plays puts a body further than 271), then sends every pellet's line through them
+each bot a bullet can meet that the pull's cone can reach: the living, and the dead, who are drawn on in the
+pose they died in (`enemy_stops_bullets`; a story character who is off stage is not). The reach is 360 uu
+from where he stands, against a measured 303: the oracle's stage 23 poses every archetype in every state and
+with every sequence the controller gives a bot, and the furthest a body gets is 303 uu, in a bot thrown back
+by the kick from the air (`HitMeleeInAir_High`), alive or dead; kicked along the floor it is 272, being
+disarmed 271, standing, walking or aiming 185 to 188. It then sends every pellet's line through those poses
 (`trace_enemy_bodies`: a slab test for a box, the cylinder's side and the two end spheres for a capsule, the
-nearest shape winning). The body met gives the tracer its end, the surface's normal and its material
-(`BulletTracer::pawn_normal`, `pawn_surface`); the damage is doubled on `PM_Character_Head`, which each level
-loads beside `PM_Character_Body` (`LevelScene::character_head_physical`); the impact effect is made there,
-pointed as from that surface, with the body's sound; the tutorial's bot shows and sounds nothing. With no
-callback (`me_replay`, which has no renderer) or no character assets a bot is still his pawn's cylinder
-(48 round his axis, 180 high, the head from 150 up), which retail never tests.
+nearest shape winning), so the pellets that come after the one that kills him end in him too. The body met
+gives the tracer its end, the surface's normal and its material (`BulletTracer::pawn_normal`,
+`pawn_surface`); the damage is doubled on `PM_Character_Head`, which each level loads beside
+`PM_Character_Body` (`LevelScene::character_head_physical`); the impact effect is made there, pointed as from
+that surface, with the body's sound. A shot in a dead bot, the shot that kills one and any shot in the
+tutorial's bot show and sound nothing (`BulletTracer::pawn_hit` 3), the red burst the port draws at a tracer's
+end included, and a dead bot takes no damage. With no callback (`me_replay`, which has no renderer) or no
+character assets a living bot is still his pawn's cylinder (48 round his axis, 180 high, the head from 150
+up), which retail never tests, and a dead one is met by nothing.
 
 What runs is sprite and mesh emitters with the module classes of the table: in the Prologue's opening area
 149 emitters of 95 systems, 38 of them mesh emitters, 1 left out; in Heat's 130 of 110 systems, 27 mesh
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
 attractors and collision. Not as the game: whether a bot's shot shows its impact is only its distance from
 the player (the game also asks whether the shooter was drawn lately); a bot's bodies stand as the port's own
-table of states poses him, not as retail's animation tree would (he takes no bullet hole, and does not in the
-game: section 12); the armour that `TdPawn.AdjustDamage` takes off by the bone hit, the riot shield, the
-player's own bodies under a bot's fire and the helicopter are not there (`TODO.md`);
-sprites are not sorted against other translucent surfaces. (The glass panes' effects play when
-the pane is broken: [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
+table of states poses him, not as retail's animation tree would, and a dead bot's where the sequence he died
+with ends, not as retail's death animation or ragdoll leaves him (he takes no bullet hole, and does not in the
+game: section 12); a story character playing a cutscene's sequence is drawn as far from where she is placed
+as the scene takes her, past the first reject's 360 uu, and a shot at her there goes through; the armour that
+`TdPawn.AdjustDamage` takes off by the bone hit, the riot shield, the player's own bodies under a bot's fire
+and the helicopter are not there (`TODO.md`); sprites are not sorted against other translucent surfaces. (The
+glass panes' effects play when the pane is broken:
+[`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
-`ME_IMPACT_DEBUG=1` says what every bullet hit and what it left; `ME_SHOW_BODIES=1` draws every living
-enemy's bodies over him as lines.
+`ME_IMPACT_DEBUG=1` says what every bullet hit and what it left; `ME_SHOW_BODIES=1` draws, as lines over
+him, the bodies of every enemy a bullet can meet within 3000 uu of the view.
 
 ## 14. In the port
 
@@ -809,9 +822,9 @@ Options for looking at things:
 | `ME_SHOT_STAND="x,y,z"` | With `--intro-shots`: the pictures are the player's, standing there (feet), not the intro's camera's |
 | `ME_SHOT_MOVERS="degrees,units[,1]"` | With `--intro-shots`: lists the level's doors and lifts; the shots are fired before the first picture only, and after it every door is swung by the degrees and every lift part raised by the units (with the third number the shots are fired before the later pictures too) |
 | `ME_SHOT_BODY=<units>` | With `ME_SHOT_FIRE`: the shots stop in a person that far ahead, not in the level |
-| `ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds]]]]]"` | With `--intro-shots`: the level's own enemies are put away and one bot stands on the floor that far ahead of the view (220 unless given), in the state named (`idle`, `walk`, `run`, `aim`, `windup`, `strike`, `stagger`, `disarm`), with that weapon, turned by so many degrees from facing the view, so many seconds into a timed state; the shots of `ME_SHOT_FIRE` then meet his bodies and say which, e.g. `ME_SHOT_BOT="PatrolCop,run,170,Colt1911,70"` |
-| `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every living enemy, as lines: the head's material in the runner-vision red, the body's green; at start, lists the physics asset as read |
-| `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds); with the variable it prints what level lines meet across the bot it poses, front on and side on, by body |
+| `ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds[,sequence]]]]]]"` | With `--intro-shots`: the level's own enemies are put away and one bot stands on the floor that far ahead of the view (220 unless given), in the state named (`idle`, `walk`, `run`, `aim`, `windup`, `strike`, `stagger`, `disarm`, `dead`), with that weapon, turned by so many degrees from facing the view, so many seconds into a timed state, playing the sequence named where the state takes one from the controller; the shots of `ME_SHOT_FIRE` then meet his bodies and say which, e.g. `ME_SHOT_BOT="PatrolCop,run,170,Colt1911,70"`, `ME_SHOT_BOT="Assault_SWAT,dead,60,None,0,1,HitMeleeInAir_High"` |
+| `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every enemy it can meet (the living and the dead) within 3000 uu of the view, as lines: the head's material in the runner-vision red, the body's green; at start, lists the physics asset as read |
+| `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds); with the variable it also prints the bodies' reach by sequence, and what level lines meet across the bot it poses, front on and side on, by body |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |

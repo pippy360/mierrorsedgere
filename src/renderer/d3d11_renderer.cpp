@@ -2352,7 +2352,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             bind_world_char_wep_textures(pickup_wname);
             std::vector<Vertex> combat_fx_verts;
             std::vector<Vertex> combat_rv_verts;
-            impl->anim_system.evaluate_combat_world_fx(active_scene, telemetry.sim_time, telemetry.reaction_active,
+            impl->anim_system.evaluate_combat_world_fx(active_scene, cam_pos, telemetry.sim_time, telemetry.reaction_active,
                                                        combat_fx_verts, combat_rv_verts);
             if (!combat_fx_verts.empty()) {
                 set_matrix(uniforms.model, identity);

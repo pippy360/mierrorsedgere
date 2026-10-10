@@ -79,6 +79,16 @@ struct EnemyBodyHit {
     std::string_view bone;         // the body's bone: the set's own string, good while the set is
 };
 
+// Whether a bullet can meet this bot at all. A pawn that has died is still what the weapon's trace
+// meets: the script has a branch for the bullet that finds him so (TdBotPawn.TakeDamage does
+// nothing to one already dead; TdBotPawn.PreventWeaponImpactEffect answers true in the state Dying,
+// so it leaves no effect and no sound). That his mesh goes on colliding is inferred from those
+// branches, not read in the executable. Here a dead bot is drawn on in the pose he died in, by the
+// code that poses a living one. A story character's `alive` says only whether she is on stage.
+inline bool enemy_stops_bullets(const EnemyBot& bot) {
+    return bot.alive || !bot.is_story_npc;
+}
+
 // Whether the line from `from` along the unit vector `dir`, `max_dist` long, comes within `radius`
 // of `centre`.
 inline bool line_near_point(const Vec3& from, const Vec3& dir, float max_dist, const Vec3& centre, float radius) {

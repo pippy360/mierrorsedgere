@@ -5427,7 +5427,7 @@ void ParkourController::pose_enemies_for_shot(const LevelScene& scene, const Vec
     spread = std::clamp(spread, 0.0f, 0.9f);
     for (size_t i = 0; i < scene.enemies.size(); ++i) {
         const EnemyBot& bot = scene.enemies[i];
-        if (!bot.alive) continue;
+        if (!enemy_stops_bullets(bot)) continue;
         // Out of every pellet's reach: a pellet is at most `spread` of its way off the middle line,
         // and his bodies within kEnemyBodyReach of where he stands.
         const Vec3 to_bot = bot.position - from;
@@ -5448,10 +5448,11 @@ bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector
     float best = max_dist;
     for (size_t i = 0; i < scene.enemies.size(); ++i) {
         const EnemyBot& bot = scene.enemies[i];
-        if (!bot.alive) continue;
         if (i < posed.size() && posed[i].valid) {
             // UPhysicsAsset::LineCheck: the nearest of his bodies; its material and its bone go
-            // with the hit (HitInfo.PhysMaterial, HitInfo.BoneName).
+            // with the hit (HitInfo.PhysMaterial, HitInfo.BoneName). He was posed for this pull, so
+            // he is met whether he lives or not: a pellet that comes after the one that killed him
+            // ends in him too, as the trace still finds a dying pawn.
             EnemyBodyHit h;
             if (!trace_enemy_bodies(posed[i], from, dir, best, h)) continue;
             if (out.enemy >= 0 && h.distance >= best) continue;
@@ -5466,6 +5467,8 @@ bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector
             out.bone.assign(h.bone);
             continue;
         }
+        // The cylinder is a living bot's alone, as it was before there were bodies.
+        if (!bot.alive) continue;
         const Vec3 bot_center = bot.position + Vec3(0, 0, kBotHeight * 0.5f);
         const float proj = (bot_center - from).dot(dir);
         if (proj > 0.0f && proj < best) {
@@ -5800,8 +5803,8 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             float max_dist = wall_hit.hit ? eye.distance(wall_hit.point) : ws.range;
             Vec3 tracer_end = wall_hit.hit ? wall_hit.point : (eye + ray_dir * std::min(ws.range, 2500.0f));
 
-            // Against the living enemies, short of the level: the nearest body of a bot's physics
-            // asset the line goes into (his pawn's cylinder where he has none here).
+            // Against the enemies, short of the level: the nearest body of a bot's physics asset the
+            // line goes into (a living bot's cylinder where he has none here).
             EnemyShotHit shot;
             EnemyBot* hit_bot = nullptr;
             float best_bot_dist = max_dist;
@@ -5811,7 +5814,9 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                 tracer_end = shot.location;
             }
 
-            if (hit_bot != nullptr) {
+            // TdBotPawn.TakeDamage: nothing for a bot already dead (an earlier pellet of this pull
+            // killed him, or he lay there before it); the bullet stops in him all the same.
+            if (hit_bot != nullptr && hit_bot->alive) {
                 any_hit = true;
                 // Distance damage falloff from DefaultWeapons.ini
                 float t_falloff = 0.0f;
@@ -5865,8 +5870,8 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.timer = 0.09f;
             tr.max_time = 0.09f;
             tr.hit_enemy = (hit_bot != nullptr);
-            // TdBotPawn.PreventWeaponImpactEffect: a bot that is dying (the shot that killed him
-            // included: the damage comes first) shows nothing; TdBotPawn_Tutorial's never does.
+            // TdBotPawn.PreventWeaponImpactEffect: a bot that is dying or dead (the shot that killed
+            // him included: the damage comes first) shows nothing; TdBotPawn_Tutorial's never does.
             tr.pawn_hit = hit_bot ? ((hit_bot->alive && !is_tutorial_bot(*hit_bot)) ? 1 : 3) : 0;
             tr.pawn_normal = shot.normal;
             tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;

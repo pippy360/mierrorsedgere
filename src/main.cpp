@@ -1040,12 +1040,15 @@ static int run_dump_sound_cues(const std::string& game_root, const std::string& 
 // with the renderer's own skeletons. Oracle stage 24; --verify-bodies runs it alone.
 //   Asset   the bodies a posed bot carries against the sizes read out of the package
 //           (CH_TKY_Cop_SWAT.Male3p_Physics: 16 bodies, 7 boxes, 10 capsules), on every archetype,
-//           and how far from where he stands they reach in any state
+//           and how far from where he stands they reach in any state and sequence the controller
+//           gives a bot, a dead one's included
 //   Lines   a few thousand lines through a posed bot from three sides, each against the same
-//           shapes walked in steps of a twentieth of a unit with a point-in-shape test
+//           shapes walked in steps of a twentieth of a unit, the two compared across the shapes'
+//           surfaces
 //   Rays    lines with known answers, on his bodies and on the cylinder that stands in for them
 //   Pulls   the controller's own trigger pulls: the damage, what the tracer carries, how many bots
-//           a pull poses, the cylinder when nothing poses them, the tutorial's bot
+//           a pull poses, a shotgun's pellets after the one that kills, a dead bot, the cylinder
+//           when nothing poses them, the tutorial's bot
 // -----------------------------------------------------------------------------
 static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, const me::MovementConfig& move_cfg) {
     using namespace me;
@@ -1125,35 +1128,69 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         }
     }
     asset_ok = asset_ok && worst_size < 0.001f;
-    // Every archetype the port draws, in every state it plays: the bodies found, and their reach.
+    // Every archetype the port draws, in every state the controller puts a bot in and with every
+    // sequence it names for him there (ParkourController writes EnemyBot::active_anim_seq: a blow's
+    // or a bullet's HitMelee*, the disarm's Snatch*; none is the state's own), with a light weapon's
+    // set of sequences and a heavy one's, at forty moments: the bodies found, and their reach. A
+    // dead bot keeps the sequence he died with and is drawn, and met, at its end.
     static const char* const kArchetypes[] = {"Assault_SWAT", "PatrolCop", "Support", "RiotCop", "PursuitCop", "Celeste",
                                               "Kate",         "Jacknife",  "Ropeburn", "Miller",  "Kreeg"};
-    static const EEnemyAnimState kStates[] = {EEnemyAnimState::Idle,        EEnemyAnimState::Patrol,      EEnemyAnimState::Chase,
-                                              EEnemyAnimState::AimFire,     EEnemyAnimState::MeleeWindup, EEnemyAnimState::MeleeStrike,
-                                              EEnemyAnimState::HitStagger,  EEnemyAnimState::BeingDisarmed};
-    static const char* const kStateNames[] = {"idle", "walk", "run", "aim", "windup", "strike", "stagger", "disarm"};
-    std::string archetype_note, reach_note;
-    float reach = 0.0f, state_reach[std::size(kStates)] = {};
+    static const char* const kOwn[] = {""};
+    static const char* const kBlows[] = {"",                    "HitMeleeRight",      "HitMeleeLeft",  "HitMeleeSoccerKick",
+                                         "HitMeleeCrouchSweep", "HitMeleeInAir_High", "HitMeleeSlide", "HitMeleeWallrunRight"};
+    static const char* const kSnatches[] = {"", "SnatchFwd", "SnatchBack"};
+    static const char* const kDeaths[] = {"",                   "HitMeleeRight", "HitMeleeLeft",         "HitMeleeSoccerKick", "HitMeleeCrouchSweep",
+                                          "HitMeleeInAir_High", "HitMeleeSlide", "HitMeleeWallrunRight", "SnatchFwd",          "SnatchBack"};
+    struct Played {
+        const char* name;
+        EEnemyAnimState state;
+        bool stunned, alive;
+        const char* const* sequences;
+        size_t sequence_count;
+    };
+    static const Played kPlayed[] = {
+        {"idle", EEnemyAnimState::Idle, false, true, kOwn, std::size(kOwn)},
+        {"walk", EEnemyAnimState::Patrol, false, true, kOwn, std::size(kOwn)},
+        {"run", EEnemyAnimState::Chase, false, true, kOwn, std::size(kOwn)},
+        {"aim", EEnemyAnimState::AimFire, false, true, kOwn, std::size(kOwn)},
+        {"windup", EEnemyAnimState::MeleeWindup, false, true, kOwn, std::size(kOwn)},
+        {"strike", EEnemyAnimState::MeleeStrike, false, true, kOwn, std::size(kOwn)},
+        {"stagger", EEnemyAnimState::HitStagger, true, true, kBlows, std::size(kBlows)},
+        {"disarm", EEnemyAnimState::BeingDisarmed, true, true, kSnatches, std::size(kSnatches)},
+        {"dead", EEnemyAnimState::KnockedOut, true, false, kDeaths, std::size(kDeaths)},
+    };
+    std::string archetype_note, reach_note, state_note[std::size(kPlayed)];
+    float reach = 0.0f, state_reach[std::size(kPlayed)] = {}, sequence_reach[std::size(kPlayed)][std::size(kDeaths)] = {};
     int poses = 0;
     for (const char* archetype : kArchetypes) {
         size_t shapes = 0;
-        for (size_t state = 0; state < std::size(kStates); ++state) {
-            for (int k = 0; k < 40; ++k) {
-                EnemyBot bot = make_bot(archetype, k % 2 ? "G36C" : "Colt1911");
-                bot.anim_state = kStates[state];
-                bot.anim_timer = static_cast<float>(k) * 0.025f;
-                EnemyBodySet s;
-                if (!renderer.pose_enemy_bodies(bot, static_cast<float>(k) * 0.0437f, false, s)) continue;
-                ++poses;
-                shapes = s.shapes.size();
-                float far = 0.0f;
-                for (const BodyShape& b : s.shapes) {
-                    far = std::max(far, (b.centre - bot.position).length() + (b.kind == EBodyShape::Box ? b.half.length() : b.half.x + b.half.z));
-                }
-                state_reach[state] = std::max(state_reach[state], far);
-                if (far > reach) {
-                    reach = far;
-                    reach_note = std::string(archetype) + ", " + kStateNames[state];
+        for (size_t state = 0; state < std::size(kPlayed); ++state) {
+            const Played& played = kPlayed[state];
+            for (size_t q = 0; q < played.sequence_count; ++q) {
+                for (int k = 0; k < 80; ++k) {
+                    EnemyBot bot = make_bot(archetype, k % 2 ? "G36C" : "Colt1911");
+                    bot.anim_state = played.state;
+                    bot.alive = played.alive;
+                    bot.stunned = played.stunned;
+                    bot.active_anim_seq = played.sequences[q];
+                    bot.anim_timer = static_cast<float>(k / 2) * 0.025f;
+                    EnemyBodySet s;
+                    if (!renderer.pose_enemy_bodies(bot, static_cast<float>(k / 2) * 0.0437f, false, s)) continue;
+                    ++poses;
+                    shapes = s.shapes.size();
+                    float far = 0.0f;
+                    for (const BodyShape& b : s.shapes) {
+                        far = std::max(far, (b.centre - bot.position).length() + (b.kind == EBodyShape::Box ? b.half.length() : b.half.x + b.half.z));
+                    }
+                    sequence_reach[state][q] = std::max(sequence_reach[state][q], far);
+                    if (far > state_reach[state]) {
+                        state_reach[state] = far;
+                        state_note[state] = played.sequences[q];
+                    }
+                    if (far > reach) {
+                        reach = far;
+                        reach_note = std::string(archetype) + ", " + played.name + (played.sequences[q][0] ? std::string(" with ") + played.sequences[q] : std::string());
+                    }
                 }
             }
         }
@@ -1171,8 +1208,22 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
               << " shapes on a posed bot, sizes within " << std::setprecision(5) << worst_size << std::setprecision(2)
               << " of the package's; shapes by archetype: " << archetype_note << "; furthest reach from where he stands over " << poses
               << " poses " << reach << " uu (" << reach_note << "; the first reject allows " << kEnemyBodyReach << "), by state:";
-    for (size_t k = 0; k < std::size(kStates); ++k) std::cout << " " << kStateNames[k] << " " << state_reach[k];
+    for (size_t k = 0; k < std::size(kPlayed); ++k) {
+        std::cout << " " << kPlayed[k].name << " " << state_reach[k];
+        if (!state_note[k].empty()) std::cout << " (" << state_note[k] << ")";
+    }
     std::cout << std::endl;
+    if (std::getenv("ME_BODIES_DEBUG")) {
+        // The reach by sequence, in the states that take one from the controller.
+        for (size_t k = 0; k < std::size(kPlayed); ++k) {
+            if (kPlayed[k].sequence_count < 2) continue;
+            std::cout << "  reach, " << kPlayed[k].name << ":";
+            for (size_t q = 0; q < kPlayed[k].sequence_count; ++q) {
+                std::cout << " " << (kPlayed[k].sequences[q][0] ? kPlayed[k].sequences[q] : "(its own)") << " " << sequence_reach[k][q];
+            }
+            std::cout << std::endl;
+        }
+    }
     pass = pass && asset_ok;
     if (!posed_ok) {
         std::cout << "  -> Stage 24 Result: FAIL (no bot could be posed: the character assets are missing)" << std::endl;
@@ -1187,48 +1238,78 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     std::vector<EnemyBodySet> posed;
     controller.pose_enemies_for_shot(scene, stand + up * 150.0f, fwd * -1.0f, 4000.0f, 0.0f, posed);
     set = posed[0];
-    const auto inside = [](const BodyShape& s, const Vec3& p) {
-        const Vec3 rel = p - s.centre;
-        const float x = rel.dot(s.axis[0]), y = rel.dot(s.axis[1]), z = rel.dot(s.axis[2]);
-        if (s.kind == EBodyShape::Box) return std::abs(x) <= s.half.x && std::abs(y) <= s.half.y && std::abs(z) <= s.half.z;
-        const float past = z - std::clamp(z, -s.half.z, s.half.z);
-        return x * x + y * y + past * past <= s.half.x * s.half.x;
+    // How far a point is from a shape's surface, less than nothing inside it. In doubles, so that
+    // the walk has no rounding of its own to answer for.
+    const auto off_surface = [](const BodyShape& s, double px, double py, double pz) {
+        const double rx = px - s.centre.x, ry = py - s.centre.y, rz = pz - s.centre.z;
+        const auto along = [&](const Vec3& axis) { return rx * axis.x + ry * axis.y + rz * axis.z; };
+        const double x = along(s.axis[0]), y = along(s.axis[1]), z = along(s.axis[2]);
+        if (s.kind == EBodyShape::Box) {
+            const double ex = std::abs(x) - s.half.x, ey = std::abs(y) - s.half.y, ez = std::abs(z) - s.half.z;
+            const double ox = std::max(ex, 0.0), oy = std::max(ey, 0.0), oz = std::max(ez, 0.0);
+            return std::sqrt(ox * ox + oy * oy + oz * oz) + std::min(std::max({ex, ey, ez}), 0.0);
+        }
+        const double past = z - std::clamp(z, -static_cast<double>(s.half.z), static_cast<double>(s.half.z));
+        return std::sqrt(x * x + y * y + past * past) - s.half.x;
     };
-    constexpr float kStep = 0.05f;
+    constexpr double kStep = 0.05;
+    // The trace and the walk are held against each other across a shape's surface, not along the
+    // line: where a line that grazes a shape goes into it moves along the line by many times a
+    // float's last bit (half a thousandth of a unit at these coordinates), across the surface by
+    // no more than that bit. A hundredth of a unit is the skin within which the two may differ.
+    constexpr double kSkin = 0.01;
+    // The walk: how deep in a shape of `in` the points of a line get, on all of it, and on the part
+    // of it short of `before`.
+    const auto walk = [&](const EnemyBodySet& in, const Vec3& from, const Vec3& dir, float length, float before, double& deepest_before) {
+        double deepest = 0.0;
+        deepest_before = 0.0;
+        for (const BodyShape& s : in.shapes) {
+            const double round = (s.kind == EBodyShape::Box ? s.half.length() : s.half.x + s.half.z) + 1.0;
+            const double mid = (s.centre - from).dot(dir);
+            const int first = std::max(0, static_cast<int>(std::ceil((mid - round) / kStep)));
+            const int last = static_cast<int>(std::floor(std::min(static_cast<double>(length), mid + round) / kStep));
+            for (int k = first; k <= last; ++k) {
+                const double t = static_cast<double>(k) * kStep;
+                const double deep = -off_surface(s, from.x + dir.x * t, from.y + dir.y * t, from.z + dir.z * t);
+                deepest = std::max(deepest, deep);
+                if (t < before) deepest_before = std::max(deepest_before, deep);
+            }
+        }
+        return deepest;
+    };
     int lines = 0, same_hit = 0, same_miss = 0, grazes = 0, wrong = 0, bad_normals = 0;
-    float worst_step = 0.0f;
+    double worst_entry = 0.0, worst_before = 0.0;
     const auto check_line = [&](const Vec3& from, const Vec3& dir, float length) {
         ++lines;
         EnemyBodyHit hit;
         const bool met = trace_enemy_bodies(set, from, dir, length, hit);
-        float walked = -1.0f;
-        for (int k = 0; static_cast<float>(k) * kStep <= length && walked < 0.0f; ++k) {
-            const Vec3 p = from + dir * (static_cast<float>(k) * kStep);
-            if ((p - set.bound_centre).length() > set.bound_radius + 1.0f) continue;
-            for (const BodyShape& s : set.shapes) {
-                if (inside(s, p)) {
-                    walked = static_cast<float>(k) * kStep;
-                    break;
-                }
-            }
-        }
+        double deepest_before = 0.0;
+        const double deepest = walk(set, from, dir, length, met ? hit.distance : 0.0f, deepest_before);
         if (!met) {
-            walked < 0.0f ? ++same_miss : ++wrong;
+            // Nothing met: right unless the walk gets under a shape's skin.
+            if (deepest > kSkin) {
+                ++wrong;
+            } else {
+                deepest > 0.0 ? ++grazes : ++same_miss;
+            }
             return;
         }
+        // Met: right when the place is on the surface of the shape named and the walk is under no
+        // shape's skin before it.
         const BodyShape& s = set.shapes[static_cast<size_t>(hit.shape)];
-        if (walked >= hit.distance - 0.002f && walked <= hit.distance + kStep + 0.002f) {
-            ++same_hit;
-            worst_step = std::max(worst_step, walked - hit.distance);
-            // The normal: of length one, against the line, and across the shape's surface.
-            const bool normal_ok = std::abs(hit.normal.length() - 1.0f) < 1.0e-3f && hit.normal.dot(dir) <= 1.0e-3f &&
-                                   !inside(s, hit.location + hit.normal * 0.02f) && inside(s, hit.location - hit.normal * 0.02f);
-            if (!normal_ok) ++bad_normals;
-        } else if (!inside(s, from + dir * (hit.distance + kStep))) {
-            ++grazes;  // the line is in the shape for less than a step: the walk may pass over it
-        } else {
+        const double at_entry = off_surface(s, hit.location.x, hit.location.y, hit.location.z);
+        if (std::abs(at_entry) > kSkin || deepest_before > kSkin) {
             ++wrong;
+            return;
         }
+        worst_entry = std::max(worst_entry, std::abs(at_entry));
+        worst_before = std::max(worst_before, deepest_before);
+        // The normal: of length one, against the line, and straight out of the shape: ten units
+        // along it from the place are ten units further from the surface.
+        const double out = off_surface(s, hit.location.x + 10.0 * hit.normal.x, hit.location.y + 10.0 * hit.normal.y, hit.location.z + 10.0 * hit.normal.z);
+        if (std::abs(hit.normal.length() - 1.0f) >= 1.0e-3f || hit.normal.dot(dir) > 1.0e-3f || out - at_entry < 10.0 - kSkin) ++bad_normals;
+        // (A line that is under the skin for less than a step, or never, the walk cannot vouch for.)
+        deepest > kSkin ? ++same_hit : ++grazes;
     };
     for (int iy = -15; iy <= 15; ++iy) {
         for (int iz = -1; iz <= 50; ++iz) {
@@ -1241,9 +1322,10 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         }
     }
     const bool lines_ok = wrong == 0 && bad_normals == 0 && same_hit > 500 && same_miss > 500;
-    std::cout << "  [Lines] " << (lines_ok ? "OK" : "FAIL") << ": " << lines << " lines: " << same_hit << " meet the same shape where the walk does (the walk at most "
-              << std::setprecision(3) << worst_step << std::setprecision(2) << " uu later), " << same_miss << " meet nothing either way, " << grazes
-              << " graze a shape for less than a step, " << wrong << " differ; " << bad_normals << " wrong normals" << std::endl;
+    std::cout << "  [Lines] " << (lines_ok ? "OK" : "FAIL") << ": " << lines << " lines: " << same_hit << " go into a shape as the walk does (the place within "
+              << std::setprecision(4) << worst_entry << " uu of that shape's surface, the walk no deeper than " << worst_before << std::setprecision(2)
+              << " in any shape before it), " << same_miss << " meet nothing either way, " << grazes << " graze a shape (in it for less than a step, or no deeper than "
+              << kSkin << "), " << wrong << " differ; " << bad_normals << " wrong normals" << std::endl;
     pass = pass && lines_ok;
     if (std::getenv("ME_BODIES_DEBUG")) {
         // What lines straight at him meet, front on and from his right, every 2 uu across and 4 up:
@@ -1341,13 +1423,18 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         bool fired = false;
         float damage = 0.0f;
         int tracers = 0, bots_met = 0, posed = 0;
-        BulletTracer tracer;  // the last one of the pull
+        int unshown = 0;       // of bots_met: those that left nothing to see (pawn_hit 3)
+        int through_pose = 0;  // the tracers whose line from her eyes goes into the bodies the first bot had at the pull
+        int astray = 0;        // the tracers at odds with those bodies: through one and on, or ended on none
+        bool alive = false;    // the first bot, after it
+        BulletTracer tracer;   // the last one of the pull
         ParkourController::EnemyShotHit expected;  // what the same line meets, asked just before
         bool expected_met = false;
     };
     // One pull at the aim `which` on the first of `bots`, which are the enemies for it.
     const auto pull = [&](const std::vector<EnemyBot>& bots, int which, bool scatter) {
-        for (int i = 0; i < 16; ++i) controller.step(idle, kDt, scene);  // the weapon's interval, and the trigger let go
+        // The weapon's interval (a pump-action's is the longest), and the trigger let go.
+        for (int i = 0; i < 16 || (i < 240 && controller.get_telemetry().weapon.cooldown > 0.0f); ++i) controller.step(idle, kDt, scene);
         scene.enemies = bots;
         scene.active_tracers.clear();
         if (!scatter) controller.get_telemetry().weapon.spread_rad = 0.0f;
@@ -1367,10 +1454,24 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         p.fired = controller.get_telemetry().weapon.fired_this_tick;
         p.posed = posed_calls - calls;
         p.damage = health - scene.enemies[0].health;
+        p.alive = scene.enemies[0].alive;
         for (const BulletTracer& tr : scene.active_tracers) {
             if (!tr.from_player) continue;
             ++p.tracers;
             p.bots_met += tr.pawn_hit != 0 ? 1 : 0;
+            p.unshown += tr.pawn_hit == 3 ? 1 : 0;
+            // The tracer's line against the bodies the first bot had as the trigger was pulled, across
+            // their surfaces as for the lines above: one that stopped in a bot ends on a shape's
+            // surface with no shape gone through before it, one that did not has gone through none.
+            const Vec3 line = tr.end_pos - eye, along = line.normalized();
+            EnemyBodyHit in_pose;
+            p.through_pose += trace_enemy_bodies(now[0], eye, along, line.length() + 0.05f, in_pose) ? 1 : 0;
+            if (now[0].valid) {
+                double deepest_before = 0.0, off = 1.0e9;
+                const double deepest = walk(now[0], eye, along, line.length(), line.length(), deepest_before);
+                for (const BodyShape& s : now[0].shapes) off = std::min(off, std::abs(off_surface(s, tr.end_pos.x, tr.end_pos.y, tr.end_pos.z)));
+                p.astray += (tr.pawn_hit != 0 ? off > kSkin || deepest_before > kSkin : deepest > kSkin) ? 1 : 0;
+            }
             p.tracer = tr;
         }
         return p;
@@ -1408,21 +1509,51 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     }
 
     // A shotgun: every pellet of the pull meets the pose he had as the trigger was pulled, posed once,
-    // whatever the first pellet's blow made of him.
+    // whatever the pellets before it made of him. The pull kills a bot of 100: the pellets that come
+    // after the one that does end in him as well, and show nothing. Each tracer's line is held
+    // against the bodies he had at the pull; and the same pull at a bot who cannot die.
     controller.equip_weapon("Remington870");
+    const auto pellets = [](const Pull& q) {
+        return ", " + std::to_string(q.tracers) + " pellets: " + std::to_string(q.bots_met) + " end in him, " + std::to_string(q.unshown) +
+               " of them showing nothing; " + std::to_string(q.through_pose) + " lines go into the bodies he had at the pull, " +
+               std::to_string(q.astray) + " at odds with them";
+    };
     Pull p = pull(swat, kAimBelly, true);
-    say("a shotgun at the belly", p.fired && p.tracers > 1 && p.bots_met > 1 && p.posed == 1 && p.damage > 0.0f, p,
-        ", " + std::to_string(p.tracers) + " pellets, " + std::to_string(p.bots_met) + " in him");
+    say("a shotgun at the belly", p.fired && p.tracers > 1 && p.posed == 1 && !p.alive && p.astray == 0 && p.unshown >= 2, p, pellets(p));
+    std::vector<EnemyBot> tough = swat;
+    tough[0].health = tough[0].max_health = 100000.0f;
+    p = pull(tough, kAimBelly, true);
+    say("a shotgun at the belly of one who cannot die",
+        p.fired && p.tracers > 1 && p.posed == 1 && p.alive && p.astray == 0 && p.bots_met > 1 && p.unshown == 0 && p.damage > 100.0f, p, pellets(p));
     controller.equip_weapon("Colt1911");
 
-    // Three bots: the one aimed at, one 400 uu to his side and one behind her. Only the first is posed.
+    // A bot who lies dead is still met, in the bodies of the pose he is drawn in, and nothing comes
+    // of it (TdBotPawn.TakeDamage, TdBotPawn.PreventWeaponImpactEffect).
+    EnemyBot dead = make_bot("Assault_SWAT", "None");
+    dead.alive = false;
+    dead.health = 0.0f;
+    dead.stunned = true;
+    dead.anim_state = EEnemyAnimState::KnockedOut;
+    dead.active_anim_seq = "HitMeleeRight";
+    dead.anim_timer = 2.0f;
+    p = pull({dead}, kAimBelly, false);
+    say("at a dead bot", p.fired && p.posed == 1 && p.damage == 0.0f && p.tracer.pawn_hit == 3 && as_asked(p) && p.expected.posed && p.astray == 0, p, "");
+
+    // A story character who is off stage (her `alive`) is neither posed nor met.
+    EnemyBot off_stage = make_bot("Kate", "None");
+    off_stage.is_story_npc = true;
+    off_stage.alive = false;
+    p = pull({off_stage}, kAimBelly, false);
+    say("at a story character off stage", p.fired && p.posed == 0 && !p.expected_met && p.damage == 0.0f && p.tracer.pawn_hit == 0, p, "");
+
+    // Three bots: the one aimed at, one 400 uu to his side and one 500 behind her. Only the first is posed.
     std::vector<EnemyBot> three = swat;
     three.push_back(make_bot("PatrolCop", "Colt1911"));
     three.back().position = bot_at + right * 400.0f;
     three.push_back(make_bot("Support", "FNMinimi"));
-    three.back().position = stand + fwd * 300.0f;
+    three.back().position = stand + fwd * 500.0f;
     p = pull(three, kAimBelly, false);
-    say("with a bot 400 uu aside and one behind her", p.fired && p.damage == colt && p.posed == 1 && as_asked(p), p, "");
+    say("with a bot 400 uu aside and one 500 behind her", p.fired && p.damage == colt && p.posed == 1 && as_asked(p), p, "");
 
     // The tutorial's partner (TdBotPawn_Tutorial.PreventWeaponImpactEffect): hurt, and nothing shown.
     p = pull({make_bot("TutorialTrainer_Celeste", "Colt1911")}, kAimBelly, false);
@@ -1436,6 +1567,9 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     p = pull(swat, kAimHead, false);
     say("with no poser, at the head",
         p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && p.expected.head && p.damage == colt * 2.0f && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
+    // (The cylinder is a living bot's alone, as it was before there were bodies.)
+    p = pull({dead}, kAimBelly, false);
+    say("with no poser, at a dead bot", p.fired && p.posed == 0 && !p.expected_met && p.damage == 0.0f && p.tracer.pawn_hit == 0, p, "");
     // ...and with one that cannot pose him, as the animation system answers without the character assets.
     controller.set_enemy_body_poser([](const EnemyBot&, float, bool, EnemyBodySet& out) {
         out.valid = false;
@@ -3363,11 +3497,13 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             if (!pm.impact_sound.empty() && !audio->has_cue(pm.impact_sound)) audio->load_cue_bank(game_root, pm.impact_sound_package);
         }
     }
-    // ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds]]]]]": the level's own enemies are
-    // put away and one bot stands on the floor `distance` units ahead of the view (220 unless given),
-    // in the state named (idle, walk, run, aim, windup, strike, stagger, disarm), with that weapon,
-    // turned by `turn` degrees from facing the view, `seconds` into a state that is timed. The shots
-    // of ME_SHOT_FIRE then meet his bodies as the controller's do (ME_SHOW_BODIES=1 draws them).
+    // ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds[,sequence]]]]]]": the level's own
+    // enemies are put away and one bot stands on the floor `distance` units ahead of the view (220
+    // unless given), in the state named (idle, walk, run, aim, windup, strike, stagger, disarm,
+    // dead), with that weapon, turned by `turn` degrees from facing the view, `seconds` into a state
+    // that is timed, playing the sequence named where the state takes one from the controller (a
+    // blow's HitMelee*, the disarm's Snatch*). The shots of ME_SHOT_FIRE then meet his bodies as the
+    // controller's do (ME_SHOW_BODIES=1 draws them).
     bool shot_bot = false;
     float bot_distance = 220.0f, bot_turn = 0.0f;
     if (const char* bot_spec = std::getenv("ME_SHOT_BOT")) {
@@ -3380,14 +3516,16 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         static const std::pair<const char*, EEnemyAnimState> kStates[] = {
             {"idle", EEnemyAnimState::Idle},          {"walk", EEnemyAnimState::Patrol},         {"run", EEnemyAnimState::Chase},
             {"aim", EEnemyAnimState::AimFire},        {"windup", EEnemyAnimState::MeleeWindup},  {"strike", EEnemyAnimState::MeleeStrike},
-            {"stagger", EEnemyAnimState::HitStagger}, {"disarm", EEnemyAnimState::BeingDisarmed}};
+            {"stagger", EEnemyAnimState::HitStagger}, {"disarm", EEnemyAnimState::BeingDisarmed}, {"dead", EEnemyAnimState::KnockedOut}};
         for (const auto& [name, state] : kStates) {
             if (given(1) && field[1] == name) bot.anim_state = state;
         }
+        bot.alive = bot.anim_state != EEnemyAnimState::KnockedOut;
         if (given(2)) bot_distance = static_cast<float>(std::atof(field[2].c_str()));
         bot.weapon_name = given(3) ? field[3] : std::string("Colt1911");
         if (given(4)) bot_turn = static_cast<float>(std::atof(field[4].c_str()));
         if (given(5)) bot.anim_timer = static_cast<float>(std::atof(field[5].c_str()));
+        if (given(6)) bot.active_anim_seq = field[6];
         scene.enemies.clear();
         scene.enemies.push_back(bot);
         shot_bot = true;
@@ -3474,7 +3612,7 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
                     tr.end_pos = shot.location;
                     tr.from_player = true;
                     tr.hit_enemy = true;
-                    tr.pawn_hit = 1;
+                    tr.pawn_hit = scene.enemies[static_cast<size_t>(shot.enemy)].alive ? 1 : 3;  // a dead bot shows nothing
                     tr.pawn_normal = shot.normal;
                     tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;
                 } else if (body_at > 0.0f) {

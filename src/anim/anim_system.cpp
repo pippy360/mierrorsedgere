@@ -3195,29 +3195,32 @@ bool AnimSystem::pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool rea
 
 namespace {
 
-// A line as two crossed ribbons, each with both of its faces, so that it shows from any side.
-void append_wire_line(std::vector<Vertex>& out, const Vec3& a, const Vec3& b, float half_width, uint32_t col) {
+// A line as one ribbon turned to face `view_pos`, with both of its faces.
+void append_wire_line(std::vector<Vertex>& out, const Vec3& a, const Vec3& b, const Vec3& view_pos, float half_width, uint32_t col) {
     const Vec3 diff = b - a;
     const float len = diff.length();
     if (len < 1.0e-4f) return;
     const Vec3 dir = diff * (1.0f / len);
-    const Vec3 up = (std::abs(dir.z) < 0.9f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f);
-    const Vec3 side = dir.cross(up).normalized();
-    const Vec3 ortho = side.cross(dir).normalized();
-    for (const Vec3& axis : {side, ortho}) {
-        const Vec3 n = dir.cross(axis);
-        const Vertex va{a - axis * half_width, n, {1, 0, 0}, 0.0f, 0.0f, 0.0f, 0.0f, col};
-        const Vertex vb{a + axis * half_width, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, col};
-        const Vertex vc{b + axis * half_width, n, {1, 0, 0}, 1.0f, 1.0f, 0.0f, 0.0f, col};
-        const Vertex vd{b - axis * half_width, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, col};
-        for (const Vertex* v : {&va, &vb, &vc, &va, &vc, &vd, &va, &vc, &vb, &va, &vd, &vc}) out.push_back(*v);
+    // Across the line as the view sees it; a line seen end on gets any side.
+    const Vec3 to_line = (a + b) * 0.5f - view_pos;
+    Vec3 axis = dir.cross(to_line);
+    if (axis.length_sq() <= 1.0e-6f * to_line.length_sq()) {
+        axis = dir.cross((std::abs(dir.z) < 0.9f) ? Vec3(0.0f, 0.0f, 1.0f) : Vec3(1.0f, 0.0f, 0.0f));
     }
+    axis = axis.normalized();
+    const Vec3 n = dir.cross(axis);
+    const Vertex va{a - axis * half_width, n, {1, 0, 0}, 0.0f, 0.0f, 0.0f, 0.0f, col};
+    const Vertex vb{a + axis * half_width, n, {1, 0, 0}, 1.0f, 0.0f, 0.0f, 0.0f, col};
+    const Vertex vc{b + axis * half_width, n, {1, 0, 0}, 1.0f, 1.0f, 0.0f, 0.0f, col};
+    const Vertex vd{b - axis * half_width, n, {1, 0, 0}, 0.0f, 1.0f, 0.0f, 0.0f, col};
+    for (const Vertex* v : {&va, &vb, &vc, &va, &vc, &vd, &va, &vc, &vb, &va, &vd, &vc}) out.push_back(*v);
 }
 
 // A posed body shape's outline: a box's twelve edges; a capsule's rings at the ends of its
 // cylinder, four lines along it and two arcs over each end.
-void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, float half_width, uint32_t col) {
+void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, const Vec3& view_pos, float half_width, uint32_t col) {
     const auto at = [&](float x, float y, float z) { return s.centre + s.axis[0] * x + s.axis[1] * y + s.axis[2] * z; };
+    const auto line = [&](const Vec3& a, const Vec3& b) { append_wire_line(out, a, b, view_pos, half_width, col); };
     if (s.kind == EBodyShape::Box) {
         Vec3 corner[8];
         for (int k = 0; k < 8; ++k) {
@@ -3225,7 +3228,7 @@ void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, float
         }
         for (int k = 0; k < 8; ++k) {
             for (const int bit : {1, 2, 4}) {
-                if ((k & bit) == 0) append_wire_line(out, corner[k], corner[k | bit], half_width, col);
+                if ((k & bit) == 0) line(corner[k], corner[k | bit]);
             }
         }
         return;
@@ -3235,18 +3238,18 @@ void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, float
     for (int i = 0; i < kSeg; ++i) {
         const float t0 = 2.0f * PI * static_cast<float>(i) / kSeg, t1 = 2.0f * PI * static_cast<float>(i + 1) / kSeg;
         for (const float z : {-h, h}) {
-            append_wire_line(out, at(r * std::cos(t0), r * std::sin(t0), z), at(r * std::cos(t1), r * std::sin(t1), z), half_width, col);
+            line(at(r * std::cos(t0), r * std::sin(t0), z), at(r * std::cos(t1), r * std::sin(t1), z));
         }
         if (i % (kSeg / 4) == 0 && h > 0.0f) {
-            append_wire_line(out, at(r * std::cos(t0), r * std::sin(t0), -h), at(r * std::cos(t0), r * std::sin(t0), h), half_width, col);
+            line(at(r * std::cos(t0), r * std::sin(t0), -h), at(r * std::cos(t0), r * std::sin(t0), h));
         }
     }
     for (int i = 0; i < kSeg / 2; ++i) {
         const float t0 = PI * static_cast<float>(i) / (kSeg / 2), t1 = PI * static_cast<float>(i + 1) / (kSeg / 2);
         for (const float end : {-1.0f, 1.0f}) {
             const float z0 = end * (h + r * std::sin(t0)), z1 = end * (h + r * std::sin(t1));
-            append_wire_line(out, at(r * std::cos(t0), 0.0f, z0), at(r * std::cos(t1), 0.0f, z1), half_width, col);
-            append_wire_line(out, at(0.0f, r * std::cos(t0), z0), at(0.0f, r * std::cos(t1), z1), half_width, col);
+            line(at(r * std::cos(t0), 0.0f, z0), at(r * std::cos(t1), 0.0f, z1));
+            line(at(0.0f, r * std::cos(t0), z0), at(0.0f, r * std::cos(t1), z1));
         }
     }
 }
@@ -3256,23 +3259,27 @@ void append_body_shape_wires(std::vector<Vertex>& out, const BodyShape& s, float
 // -----------------------------------------------------------------------------
 // Evaluate 3D Dropped Weapons & Active Ballistic Bullet Tracers in World Space
 // -----------------------------------------------------------------------------
-void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float sim_time, bool reaction_disarm,
+void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, const Vec3& view_pos, float sim_time, bool reaction_disarm,
                                           std::vector<Vertex>& out_world_tris,
                                           std::vector<Vertex>& out_rv_tris) const {
     out_world_tris.clear();
     out_rv_tris.clear();
 
-    // ME_SHOW_BODIES: the shapes a bullet meets in each living enemy, as pose_enemy_bodies() gives
-    // them to the controller, over the mesh they belong to. The bodies of the head's material go
-    // with what is drawn in the runner-vision red.
+    // ME_SHOW_BODIES: the shapes a bullet meets in each enemy it can meet, as pose_enemy_bodies()
+    // gives them to the controller, over the mesh they belong to. The bodies of the head's material
+    // go with what is drawn in the runner-vision red. Only the enemies near the view: a chapter has
+    // 29 to 71 of them and a bot's lines are some 9,000 vertices, made anew each frame; further off
+    // than this a line is under a fifth of a pixel wide in a picture 1280 across.
     if (show_enemy_bodies_) {
+        constexpr float kShownWithin = 3000.0f, kHalfWidth = 0.45f;
         const uint32_t body_col = pack_rgba8(0.55f, 1.0f, 0.15f), head_col = pack_rgba8(1.0f, 0.10f, 0.10f);
         EnemyBodySet set;
         for (const EnemyBot& bot : scene.enemies) {
-            if (!bot.alive || !pose_enemy_bodies(bot, sim_time, reaction_disarm, set)) continue;
+            if (!enemy_stops_bullets(bot) || (bot.position - view_pos).length_sq() > kShownWithin * kShownWithin) continue;
+            if (!pose_enemy_bodies(bot, sim_time, reaction_disarm, set)) continue;
             for (const BodyShape& s : set.shapes) {
                 const bool head = s.body < set.bodies.size() && set.bodies[s.body].surface == ECharacterSurface::Head;
-                append_body_shape_wires(head ? out_rv_tris : out_world_tris, s, 0.45f, head ? head_col : body_col);
+                append_body_shape_wires(head ? out_rv_tris : out_world_tris, s, view_pos, kHalfWidth, head ? head_col : body_col);
             }
         }
     }
@@ -3357,8 +3364,9 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, float sim_tim
         add_quad(side);
         add_quad(ortho);
 
-        // Impact spark burst at end_pos
-        if (alpha > 0.3f) {
+        // Impact spark burst at end_pos; none in a bot who shows nothing of the bullet (pawn_hit 3:
+        // one dying or dead, the tutorial's: TdBotPawn.PreventWeaponImpactEffect)
+        if (alpha > 0.3f && tr.pawn_hit != 3) {
             append_muzzle_flash_mesh(tr.hit_enemy ? out_rv_tris : out_world_tris,
                                      tr.end_pos - dir * 3.0f,
                                      dir * -1.0f, side, ortho,

@@ -37,9 +37,12 @@ inline constexpr float kPawnFloorHover = 3.15f;
 
 // How far from EnemyBot::position a posed bot's bodies are looked for by a trigger pull's first
 // reject (ParkourController::pose_enemies_for_shot). Standing, walking or aiming they end 185 to 188
-// from it (the top of the head's capsule); the furthest any archetype's get in a state the port
-// plays is 271, part way through being disarmed (the oracle's stage 23 measures it).
-inline constexpr float kEnemyBodyReach = 320.0f;
+// from it (the top of the head's capsule); the furthest any archetype's get, in a state and with a
+// sequence this controller gives a bot, is 303: thrown back by the kick from the air
+// (HitMeleeInAir_High; kicked along the floor 272, being disarmed 271). The oracle's stage 23
+// measures it over every such state and sequence, a dead bot's included. (A story character's
+// cutscene sequence carries her as far from where she is placed as the scene goes: not covered.)
+inline constexpr float kEnemyBodyReach = 360.0f;
 
 class ParkourController {
 public:
@@ -121,16 +124,19 @@ public:
     // in the bodies of his physics asset, placed by his bones as they are (UPhysicsAsset::LineCheck).
     // The controller has no skeletons: it asks whoever poses the drawn ones, through this (the
     // renderer's pose_enemy_bodies). Unset, as in the tools that run the controller with no
-    // renderer, or where a bot cannot be posed (no character assets), he is his pawn's cylinder.
+    // renderer, or where a bot cannot be posed (no character assets), a living bot is his pawn's
+    // cylinder and a dead one is met by nothing, as before there were bodies.
     void set_enemy_body_poser(EnemyBodyPoser poser) { m_enemy_body_poser = std::move(poser); }
 
     // A trigger pull, as the weapons' fire does it, in its two steps.
-    // pose_enemies_for_shot: every living enemy the pull can reach (within `spread`, the tangent of
-    // the cone's half angle, of the line from `from` along the unit vector `toward`, `range` long) is
-    // posed once, as he is now: all of a shotgun's pellets meet the pose he had when the trigger was
-    // pulled, whatever the first of them does to him. `out` is by LevelScene::enemies.
+    // pose_enemies_for_shot: every enemy a bullet can meet (enemy_stops_bullets: the living, and the
+    // dead who are drawn on) that the pull can reach (within `spread`, the tangent of the cone's
+    // half angle, of the line from `from` along the unit vector `toward`, `range` long) is posed
+    // once, as he is now. `out` is by LevelScene::enemies.
     // trace_enemies: one bullet's line through them, the level aside: the nearest enemy it goes into
-    // within `max_dist`, on his posed bodies, or on his cylinder if he has none in `posed`.
+    // within `max_dist`, on the bodies he has in `posed`, or, with none there, on his cylinder if he
+    // lives. All of a shotgun's pellets so meet the pose a bot had when the trigger was pulled,
+    // whatever the pellets before them did to him: those after the one that kills him end in him too.
     struct EnemyShotHit {
         int32_t enemy = -1;      // LevelScene::enemies
         float distance = 0.0f;   // along the line

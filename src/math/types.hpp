@@ -940,7 +940,8 @@ struct BulletTracer {
     float damage = 20.0f;      // what it does to the level actor it hits (the level's script hears of it)
     // The person it stopped in (TdWeapon.RegisterPendingImpact / PlayImpactEffects): 0 nobody;
     // 1 a bot the player shot, who gets his body's impact effect and sound; 2 the player, who
-    // gets the sound alone; 3 a bot that gets nothing (shot by another bot, or dying).
+    // gets the sound alone; 3 a bot that gets nothing (shot by another bot, dying or dead, or the
+    // tutorial's).
     uint8_t pawn_hit = 0;
     // Where it went into him is end_pos; the surface there, as HitInfo has it: its normal (out of
     // the body; zero: not known) and its material.
