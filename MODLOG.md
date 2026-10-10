@@ -1589,3 +1589,18 @@ A bot is a cylinder of one material, where the game traces his physics asset's b
 hole; the decals computed at load are still not on movers; the sounds were checked in the log, not by ear.
 Two `--intro-shots` runs started at once both hung after their first frame; one at a time, each takes half a
 minute. In `TODO.md`.
+
+---
+
+## 33. Agent workflow: rebuild `main`'s binary after every merge (`agent/agents-md-rebuild-main`, 2026-10-10)
+
+User request: every agent rebuilds the binary on `main` when it merges back. The primary repository's
+`build/mirrorsedge_macos`, which `./play_macos.sh` launches, still dated from 11:56, several merges behind `main`.
+- `AGENTS.md` Step 4 now runs the configure and build in `/Users/tomnom/git/mierrorsedgere/build` right after the
+  merge and before the push. If it fails, the agent does not push: it fixes the build in its worktree, merges
+  again and rebuilds. The step only builds. `--verify-all` stays in the worktree because it rewrites the tracked
+  `screenshots/`.
+- §1 makes this rebuild the one build allowed in the root workspace, and the "Always Leave `main` Buildable" rule
+  points to it.
+- Check: only `AGENTS.md` and `MODLOG.md` changed. `main` at `2f48a83` builds and passes `--verify-all` (every
+  stage) on macOS `arm64` in the worktree.
