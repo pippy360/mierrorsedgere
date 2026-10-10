@@ -1414,3 +1414,50 @@ factories were checked by reading the sequences and the load logs, not by a run 
 not break (a pane's sequence waits for damage and death events the port does not send), which is what 1024 of
 the 1080 factories are for. PhysX emitters, attractors and collision modules, flares on movers, a hit pawn's
 effect and the impact sounds are not done. In `TODO.md`.
+
+---
+
+## 30. Ledge Pull-Up Camera: the Heave's Retail Root Motion (`agent/ledge-pullup-camera`, 2026-10-10)
+
+User report (third time, after the two attempts in §17): the camera is too low while Faith pulls herself up after catching a ledge from a jump.
+
+### 30.1 What retail does
+- **Recordings.** Ten pull-ups, eight after Jump → Falling → IntoGrab → Grabbing; six with a valid camera (2026-09-20 14:56 and 18:59, 09-23 01:42, 09-25 16:06, 09-26 10:21 from a wall climb, 09-29 21:48 hanging free).
+- **The capsule follows the heave's Root bone exactly, from the first frame.** Five `HangHeaveUp` pull-ups, capsule rise from the hang: +34.2 at 0.2 s, +68.6 at 0.4, +103.8 at 0.6, +142.0 at 0.8, +177.2 at 1.0, +188.4 at 1.2 (spread 0.6 uu at most). `AS_C1P_Unarmed` `HangHeaveUp`'s Root track (46 keys over 1.5333 s, `ACF_None`, no rotation) has +35.2 at 0.204 s, +70.2 at 0.409, +188.46 at 1.193, and ends at +186.53 up, +67.84 forward. The free hang follows `HangFreeHeaveUp` (60 keys, 2.0 s: +100 up within 0.27 s) the same way.
+- **Along the facing it started with.** In 09-26 10:21 the body turns to 98° after `ReleaseCamera` while the capsule's sideways offset stays 0.00 until the blend into walking.
+- **`TdMove_GrabPullUp` (TdGame.u):** `PawnPhysics=PHYS_Flying`, `bDisableCollision`, `DisableLookTime=0.2`, look limits pitch 0..16384, yaw ±10000. `StartMove`'s bytecode plays the heave with `(1.0, 0.1, 0.2, bRootMotion)` and sets two timers: `ReleaseCamera` at 0.8 s and `EnableCollision` at 1.4 s for `HangHeaveUp` / `HangFreeHeaveUp` (0.8 / 0.8 for the folded heave, 0.6–0.7 / 0.6 for the heave-overs). Retail's body starts following the view at 0.817 s.
+- **`EnableCollision`:** where the root motion has put the capsule into the level, `PHYS_Flying` steps it up: +14.2 to +14.5 uu at 1.40 s in the free hang (`HangFreeHeaveUp`'s Root is still 12.8 below the lip then), +24.7 at 1.40 s onto a floor raised behind the lip (14:56, 01:42, 16:06). The lift stays to the end of the heave.
+- **End:** the move ends with the animation (walking at 1.517–1.535 s, free hang 1.966–1.983 s), and the camera eases the drop onto the floor (14.6 uu after the free hang) over about 0.2 s.
+- **The first-person tree was already right.** `me_anim --eye` over retail's own pawn path puts the EyeJoint within about 3 uu of retail's camera through the whole heave once the camera's 10 uu near-plane offset is taken out (as `docs/FIRST_PERSON_ANIMATION_RE.md` §9 found for GrabPullUp). The fault was the pawn path in play.
+
+### 30.2 Root cause
+- `update_ledge_grab` moved the feet on a smoothstep over 84% of 1.48 s up to the lip and on a second smoothstep forward from 0.56 s. Against retail's capsule that is up to 25 uu low at 0.3 s for `HangHeaveUp` and up to 86 uu low at 0.28 s for `HangFreeHeaveUp`. The camera rides the pawn, so it was low by as much.
+- At the end, `climb_onto_ledge` traced for a wall from a pawn that was already over the lip, found none (40 uu default) and moved her 76 uu forward in one frame.
+- The move ended at 1.48 s (1.85 s free) instead of with the animation, and `ReleaseCamera` came at 0.6 s instead of 0.8 s.
+
+### 30.3 Changes (`src/physics/parkour_controller.*`, `src/main.cpp`)
+- The four heaves' Root tracks (`HangHeaveUp`, `HangFreeHeaveUp`, `HangHeaveUpToCrouch`, `hangfreeheaveuptocrouch`), extracted from `AS_C1P_Unarmed.upk`, as key tables with `heave_root_motion()`. This is the same pattern as `kSkillRollRootForward`.
+- `start_pull_up()` replaces the two copies of the start code. It picks the heave the same way as before (standing or crouched on top, free or not) and stores the start, the facing into the wall, and the length.
+- Each substep the pawn is at start + facing × forward + up (+ lift). From 1.4 s, a capsule that overlaps the level is lifted out of it (binary search, at most `MaxStepHeight`, feet 1.4 above what it clears). The move ends at the animation's length where the heave left her, walking (crouched after a `...ToCrouch` heave), and the walk's floor check puts her feet on the floor. `climb_onto_ledge` is no longer used here.
+- `ReleaseCamera` at 0.8 s.
+- The drop onto the floor as a heave ends is held back like a step, on any floor (`m_smooth_was_heave`). The walking `SmoothOffset` itself is unchanged; see 30.5.
+- Oracle Stage 20 (`--verify-all`): at the Escape_p ledge of 2026-09-20 18:59 (hang capsule (17584, −6869, 12139.2), lip 12232), fall onto it, hang 1.2 s, pull up holding W. It checks the capsule rise (±1.5 uu) and the in-game camera's height over the hanging capsule's centre (±5 uu) against the mean of retail's five `HangHeaveUp` pull-ups at 0.2–1.2 s. Retail's camera is taken back to the eye: it is recorded 10 uu ahead along the view and a frame older than the pawn. The stage also checks the move's length, the landing on the lip, and the largest one-frame camera move (< 12 uu). It saves `oracle_20_ledge_pullup.png` 0.5 s in.
+
+### 30.4 Verification
+- **Scenario harness** (scratch: the game's `ParkourController` and `AnimSystem::player_camera`, pre-fix controller from `main` against this branch's), at retail's own ledges, the eye over the hanging capsule's centre against retail's recorded eye (near plane and frame lag taken out):
+
+  | heave (ledge) | worst eye-height error, before → after | largest one-frame camera move, before → after |
+  |---|---|---|
+  | `HangHeaveUp` (2026-09-20 18:59) | −24.3 uu at 0.33 s → +1.9 uu | 77.7 → 7.9 uu |
+  | `HangFreeHeaveUp` (2026-09-29 21:48) | −86.5 uu at 0.28 s → within 0.8 uu from 0.2 s to 1.95 s | 75.2 → 13.9 uu (the 1.4 s lift; retail's camera jumps 15.8 there) |
+
+  The free hang's lift lands the capsule at +184.2 at 1.4 s against retail's +184.3. Its landing eases 259.3 → 254.6 → 251.4 against retail's 261.7 → 255.9 → 253.0.
+- **`./build/mirrorsedge_macos --verify-all`: ALL SYSTEMS PASS (18 verified stages, exit code 0).** Stage 20: `Heave=HangHeaveUp, RootMotion=OK [worst 0.35 uu], Camera=OK [eye over hang centre port/retail 0.2s:115/115 0.4s:152/152 0.6s:176/175 0.8s:190/190 1s:204/203 1.2s:225/228; worst −2.6 uu], End=OK [1.525 s, rise 182.8 uu, largest camera step 6.9 uu]`.
+- **Negative control:** the same Stage 20 built against `main`'s controller: `FAIL (RootMotion worst −23.9 uu, Camera 0.2s:93/115 0.4s:128/152 0.6s:159/175 0.8s:178/190 1s:191/203 1.2s:219/228, End [1.475 s, largest camera step 77.7 uu])`.
+
+### 30.5 Remaining gaps (in `TODO.md`)
+- Ledges retail catches and the port refuses: a lip with the floor behind it up to `MaxStepHeight` higher (the Escape_p ledge of 14:56 / 01:42 / 16:06), and a ledge reached falling fast (16:06, −1255 uu/s, 46 uu from the wall). Replaying 18:59, the port wall-climbs where retail caught the ledge.
+- The folded hang and its 1.2 s `HangFoldedHeaveUp` (`EnableCollision` and `ReleaseCamera` at 0.8 s).
+- `SmoothOffset` (walking) needs `m_base_actor < 0`, and every static-mesh floor has an actor index, so steps are smoothed only on BSP.
+- The port's walking feet stand on the floor, while retail's capsule hovers about 2 uu over it, so after the heave the port's eye is about 2 uu lower than retail's.
+

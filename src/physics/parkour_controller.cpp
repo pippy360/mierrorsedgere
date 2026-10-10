@@ -211,6 +211,102 @@ float skill_roll_root_forward(float t) {
     return kSkillRollRootForward[i0] + (kSkillRollRootForward[i0 + 1] - kSkillRollRootForward[i0]) * a;
 }
 
+// TdMove_GrabPullUp (PawnPhysics PHYS_Flying, bDisableCollision) plays the heave with root motion:
+// PlayMoveAnim(CNT_FullBody, <heave>, 1.0, 0.1, 0.2, bRootMotion). The pawn rises and goes over
+// the lip as the animation's Root bone does, from the first frame: in the five HangHeaveUp
+// pull-ups recorded in retail (2026-09-20 to 09-26) the capsule is on these keys to half a unit
+// (+70.2 up at 0.409 s, +188.5 at 1.193 s, +67.8 forward at the end), and in the free hang of
+// 2026-09-29 21:48 on HangFreeHeaveUp's until collision comes back. AT_C1P's
+// IgnoreRootTransformation keeps the first-person mesh, and its EyeJoint, on the pawn, so the
+// camera rides these keys. They are AS_C1P_Unarmed's Root track (ACF_None; the bone never turns),
+// forward and up of the pawn from the first key, Length / (NumKeys - 1) apart.
+// HangHeaveUp: 46 keys over 1.533333 s.
+constexpr float kHangHeaveUpRoot[][2] = {
+    {0.000f, 0.000f}, {1.098f, 5.927f}, {2.142f, 11.820f}, {3.139f, 17.685f}, {4.096f, 23.528f},
+    {5.019f, 29.355f}, {5.917f, 35.172f}, {6.794f, 40.985f}, {7.660f, 46.800f}, {8.519f, 52.623f},
+    {9.380f, 58.460f}, {10.249f, 64.317f}, {11.133f, 70.200f}, {12.039f, 76.115f}, {12.975f, 82.068f},
+    {13.946f, 88.064f}, {14.959f, 94.111f}, {16.023f, 100.213f}, {17.143f, 106.377f}, {18.326f, 112.608f},
+    {19.580f, 118.914f}, {20.908f, 125.423f}, {22.307f, 132.179f}, {23.775f, 139.058f}, {25.308f, 145.935f},
+    {26.904f, 152.688f}, {28.560f, 159.192f}, {30.274f, 165.323f}, {32.043f, 170.957f}, {33.863f, 175.971f},
+    {35.733f, 180.239f}, {37.650f, 183.640f}, {39.610f, 186.050f}, {41.611f, 187.544f}, {43.651f, 188.290f},
+    {45.727f, 188.457f}, {47.835f, 188.216f}, {49.974f, 187.733f}, {52.140f, 187.180f}, {54.331f, 186.724f},
+    {56.544f, 186.534f}, {58.776f, 186.534f}, {61.025f, 186.534f}, {63.288f, 186.534f}, {65.562f, 186.534f},
+    {67.844f, 186.534f},
+};
+// HangFreeHeaveUp: 60 keys over 2.000000 s.
+constexpr float kHangFreeHeaveUpRoot[][2] = {
+    {0.000f, 0.000f}, {-0.043f, 15.059f}, {-0.100f, 31.693f}, {-0.160f, 48.722f}, {-0.213f, 64.962f},
+    {-0.249f, 79.233f}, {-0.257f, 90.351f}, {-0.227f, 97.135f}, {-0.255f, 100.803f}, {-0.423f, 103.440f},
+    {-0.702f, 105.166f}, {-1.059f, 106.103f}, {-1.463f, 106.372f}, {-1.885f, 106.092f}, {-2.292f, 105.385f},
+    {-2.653f, 104.371f}, {-2.938f, 103.171f}, {-3.115f, 101.906f}, {-3.153f, 100.696f}, {-3.021f, 99.662f},
+    {-2.688f, 98.925f}, {-2.124f, 98.605f}, {-1.296f, 98.823f}, {-0.175f, 99.701f}, {1.272f, 101.357f},
+    {2.963f, 104.261f}, {4.787f, 108.577f}, {6.739f, 113.966f}, {8.808f, 120.093f}, {10.986f, 126.620f},
+    {13.264f, 133.210f}, {15.635f, 139.527f}, {18.089f, 145.234f}, {20.619f, 149.994f}, {23.214f, 153.470f},
+    {25.868f, 156.140f}, {28.571f, 158.705f}, {31.314f, 161.162f}, {34.090f, 163.508f}, {36.890f, 165.738f},
+    {39.704f, 167.849f}, {42.525f, 169.838f}, {45.345f, 171.702f}, {48.153f, 173.436f}, {50.943f, 175.038f},
+    {53.705f, 176.504f}, {56.430f, 177.830f}, {59.111f, 179.014f}, {61.739f, 180.050f}, {64.305f, 180.937f},
+    {66.800f, 181.671f}, {69.217f, 182.247f}, {71.546f, 182.663f}, {73.779f, 182.915f}, {75.907f, 183.000f},
+    {77.347f, 183.173f}, {77.750f, 183.628f}, {77.462f, 184.272f}, {76.828f, 185.010f}, {76.195f, 185.748f},
+};
+// HangHeaveUpToCrouch: 45 keys over 1.500000 s.
+constexpr float kHangHeaveUpToCrouchRoot[][2] = {
+    {0.000f, 0.000f}, {1.312f, 8.421f}, {2.635f, 17.687f}, {3.966f, 27.588f}, {5.302f, 37.912f},
+    {6.641f, 48.446f}, {7.981f, 58.981f}, {9.317f, 69.305f}, {10.648f, 79.205f}, {11.971f, 88.472f},
+    {13.283f, 96.893f}, {14.581f, 104.257f}, {15.862f, 110.352f}, {17.125f, 114.968f}, {18.365f, 117.892f},
+    {19.580f, 118.914f}, {20.675f, 118.952f}, {21.601f, 119.053f}, {22.431f, 119.196f}, {23.237f, 119.360f},
+    {24.090f, 119.523f}, {25.062f, 119.666f}, {26.226f, 119.767f}, {27.652f, 119.805f}, {29.392f, 121.414f},
+    {31.404f, 125.683f}, {33.625f, 131.780f}, {35.990f, 138.871f}, {38.435f, 146.121f}, {40.895f, 152.698f},
+    {43.305f, 157.768f}, {45.785f, 161.709f}, {48.450f, 165.434f}, {51.227f, 168.904f}, {54.047f, 172.084f},
+    {56.837f, 174.937f}, {59.525f, 177.425f}, {62.042f, 179.512f}, {64.315f, 181.162f}, {66.273f, 182.337f},
+    {67.844f, 183.000f}, {68.712f, 183.593f}, {68.820f, 184.436f}, {68.495f, 185.309f}, {68.061f, 185.993f},
+};
+// hangfreeheaveuptocrouch: 60 keys over 2.000000 s.
+constexpr float kHangFreeHeaveUpToCrouchRoot[][2] = {
+    {0.000f, 0.000f}, {-0.043f, 15.059f}, {-0.100f, 31.693f}, {-0.160f, 48.722f}, {-0.213f, 64.962f},
+    {-0.249f, 79.233f}, {-0.257f, 90.351f}, {-0.227f, 97.135f}, {-0.255f, 100.803f}, {-0.423f, 103.440f},
+    {-0.702f, 105.166f}, {-1.059f, 106.103f}, {-1.463f, 106.372f}, {-1.885f, 106.092f}, {-2.292f, 105.385f},
+    {-2.653f, 104.371f}, {-2.938f, 103.171f}, {-3.115f, 101.906f}, {-3.153f, 100.696f}, {-3.021f, 99.662f},
+    {-2.688f, 98.925f}, {-2.124f, 98.605f}, {-1.296f, 98.823f}, {-0.175f, 99.701f}, {1.272f, 101.357f},
+    {2.963f, 104.261f}, {4.787f, 108.577f}, {6.739f, 113.966f}, {8.808f, 120.093f}, {10.986f, 126.620f},
+    {13.264f, 133.210f}, {15.635f, 139.527f}, {18.089f, 145.234f}, {20.619f, 149.994f}, {23.214f, 153.470f},
+    {25.868f, 156.140f}, {28.571f, 158.705f}, {31.314f, 161.162f}, {34.090f, 163.508f}, {36.890f, 165.738f},
+    {39.704f, 167.849f}, {42.525f, 169.838f}, {45.345f, 171.702f}, {48.153f, 173.436f}, {50.943f, 175.038f},
+    {53.705f, 176.504f}, {56.430f, 177.830f}, {59.111f, 179.014f}, {61.739f, 180.050f}, {64.305f, 180.937f},
+    {66.800f, 181.671f}, {69.217f, 182.247f}, {71.546f, 182.663f}, {73.779f, 182.915f}, {75.907f, 183.000f},
+    {77.347f, 183.204f}, {77.750f, 183.741f}, {77.462f, 184.500f}, {76.828f, 185.370f}, {76.195f, 186.241f},
+};
+
+struct HeaveRootMotion {
+    const char* anim;        // the sequence, as the move names it to the animation (move_anim)
+    float length;            // s: the move ends with it (OnCustomAnimEnd)
+    const float (*keys)[2];  // Root: forward, up
+    int count;
+    bool crouch;             // GPUT_IntoCrouch: no room to stand on top
+};
+// Indexed by ParkourController::m_pullup_heave: bit 0 hanging free, bit 1 crouched on top.
+constexpr HeaveRootMotion kHeaveRootMotion[] = {
+    {"HangHeaveUp", 1.533333f, kHangHeaveUpRoot, static_cast<int>(std::size(kHangHeaveUpRoot)), false},
+    {"HangFreeHeaveUp", 2.0f, kHangFreeHeaveUpRoot, static_cast<int>(std::size(kHangFreeHeaveUpRoot)), false},
+    {"HangHeaveUpToCrouch", 1.5f, kHangHeaveUpToCrouchRoot, static_cast<int>(std::size(kHangHeaveUpToCrouchRoot)), true},
+    {"hangfreeheaveuptocrouch", 2.0f, kHangFreeHeaveUpToCrouchRoot, static_cast<int>(std::size(kHangFreeHeaveUpToCrouchRoot)), true},
+};
+
+// Where the heave's Root bone is `t` seconds in, forward and up of the pawn (keys interpolated
+// linearly, held at either end).
+void heave_root_motion(const HeaveRootMotion& h, float t, float& forward, float& up) {
+    const float f = std::clamp(t / h.length, 0.0f, 1.0f) * static_cast<float>(h.count - 1);
+    const int i0 = std::min(static_cast<int>(f), h.count - 2);
+    const float a = f - static_cast<float>(i0);
+    forward = h.keys[i0][0] + (h.keys[i0 + 1][0] - h.keys[i0][0]) * a;
+    up = h.keys[i0][1] + (h.keys[i0 + 1][1] - h.keys[i0][1]) * a;
+}
+
+// TdMove_GrabPullUp.StartMove's timers for these heaves (TdGame.u bytecode): ReleaseCamera after
+// 0.8 s (the body follows the view again: retail's turns from 0.817 s in 2026-09-26 10:21) and
+// EnableCollision after 1.4 s (bCollideWorld: the step-ups recorded at exactly 1.40 s).
+constexpr float kPullUpReleaseCamera = 0.8f;
+constexpr float kPullUpEnableCollision = 1.4f;
+
 // Fraction of a move of length `move_len` that stops kContactSkin short of the contact.
 float safe_fraction(float fraction, float move_len) {
     if (move_len <= 1e-6f) return 0.0f;
@@ -482,6 +578,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.camera_mesh_offset = m_cam_mesh_offset;
     m_mesh_smooth_z = 0.0f;
     m_smooth_was_walking = false;
+    m_smooth_was_heave = false;
     m_cam_constrain_look = false;
     m_snatch_align = false;
     m_against_wall = 0;
@@ -1089,7 +1186,12 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         // moves faster than 85 uu/s is held back, up to 20 uu, and let out as over the step.
         const bool walking = m_telemetry.grounded && m_base_actor < 0 &&
                              (m_telemetry.move_state == EMovement::MOVE_Walking || m_telemetry.move_state == EMovement::MOVE_Crouch);
-        if (walking && m_smooth_was_walking && effective_dt > 0.0f) {
+        // A heave ends a few units over the floor (17 after the free hang's collision lift) and the
+        // walk drops her onto it: held back the same way, whatever she lands on (retail's camera
+        // eased that drop, 14.6 uu for its hovering capsule, over 0.2 s: 2026-09-29 21:48).
+        const bool heave_landed = m_smooth_was_heave && m_telemetry.grounded &&
+                                  (m_telemetry.move_state == EMovement::MOVE_Walking || m_telemetry.move_state == EMovement::MOVE_Crouch);
+        if (((walking && m_smooth_was_walking) || heave_landed) && effective_dt > 0.0f) {
             const float dz = m_telemetry.position.z - m_smooth_last_z;
             const float held = std::max(0.0f, std::abs(dz) - 85.0f * effective_dt);
             m_mesh_smooth_z = std::clamp(m_mesh_smooth_z - (dz < 0.0f ? -held : held), -20.0f, 20.0f);
@@ -1101,6 +1203,7 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
             m_mesh_smooth_z = std::abs(m_mesh_smooth_z) <= step ? 0.0f : m_mesh_smooth_z - (m_mesh_smooth_z < 0.0f ? -step : step);
         }
         m_smooth_was_walking = walking;
+        m_smooth_was_heave = m_telemetry.move_state == EMovement::MOVE_GrabPullUp;
         m_smooth_last_z = m_telemetry.position.z;
         m_telemetry.camera_mesh_offset.z = m_mesh_smooth_z;
     }
@@ -1623,7 +1726,7 @@ void ParkourController::camera_view_rotation(float& yaw_d, float& pitch_d, float
         m_face_rotation_disabled = false;
         m_face_rotation_time_left = 0.4f;
     }
-    if (m == EMovement::MOVE_GrabPullUp && m_face_rotation_disabled && m_cam_move_time >= 0.6f) {
+    if (m == EMovement::MOVE_GrabPullUp && m_face_rotation_disabled && m_cam_move_time >= kPullUpReleaseCamera) {
         m_face_rotation_disabled = false;  // TdMove_GrabPullUp.ReleaseCamera (TimeToReleaseCamera)
         m_face_rotation_time_left = 0.25f;
     }
@@ -3846,6 +3949,24 @@ bool ParkourController::try_initiate_ledge_grab(const InputFrame& input, const L
     return true;
 }
 
+void ParkourController::start_pull_up(const LevelScene& scene) {
+    Vec3 into = horiz(-m_telemetry.wall_normal);
+    into = into.length_sq() > 1e-6f ? into.normalized() : horiz(facing_forward()).normalized();
+    // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no room
+    // to stand on top (GrabPullUpType); the free hang's own when nothing is in front of the legs.
+    const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
+    const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
+    m_pullup_heave = (m_telemetry.hanging_free ? 1 : 0) | (stand_up ? 0 : 2);
+    const HeaveRootMotion& heave = kHeaveRootMotion[m_pullup_heave];
+    m_telemetry.move_state = EMovement::MOVE_GrabPullUp;
+    m_state_timer = 0.0f;
+    m_pullup_start = m_telemetry.position;
+    m_pullup_dir = into;
+    m_pullup_lift = 0.0f;
+    m_telemetry.combat_anim_duration = heave.length;
+    set_move_anim(heave.anim);
+}
+
 void ParkourController::update_ledge_grab(const InputFrame& input, float dt, const LevelScene& scene) {
     const MovementConfig& c = m_config;
     EMovement& st = m_telemetry.move_state;
@@ -3856,36 +3977,44 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
 
     if (st == EMovement::MOVE_GrabPullUp) {
-        // TdMove_GrabPullUp (UseRootMotion(true)): HangHeaveUp (1.53 s) / HangFreeHeaveUp (2.00 s)
-        // translates Root (+68.1 fwd, +186.0 up), while AT_C1P's IgnoreRootTransformation strips Root
-        // on Mesh1p so Pawn.Location carries both the 1P mesh and EyeJoint smoothly up over the lip.
-        const float pull_dur = std::max(m_telemetry.combat_anim_duration, 1.35f);
-        const float progress = std::clamp(m_state_timer / pull_dur, 0.0f, 1.0f);
-        const float uz_t = std::clamp(progress / 0.84f, 0.0f, 1.0f);
-        const float uz = uz_t * uz_t * (3.0f - 2.0f * uz_t);
-        const float uxy_t = std::clamp((progress - 0.38f) / 0.58f, 0.0f, 1.0f);
-        const float uxy = uxy_t * uxy_t * (3.0f - 2.0f * uxy_t);
-        const Vec3 end_xy = m_pullup_start + into * (2.0f * kPawnRadius + 5.0f);
-        const Vec3 next_pos(m_pullup_start.x + (end_xy.x - m_pullup_start.x) * uxy,
-                            m_pullup_start.y + (end_xy.y - m_pullup_start.y) * uxy,
-                            m_pullup_start.z + ((m_ledge_z + 0.5f) - m_pullup_start.z) * uz);
-        if (dt > 1e-5f) {
-            m_telemetry.velocity = (next_pos - m_telemetry.position) * (1.0f / dt);
-        }
-        m_telemetry.position = next_pos;
-        set_stance(kEyeHeightStand);
-        if (m_state_timer >= pull_dur) {
-            if (climb_onto_ledge(n, m_ledge_z, scene)) {
-                const bool stand = has_room(kPawnHeight, scene);
-                st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
-                m_telemetry.grounded = true;
-                m_telemetry.velocity = into * 100.0f;
-                set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
-            } else {
-                m_telemetry.velocity = n * 50.0f;
-                set_stance(kEyeHeightStand);
-                leave_ground(EMovement::MOVE_Falling);
+        // TdMove_GrabPullUp: the heave's root motion carries her (kHeaveRootMotion), PHYS_Flying with
+        // collision off, along the way she faced the wall when it began (retail's capsule keeps to
+        // that line while the body turns after ReleaseCamera). The camera on the EyeJoint rides it.
+        const HeaveRootMotion& heave = kHeaveRootMotion[m_pullup_heave];
+        float forward = 0.0f, up = 0.0f;
+        heave_root_motion(heave, m_state_timer, forward, up);
+        Vec3 next = m_pullup_start + m_pullup_dir * forward + Vec3(0.0f, 0.0f, up + m_pullup_lift);
+        // EnableCollision: from then on PHYS_Flying steps a pawn the root motion has put into the
+        // level up out of it (at most MaxStepHeight), and the lift stays for the rest of the heave.
+        // Retail: 14 uu at 1.40 s in the free hang of 2026-09-29 21:48 (HangFreeHeaveUp's Root is
+        // still 13 below the lip then), 25 onto a raised floor behind the lip in 2026-09-20 14:56.
+        if (m_state_timer >= kPullUpEnableCollision && !has_room_at(next, kPawnHeight, scene) &&
+            has_room_at(next + Vec3(0.0f, 0.0f, kMaxStepHeight), kPawnHeight, scene)) {
+            float lo = 0.0f, hi = kMaxStepHeight;
+            for (int i = 0; i < 10; ++i) {
+                const float mid = 0.5f * (lo + hi);
+                (has_room_at(next + Vec3(0.0f, 0.0f, mid), kPawnHeight, scene) ? hi : lo) = mid;
             }
+            // has_room_at stands its box a unit off the feet, so at `hi` the feet are a unit under
+            // the top they clear; the step-up leaves her hovering a floor distance over it (feet 1.4
+            // above the lip; retail's lifts of 14.2 to 14.5 uu put them 1.5 above).
+            const float lift = hi + kMaxFloorDist;
+            m_pullup_lift += lift;
+            next.z += lift;
+        }
+        if (dt > 1e-5f) {
+            m_telemetry.velocity = (next - m_telemetry.position) * (1.0f / dt);
+        }
+        m_telemetry.position = next;
+        set_stance(kEyeHeightStand);
+        if (m_state_timer >= heave.length) {
+            // OnCustomAnimEnd: walking (crouched after a ...ToCrouch heave) from where the heave left
+            // her, a few units over the floor the walk then puts her feet on.
+            const bool stand = !heave.crouch && has_room(kPawnHeight, scene);
+            st = stand ? EMovement::MOVE_Walking : EMovement::MOVE_Crouch;
+            m_telemetry.grounded = true;
+            m_telemetry.velocity = m_pullup_dir * 100.0f;
+            set_stance(stand ? kEyeHeightStand : kEyeHeightCrouch);
             m_sprint_energy = 0.0f;
         }
         return;
@@ -3912,18 +4041,7 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
                 }
                 return;
             }
-            st = EMovement::MOVE_GrabPullUp;
-            m_state_timer = 0.0f;
-            m_pullup_start = m_telemetry.position;
-            m_telemetry.combat_anim_duration = m_telemetry.hanging_free ? 1.85f : 1.48f;
-            {
-                // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
-                // room to stand on top.
-                const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
-                const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
-                set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
-                                                       : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
-            }
+            start_pull_up(scene);
             return;
         }
         const float push = std::clamp(fwd.dot(n), 0.0f, 1.0f);
@@ -3938,18 +4056,7 @@ void ParkourController::update_ledge_grab(const InputFrame& input, float dt, con
         return;
     }
     if (input.forward > 0.8f && facing_wall && m_hang_time > 0.1f && !m_grab_rail) {
-        st = EMovement::MOVE_GrabPullUp;
-        m_state_timer = 0.0f;
-        m_pullup_start = m_telemetry.position;
-        m_telemetry.combat_anim_duration = m_telemetry.hanging_free ? 1.85f : 1.48f;
-        {
-            // TdMove_GrabPullUp.StartMove: the heave that ends standing, or crouched where there is no
-            // room to stand on top.
-            const Vec3 top_at = m_telemetry.position + into * (2.0f * kPawnRadius + 5.0f);
-            const bool stand_up = has_room_at(Vec3(top_at.x, top_at.y, m_ledge_z + 0.5f), kPawnHeight, scene);
-            set_move_anim(m_telemetry.hanging_free ? (stand_up ? "HangFreeHeaveUp" : "hangfreeheaveuptocrouch")
-                                                   : (stand_up ? "HangHeaveUp" : "HangHeaveUpToCrouch"));
-        }
+        start_pull_up(scene);
         return;
     }
     if (m_crouch_pressed || (input.forward < -0.8f && m_hang_time > 0.2f)) {

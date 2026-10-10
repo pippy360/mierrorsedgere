@@ -71,7 +71,7 @@ In `TdPawn`, the current player move is tracked by `MovementState` and `OldMovem
 | `7` | `MOVE_SpringBoarding` | `TdMove_SpringBoard`| `TdPhysicsMove` | `PHYS_Falling` | Launching off low obstacle (dumpster/vent) to gain height |
 | `8` | `MOVE_SpeedVaulting` | `TdMove_SpeedVault` | `TdPhysicsMove` | `PHYS_Flying` | Fast momentum-preserving one-hand vault over railings |
 | `9` | `MOVE_VaultOver` | `TdMove_VaultOver` | `TdMove_SpeedVault` | `PHYS_Flying` | Two-handed vault over thicker obstacles or tables |
-| `10` | `MOVE_GrabPullUp` | `TdMove_GrabPullUp` | `TdPhysicsMove` | `PHYS_Flying` | Climbing up from ledge hang to standing position |
+| `10` | `MOVE_GrabPullUp` | `TdMove_GrabPullUp` | `TdPhysicsMove` | `PHYS_Flying` | Climbing up from ledge hang to standing position: the heave's root motion moves the pawn (`HangHeaveUp` 1.533 s, Root +186.5 up / +67.8 forward; `HangFreeHeaveUp` 2.0 s) along the facing it started with, collision off (`bDisableCollision`) until `EnableCollision` at 1.4 s, `ReleaseCamera` at 0.8 s, ends with the animation (`MODLOG.md` §30) |
 | `11` | `MOVE_Jump` | `TdMove_Jump` | `TdPhysicsMove` | `PHYS_Falling` | Standard ground jump with speed-dependent vertical impulse |
 | `12` | `MOVE_WallRunJump` | `TdMove_WallrunJump`| `TdPhysicsMove` | `PHYS_Falling` | Angled leap off a wallrun across a gap |
 | `13` | `MOVE_GrabJump` | `TdMove_GrabJump` | `TdPhysicsMove` | `PHYS_Falling` | Leap backward or sideways from a hanging ledge |
