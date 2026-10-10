@@ -367,4 +367,22 @@ inline void fill_filter_taps(int view_w, int buffer_w, int buffer_h, bool horizo
     u.filter_axis[2] = static_cast<float>(count);
 }
 
+// UTdHudEffectManager post-process parameters (MirrorsEdge.exe 0x01264410 / FX_PostProcess.upk):
+//   dof_packed[0]     = FocusDistance (1600 -> -500 during hit blur)
+//   misc[2]           = MaxFarBlurAmount (hit_blur, up to 0.95)
+//   misc[3]           = FXFScreen_HealthDesaturate (M_FX_FullScreenFX_HealthEffect_01)
+//   inv_highlights[3] = FXFscreen_MeleeDamageEffect (M_FX_FullScreenFX_MeleeDamage_01)
+//   midtones[3]       = FXFScreen_MeleeHitDirection (M_FX_FullScreenFX_MeleeDamage_01)
+//   lum_weights[3]    = FXFScreen_FallDamageEffect (M_FX_FullScreenFX_Falldamage_01)
+inline void apply_hud_damage_uniforms(const PlayerTelemetry& telemetry, PostUniformsGPU& u) {
+    if (telemetry.hit_blur > 0.001f) {
+        u.dof_packed[0] = telemetry.hit_focus_distance;
+        u.misc[2] = telemetry.hit_blur;
+    }
+    u.misc[3] = telemetry.health_desat;
+    u.inv_highlights[3] = telemetry.melee_damage_strength;
+    u.midtones[3] = telemetry.melee_hit_dir;
+    u.lum_weights[3] = telemetry.fall_damage_strength;
+}
+
 }  // namespace me

@@ -1102,6 +1102,11 @@ void Director::tick(const PawnFrame& frame) {
         const bool own = frame.movement == EMovement::MOVE_Grabbing && lower(frame.move_anim).compare(0, 8, "hangturn") == 0;
         if (!own) play_named(frame.move_anim, frame.move_anim_rate);
     }
+    if (!frame.camera_anim.empty()) {
+        // ATdPlayerPawn::PlayHitCameraShake / PlayTaserCameraShake (0x012b0d60):
+        // CustomCameraNode->PlayCustomAnim(AnimName, 1.0f, 0.15f, 0.15f, false, false)
+        tree_.play_custom_anim(Slot::Camera, frame.camera_anim, 1.0f, 0.15f, 0.15f, false, false);
+    }
 
     // Letting go of the stick while walking: the legs take the stopping step (native; measured).
     // Which leg: walktostandpassright with the walk cycle between 0.21 and 0.71 of its length.

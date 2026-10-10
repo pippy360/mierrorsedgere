@@ -2993,6 +2993,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         // TdMotionBlur's amount, from how the camera itself moved since the last frame.
         const float motion_amount = impl->motion_blur.update(cam_pos, fwd, post_dt, still || opening);
         fill_post_uniforms(active_scene, view_post, cam_pos, (post_dt > 0.0f && post_dt < 0.5f) ? post_dt : 0.0f, still, post);
+        apply_hud_damage_uniforms(telemetry, post);
         post.fade[0] = telemetry.fade_color.x;
         post.fade[1] = telemetry.fade_color.y;
         post.fade[2] = telemetry.fade_color.z;

@@ -1250,3 +1250,30 @@ Slide-kicking a closed bargeable door (`MOVE_Slide` -> `MOVE_MeleeSlide`, or sim
 - `./build/mirrorsedge_macos --verify-all`: **ALL SYSTEMS PASS (`exit code 0`)**, Stage 12 output:
   `SlideKick=OK (swing -103.755 deg, endX -4318.96), SlideKickSounds=OK`
 
+---
+
+## 26. Player Damage Screen Effects, Directional Hit Camera Shake & Hit Audio (`agent/damage-screen-fx`, 2026-10-10)
+
+Resolved the user-reported issue where Faith had no on-screen reaction, camera shake, or impact audio when getting shot or struck by enemies:
+
+1. **Reverse Engineering (`MirrorsEdge.exe`, `DefaultHudEffects.ini`, `FX_PostProcess.upk`, `FX_FirstPEffects.upk`, `AS_F_1P_Unarmed.upk`)**:
+   - **`UTdHudEffectManager::DisplayHit` (`0x01264410`) & `GetHitAngleNorm` (`0x01262930`)**: Computes the normalized incoming hit angle around camera yaw in `[0, 1)` (`0.0` = front, `0.25` = right, `0.5` = back, `0.75` = left).
+   - **`ATdPlayerPawn::PlayHitCameraShake` (`0x012b0d60`)**: Plays directional first-person skeletal camera hit animations on `CustomCameraNode` (`Slot::Camera`) from `AS_F_1P_Unarmed.upk` (`rate = 1.0`, `blend_in = 0.15 s`, `blend_out = 0.15 s`, throttled by `SpazzThrottle = 0.20 s`):
+     - `angle <= 0.125 || angle >= 0.875` -> `gethitfront` (`0.733 s`, peak `-11.0°` pitch, `+9.7°` roll)
+     - `0.125 < angle < 0.375` -> `gethitright` (`0.600 s`, peak `-4.1°` pitch, `-6.1°` yaw, `-9.0°` roll)
+     - `0.375 <= angle < 0.625` -> `gethitback` (`0.667 s`, peak `+13.1°` pitch, `-11.5°` roll)
+     - `0.625 <= angle < 0.875` -> `gethitleft` (`0.567 s`, peak `-6.4°` pitch, `+10.9°` yaw, `+6.2°` roll)
+   - **`ActivateSaturationEffect` (`0x012624e0`) & `UpdateHealthSaturation` (`0x01261330`)**: Drives `HealthEffect` (`M_FX_FullScreenFX_HealthEffect_01`) with `PPHealthSaturationSettings=(FadeInDuration=0.06, Duration=0.5, FadeOutDuration=0.5)` plus continuous missing-health desaturation.
+   - **`UpdateHitEffectBlur` (`0x01261e00`)**: Drives `DOFAndBloomGatherPixelShader` / `DOFAndBloomBlendPixelShader` via `FocusDistance = -500.0` (`P.dof_packed.x`) and `MaxFarBlurAmount = 0.95` (`P.misc.z`) using retail's 3-phase envelopes (`Bullet`: `0.03 / 0.25 / 0.15 s`; `Melee`: `0.05 / 0.15 / 0.20 s`; `FallDamage`: `0.05 / 0.10 / 0.75 s`).
+   - **`TriggerHitParticles` (`0x01262550`)**: Spawns directional screen-periphery blood mist (`M_FX_BloodSmoke_01`) and blood droplet splatter (`M_FX_BloodDrops_02`) from `PS_FX_FullScreenFX_BulletHit_01` (`FadeInDuration = 0.05 s, Duration = 0.20 s`) along the 16:9 screen ellipse in the direction of the shooter.
+   - **Melee & Fall Post-Process Materials (`M_FX_FullScreenFX_MeleeDamage_01`, `M_FX_FullScreenFX_Falldamage_01`)**: Feeds `melee_hit_count`, `melee_hit_damage`, `melee_hit_turns`, `fall_hit_count`, and `fall_hit_damage` from `ParkourController::apply_damage` into `ScreenEffects::update`.
+2. **Implementation (`src/math/types.hpp`, `src/anim/fp_director.*`, `src/anim/anim_system.cpp`, `src/physics/parkour_controller.*`, `src/audio/audio_engine.cpp`, `src/game/screen_effects.hpp`, `src/renderer/post_process.hpp`, `src/renderer/overlay_ui.inl`, `src/renderer/metal_renderer.mm`, `src/renderer/opengl_renderer.cpp`, `src/renderer/d3d11_renderer.cpp`, `src/main.cpp`)**:
+   - Wired `camera_anim` / `camera_anim_serial` into `fp::PawnFrame` and `Director::tick` (`Slot::Camera`) so `AnimSystem::tick_first_person` evaluates `gethitfront`, `gethitback`, `gethitleft`, and `gethitright` on Faith's 1P camera rig.
+   - Implemented `ParkourController::apply_damage(amount, dmt, hit_dir_world)` and `HudEffectEnvelope` across AI bot gunfire, helicopter door-gunner bursts, close-quarters melee strikes, hard-landing fall damage, and Kismet `host.damage_player`.
+   - Loaded `A_Effects_Bullet_Impacts.upk` and `A_Effects_Bullet_Bys.upk` in `AudioEngine::load_stock_audio`, emitting `Faith.9mm_Faith_Impact`, `Punch_Hit`, and `Oral_Impact.Hard` on player hits plus 3D `BerettaM93R_Fire` and `BulletBy.9mm_BulletBy` whizzes from enemy shots.
+   - Applied `hit_focus_distance` and `hit_blur` in `apply_hud_damage_uniforms` across Metal, OpenGL, and Direct3D 11, and rendered directional `PS_FX_FullScreenFX_BulletHit_01` blood mist/droplets in `overlay_ui.inl`.
+3. **Verification**:
+   - Added Oracle Stage 17 (`Verifying Player Damage Screen Effects & Directional Hit Camera Shake`) testing front/right/back/left directional hits, `Slot::Camera` animation selection, blur/desat/melee/fall envelopes, `ScreenEffects` material pass activation, and hit sound events.
+   - `./build/mirrorsedge_macos --verify-all`: **ALL 17 VERIFIED STAGES PASS** (`exit code 0`).
+   - `./build/me_glsl`: **all shaders compiled** (`exit code 0`).
+

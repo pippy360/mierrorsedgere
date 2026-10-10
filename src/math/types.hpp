@@ -1407,6 +1407,30 @@ struct PlayerTelemetry {
     uint32_t fall_hit_count = 0;
     float fall_hit_damage = 0.0f;
     float damage_flash_timer = 0.0f;
+    // First-person camera slot animation (ATdPlayerPawn::PlayHitCameraShake / PlayTaserCameraShake):
+    // separate from move_anim so taking a hit on the same frame a move starts does not clobber move_anim.
+    std::string camera_anim;
+    uint32_t camera_anim_serial = 0;
+    // UTdHudEffectManager (DefaultHudEffects.ini + FX_PostProcess.upk + FX_FirstPEffects.upk):
+    // - health_desat: FXFScreen_HealthDesaturate (PPHealthSaturationSettings: +Damage*0.01 up to 1.0,
+    //   FadeIn 0.06s, Hold 0.5s, FadeOut 0.5s)
+    // - hit_blur: DOFAndBloomPP MaxFarBlurAmount (TdHudEffect_Bullet/Melee/FallDamage: up to 0.95,
+    //   FocusDistance = -500, FadeIn 0.03s, Hold 0.25s, FadeOut 0.15s)
+    // - hit_focus_distance: DOFAndBloomPP FocusDistance (1600 at rest, -500 during hit blur)
+    // - melee_damage_strength: FXFScreen_MeleeDamage (FadeIn 0.05s, Hold 0.15s, FadeOut 0.4s)
+    // - melee_hit_dir: FXFScreen_MeleeHitDirection in [0, 1) (0=front, 0.25=right, 0.5=back, 0.75=left)
+    // - fall_damage_strength: FXFScreen_FallDamage (FadeIn 0.05s, Hold 0.1s, FadeOut 0.75s)
+    // - bullet_hit_angles / bullet_hit_timers: active PS_FX_FullScreenFX_BulletHit_01 directional blood
+    //   splatter bursts around the screen periphery (up to 4 concurrent slots, 0.25s lifetime).
+    float health_desat = 0.0f;
+    float hit_blur = 0.0f;
+    float hit_focus_distance = 1600.0f;
+    float melee_damage_strength = 0.0f;
+    float melee_hit_dir = 0.0f;
+    float fall_damage_strength = 0.0f;
+    float bullet_hit_angles[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float bullet_hit_timers[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t bullet_hit_seeds[4] = {0u, 0u, 0u, 0u};
     bool falling_to_death = false;
     bool fall_death_impact = false;
     float death_anim_progress = 0.0f;

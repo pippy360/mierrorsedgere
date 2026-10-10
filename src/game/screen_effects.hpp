@@ -57,9 +57,14 @@ public:
             falling_ = 0.0f;
         }
 
-        // Health.
+        // Health (M_FX_FullScreenFX_HealthEffect_01 + PPHealthSaturationSettings impulse on hit).
         const bool dead = tel.health <= 0.0f;
-        if (tel.health < 100.0f) out.push_back(effect("HealthEffect", "Health", dead ? 0.0f : tel.health * 0.01f));
+        if (tel.health < 100.0f || tel.health_desat > 0.001f) {
+            const float h_val = dead ? 0.0f : std::clamp(std::min(tel.health * 0.01f, 1.0f - tel.health_desat * 0.65f), 0.0f, 1.0f);
+            ScreenEffect fx = effect("HealthEffect", "Health", h_val);
+            fx.params.emplace_back("FXFScreen_HealthDesaturate", std::array<float, 4>{tel.health_desat, 0.0f, 0.0f, 0.0f});
+            out.push_back(std::move(fx));
+        }
 
         // Death.
         if (dead) {
