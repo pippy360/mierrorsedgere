@@ -259,6 +259,10 @@ inline bool spawn_decal(LevelScene& scene, const ImpactDecalInfo& info, const Im
         std::vector<Vec3> poly, next;
         for (uint32_t index : found) {
             const CollisionWorld::Triangle& tri = triangles[index];
+            // The hit component alone takes it (UDecalComponent::ComputeReceivers, 0x00fc73f0, offers a
+            // decal that has a HitComponent to that component and returns): the mesh that was hit, or
+            // the BSP when that was (there the engine keeps it to the one node, HitNodeIndex).
+            if (tri.actor != on.actor) continue;
             // The side the bullet came to. What is edge-on to the decal takes none (BackfaceAngle 0.001).
             const Vec3 face = tri.normal.dot(n) < 0.0f ? tri.normal * -1.0f : tri.normal;
             if (face.dot(n) <= 0.001f) continue;

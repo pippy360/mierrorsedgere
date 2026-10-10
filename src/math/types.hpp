@@ -569,6 +569,10 @@ struct MeshBuffer {
     // drawn with a depth bias, after what they lie on and before the other translucent surfaces, and
     // cast no shadow.
     bool is_decal = false;
+    // The decals on one receiver that moves or is drawn apart (LevelScene::actors[decal_receiver]): the
+    // engine draws a decal's triangles with their receiver's transform, so on a lift's part or a door
+    // they are given that mover's (elevator, elevator_part, barge_door above) once the movers are known.
+    int32_t decal_receiver = -1;
     // The one actor it draws, when the level's script can hide that actor (LevelActor::script_switched):
     // not drawn, and casting no shadow, while LevelScene::actors[actor].is_hidden.
     int32_t actor = -1;
