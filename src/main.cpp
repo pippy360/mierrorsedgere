@@ -2406,9 +2406,7 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         std::cerr << "[Shots] " << map_rel << ": not loaded, or it has no intro" << std::endl;
         return 1;
     }
-    // ME_SHOT_CHECKPOINT=<n>: the sublevels of that checkpoint, to look at a place the level's opening does not load.
-    const char* checkpoint_spec = std::getenv("ME_SHOT_CHECKPOINT");
-    stream_level_to_checkpoint(game_root, scene, checkpoint_spec ? std::atoi(checkpoint_spec) : 0);
+    stream_level_to_checkpoint(game_root, scene, 0);
     ensure_dir(out_dir);
 
     MovementConfig move_cfg;

@@ -498,7 +498,7 @@ which every stored vertex satisfies too. A mesh takes it only if its component h
 triangle only if it faces the decal (`BackfaceAngle` 0.001, unless `bProjectOnBackfaces`). What is clipped is
 the mesh's collision-tree (kDOP) triangles, facing by their geometric normal.
 
-**What a decal attaches to**, read in the executable:
+**What a decal attaches to**, read in the executable (where a step is inferred, it says so):
 
 - A stored receiver is attached as it is (`0x00fc7020`): nothing is asked of its owner. Two of the game's
   8844 stored receivers are on something that moves: the office's glass stripes
@@ -507,9 +507,11 @@ the mesh's collision-tree (kDOP) triangles, facing by their geometric normal.
 - A computed receiver (`ComputeReceivers`, `0x00fc73f0`, each tested by `0x00fc72a0`) has to come out of the
   collision hash's query of the decal's box, have `bAcceptsDecals` (and `bAcceptsDecalsDuringGameplay` once
   play has begun), not be hidden, pass the decal's `bProjectOn..` flag for its kind and its filter, and, for a
-  decal placed in a level, belong to that same level. Whether its owner moves is not asked. In the data no
-  computed decal has a mover to lie on: of 26 pairs of one and a mover whose boxes meet, 25 are in different
-  levels and the last offers only the underside of a barrel.
+  decal placed in a level, have an owner whose `+0x28` equals the decal actor's (its `Outer`, so the same
+  level: the comparison is read, the field's meaning inferred). That the query returns colliding components
+  only is inferred from the data (none of 6771 stored mesh receivers is non-colliding). Whether its owner
+  moves is not asked. In the data no computed decal has a mover to lie on: of 26 pairs of one and a mover whose
+  boxes meet, 25 are in different levels and the last offers only the underside of a barrel.
 - A decal with a `HitComponent`, which a bullet hole is, is offered to that component alone, and on BSP to the
   one node that was hit (`HitNodeIndex`).
 - A skeletal mesh takes a decal only when the decal has `bProjectOnSkeletalMeshes` (its
@@ -555,8 +557,9 @@ surfaces. The ones with no stored receiver are clipped onto the level's static m
 the decals that *do* store receivers the same way and compares areas: Jacknife 1.12 of the stored area, 577
 of 621 decals within 0.8..1.25; the Prologue 1.01, 12 of 12. A stored receiver that moves or is drawn apart
 (a lift's part, a door, another `InterpActor`, an actor the level's script shows and hides) has its decals in
-a buffer of its own (`MeshBuffer::decal_receiver`), drawn with the mover's matrix and not while the actor is
-hidden: the Escape office door's stripes, 76 triangles. Every bullet tracer that ends on a surface leaves its
+a buffer of its own (`MeshBuffer::decal_receiver`), drawn with the mover's matrix, lit from the receiver's
+place and not while the actor is hidden: the Escape office door's stripes, 76 triangles. A computed decal on
+an actor the script shows and hides goes to that actor's buffer too. Every bullet tracer that ends on a surface leaves its
 hole, clipped against the triangles of what it hit alone, the mesh, the mover's part or the BSP, and drawn
 with the particles' batches under the decals' bias, in the order made. What it hit is the level, or a part of
 a lift or a door where that is now (`find_impact_surface`). A hole in a mover is clipped and kept in the place
@@ -564,8 +567,9 @@ the level has the mover in, and its triangles are carried to where the mover is 
 lift's part by its offset and a door about its hinge (`dynamic_decal_vertices`). Not as the game: on BSP a
 hole lies on all the BSP in its box, not on the one node; a bullet hole does not fade, it goes; a computed
 decal is clipped onto the static meshes and BSP of every loaded package, where the game asks the colliding
-components of the decal's own level only (by the data that leaves 167 of the 199 the port puts on static
-meshes with nothing to lie on in the game; no retail picture was held against it, so they stay); the door
+components of the decal's own level only (a model of both rules over the data leaves 167 of the 199 the
+port's rule puts on static meshes with nothing to lie on in the game; no retail picture was held against it,
+so they stay); the door
 with the stripes does not open here, the port playing no Matinee's movement but the lifts' and the barge
 doors'. Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
@@ -746,7 +750,6 @@ Options for looking at things:
 | `ME_SHOT_STAND="x,y,z"` | With `--intro-shots`: the pictures are the player's, standing there (feet), not the intro's camera's |
 | `ME_SHOT_MOVERS="degrees,units[,1]"` | With `--intro-shots`: lists the level's doors and lifts; the shots are fired before the first picture only, and after it every door is swung by the degrees and every lift part raised by the units (with the third number the shots are fired before the later pictures too) |
 | `ME_SHOT_BODY=<units>` | With `ME_SHOT_FIRE`: the shots stop in a person that far ahead, not in the level |
-| `ME_SHOT_CHECKPOINT=<n>` | With `--intro-shots`: the sublevels of that checkpoint are streamed in, to look at a place the level's opening does not load |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |

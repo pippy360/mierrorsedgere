@@ -3854,7 +3854,9 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         static const bool no_dynamic = std::getenv("ME_NO_DYNAMIC_DECALS") != nullptr;    // nor those on what is drawn apart
         std::vector<Vertex> decal_scratch;
         // What lies in a decal's box, found and clipped: the level's static meshes and BSP.
-        const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box) {
+        // (`apart`: what lies on an actor the script shows and hides goes to that actor's own buffer.)
+        const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box,
+                                         bool apart = false) {
             const Vec3 o = decal.hit_location;
             const float reach = std::sqrt(decal.width * decal.width + decal.height * decal.height) * 0.5f +
                                 std::max(std::abs(decal.far_plane), std::abs(decal.near_plane));
@@ -3889,6 +3891,12 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                         decal_scratch[k + 2].position = p2;
                         decal_scratch[k].normal = decal_scratch[k + 1].normal = decal_scratch[k + 2].normal = n;
                     }
+                    if (apart && a.script_switched && !no_dynamic) {
+                        auto& own = on_dynamic[{decal.sort_order, static_cast<size_t>(&a - actors.data())}];
+                        if (own.first.empty()) own.second = AABB(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
+                        made += emitter.project_decal(decal, decal_scratch, nullptr, own.first, own.second);
+                        continue;
+                    }
                     made += emitter.project_decal(decal, decal_scratch, nullptr, bins, box);
                 }
             }
@@ -3916,7 +3924,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             if (decal.compute_receivers) {
                 // No receiver is stored: what lies in its box is found and clipped now.
                 if (no_computed) continue;
-                const size_t made = clip_onto_level(decal, by_order[decal.sort_order], decal_box);
+                const size_t made = clip_onto_level(decal, by_order[decal.sort_order], decal_box, true);
                 computed += made > 0 ? 1 : 0;
                 computed_triangles += made;
                 continue;
@@ -4003,7 +4011,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             mb.is_decal = true;
             mb.decal_receiver = static_cast<int32_t>(key.second);
             mb.actor = a.script_switched ? static_cast<int32_t>(key.second) : -1;
-            mb.dynamic_lit = a.dynamic_class;
+            mb.dynamic_lit = a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0;  // as its receiver's own buffer
             mb.lighting = a.lighting;
             MeshEmitter::flush(mb, apart.first);
             if (mb.vertices.empty()) continue;
@@ -5580,20 +5588,36 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
     build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
-    // The decals of a lift's part or of a door go where that goes (MeshBuffer::decal_receiver).
+    // The decals of a lift's part or of a door go where that goes (MeshBuffer::decal_receiver), and
+    // every such buffer is lit from its receiver's place, not from the decal's own small box.
     for (MeshBuffer& mb : out_scene.meshes) {
         if (mb.decal_receiver < 0 || static_cast<size_t>(mb.decal_receiver) >= out_scene.actors.size()) continue;
         const LevelActor& a = out_scene.actors[static_cast<size_t>(mb.decal_receiver)];
         if (a.elevator >= 0 && static_cast<size_t>(a.elevator) < out_scene.elevators.size()) {
+            // The part that is this actor, or, for the copy of a lift cooked into a second package
+            // (assign_elevator_parts keeps one), the part placed where it is.
             const auto& parts = out_scene.elevators[static_cast<size_t>(a.elevator)].parts;
-            for (size_t p = 0; p < parts.size(); ++p) {
-                if (parts[p].actor_index != mb.decal_receiver) continue;
-                mb.elevator = a.elevator;
-                mb.elevator_part = static_cast<int32_t>(p);
+            for (int pass = 0; pass < 2 && mb.elevator < 0; ++pass) {
+                for (size_t p = 0; p < parts.size() && mb.elevator < 0; ++p) {
+                    if (parts[p].actor_index < 0 || static_cast<size_t>(parts[p].actor_index) >= out_scene.actors.size()) continue;
+                    const LevelActor& part = out_scene.actors[static_cast<size_t>(parts[p].actor_index)];
+                    const bool same = pass == 0 ? parts[p].actor_index == mb.decal_receiver
+                                                : to_lower(part.mesh_name) == to_lower(a.mesh_name) &&
+                                                      (part.location - a.location).length() < 1.0f;
+                    if (!same) continue;
+                    mb.elevator = a.elevator;
+                    mb.elevator_part = static_cast<int32_t>(p);
+                }
+            }
+            if (mb.elevator < 0) {  // a lift's actor that is no part of it is not drawn: nor are its decals
+                mb.vertices.clear();
+                mb.sections.clear();
+                continue;
             }
         } else if (a.barge_door >= 0 && static_cast<size_t>(a.barge_door) < out_scene.barge_doors.size()) {
             mb.barge_door = a.barge_door;
         }
+        if (valid_box(a.world_bounds)) mb.bounds = a.world_bounds;
         if (std::getenv("ME_DECAL_DEBUG")) {
             std::cout << "[Level]   decals on " << a.source_package << ":" << a.unique_name << " (" << a.mesh_name << ") at ("
                       << a.location.x << ", " << a.location.y << ", " << a.location.z << "): " << mb.vertices.size() / 3 << " triangles, "
