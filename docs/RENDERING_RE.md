@@ -735,7 +735,7 @@ controller has no skeletons: it is given a callback (`ParkourController::set_ene
 renderer's `pose_enemy_bodies` in the game, the oracle and `--intro-shots`). At a trigger pull it poses, once,
 each bot a bullet can meet that the pull's cone can reach: the living, and the dead, who are drawn on in the
 pose they died in (`enemy_stops_bullets`; a story character who is off stage is not). The reach is 360 uu
-from where he stands, against a measured 303: the oracle's stage 23 poses every archetype in every state and
+from where he stands, against a measured 303: the oracle's stage 24 poses every archetype in every state and
 with every sequence the controller gives a bot, and the furthest a body gets is 303 uu, in a bot thrown back
 by the kick from the air (`HitMeleeInAir_High`), alive or dead; kicked along the floor it is 272, being
 disarmed 271, standing, walking or aiming 185 to 188. It then sends every pellet's line through those poses

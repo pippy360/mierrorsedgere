@@ -55,7 +55,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 ---
 
 ## Rendering, Lighting & Post-Processing
-*(Refs: `docs/RENDERING_RE.md` §16, `MODLOG.md` §9.4, §14, §23, §24, §29, §31, §32, §36 & §37, `src/renderer/*`, `src/assets/level_*`; research notes in the main checkout's ignored `build/re/notes/`, and for a bullet in a person `build/re/impacts/research/bodies/`, `bodies/` below)*
+*(Refs: `docs/RENDERING_RE.md` §16, `MODLOG.md` §9.4, §14, §23, §24, §29, §31, §32, §36 & §39, `src/renderer/*`, `src/assets/level_*`; research notes in the main checkout's ignored `build/re/notes/`, and for a bullet in a person `build/re/impacts/research/bodies/`, `bodies/` below)*
 
 - **Particle emitters left out:** the PhysX type-data emitters (`ParticleModuleTypeDataMeshPhysX`: 4 in Heat's opening area), and any emitter with an attractor or a collision module (`ME_PARTICLE_DEBUG=1` lists them). Sprites are not sorted against other translucent surfaces, and the emitter tick's order is stock UE3's, not read from the executable (`docs/RENDERING_RE.md` §13).
 - **Damage events, remaining differences:** damage classes are told apart as bullet, barge and blow only, so a `SeqEvent_TakeDamage` filter that names another class is never met; a punch or kick on the ground deals no damage to level actors (`TdDmgType_Melee`); the 38 `SeqEvent_Destroyed` on `GameBreakableActor`s (exploding barrels, gas cans) are not run; a pane has no shards beyond its particle effects; a door the port opens itself (`LevelScene::barge_doors`) does not run its own sequence (`docs/GAMEPLAY_SCRIPTING_RE.md` §8).

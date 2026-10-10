@@ -2057,7 +2057,7 @@ the dumper `physasset.py`) and `portbots/` (the port's side).
   he died, so a shotgun's pellets after the killing one went through the pose the notes said they met (now
   met, and a dead bot on later pulls too); the first reject's bound had been measured over the states with
   none of the sequences the controller names for them (271 uu, now 303 over all of them, the bound 320 to
-  360); stage 23's comparison of the trace with the walk was along the line, where a grazing line's entry
+  360); stage 24's comparison of the trace with the walk was along the line, where a grazing line's entry
   moves by more than its tolerance with a float's last bit (now across the surface); `ME_SHOW_BODIES` posed
   every living bot of the level each frame; the tracer's end burst was still drawn on a bot that shows
   nothing; two statements of this log and `TODO.md` said more than the research (the name-table scan above,
@@ -2121,7 +2121,7 @@ the dumper `physasset.py`) and `portbots/` (the port's side).
   five of five in him (`LeftHand` twice, `RightArm`, `LeftArm`, `Spine1`), 5 impact effects, 5 sounds. Dead of
   it: five of five in him (`Spine1`, both forearms, both thighs, 266 to 305 uu off), 0 impact effects, 0
   bullet holes, 0 sounds, and none goes on to the level.
-- **The trace against the walk on other layouts** (scratch, `build/review_fix/robust.cpp`: stage 23's
+- **The trace against the walk on other layouts** (scratch, `build/review_fix/robust.cpp`: stage 24's
   comparison copied, the 17 shapes at random places and turns, and each layout again with every centre moved
   by one float at most): of 1500 layouts none fails, moved or not, built plain and built with
   `-mfma -ffp-contract=fast` as arm64's clang contracts by default; of the 7.25 million lines of the unmoved
@@ -2138,7 +2138,7 @@ the dumper `physasset.py`) and `portbots/` (the port's side).
   `-std=c++20`, the MinGW headers; its own diagnostics only) takes `parkour_controller.cpp`,
   `anim_system.cpp`, `opengl_renderer.cpp` and `main.cpp` as built for OpenGL with no error.
 - **Not built:** the Metal renderer; its changes are the two lines, the argument and the forwarder the other
-  two renderers got. No branch was pushed for the macOS build, so stage 23 was not run on arm64 either.
+  two renderers got. No branch was pushed for the macOS build, so stage 24 was not run on arm64 either.
   **Not run:** the windowed game; no shot was fired by hand, and `ME_SHOW_BODIES` was looked at with one bot
   only.
 

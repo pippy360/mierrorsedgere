@@ -39,7 +39,7 @@ inline constexpr float kPawnFloorHover = 3.15f;
 // reject (ParkourController::pose_enemies_for_shot). Standing, walking or aiming they end 185 to 188
 // from it (the top of the head's capsule); the furthest any archetype's get, in a state and with a
 // sequence this controller gives a bot, is 303: thrown back by the kick from the air
-// (HitMeleeInAir_High; kicked along the floor 272, being disarmed 271). The oracle's stage 23
+// (HitMeleeInAir_High; kicked along the floor 272, being disarmed 271). The oracle's stage 24
 // measures it over every such state and sequence, a dead bot's included. (A story character's
 // cutscene sequence carries her as far from where she is placed as the scene goes: not covered.)
 inline constexpr float kEnemyBodyReach = 360.0f;
