@@ -48,9 +48,21 @@ it took the checkpoint's place plus 35 for her feet, 125 too high: her head stoo
 lower than 311 over the floor. A restart of the level (`restart_level_at`: a death, the R key, a
 chapter begun at a checkpoint) also puts the lifts back, which are the script levels': each where
 the level has it, but one whose cab at the far end of its run is round the spot (Heat's
-`Pursuit_chase`, The Shard's `Elevator_shaft`), which waits there. `--verify-respawn` restarts at
-every checkpoint of every chapter; the oracle's stage 25 at the Training Area's and the
-Prologue's.
+`Pursuit_chase`, The Shard's `Elevator_shaft`), which waits there. A teleport or a cutscene's
+hand-over moves her and leaves the active checkpoint what it was (`relocate`): a death goes back to
+the checkpoint, not to where she was last put.
+
+The Training Area has no such checkpoints. There nobody dies: `TdSPTutorialGame.PreventDeath`
+restarts the movement challenge, and `ResetPlayer` sets the pawn's `Location` to a `TdTutorialStart`'s,
+the challenge's start nearest the last gate passed (`FindMCStartSpot`), or nearest
+`LastValidPlayerLocation`, which a timer stores while she walks. The port keeps a list of the
+nineteen stages' starts (`LevelScene::checkpoints`, her feet there) and restarts her at the last one
+she walked onto. Until 2026-10-11 that restart took the stage's place at the height of the lowest
+floor she had stood on since, which is what the void test keeps; a death after a drop put her
+inside whatever stands under the stage.
+
+`--verify-respawn` restarts at every checkpoint of every chapter and every stage of the Training
+Area; the oracle's stage 25 does the Training Area's and the Prologue's, and a death in each.
 
 A `TdCheckpoint` carries `CheckpointName`, `DefaultCheckpoint` and `StreamingLevels`, the
 sublevels resident while it is active. All 183 `SeqEvt_TdCheckpointLoaded` events of the campaign

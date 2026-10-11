@@ -53,11 +53,17 @@ public:
 
     // Reset player position and orientation
     void reset(const Vec3& spawn_pos, float spawn_yaw = 0.0f);
+    // The same, the active checkpoint and where a restart goes left as they are: she is moved, the
+    // level is not begun again (a teleport, a cutscene's hand-over, the walk onto a cutscene's mark).
+    void relocate(const Vec3& feet, float yaw);
     // A cutscene ends and the player is let go where its animation left the mesh's root (the
     // stand-in's place, on the floor or near it): she hovers over the floor under it, facing `yaw`,
     // and the view is let down onto her own standing pose as retail's is (parkour_controller.cpp,
     // kHandoverLift).
     void hand_over(const Vec3& root_end, float yaw, const LevelScene& scene);
+    // A cutscene whose Kismet teleported the pawn on the way hands her over at that teleport's
+    // destination, a start spot like any other (restart_at), with the same let-down of the view.
+    void hand_over_at_spot(const Vec3& start_location, float yaw, const LevelScene& scene);
     // The game puts her at a start spot (TdSPStoryGame.RestartPlayer at a TdCheckpoint,
     // TdCheckpoint.HandlePawnTeleport, a SeqAct_Teleport's destination): her capsule's centre goes
     // to the spot's Location and she falls from there (PHYS_Falling), the engine first making room
@@ -71,6 +77,12 @@ public:
     // its doors open (in the game the checkpoint's own events have run it; a checkpoint in a cab at
     // its top is how Heat's and Pirandello Kruger's lifts leave her off).
     void restart_level_at(const Vec3& start_location, float yaw_deg, LevelScene& scene);
+    // The level begun again where a restart goes now: the active checkpoint, or, before any, where
+    // she was first put. (A death does this itself; the game loop calls it again once the level's
+    // script has put its own actors back, so that she is set on the level as it then is.)
+    void restart_at_checkpoint(LevelScene& scene);
+    // The place a restart goes when it is given as her feet, not as a start spot's centre.
+    [[nodiscard]] static Vec3 start_spot_over_feet(const Vec3& feet) { return feet + Vec3(0.0f, 0.0f, kPawnCollisionHeight); }
     // The active checkpoint as the level script sets it (SeqAct_TdCheckpoint): where the player
     // respawns, and which one the HUD counts. `start_location` is the TdCheckpoint's Location.
     void set_checkpoint(const Vec3& start_location, float yaw_deg, int index, const std::string& name);
@@ -596,9 +608,8 @@ private:
     float m_last_checkpoint_yaw = 0.0f;
     // Where a death puts the player back when the level script owns the checkpoints: the
     // checkpoint itself, not the void baseline above, which follows the pawn down.
-    Vec3 m_respawn_pos{0.0f, 0.0f, 100.0f};
+    Vec3 m_respawn_pos{0.0f, 0.0f, 190.0f};  // a start spot's Location: her capsule's centre (restart_at)
     float m_respawn_yaw = 0.0f;
-    bool m_respawn_at_spot = false;  // m_respawn_pos is a start spot's Location (restart_at), not her feet
     float m_death_timer = 0.0f;
     float m_death_total_duration = 1.35f;
 };

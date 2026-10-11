@@ -742,9 +742,8 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
-    m_respawn_pos = spawn_pos;
+    m_respawn_pos = start_spot_over_feet(spawn_pos);
     m_respawn_yaw = spawn_yaw;
-    m_respawn_at_spot = false;
     m_death_timer = 0.0f;
     m_death_total_duration = 1.35f;
 }
@@ -757,9 +756,24 @@ void ParkourController::set_checkpoint(const Vec3& start_location, float yaw_deg
     m_last_checkpoint_yaw = yaw_deg;
     m_respawn_pos = start_location;
     m_respawn_yaw = yaw_deg;
-    m_respawn_at_spot = true;
     m_telemetry.active_checkpoint = index;
     m_telemetry.active_checkpoint_name = name;
+}
+
+void ParkourController::relocate(const Vec3& feet, float yaw) {
+    const Vec3 respawn = m_respawn_pos;
+    const float respawn_yaw = m_respawn_yaw;
+    const int index = m_telemetry.active_checkpoint;
+    const std::string name = m_telemetry.active_checkpoint_name;
+    reset(feet, yaw);
+    m_respawn_pos = respawn;
+    m_respawn_yaw = respawn_yaw;
+    m_telemetry.active_checkpoint = index;
+    m_telemetry.active_checkpoint_name = name;
+}
+
+void ParkourController::restart_at_checkpoint(LevelScene& scene) {
+    restart_level_at(m_respawn_pos, m_respawn_yaw, scene);
 }
 
 void ParkourController::settle_lifts_for_restart(LevelScene& scene, const Vec3& start_location) {
@@ -771,7 +785,9 @@ void ParkourController::settle_lifts_for_restart(LevelScene& scene, const Vec3& 
             return std::abs(start_location.x - floor_centre.x) <= he.x + 30.0f && std::abs(start_location.y - floor_centre.y) <= he.y + 30.0f &&
                    start_location.z >= floor_centre.z - 30.0f && start_location.z <= floor_centre.z + he.z * 2.0f + 260.0f;
         };
-        const bool at_end = holds(elev.end_pos) && !holds(elev.start_pos);
+        // (A short run's two boxes overlap: then the cab whose floor is the nearer under the spot.)
+        const auto under = [&](const Vec3& cab_pos) { return std::abs(start_location.z - kPawnCollisionHeight - (cab_pos.z + elev.cab_local_offset.z)); };
+        const bool at_end = holds(elev.end_pos) && (!holds(elev.start_pos) || under(elev.end_pos) < under(elev.start_pos));
         elev.state = at_end ? ElevatorState::IdleEnd : ElevatorState::IdleStart;
         elev.current_pos = elev.prev_pos = at_end ? elev.end_pos : elev.start_pos;
         elev.timer = 0.0f;
@@ -793,8 +809,7 @@ void ParkourController::restart_at(const Vec3& start_location, float yaw_deg, co
     // fall to show: a checkpoint's own cylinder is 96 high and most stand on their floor, 6 under
     // those feet, and some are placed a little over it.
     constexpr float kStartSpotDrop = 60.0f;
-    reset(start_spot_feet(start_location), yaw_deg);
-    const Vec3 keep_respawn = m_respawn_pos;  // reset() takes the place it is given for the next restart
+    relocate(start_spot_feet(start_location), yaw_deg);
     // The floor under the spot, felt for from the spot's middle with a capsule short enough to
     // stand inside the spot's own cylinder under any ceiling; from higher up when the spot's
     // middle is itself under the floor.
@@ -815,7 +830,6 @@ void ParkourController::restart_at(const Vec3& start_location, float yaw_deg, co
     }
     m_smooth_last_z = m_telemetry.position.z;
     m_last_checkpoint_pos = m_telemetry.position;
-    m_respawn_pos = keep_respawn;
 }
 
 void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw, float pitch,
@@ -837,8 +851,14 @@ void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw
     if (state.jump) m_pre_jump_momentum = state.pre_jump_momentum;
 }
 
+void ParkourController::hand_over_at_spot(const Vec3& start_location, float yaw, const LevelScene& scene) {
+    restart_at(start_location, yaw, scene);
+    m_handover_lift = kHandoverLift;
+    m_telemetry.camera_mesh_offset.z = m_handover_lift;
+}
+
 void ParkourController::hand_over(const Vec3& root_end, float yaw, const LevelScene& scene) {
-    reset(root_end + Vec3(0.0f, 0.0f, 2.0f), yaw);
+    relocate(root_end + Vec3(0.0f, 0.0f, 2.0f), yaw);
     // Onto her hover over the floor under her now, not by a fall in the first frames of play.
     FloorHit floor;
     if (check_ground(scene, 2.0f + kMaxStepHeight, kPawnHeight, floor)) {
@@ -6714,23 +6734,11 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
             m_telemetry.death_anim_progress = std::clamp(
                 1.0f - (m_death_timer / std::max(0.10f, m_death_total_duration)), 0.0f, 1.0f);
             if (m_death_timer <= 0.0f) {
-                // The level script's checkpoint when it has one; the drifting void baseline otherwise.
-                const Vec3 respawn = scene.script_checkpoints ? m_respawn_pos : m_last_checkpoint_pos;
-                const float respawn_yaw = scene.script_checkpoints ? m_respawn_yaw : m_last_checkpoint_yaw;
-                const int keep_index = m_telemetry.active_checkpoint;
-                const std::string keep_name = m_telemetry.active_checkpoint_name;
-                if (scene.script_checkpoints && m_respawn_at_spot) {
-                    // TdSPStoryGame.RestartPlayer: at the checkpoint, as the level began there, the
-                    // lifts back where a restart has them.
-                    restart_level_at(respawn, respawn_yaw, scene);
-                    m_respawn_pos = respawn;
-                    m_respawn_yaw = respawn_yaw;
-                    m_respawn_at_spot = true;
-                } else {
-                    reset(respawn, respawn_yaw);
-                }
-                m_telemetry.active_checkpoint = keep_index;
-                m_telemetry.active_checkpoint_name = keep_name;
+                // TdSPStoryGame.RestartPlayer: at the active checkpoint (the level script's, or the
+                // one last passed in a level without a script), as the level began there, the lifts
+                // back where a restart has them. Not at the void baseline below, whose height is the
+                // lowest floor she has stood on since.
+                restart_at_checkpoint(scene);
                 m_telemetry.respawned = true;
                 if (!scene.script_checkpoints) m_telemetry.active_subtitle = "Respawned at Checkpoint";
             }
@@ -6746,6 +6754,8 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
                 m_telemetry.active_checkpoint = static_cast<int>(i);
                 m_last_checkpoint_pos = scene.checkpoints[i];
                 m_last_checkpoint_yaw = m_telemetry.yaw_deg;
+                m_respawn_pos = scene.checkpoints_are_feet ? start_spot_over_feet(scene.checkpoints[i]) : scene.checkpoints[i];
+                m_respawn_yaw = m_telemetry.yaw_deg;
                 if (i < scene.checkpoint_infos.size()) {
                     const auto& cp = scene.checkpoint_infos[i];
                     m_telemetry.active_checkpoint_name = cp.checkpoint_name;
