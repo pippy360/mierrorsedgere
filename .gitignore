@@ -24,6 +24,15 @@ out/
 .build/
 .worktrees/
 
+# Android (android/README.md): fetched sources, Gradle state, native build trees, local paths
+android/third_party/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/.kotlin/
+
 # Python & Environment
 __pycache__/
 *.py[cod]
@@ -53,3 +62,4 @@ ida/
 scratch/
 *.log
 build-*/
+android/app/.gradle/

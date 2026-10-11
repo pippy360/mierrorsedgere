@@ -60,6 +60,53 @@ set(CORE_SOURCES
 # me_replay: replays a recorded retail run through the controller, headless (tools/retail/README.md).
 # Builds on any platform, so it runs on the Windows machine that records the retail game.
 find_package(ZLIB REQUIRED)
+find_package(Threads REQUIRED)
+
+# The front end ("Press Any Key" and the main menu): its state machine and the CPU reference
+# renderer. Plain C++, so it builds wherever the core does.
+set(FRONTEND_SOURCES
+    src/ui/frontend/frontend_assets.cpp
+    src/ui/frontend/frontend_city.cpp
+    src/ui/frontend/frontend.cpp
+    src/ui/frontend/kismet.cpp
+    src/ui/frontend/ui_scene.cpp
+    src/ui/frontend/frontend_menus.cpp
+    src/ui/frontend/soft_city.cpp
+    src/ui/frontend/soft_render.cpp
+)
+
+# The game itself: everything but the renderer backend is shared between the platforms.
+# main.cpp is compiled per target (renderer/renderer.hpp picks the backend from its defines).
+set(GAME_SOURCES
+    ${CORE_SOURCES}
+    src/audio/audio_engine.cpp
+    src/cutscene/cutscene_player.cpp
+    src/platform/platform.cpp
+    src/platform/android_log.cpp
+    src/platform/touch_controls.cpp
+    src/ui/main_menu.cpp
+    ${FRONTEND_SOURCES}
+)
+add_library(me_game_objs OBJECT ${GAME_SOURCES})
+
+# The OpenGL 4.1 backend (src/renderer/opengl_renderer.cpp): the Linux renderer. It can be built
+# on macOS as well, as `mirrorsedge_opengl`, to check it against the Metal backend there. On
+# Android it is built with ME_GLES=1 and runs on OpenGL ES 3.0 (docs/ANDROID_PORT.md).
+set(OPENGL_RENDERER_SOURCES
+    src/renderer/opengl_renderer.cpp
+    src/renderer/msl_to_glsl.cpp
+    src/renderer/gl/gl_api.cpp
+)
+# glcorearb.h includes <KHR/khrplatform.h>; both are vendored under src/renderer/gl.
+set(OPENGL_RENDERER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/gl)
+if(APPLE OR WIN32)
+    option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS and Windows" ON)
+endif()
+
+# The headless tools: desktop only (me_glsl needs the system's SDL2; the others are of no use on a
+# phone).
+if(NOT ANDROID)
+
 add_executable(me_replay src/tools/replay_main.cpp ${CORE_SOURCES})
 target_link_libraries(me_replay PRIVATE ZLIB::ZLIB)
 if(MINGW)
@@ -75,50 +122,11 @@ if(MINGW)
     target_link_options(me_anim PRIVATE -static)
 endif()
 
-# The front end ("Press Any Key" and the main menu): its state machine and the CPU reference
-# renderer. Plain C++, so it builds wherever the core does.
-set(FRONTEND_SOURCES
-    src/ui/frontend/frontend_assets.cpp
-    src/ui/frontend/frontend_city.cpp
-    src/ui/frontend/frontend.cpp
-    src/ui/frontend/kismet.cpp
-    src/ui/frontend/ui_scene.cpp
-    src/ui/frontend/frontend_menus.cpp
-    src/ui/frontend/soft_city.cpp
-    src/ui/frontend/soft_render.cpp
-)
-
 # me_menu: renders front-end frames to PNG, headless (docs/MAIN_MENU_SYSTEM_RE.md).
-find_package(Threads REQUIRED)
 add_executable(me_menu src/tools/menu_main.cpp ${FRONTEND_SOURCES} ${CORE_SOURCES})
 target_link_libraries(me_menu PRIVATE ZLIB::ZLIB Threads::Threads)
 if(MINGW)
     target_link_options(me_menu PRIVATE -static)
-endif()
-
-# The game itself: everything but the renderer backend is shared between the platforms.
-# main.cpp is compiled per target (renderer/renderer.hpp picks the backend from its defines).
-set(GAME_SOURCES
-    ${CORE_SOURCES}
-    src/audio/audio_engine.cpp
-    src/cutscene/cutscene_player.cpp
-    src/platform/platform.cpp
-    src/ui/main_menu.cpp
-    ${FRONTEND_SOURCES}
-)
-add_library(me_game_objs OBJECT ${GAME_SOURCES})
-
-# The OpenGL 4.1 backend (src/renderer/opengl_renderer.cpp): the Linux renderer. It can be built
-# on macOS as well, as `mirrorsedge_opengl`, to check it against the Metal backend there.
-set(OPENGL_RENDERER_SOURCES
-    src/renderer/opengl_renderer.cpp
-    src/renderer/msl_to_glsl.cpp
-    src/renderer/gl/gl_api.cpp
-)
-# glcorearb.h includes <KHR/khrplatform.h>; both are vendored under src/renderer/gl.
-set(OPENGL_RENDERER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/renderer/gl)
-if(APPLE OR WIN32)
-    option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS and Windows" ON)
 endif()
 
 # me_glsl: translates every built-in and material shader to GLSL and compiles it on the GPU
@@ -135,6 +143,8 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(me_glsl PRIVATE SDL2::SDL2 ${CMAKE_DL_LIBS})
 endif()
+
+endif()  # NOT ANDROID
 
 if(APPLE)
 
@@ -234,6 +244,125 @@ if(ME_BUNDLE_RUNTIME_DLLS)
         VERBATIM
     )
 endif()
+
+elseif(ANDROID)
+
+# libmain.so: the game on OpenGL ES 3.0, loaded by SDL's Java activity (android/, docs/ANDROID_PORT.md).
+# Built by Gradle's externalNativeBuild (android/app/build.gradle) with the NDK toolchain, or by
+# hand with -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a.
+# The third-party libraries are compiled from source, fetched by android/fetch_deps.sh into
+# android/third_party (ME_ANDROID_THIRD_PARTY): SDL2 as a shared library next to libmain.so, the
+# rest static inside it. Neither GLESv3 nor EGL is linked: the renderer resolves GL through
+# SDL_GL_GetProcAddress, as on Linux.
+enable_language(C)
+set(ME_ANDROID_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/android/third_party" CACHE PATH
+    "Where android/fetch_deps.sh unpacked SDL2, openal-soft, libogg and libvorbis")
+foreach(dep SDL2 openal-soft libogg libvorbis)
+    if(NOT EXISTS "${ME_ANDROID_THIRD_PARTY}/${dep}/CMakeLists.txt")
+        message(FATAL_ERROR "${ME_ANDROID_THIRD_PARTY}/${dep} is missing: run android/fetch_deps.sh first")
+    endif()
+endforeach()
+# CMake 4 refuses projects whose cmake_minimum_required is older than 3.5 (SDL2's is 3.0) unless told
+# which policies to assume for them.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+# --- SDL2 (shared: libSDL2.so ships in the APK and SDLActivity loads it before libmain.so) ---
+set(SDL_SHARED ON CACHE BOOL "" FORCE)
+set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+set(SDL_TEST OFF CACHE BOOL "" FORCE)
+set(SDL2_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+set(SDL2_DISABLE_UNINSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory("${ME_ANDROID_THIRD_PARTY}/SDL2" "${CMAKE_BINARY_DIR}/third_party/SDL2" EXCLUDE_FROM_ALL)
+# The game includes <SDL2/SDL.h> (the system packages' layout); the source tree has include/SDL.h,
+# so an include directory with an SDL2 link to it is made.
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/sdl2_include")
+file(CREATE_LINK "${ME_ANDROID_THIRD_PARTY}/SDL2/include" "${CMAKE_BINARY_DIR}/sdl2_include/SDL2" SYMBOLIC)
+set(ME_SDL2_INCLUDE_DIR "${CMAKE_BINARY_DIR}/sdl2_include")
+# Every game object (me_game_objs is declared above the branch) needs the SDL headers.
+target_include_directories(me_game_objs PRIVATE ${ME_SDL2_INCLUDE_DIR})
+target_compile_definitions(me_game_objs PRIVATE ME_NO_FFMPEG=1)
+
+# --- OpenAL Soft (static, OpenSL ES backend) ---
+set(LIBTYPE STATIC)
+set(ALSOFT_UTILS OFF CACHE BOOL "" FORCE)
+set(ALSOFT_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL_CONFIG OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL_HRTF_DATA OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL_AMBDEC_PRESETS OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(ALSOFT_INSTALL_UTILS OFF CACHE BOOL "" FORCE)
+set(ALSOFT_UPDATE_BUILD_VERSION OFF CACHE BOOL "" FORCE)
+set(ALSOFT_BACKEND_OPENSL ON CACHE BOOL "" FORCE)
+set(ALSOFT_REQUIRE_OPENSL ON CACHE BOOL "" FORCE)
+set(ALSOFT_BACKEND_OBOE OFF CACHE BOOL "" FORCE)
+set(ALSOFT_BACKEND_WAVE OFF CACHE BOOL "" FORCE)
+set(ALSOFT_RTKIT OFF CACHE BOOL "" FORCE)
+add_subdirectory("${ME_ANDROID_THIRD_PARTY}/openal-soft" "${CMAKE_BINARY_DIR}/third_party/openal-soft" EXCLUDE_FROM_ALL)
+
+# --- libogg / libvorbis (static; their own CMake wants a found Ogg, so plain rules over the sources) ---
+set(ME_OGG_DIR "${ME_ANDROID_THIRD_PARTY}/libogg")
+set(ME_VORBIS_DIR "${ME_ANDROID_THIRD_PARTY}/libvorbis")
+set(INCLUDE_INTTYPES_H 1)
+set(INCLUDE_STDINT_H 1)
+set(INCLUDE_SYS_TYPES_H 1)
+set(SIZE16 int16_t)
+set(USIZE16 uint16_t)
+set(SIZE32 int32_t)
+set(USIZE32 uint32_t)
+set(SIZE64 int64_t)
+set(USIZE64 uint64_t)
+configure_file("${ME_OGG_DIR}/include/ogg/config_types.h.in" "${CMAKE_BINARY_DIR}/ogg_include/ogg/config_types.h" @ONLY)
+add_library(ogg STATIC "${ME_OGG_DIR}/src/bitwise.c" "${ME_OGG_DIR}/src/framing.c")
+target_include_directories(ogg PUBLIC "${ME_OGG_DIR}/include" "${CMAKE_BINARY_DIR}/ogg_include")
+set(ME_VORBIS_SOURCES
+    mdct.c smallft.c block.c envelope.c window.c lsp.c lpc.c analysis.c synthesis.c psy.c info.c
+    floor1.c floor0.c res0.c mapping0.c registry.c codebook.c sharedbook.c lookup.c bitrate.c
+)
+list(TRANSFORM ME_VORBIS_SOURCES PREPEND "${ME_VORBIS_DIR}/lib/")
+add_library(vorbis STATIC ${ME_VORBIS_SOURCES})
+target_include_directories(vorbis PUBLIC "${ME_VORBIS_DIR}/include" PRIVATE "${ME_VORBIS_DIR}/lib")
+target_link_libraries(vorbis PUBLIC ogg)
+add_library(vorbisfile STATIC "${ME_VORBIS_DIR}/lib/vorbisfile.c")
+target_include_directories(vorbisfile PUBLIC "${ME_VORBIS_DIR}/include" PRIVATE "${ME_VORBIS_DIR}/lib")
+target_link_libraries(vorbisfile PUBLIC vorbis)
+foreach(t ogg vorbis vorbisfile)
+    target_compile_options(${t} PRIVATE -w)   # their warnings are theirs
+endforeach()
+# The game objects include <AL/al.h> and <vorbis/vorbisfile.h>: the headers come with the targets.
+target_link_libraries(me_game_objs PRIVATE OpenAL vorbisfile)
+
+# --- the game ---
+add_library(main SHARED src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+target_compile_definitions(main PRIVATE ME_RENDERER_OPENGL=1 ME_GLES=1 ME_NO_FFMPEG=1)
+target_include_directories(main PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR} ${ME_SDL2_INCLUDE_DIR})
+set(ME_ANDROID_SDL_TARGETS SDL2::SDL2)
+if(TARGET SDL2::SDL2main)
+    list(APPEND ME_ANDROID_SDL_TARGETS SDL2::SDL2main)
+endif()
+target_link_libraries(main PRIVATE
+    ${ME_ANDROID_SDL_TARGETS}
+    OpenAL
+    vorbisfile
+    vorbis
+    ogg
+    ZLIB::ZLIB
+    Threads::Threads
+    log
+    android
+    ${CMAKE_DL_LIBS}
+)
+# SDLActivity dlsym()s SDL_main out of libmain.so: keep it exported whatever the visibility flags.
+target_link_options(main PRIVATE "-Wl,--undefined=SDL_main")
+# libSDL2.so is built with the app (it is not in `all` because of EXCLUDE_FROM_ALL above).
+add_dependencies(main SDL2)
+# 16 KB pages: Android 15+ warns at launch about a shared library whose LOAD segments are aligned
+# to 4 KB, and a device booted with 16 KB pages will not load it at all. The NDK's libc++_shared.so
+# is already aligned; libmain.so and SDL2's own library are linked so here (ANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES
+# covers only targets the NDK toolchain file saw before SDL's CMake set its own flags).
+foreach(t main SDL2)
+    target_link_options(${t} PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
+endforeach()
 
 else()
 

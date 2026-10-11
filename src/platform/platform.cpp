@@ -14,6 +14,10 @@
 #endif
 #include <windows.h>
 #endif
+#if defined(__ANDROID__)
+// The app's own directories come from the Java side, through SDL (android/README.md).
+#include <SDL2/SDL.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -24,10 +28,31 @@ const char* platform_name() {
     return "Windows";
 #elif defined(__APPLE__)
     return "macOS";
+#elif defined(__ANDROID__)
+    return "Android";
 #else
     return "Linux";
 #endif
 }
+
+#if defined(__ANDROID__)
+namespace {
+
+// /storage/emulated/0/Android/data/<package>/files: reachable through adb with no permission;
+// where the assets are pushed to and the screenshots pulled from.
+std::string android_external_files_dir() {
+    const char* p = SDL_AndroidGetExternalStoragePath();
+    return p ? std::string(p) : std::string();
+}
+
+// /data/data/<package>/files: the app's private storage.
+std::string android_internal_files_dir() {
+    const char* p = SDL_AndroidGetInternalStoragePath();
+    return p ? std::string(p) : std::string();
+}
+
+}  // namespace
+#endif
 
 bool is_game_root(const std::string& game_root) {
     std::error_code ec;
@@ -52,7 +77,7 @@ std::string registry_string(HKEY root, const char* key, const char* value) {
 }  // namespace
 #endif
 
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 namespace {
 
 // Every Steam library: the Steam installs themselves plus the "path" entries of their
@@ -115,6 +140,17 @@ std::string default_game_root() {
         if (is_game_root(c)) return c;
     }
     return "C:/Program Files (x86)/Steam/steamapps/common/mirrors edge";
+#elif defined(__ANDROID__)
+    // A copy of the install directory under the app's external files directory (pushed with adb,
+    // android/README.md), or one at /sdcard/mirrorsedge.
+    std::vector<std::string> candidates;
+    const std::string external = android_external_files_dir();
+    if (!external.empty()) candidates.push_back(external + "/mirrorsedge");
+    candidates.push_back("/sdcard/mirrorsedge");
+    for (const std::string& c : candidates) {
+        if (is_game_root(c)) return c;
+    }
+    return candidates.front();
 #elif defined(__linux__)
     // The Windows game installed through Steam (Proton) lands in the same place as on Windows,
     // relative to the library. Otherwise a copy of the install directory under $HOME.
@@ -140,6 +176,11 @@ std::string temp_dir() {
     std::string dir = fs::temp_directory_path(ec).generic_string();
     while (!dir.empty() && dir.back() == '/') dir.pop_back();
     return dir.empty() ? "." : dir;
+#elif defined(__ANDROID__)
+    // No /tmp on Android: the external files directory (pullable with adb), else the internal one.
+    std::string dir = android_external_files_dir();
+    if (dir.empty()) dir = android_internal_files_dir();
+    return dir.empty() ? "." : dir;
 #else
     return "/tmp";
 #endif
@@ -151,6 +192,9 @@ std::string cache_dir() {
     if (const char* local = std::getenv("LOCALAPPDATA")) base = local;
 #elif defined(__APPLE__)
     if (const char* home = std::getenv("HOME")) base = std::string(home) + "/Library/Caches";
+#elif defined(__ANDROID__)
+    base = android_internal_files_dir();
+    if (!base.empty()) base += "/cache";
 #else
     if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
         base = xdg;

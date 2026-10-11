@@ -11,6 +11,13 @@
 // glcorearb.h (Khronos registry) supplies the types, enums and PFNGL*PROC typedefs
 // of the core profile; it declares no prototypes unless GL_GLEXT_PROTOTYPES is set,
 // which it is not here. Apple's own gl3.h is never included.
+//
+// The same loader serves OpenGL ES 3.x (Android, ME_GLES): every enum the renderer
+// shares with ES has the same value there, so glcorearb.h stays the source of the
+// numbers, and the few ES-only names are defined below. Functions that exist only
+// on desktop GL are optional (ME_GL_OPTIONAL_FUNCTIONS) and the renderer takes the
+// ES spelling where they are missing; functions an ES driver exports under an
+// OES / EXT / KHR suffix are found by the resolver.
 // -----------------------------------------------------------------------------
 
 #include "glcorearb.h"
@@ -18,10 +25,23 @@
 #include <string>
 #include <vector>
 
+// OpenGL ES names the renderer uses that glcorearb.h does not carry. The values are the
+// desktop ones (the registry gives an extension's enum the same number on both APIs).
+#ifndef GL_TIME_ELAPSED_EXT
+#define GL_TIME_ELAPSED_EXT 0x88BF  // GL_EXT_disjoint_timer_query == GL_TIME_ELAPSED
+#endif
+#ifndef GL_GPU_DISJOINT_EXT
+#define GL_GPU_DISJOINT_EXT 0x8FBB  // GL_EXT_disjoint_timer_query
+#endif
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1  // GL_EXT_texture_format_BGRA8888 == GL_BGRA
+#endif
+
 namespace me {
 namespace gl {
 
-// Every function the renderer calls. X(typedef, name).
+// Every function the renderer calls; all of them exist on OpenGL 4.1 core and OpenGL ES 3.0.
+// X(typedef, name).
 #define ME_GL_FUNCTIONS(X)                                                  \
     /* state */                                                              \
     X(PFNGLGETSTRINGPROC, glGetString)                                       \
@@ -31,11 +51,11 @@ namespace gl {
     X(PFNGLENABLEPROC, glEnable)                                             \
     X(PFNGLDISABLEPROC, glDisable)                                           \
     X(PFNGLVIEWPORTPROC, glViewport)                                         \
-    X(PFNGLDEPTHRANGEPROC, glDepthRange)                                     \
+    X(PFNGLDEPTHRANGEFPROC, glDepthRangef)                                   \
     X(PFNGLDEPTHFUNCPROC, glDepthFunc)                                       \
     X(PFNGLDEPTHMASKPROC, glDepthMask)                                       \
     X(PFNGLCLEARCOLORPROC, glClearColor)                                     \
-    X(PFNGLCLEARDEPTHPROC, glClearDepth)                                     \
+    X(PFNGLCLEARDEPTHFPROC, glClearDepthf)                                   \
     X(PFNGLCLEARPROC, glClear)                                               \
     X(PFNGLCLEARBUFFERFVPROC, glClearBufferfv)                               \
     X(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate)                       \
@@ -48,7 +68,7 @@ namespace gl {
     X(PFNGLFINISHPROC, glFinish)                                             \
     X(PFNGLREADPIXELSPROC, glReadPixels)                                     \
     X(PFNGLREADBUFFERPROC, glReadBuffer)                                     \
-    X(PFNGLDRAWBUFFERPROC, glDrawBuffer)                                     \
+    X(PFNGLDRAWBUFFERSPROC, glDrawBuffers)                                   \
     X(PFNGLACTIVETEXTUREPROC, glActiveTexture)                               \
     /* textures */                                                           \
     X(PFNGLGENTEXTURESPROC, glGenTextures)                                   \
@@ -114,22 +134,30 @@ namespace gl {
     /* drawing */                                                            \
     X(PFNGLDRAWARRAYSPROC, glDrawArrays)                                     \
     X(PFNGLDRAWELEMENTSPROC, glDrawElements)                                 \
-    /* timer queries (ME_RENDER_PROF: GPU time per frame) */                 \
+    /* queries (ME_RENDER_PROF: GPU time per frame; ES 3.0 has the objects, not the timer) */ \
     X(PFNGLGENQUERIESPROC, glGenQueries)                                     \
     X(PFNGLDELETEQUERIESPROC, glDeleteQueries)                               \
     X(PFNGLBEGINQUERYPROC, glBeginQuery)                                     \
     X(PFNGLENDQUERYPROC, glEndQuery)                                         \
-    X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv)                       \
-    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)
+    X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv)
 
-// Entry points of extensions the renderer can do without: null when the driver lacks them.
-//   glDebugMessageCallback / glDebugMessageControl : GL_KHR_debug (ME_GL_DEBUG=1; Apple has neither)
+// Entry points the renderer can do without: null when the driver lacks them.
+//   glDebugMessageCallback / glDebugMessageControl : GL_KHR_debug (ME_GL_DEBUG=1; Apple has neither;
+//                          on ES the KHR-suffixed names)
 //   glPolygonOffsetClamp : GL_ARB_polygon_offset_clamp / GL_EXT_polygon_offset_clamp (core in 4.6);
 //                          without it the shadow passes' slope-scaled bias is not capped.
+//   glDepthRange, glClearDepth, glDrawBuffer : desktop only; ES has the f / s forms above, which
+//                          the renderer uses where these are missing.
+//   glGetQueryObjectui64v : desktop 3.3+; on ES GL_EXT_disjoint_timer_query's ...EXT. Without it
+//                          (and GL_TIME_ELAPSED) ME_RENDER_PROF reports no GPU time.
 #define ME_GL_OPTIONAL_FUNCTIONS(X)                                         \
     X(PFNGLDEBUGMESSAGECALLBACKPROC, glDebugMessageCallback)                 \
     X(PFNGLDEBUGMESSAGECONTROLPROC, glDebugMessageControl)                   \
-    X(PFNGLPOLYGONOFFSETCLAMPPROC, glPolygonOffsetClamp)
+    X(PFNGLPOLYGONOFFSETCLAMPPROC, glPolygonOffsetClamp)                     \
+    X(PFNGLDEPTHRANGEPROC, glDepthRange)                                     \
+    X(PFNGLCLEARDEPTHPROC, glClearDepth)                                     \
+    X(PFNGLDRAWBUFFERPROC, glDrawBuffer)                                     \
+    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v)
 
 #define ME_GL_DECLARE(type, name) extern type name;
 ME_GL_FUNCTIONS(ME_GL_DECLARE)
@@ -148,6 +176,13 @@ void unload();
 
 // The extension strings of the current context (GL_NUM_EXTENSIONS / glGetStringi).
 bool has_extension(const char* name);
+
+// True when the context load() saw is an OpenGL ES context (GL_VERSION starts with
+// "OpenGL ES"), whatever the build was configured for.
+bool is_es();
+// The context's version (GL_MAJOR_VERSION / GL_MINOR_VERSION; 3.0 for ES 3.0, 4.1 for desktop 4.1).
+int version_major();
+int version_minor();
 
 }  // namespace gl
 }  // namespace me

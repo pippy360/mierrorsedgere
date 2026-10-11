@@ -2,7 +2,7 @@
 
 A high-performance, clean-room native macOS port and engine reimplementation of *Mirror's Edge* (PC Unreal Engine 3 CookedPC) designed from first principles for Apple Silicon (arm64, M-series) and macOS Metal 3.0.
 
-The same game also builds and runs on Windows, drawn with Direct3D 11 (see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)), and on Linux, drawn with OpenGL 4.1 (see [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md)).
+The same game also builds and runs on Windows, drawn with Direct3D 11 (see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)), on Linux, drawn with OpenGL 4.1 (see [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md)), and on Android, drawn with OpenGL ES 3.0 (see [`docs/ANDROID_PORT.md`](docs/ANDROID_PORT.md)).
 
 Built under the `universal-modder` methodology (Pattern 4: *Reimplement, then Fuse*), `mierrorsedgere` directly loads and runs retail PC assets (UPK/ME1 packages, Ogg Vorbis audio banks, INI physics configs, and INT localization files) from the user's local game installation without redistributing or modifying proprietary game binaries.
 
@@ -100,7 +100,19 @@ Install the distribution's toolchain and libraries (Debian / Ubuntu: `g++ cmake 
 ```
 It builds `build/mirrorsedge_linux` (OpenGL 4.1 core) and starts it; arguments are passed on (`./play_linux.sh --chapter 1`). The retail install is found in the Steam libraries (native, Flatpak and Snap clients, Proton installs included), or set `MEDGE_ME_INSTALL` or pass `--game-root`. The same backend builds on macOS as `build/mirrorsedge_opengl`. Details, what was verified and the known gaps are in [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md).
 
+### Android
+With the Android SDK (NDK 27, platform 35), a JDK 17 and CMake on the `PATH`:
+```bash
+cd android
+./fetch_deps.sh            # SDL2, OpenAL Soft, libogg, libvorbis sources -> android/third_party/
+./gradlew assembleDebug    # -> app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb push ~/mirrorsedge/TdGame /sdcard/Android/data/com.pippy360.mierrorsedgere/files/mirrorsedge/TdGame
+```
+The app draws with OpenGL ES 3.0 through the same backend as Linux (`ME_GLES`), plays with on-screen touch controls or a gamepad, and takes the desktop command line from an intent extra (`adb shell 'am start -n com.pippy360.mierrorsedgere/.MirrorsEdgeActivity --es args "--chapter 0"'`) or `me_args.txt`. Logs go to `adb logcat -s mirrorsedge`. The chapter movies are skipped (no FFmpeg on Android). Details, what was run on the emulator and the known gaps are in [`docs/ANDROID_PORT.md`](docs/ANDROID_PORT.md) and [`android/README.md`](android/README.md).
+
 ---
+
 
 ## Controls Reference
 
@@ -176,6 +188,7 @@ Options:
   --max-frames <N>         Exit cleanly after rendering N frames (useful for smoke tests)
   --trace <file>           Write the camera and every sound played, one JSON line per frame, in the
                            shape of a retail recording (docs/LEVEL_INTROS.md uses it)
+  --exit-screenshot <png>  With --max-frames: save the last frame there before exiting
   --game-root <dir>        Set retail game assets directory (default: $MEDGE_ME_INSTALL, else the Steam
                            install on Windows, else /Users/tomnom/mirrorsedge)
   --help, -h               Show help message

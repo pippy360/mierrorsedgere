@@ -105,12 +105,15 @@ inline bool mod_shadow_resolution(const ModShadowView& view, const Vec3& center,
 }
 
 // Keeps the largest kMaxModShadows, gives each its cell, and builds the frustums (the point
-// light's, 0x00f2b670, then CalcTransforms).
-inline void layout_mod_shadows(std::vector<ModShadow>& shadows) {
+// light's, 0x00f2b670, then CalcTransforms). `map_size` is the side of the shadow array the
+// renderer actually allocated (kSunShadowMapSize unless a device made it smaller); shadows
+// beyond the cells it holds are dropped.
+inline void layout_mod_shadows(std::vector<ModShadow>& shadows, int map_size = kSunShadowMapSize) {
     std::stable_sort(shadows.begin(), shadows.end(),
                      [](const ModShadow& a, const ModShadow& b) { return a.resolution > b.resolution; });
-    if (shadows.size() > static_cast<size_t>(kMaxModShadows)) shadows.resize(static_cast<size_t>(kMaxModShadows));
-    const int per_side = kSunShadowMapSize / kModShadowCell;
+    const int per_side = std::max(1, map_size / kModShadowCell);
+    const size_t capacity = std::min(static_cast<size_t>(kMaxModShadows), static_cast<size_t>(per_side * per_side));
+    if (shadows.size() > capacity) shadows.resize(capacity);
     for (size_t i = 0; i < shadows.size(); ++i) {
         ModShadow& s = shadows[i];
         s.cell_x = (static_cast<int>(i) % per_side) * kModShadowCell + kModShadowBorder;
@@ -155,9 +158,10 @@ inline void layout_mod_shadows(std::vector<ModShadow>& shadows) {
     }
 }
 
-inline void fill_mod_shadow_uniforms(const std::vector<ModShadow>& shadows, ModShadowUniformsGPU& u) {
+inline void fill_mod_shadow_uniforms(const std::vector<ModShadow>& shadows, ModShadowUniformsGPU& u,
+                                     int map_size = kSunShadowMapSize) {
     u = ModShadowUniformsGPU{};
-    const float inv = 1.0f / static_cast<float>(kSunShadowMapSize);
+    const float inv = 1.0f / static_cast<float>(map_size);
     const size_t n = std::min(shadows.size(), static_cast<size_t>(kMaxModShadows));
     u.count[0] = static_cast<float>(n);
     for (size_t i = 0; i < n; ++i) {
@@ -240,7 +244,7 @@ inline void player_body_stand_in(const Vec3& eye, const Vec3& feet, const Vec3& 
 // and those of the scene's dynamic objects that have a light environment that casts.
 inline void collect_mod_shadows(const LevelScene& scene, SceneLightEnvironments& envs, const ModShadowView& view,
                                 const Vec3* player_position, float player_yaw_deg, const std::vector<uint8_t>& enemy_ready,
-                                float now, std::vector<ModShadow>& out) {
+                                float now, std::vector<ModShadow>& out, int map_size = kSunShadowMapSize) {
     out.clear();
     static const bool off = std::getenv("ME_NO_DYNAMIC_SHADOWS") != nullptr;  // to see a picture without them
     if (off) return;
@@ -277,7 +281,7 @@ inline void collect_mod_shadows(const LevelScene& scene, SceneLightEnvironments&
         const ShadowLight light = envs.mesh_shadow(scene, i, now, center, radius);
         add(ModShadow::Kind::Mesh, i, center, radius, light);
     }
-    layout_mod_shadows(out);
+    layout_mod_shadows(out, map_size);
 }
 
 }  // namespace me
