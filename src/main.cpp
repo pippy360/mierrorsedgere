@@ -18,6 +18,9 @@
 #else
 #define ME_PLATFORM_TITLE "Linux"
 #endif
+#if defined(ME_RENDERER_VULKAN)
+#include <SDL2/SDL_vulkan.h>
+#endif
 #include "platform/touch_controls.hpp"
 #if defined(_WIN32) && defined(ME_RENDERER_OPENGL)
 // The OpenGL backend built on Windows to check it (docs/LINUX_PORT.md): on a laptop with two GPUs
@@ -3965,11 +3968,18 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
                               const std::string& custom_level, int max_frames,
                               bool start_in_main_menu, const std::string& trace_path,
-                              const std::string& exit_screenshot) {
+                              const std::string& exit_screenshot, bool mute_requested = false) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
     std::cout << "  MIRROR'S EDGE NATIVE " << platform_upper() << " - INTERACTIVE LAUNCH" << std::endl;
     std::cout << "============================================================" << std::endl;
+
+    const char* env_mute = std::getenv("ME_MUTE");
+    const bool mute_audio = mute_requested || (env_mute && env_mute[0] != '\0' && env_mute[0] != '0') ||
+                            (max_frames > 0) || !exit_screenshot.empty();
+    if (mute_audio) {
+        SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
+    }
 
     SDL_SetMainReady();
 #if defined(_WIN32)
@@ -3990,7 +4000,23 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     int win_w = 1280;
     int win_h = 720;
+#if defined(ME_RENDERER_VULKAN)
+    Renderer::prepare_window_attributes();
 #if defined(__ANDROID__)
+    const char* window_title = "Mirror's Edge (Native Android Vulkan)";
+    const Uint32 window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI;
+    {
+        SDL_DisplayMode mode{};
+        if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0) {
+            win_w = std::max(mode.w, mode.h);
+            win_h = std::min(mode.w, mode.h);
+        }
+    }
+#else
+    const char* window_title = "Mirror's Edge (Native " ME_PLATFORM_TITLE " Vulkan)";
+    const Uint32 window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#endif
+#elif defined(__ANDROID__)
     // The whole display, in landscape; the drawable's pixel size comes from SDL_GL_GetDrawableSize.
     const char* window_title = "Mirror's Edge (Native Android OpenGL ES)";
     const Uint32 window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI;
@@ -4028,9 +4054,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return 1;
     }
 
-    // What the renderer draws into: a CAMetalLayer on macOS, the window itself (HWND) on Windows,
-    // the SDL window's GL context on Linux.
-#if defined(ME_RENDERER_OPENGL)
+    // What the renderer draws into: Vulkan surface, CAMetalLayer on macOS, HWND on Windows,
+    // or SDL window GL context on Linux / Android GLES.
+#if defined(ME_RENDERER_VULKAN)
+    auto get_drawable_size = [&](int* w, int* h) { SDL_Vulkan_GetDrawableSize(window, w, h); };
+    auto destroy_surface = []() {};
+#elif defined(ME_RENDERER_OPENGL)
     auto get_drawable_size = [&](int* w, int* h) { SDL_GL_GetDrawableSize(window, w, h); };
     auto destroy_surface = []() {};
 #elif defined(__APPLE__)
@@ -4054,7 +4083,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     Renderer renderer;
     renderer.set_game_root(game_root);
-#if defined(ME_RENDERER_OPENGL)
+#if defined(ME_RENDERER_VULKAN) || defined(ME_RENDERER_OPENGL)
     const bool renderer_ok = renderer.init_with_window(window, drawable_w, drawable_h);
 #elif defined(__APPLE__)
     const bool renderer_ok = renderer.init_with_metal_layer(SDL_Metal_GetLayer(metal_view), drawable_w, drawable_h);
@@ -4073,7 +4102,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     }
 
     AudioEngine audio;
-    audio.init(false);
+    audio.init(mute_audio);
     audio.load_stock_audio(game_root);
 
     // --trace: one JSON line per frame (the camera, the pawn, what is playing) and one per sound asked
@@ -4128,7 +4157,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     });
 
     CutscenePlayer cutscene_player;
-    cutscene_player.init(game_root, /*headless=*/(max_frames > 0));
+    cutscene_player.init(game_root, /*headless=*/mute_audio);
     renderer.set_cutscene_player(&cutscene_player);
 
     bool pending_level_loaded_audio = false;
@@ -5889,6 +5918,7 @@ int main(int argc, char* argv[]) {
     std::string custom_level = "";
     int max_frames = 0;
     bool start_in_main_menu = true;
+    bool mute_requested = false;
     std::string trace_path;
     std::string exit_screenshot;  // --exit-screenshot <png>: the last frame when --max-frames ends the run
 
@@ -5943,6 +5973,8 @@ int main(int argc, char* argv[]) {
             start_in_main_menu = false;
         } else if (arg == "--max-frames") {
             if (i + 1 < argc) max_frames = std::atoi(argv[++i]);
+        } else if (arg == "--mute") {
+            mute_requested = true;
         } else if (arg == "--trace") {
             if (i + 1 < argc) trace_path = argv[++i];
         } else if (arg == "--exit-screenshot") {
@@ -5969,6 +6001,7 @@ int main(int argc, char* argv[]) {
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
                       << "  --level <path>           Load custom level package\n"
                       << "  --max-frames <N>         Exit after rendering N frames\n"
+                      << "  --mute                   Start with all audio muted (SDL dummy audio driver)\n"
                       << "  --trace <file>           Write the camera and every sound played, one JSON line per frame\n"
                       << "  --exit-screenshot <png>  With --max-frames: save the last frame there before exiting\n"
                       << "  --game-root <dir>        Set retail game assets directory (default: " << me::default_game_root() << ")\n"
@@ -6026,5 +6059,5 @@ int main(int argc, char* argv[]) {
     }
 
     return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu, trace_path,
-                               exit_screenshot);
+                               exit_screenshot, mute_requested);
 }

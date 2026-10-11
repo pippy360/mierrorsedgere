@@ -1,10 +1,12 @@
 # The Android Port
 
 The game as an Android app (`android/`, package `com.pippy360.mierrorsedgere`): the engine built
-with the NDK into `libmain.so`, drawn with **OpenGL ES 3.0** by the same backend that draws on
-Linux, inside SDL2's Java activity. Everything but the window, the GL dialect and the controls is
-the source the desktop builds compile: the asset loaders, the parkour controller, the level
-script, audio, the front end and `src/main.cpp`. arm64-v8a, minSdk 26 (Android 8), targetSdk 35.
+with the NDK into 16 KiB page-aligned `libmain.so`, drawn by default with **native Vulkan 1.0**
+(`VulkanRenderer` + NDK `glslang`/`SPIRV`, [`docs/VULKAN_PORT.md`](VULKAN_PORT.md)) or with
+**OpenGL ES 3.0** (`-PmeVulkan=false`) inside SDL2's Java activity. Everything but the window,
+the shader dialect and the controls is the source the desktop builds compile: the asset loaders,
+the parkour controller, the level script, audio, the front end and `src/main.cpp`. arm64-v8a,
+minSdk 26 (Android 8), targetSdk 35, 16 KiB kernel page size (`LOAD align 0x4000`) verified on Android 17.
 
 How to build, install, push the assets and run it is in [`android/README.md`](../android/README.md).
 This document is what the port is made of, what was measured, and what is still missing.

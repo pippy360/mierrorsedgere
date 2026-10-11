@@ -157,6 +157,7 @@ struct Options {
     bool builtin_only = false;
     bool es = false;         // --es: emit GLSL ES and validate with glslc instead of the GPU
     int es_version = 300;    // 300 | 310 | 320
+    bool vulkan = false;     // --vulkan: emit GLSL 450 and validate SPIR-V with glslc --target-env=vulkan1.0
 };
 
 void dump(const Options& opt, const std::string& name, const std::string& text) {
@@ -176,20 +177,12 @@ void print_failure(const std::string& what, const std::string& message) {
     }
 }
 
-// ---- --es: offline validation with glslc ---------------------------------------
-// Apple's OpenGL cannot compile GLSL ES, so the ES dialect is checked with the NDK's glslc
-// (shaderc / glslang), the reference front end, as it would be for an OpenGL ES target:
-//   glslc -fshader-stage=<stage> --target-env=opengl -fauto-bind-uniforms -fauto-map-locations -c
-// --target-env=opengl keeps OpenGL semantics (uniform blocks, combined samplers, gl_VertexID);
-// the two -fauto flags supply the SPIR-V-only bindings and locations the GLSL does not carry.
-// glslc only writes SPIR-V for ES 3.10 and up, so `#version 300 es` shaders are validated as
-// 310: GLSL ES 3.10 is a superset of 3.00 for everything the translator emits (no textureGather,
-// bitfield, image or SSBO use), so what passes as 310 passes as 300 unless it uses a 310 feature.
-// Shaders are checked in batches of one glslc run each; the errors are attributed by file name.
+// ---- --es / --vulkan: offline validation with glslc -----------------------------
 struct EsValidator {
     std::string glslc;
     std::filesystem::path dir;
     int version = 300;
+    bool vulkan = false;
     bool usable = false;
     struct Pending {
         std::string file;   // in `dir`
@@ -200,11 +193,17 @@ struct EsValidator {
     std::map<std::string, std::string> errors;  // file -> glslc's lines
     std::set<std::string> checked;
 
-    bool init(int es_version) {
+    bool init(int es_version, bool vk = false) {
         version = es_version;
+        vulkan = vk;
         if (const char* env = std::getenv("ME_GLSLC")) glslc = env;
         if (glslc.empty()) {
-            glslc = "/Users/tomnom/Library/Android/sdk/ndk/27.0.12077973/shader-tools/darwin-x86_64/glslc";
+            std::error_code ec;
+            if (std::filesystem::exists("/opt/homebrew/bin/glslc", ec)) {
+                glslc = "/opt/homebrew/bin/glslc";
+            } else {
+                glslc = "/Users/tomnom/Library/Android/sdk/ndk/27.0.12077973/shader-tools/darwin-x86_64/glslc";
+            }
         }
         std::error_code ec;
         if (!std::filesystem::exists(glslc, ec)) {
@@ -221,10 +220,10 @@ struct EsValidator {
         return true;
     }
 
-    // Queues `source` (already in the ES dialect) for the next flush().
+    // Queues `source` (already in the ES or Vulkan dialect) for the next flush().
     void add(const std::string& label, const std::string& file, bool vertex, const std::string& source) {
         std::string text = source;
-        if (version < 310) {
+        if (!vulkan && version < 310) {
             const size_t eol = text.find('\n');
             if (text.rfind("#version 300 es", 0) == 0 && eol != std::string::npos) text = "#version 310 es" + text.substr(eol);
         }
@@ -243,7 +242,8 @@ struct EsValidator {
             }
             for (size_t at = 0; at < files.size();) {
                 std::string cmd = "cd \"" + dir.string() + "\" && \"" + glslc + "\" -fshader-stage=" + (vertex ? "vertex" : "fragment") +
-                                  " --target-env=opengl -fauto-bind-uniforms -fauto-map-locations -c";
+                                  (vulkan ? " --target-env=vulkan1.0 -c"
+                                          : " --target-env=opengl -fauto-bind-uniforms -fauto-map-locations -c");
                 const size_t end = std::min(files.size(), at + 64);
                 for (size_t i = at; i < end; ++i) cmd += " " + files[i]->file;
                 cmd += " 2>&1";
@@ -342,7 +342,7 @@ bool check_program(const Options& opt, const std::string& label, const me::GlslS
     std::string log;
     GLuint vso = 0;
     GLuint fso = 0;
-    if (opt.es) {
+    if (opt.es || opt.vulkan) {
         // Offline: glslc checks each stage; there is no link step, the counts stand in for it.
         if (!vs.error.empty()) {
             print_failure(label + " / " + vs.entry + " (translate)", vs.error);
@@ -412,6 +412,7 @@ bool check_program(const Options& opt, const std::string& label, const me::GlslS
 
 void apply_dialect(const Options& opt, me::MslToGlsl& translator) {
     if (opt.es) translator.set_dialect(me::GlslDialect::ES, opt.es_version);
+    else if (opt.vulkan) translator.set_dialect(me::GlslDialect::Vulkan);
 }
 
 // The pairs the renderers build from the built-in shaders (d3d11_renderer.cpp, opengl_renderer.cpp).
@@ -501,11 +502,12 @@ bool check_chapter_es(const Options& opt, const std::string& tag, const me::Scen
             dump(opt, tag + "." + it.sh->function_name + ".frag", it.fs.source);
             continue;
         }
-        report_es_limits(tag, vs, &it.fs);
+        if (opt.es) report_es_limits(tag, vs, &it.fs);
         ++ok;
     }
     std::cout << tag << ": validated " << ok << "/" << total << " material shaders (" << lib.materials.size()
-              << " materials), GLSL ES " << opt.es_version << std::endl;
+              << " materials), " << (opt.vulkan ? "Vulkan SPIR-V" : ("GLSL ES " + std::to_string(opt.es_version)))
+              << std::endl;
     return ok == total && vs_ok;
 }
 
@@ -533,7 +535,7 @@ bool check_chapter(const Options& opt, const std::string& map) {
         return false;
     }
     const me::GlslShader vs = translator.emit(lib->vertex_function);
-    if (opt.es) return check_chapter_es(opt, tag, *lib, translator, vs);
+    if (opt.es || opt.vulkan) return check_chapter_es(opt, tag, *lib, translator, vs);
     std::string log;
     GLuint vso = 0;
     if (!vs.error.empty()) {
@@ -598,6 +600,8 @@ int main(int argc, char** argv) {
             opt.dump_all = true;
         } else if (a == "--builtin-only") {
             opt.builtin_only = true;
+        } else if (a == "--vulkan") {
+            opt.vulkan = true;
         } else if (a == "--es") {
             opt.es = true;
             if (i + 1 < argc && std::isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
@@ -609,7 +613,7 @@ int main(int argc, char** argv) {
             }
         } else {
             std::cout << "usage: me_glsl [--game-root <dir>] [--chapter N] [--dump <dir> | --dump-all <dir>] [--builtin-only]"
-                         " [--es [300|310|320]]"
+                         " [--es [300|310|320] | --vulkan]"
                       << std::endl;
             return a == "--help" || a == "-h" ? 0 : 2;
         }
@@ -618,9 +622,12 @@ int main(int argc, char** argv) {
 
     SDL_Window* window = nullptr;
     SDL_GLContext context = nullptr;
-    if (opt.es) {
+    if (opt.vulkan) {
+        if (!es_validator.init(450, true)) return 1;
+        std::cout << "Vulkan GLSL 450 SPIR-V validated with " << es_validator.glslc << std::endl;
+    } else if (opt.es) {
         // No GL context: Apple's (and Mesa's desktop) GL cannot compile GLSL ES; glslc checks it.
-        if (!es_validator.init(opt.es_version)) return 1;
+        if (!es_validator.init(opt.es_version, false)) return 1;
         std::cout << "GLSL ES " << opt.es_version << " validated with " << es_validator.glslc
                   << (opt.es_version < 310 ? " (as #version 310 es: glslc writes SPIR-V for ES 3.10 and up only)" : "")
                   << std::endl;
@@ -680,7 +687,8 @@ int main(int argc, char** argv) {
         SDL_DestroyWindow(window);
         SDL_Quit();
     }
-    std::cout << (all_ok ? (opt.es ? "me_glsl: all shaders validated" : "me_glsl: all shaders compiled") : "me_glsl: FAILURES")
+    std::cout << (all_ok ? ((opt.es || opt.vulkan) ? "me_glsl: all shaders validated" : "me_glsl: all shaders compiled")
+                         : "me_glsl: FAILURES")
               << std::endl;
     return all_ok ? 0 : 1;
 }

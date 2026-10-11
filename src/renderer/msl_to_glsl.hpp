@@ -124,7 +124,15 @@ struct GlslShader {
 //            integer literals passed where a helper takes a float or uint are spelt out.
 //            Everything else (names, blocks, samplers, the clip-space fix-up) is the same, so
 //            the renderer binds the two dialects alike.
-enum class GlslDialect { Desktop, ES };
+//   Vulkan:  `#version 450` for SPIR-V compilation (shaderc / glslang). Emits explicit
+//            `layout(set = 0, binding = ...)` on uniform blocks (VS: 0+slot, FS: 16+slot) and
+//            combined image samplers (32+unit), explicit `layout(location = ...)` on varyings,
+//            `gl_VertexIndex`, and keeps Vulkan's [0, w] clip depth (`gl_Position.y = -y` only).
+enum class GlslDialect { Desktop, ES, Vulkan };
+
+constexpr int kVulkanVsUboBindingBase = 0;
+constexpr int kVulkanFsUboBindingBase = 16;
+constexpr int kVulkanSamplerBindingBase = 32;
 
 class MslToGlsl {
 public:
@@ -134,7 +142,7 @@ public:
     MslToGlsl& operator=(const MslToGlsl&) = delete;
 
     // Selects the dialect emit() / emit_from() write. `version` 0 picks the dialect's default
-    // (410 for Desktop, 300 for ES); ES accepts 300, 310 and 320. May be called at any time.
+    // (410 for Desktop, 300 for ES, 450 for Vulkan); ES accepts 300, 310 and 320. May be called at any time.
     void set_dialect(GlslDialect dialect, int version = 0);
     [[nodiscard]] GlslDialect dialect() const;
     [[nodiscard]] int version() const;

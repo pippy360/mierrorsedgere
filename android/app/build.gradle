@@ -31,10 +31,12 @@ android {
         }
         externalNativeBuild {
             cmake {
+                def useVulkan = !project.hasProperty('meVulkan') || project.property('meVulkan').toString() != 'false'
                 // -O2 is in CMakeLists.txt for every configuration; Debug still gets symbols.
                 arguments '-DANDROID_STL=c++_shared',
                           '-DANDROID_PLATFORM=android-26',
                           '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
+                          "-DME_VULKAN=${useVulkan ? 'ON' : 'OFF'}",
                           "-DME_ANDROID_THIRD_PARTY=${rootDir}/third_party"
                 targets 'main', 'SDL2'
             }

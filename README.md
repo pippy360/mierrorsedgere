@@ -2,7 +2,7 @@
 
 A high-performance, clean-room native macOS port and engine reimplementation of *Mirror's Edge* (PC Unreal Engine 3 CookedPC) designed from first principles for Apple Silicon (arm64, M-series) and macOS Metal 3.0.
 
-The same game also builds and runs on Windows, drawn with Direct3D 11 (see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)), on Linux, drawn with OpenGL 4.1 (see [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md)), and on Android, drawn with OpenGL ES 3.0 (see [`docs/ANDROID_PORT.md`](docs/ANDROID_PORT.md)).
+The same game also builds and runs across desktop and mobile with native **Vulkan 1.0** (`mirrorsedge_vulkan` on macOS/Linux/Windows and default on Android — see [`docs/VULKAN_PORT.md`](docs/VULKAN_PORT.md)), on Windows with Direct3D 11 (see [`docs/WINDOWS_PORT.md`](docs/WINDOWS_PORT.md)), on Linux with OpenGL 4.1 (see [`docs/LINUX_PORT.md`](docs/LINUX_PORT.md)), and on Android with Vulkan 1.0 or OpenGL ES 3.0 (see [`docs/ANDROID_PORT.md`](docs/ANDROID_PORT.md)).
 
 Built under the `universal-modder` methodology (Pattern 4: *Reimplement, then Fuse*), `mierrorsedgere` directly loads and runs retail PC assets (UPK/ME1 packages, Ogg Vorbis audio banks, INI physics configs, and INT localization files) from the user's local game installation without redistributing or modifying proprietary game binaries.
 

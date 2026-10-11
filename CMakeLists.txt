@@ -103,6 +103,14 @@ if(APPLE OR WIN32)
     option(ME_OPENGL "Also build mirrorsedge_opengl, the OpenGL (Linux) backend, on macOS and Windows" ON)
 endif()
 
+# Native Vulkan 1.0/1.1 renderer backend (src/renderer/vulkan_renderer.cpp + src/renderer/vk/vk_backend.cpp).
+set(VULKAN_RENDERER_SOURCES
+    src/renderer/vulkan_renderer.cpp
+    src/renderer/vk/vk_backend.cpp
+    src/renderer/msl_to_glsl.cpp
+)
+option(ME_VULKAN "Build the native Vulkan renderer backend (mirrorsedge_vulkan on desktop; default backend on Android)" ON)
+
 # The headless tools: desktop only (me_glsl needs the system's SDL2; the others are of no use on a
 # phone).
 if(NOT ANDROID)
@@ -183,6 +191,15 @@ if(ME_OPENGL)
     target_link_libraries(mirrorsedge_opengl PRIVATE ${ME_MACOS_LIBS})
 endif()
 
+if(ME_VULKAN)
+    find_library(ME_SHADERC_LIB NAMES shaderc_combined shaderc HINTS /opt/homebrew/lib /usr/local/lib)
+    if(ME_SHADERC_LIB)
+        add_executable(mirrorsedge_vulkan src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${VULKAN_RENDERER_SOURCES})
+        target_compile_definitions(mirrorsedge_vulkan PRIVATE ME_RENDERER_VULKAN=1)
+        target_link_libraries(mirrorsedge_vulkan PRIVATE ${ME_MACOS_LIBS} ${ME_SHADERC_LIB})
+    endif()
+endif()
+
 elseif(WIN32)
 
 # mirrorsedge_windows: the same game on Direct3D 11 (src/renderer/d3d11_renderer.cpp).
@@ -230,6 +247,23 @@ if(ME_OPENGL)
     )
 endif()
 
+if(ME_VULKAN)
+    find_library(ME_SHADERC_LIB NAMES shaderc_combined shaderc)
+    if(ME_SHADERC_LIB)
+        add_executable(mirrorsedge_vulkan src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${VULKAN_RENDERER_SOURCES})
+        target_compile_definitions(mirrorsedge_vulkan PRIVATE ME_RENDERER_VULKAN=1)
+        target_link_libraries(mirrorsedge_vulkan PRIVATE
+            SDL2::SDL2
+            OpenAL::OpenAL
+            PkgConfig::VORBISFILE
+            PkgConfig::FFMPEG
+            ZLIB::ZLIB
+            Threads::Threads
+            ${ME_SHADERC_LIB}
+        )
+    endif()
+endif()
+
 # The DLLs the game loads (SDL2, OpenAL Soft, Vorbis, FFmpeg and what they need) are copied next to the
 # executable, so it starts from Explorer or any shell without MSYS2 on PATH.
 option(ME_BUNDLE_RUNTIME_DLLS "Copy the game's runtime DLLs next to mirrorsedge_windows.exe" ON)
@@ -247,13 +281,8 @@ endif()
 
 elseif(ANDROID)
 
-# libmain.so: the game on OpenGL ES 3.0, loaded by SDL's Java activity (android/, docs/ANDROID_PORT.md).
-# Built by Gradle's externalNativeBuild (android/app/build.gradle) with the NDK toolchain, or by
-# hand with -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a.
-# The third-party libraries are compiled from source, fetched by android/fetch_deps.sh into
-# android/third_party (ME_ANDROID_THIRD_PARTY): SDL2 as a shared library next to libmain.so, the
-# rest static inside it. Neither GLESv3 nor EGL is linked: the renderer resolves GL through
-# SDL_GL_GetProcAddress, as on Linux.
+# libmain.so: the game on Vulkan 1.0/1.1 (ME_VULKAN=ON default) or OpenGL ES 3.0 (ME_VULKAN=OFF),
+# loaded by SDL's Java activity (android/, docs/ANDROID_PORT.md, docs/VULKAN_PORT.md).
 enable_language(C)
 set(ME_ANDROID_THIRD_PARTY "${CMAKE_CURRENT_SOURCE_DIR}/android/third_party" CACHE PATH
     "Where android/fetch_deps.sh unpacked SDL2, openal-soft, libogg and libvorbis")
@@ -333,9 +362,92 @@ endforeach()
 target_link_libraries(me_game_objs PRIVATE OpenAL vorbisfile)
 
 # --- the game ---
-add_library(main SHARED src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
-target_compile_definitions(main PRIVATE ME_RENDERER_OPENGL=1 ME_GLES=1 ME_NO_FFMPEG=1)
-target_include_directories(main PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR} ${ME_SDL2_INCLUDE_DIR})
+if(ME_VULKAN)
+    # Compile the NDK's bundled glslang + SPIRV C interface directly into libmain.so so zero external
+    # third-party downloads or prebuilt binaries are required for GLSL 450 -> SPIR-V compilation.
+    set(NDK_GLSLANG_ROOT "${CMAKE_ANDROID_NDK}/sources/third_party/shaderc/third_party/glslang")
+    set(major 15)
+    set(minor 0)
+    set(patch 0)
+    set(flavor "")
+    configure_file("${NDK_GLSLANG_ROOT}/build_info.h.tmpl" "${CMAKE_BINARY_DIR}/glslang_gen/glslang/build_info.h" @ONLY)
+    set(NDK_GLSLANG_SOURCES
+        ${NDK_GLSLANG_ROOT}/glslang/OSDependent/Unix/ossource.cpp
+        ${NDK_GLSLANG_ROOT}/OGLCompilersDLL/InitializeDll.cpp
+        ${NDK_GLSLANG_ROOT}/hlsl/stub.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/CInterface/glslang_c_interface.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/GenericCodeGen/CodeGen.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/GenericCodeGen/Link.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslAttributes.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslGrammar.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslOpMap.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslParseables.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslParseHelper.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslScanContext.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/HLSL/hlslTokenStream.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/attribute.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/Constant.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/glslang_tab.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/InfoSink.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/Initialize.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/Intermediate.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/intermOut.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/IntermTraverse.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/iomapper.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/limits.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/linkValidate.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/parseConst.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/ParseContextBase.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/ParseHelper.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/PoolAlloc.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/propagateNoContraction.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/reflection.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/RemoveTree.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/Scan.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/ShaderLang.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/SpirvIntrinsics.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/SymbolTable.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/Versions.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/preprocessor/PpAtom.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/preprocessor/PpContext.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/preprocessor/Pp.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/preprocessor/PpScanner.cpp
+        ${NDK_GLSLANG_ROOT}/glslang/MachineIndependent/preprocessor/PpTokens.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/CInterface/spirv_c_interface.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/GlslangToSpv.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/InReadableOrder.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/Logger.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/SPVRemapper.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/SpvBuilder.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/SpvPostProcess.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/SpvTools.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/disassemble.cpp
+        ${NDK_GLSLANG_ROOT}/SPIRV/doc.cpp
+    )
+    add_library(ndk_glslang STATIC ${NDK_GLSLANG_SOURCES})
+    target_include_directories(ndk_glslang PUBLIC
+        "${NDK_GLSLANG_ROOT}"
+        "${CMAKE_BINARY_DIR}/glslang_gen"
+        PRIVATE
+        "${NDK_GLSLANG_ROOT}/glslang/OSDependent/Unix"
+        "${NDK_GLSLANG_ROOT}/OGLCompiler"
+        "${NDK_GLSLANG_ROOT}/glslang/HLSL"
+        "${NDK_GLSLANG_ROOT}/glslang/MachineIndependent"
+        "${NDK_GLSLANG_ROOT}/SPIRV"
+    )
+    target_compile_definitions(ndk_glslang PRIVATE GLSLANG_OSINCLUDE_UNIX AMD_EXTENSIONS NV_EXTENSIONS ENABLE_HLSL)
+    target_compile_options(ndk_glslang PRIVATE -w -fno-exceptions -fno-rtti)
+
+    add_library(main SHARED src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${VULKAN_RENDERER_SOURCES})
+    target_compile_definitions(main PRIVATE ME_RENDERER_VULKAN=1 ME_NO_FFMPEG=1)
+    target_include_directories(main PRIVATE ${ME_SDL2_INCLUDE_DIR})
+    target_link_libraries(main PRIVATE ndk_glslang)
+else()
+    add_library(main SHARED src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+    target_compile_definitions(main PRIVATE ME_RENDERER_OPENGL=1 ME_GLES=1 ME_NO_FFMPEG=1)
+    target_include_directories(main PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR} ${ME_SDL2_INCLUDE_DIR})
+endif()
+
 set(ME_ANDROID_SDL_TARGETS SDL2::SDL2)
 if(TARGET SDL2::SDL2main)
     list(APPEND ME_ANDROID_SDL_TARGETS SDL2::SDL2main)
@@ -389,5 +501,23 @@ target_link_libraries(mirrorsedge_linux PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+
+if(ME_VULKAN)
+    find_library(ME_SHADERC_LIB NAMES shaderc_combined shaderc)
+    if(ME_SHADERC_LIB)
+        add_executable(mirrorsedge_vulkan src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${VULKAN_RENDERER_SOURCES})
+        target_compile_definitions(mirrorsedge_vulkan PRIVATE ME_RENDERER_VULKAN=1)
+        target_link_libraries(mirrorsedge_vulkan PRIVATE
+            SDL2::SDL2
+            PkgConfig::OPENAL
+            PkgConfig::VORBISFILE
+            PkgConfig::FFMPEG
+            ZLIB::ZLIB
+            Threads::Threads
+            ${CMAKE_DL_LIBS}
+            ${ME_SHADERC_LIB}
+        )
+    endif()
+endif()
 
 endif()

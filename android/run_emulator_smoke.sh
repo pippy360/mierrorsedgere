@@ -30,7 +30,7 @@ ACTIVITY="${PKG}/.MirrorsEdgeActivity"
 FILES="/sdcard/Android/data/${PKG}/files"
 DEST="${FILES}/mirrorsedge"
 SHOT="screenshots/android_smoke.png"
-ARGS="${ME_ARGS:---chapter 0 --max-frames ${FRAMES} --exit-screenshot ${SHOT}}"
+ARGS="${ME_ARGS:---mute --chapter 0 --max-frames ${FRAMES} --exit-screenshot ${SHOT}}"
 
 mkdir -p "${OUT}"
 log() { echo "[smoke] $*"; }
@@ -42,7 +42,7 @@ device_ready() { "${ADB}" get-state >/dev/null 2>&1 && [ "$("${ADB}" shell getpr
 if ! "${ADB}" devices | awk 'NR>1 && $2=="device"' | grep -q .; then
     [ -x "${EMULATOR}" ] || { echo "no device connected and no emulator at ${EMULATOR}" >&2; exit 1; }
     log "no device connected: starting AVD ${AVD}"
-    nohup "${EMULATOR}" -avd "${AVD}" -no-snapshot-load -gpu auto -no-boot-anim >"${OUT}/emulator.log" 2>&1 &
+    nohup "${EMULATOR}" -avd "${AVD}" -no-audio -no-window -feature Vulkan -gpu host -no-boot-anim >"${OUT}/emulator.log" 2>&1 &
     "${ADB}" wait-for-device
 fi
 log "waiting for boot"
