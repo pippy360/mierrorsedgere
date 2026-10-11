@@ -38,6 +38,58 @@ inline float rand_normalized() {
     return static_cast<float>(std::rand()) / static_cast<float>(RAND_MAX);
 }
 
+#ifndef ME_NO_OPENAL
+// The low pass with distance goes to the device through OpenAL's EFX extension, as retail's does:
+// its device binds alGenFilters, alFilteri, alFilterf and the rest by name and keeps them only when
+// ALC_EXT_EFX is there (MirrorsEdge.exe 0x010D7BB0). Here they are asked of the library at run time
+// (alGetProcAddress) and never linked, because Apple's OpenAL has none of them; a device without
+// the extension gets no filter, and the gain is still worked out. The numbers are the ones retail
+// pushes, which are AL/efx.h's.
+#ifndef AL_APIENTRY
+#define AL_APIENTRY
+#endif
+constexpr ALenum kAlFilterType = 0x8001;     // AL_FILTER_TYPE
+constexpr ALint kAlFilterLowpass = 0x0001;   // AL_FILTER_LOWPASS
+constexpr ALenum kAlLowpassGain = 0x0001;    // AL_LOWPASS_GAIN
+constexpr ALenum kAlLowpassGainHF = 0x0002;  // AL_LOWPASS_GAINHF
+constexpr ALenum kAlDirectFilter = 0x20005;  // AL_DIRECT_FILTER
+constexpr ALint kAlFilterNull = 0;           // AL_FILTER_NULL
+struct EfxEntryPoints {
+    void (AL_APIENTRY* gen_filters)(ALsizei, ALuint*) = nullptr;
+    void (AL_APIENTRY* delete_filters)(ALsizei, const ALuint*) = nullptr;
+    void (AL_APIENTRY* filteri)(ALuint, ALenum, ALint) = nullptr;
+    void (AL_APIENTRY* filterf)(ALuint, ALenum, ALfloat) = nullptr;
+};
+EfxEntryPoints g_efx;
+#endif
+
+// USoundNodeWave::ParseNodes hands a wave to the device only when its volume is above this
+// (0x00B77B78; the constant is the double at 0x01A95BA0).
+constexpr float kAudibleVolume = 0.0001f;
+
+// The port's own level for a level emitter. (Its cue's VolumeMultiplier, its sound group's Volume
+// and its wave's are not applied: TODO.md.)
+constexpr float kEmitterLevel = 0.55f;
+
+// What the audio device makes of the nodes' high-frequency gain (FALSoundSource::Update, 0x010D724F).
+inline float source_high_frequency_gain(float nodes_gain) {
+    return std::clamp(nodes_gain, kMinHighFrequencyGain, kMaxHighFrequencyGain);
+}
+
+// A SoundNodeRandom's pick among its inputs, by weight.
+int pick_random_child(const SoundCueNode& n) {
+    if (n.children.empty()) return -1;
+    const auto weight = [&n](size_t i) { return (i < n.weights.size()) ? std::max(n.weights[i], 0.0f) : 1.0f; };
+    float total = 0.0f;
+    for (size_t i = 0; i < n.children.size(); ++i) total += weight(i);
+    float pick = rand_normalized() * total;
+    for (size_t i = 0; i < n.children.size(); ++i) {
+        if (pick < weight(i)) return static_cast<int>(i);
+        pick -= weight(i);
+    }
+    return static_cast<int>(n.children.size()) - 1;
+}
+
 // Memory read callbacks for libvorbisfile
 #ifdef ME_HAS_VORBIS
 struct MemOgg {
@@ -105,22 +157,15 @@ VoiceAttenuation default_voice_attenuation() {
     d.min_radius = def.min_radius[0];
     d.max_radius = def.max_radius[0];
     d.db_at_max = def.db_at_max;
+    d.low_pass = def.lowpass;
+    d.lpf_min_radius = def.lpf_min_radius[0];
+    d.lpf_max_radius = def.lpf_max_radius[0];
     att.nodes.push_back(d);
     att.spatialize = def.spatialize;
     return att;
 }
 
-// How far a wave carries: at the MaxRadius of any attenuating node above it the volume is set to 0
-// (kSoundWorldMax for a wave nothing attenuates).
-float carrying_distance(const VoiceAttenuation& att) {
-    float reach = kSoundWorldMax;
-    for (const DrawnAttenuation& n : att.nodes) {
-        if (n.attenuate) reach = std::min(reach, n.max_radius);
-    }
-    return reach;
-}
-
-// "Linear 10/2000", "LogReverse 1/18000 x LogReverse 10/8000", for ME_AUDIO_DEBUG.
+// "Linear 10/2000 lpf 1500/5000", "LogReverse 1/18000 x LogReverse 10/8000", for ME_AUDIO_DEBUG.
 std::string describe_attenuation(const VoiceAttenuation& att) {
     static const char* const kModels[] = {"Linear", "Logarithmic", "Inverse", "LogReverse", "NaturalSound"};
     if (att.nodes.empty()) return "no attenuation node";
@@ -130,16 +175,20 @@ std::string describe_attenuation(const VoiceAttenuation& att) {
         if (!out.empty()) out += " x ";
         if (!n.attenuate) {
             out += "(bAttenuate off)";
-            continue;
-        }
-        std::snprintf(text, sizeof(text), "%s %g/%g", n.model < 5 ? kModels[n.model] : "?", n.min_radius, n.max_radius);
-        out += text;
-        if (n.model == 4) {
-            std::snprintf(text, sizeof(text), " %g dB", n.db_at_max);
+        } else {
+            std::snprintf(text, sizeof(text), "%s %g/%g", n.model < 5 ? kModels[n.model] : "?", n.min_radius, n.max_radius);
             out += text;
+            if (n.model == 4) {
+                std::snprintf(text, sizeof(text), " %g dB", n.db_at_max);
+                out += text;
+            }
+            if (n.first_distance_gain != 1.0f) {
+                std::snprintf(text, sizeof(text), " (first distance %g)", n.first_distance_gain);
+                out += text;
+            }
         }
-        if (n.first_distance_gain != 1.0f) {
-            std::snprintf(text, sizeof(text), " (first distance %g)", n.first_distance_gain);
+        if (n.low_pass) {
+            std::snprintf(text, sizeof(text), " lpf %g/%g", n.lpf_min_radius, n.lpf_max_radius);
             out += text;
         }
     }
@@ -190,9 +239,10 @@ void AudioEngine::shutdown() {
     sound_clips_.clear();
     sound_cues_.clear();
     ambient_emitters_.clear();
-    ambient_plays_.clear();
+    emitter_states_.clear();
     positional_requests_.clear();
     pending_voices_.clear();
+    deferred_sounds_.clear();
     for (SourceVoice& v : source_voices_) v = SourceVoice{};
     al_buffers_.clear();
     playback_started_ = false;
@@ -271,15 +321,71 @@ bool AudioEngine::init_openal() {
         alSourcef(vsrc, AL_GAIN, 1.0f);
     }
 
-    // Create 4 dedicated 3D ambient emitter sources (*_Aud.me1 AmbientSound pool)
-    for (size_t i = 0; i < kAmbientPoolSize; ++i) {
+    // The sources the level emitters' waves share (update_ambient_emitters). The device may give
+    // fewer than are asked for: as retail's init stops at the first source it is refused
+    // (UALAudioDevice::Init, 0x010D9778), the budget is then what it gave.
+    emitter_source_count_ = 0;
+    for (size_t i = 0; i < kEmitterSourceBudget; ++i) {
+        alGetError();
         ALuint asrc = 0;
         alGenSources(1, &asrc);
-        ambient_sources_[i] = asrc;
-        active_ambient_indices_[i] = -1;
-        alSourcei(asrc, AL_LOOPING, AL_TRUE);
-        alSourcei(asrc, AL_SOURCE_RELATIVE, AL_FALSE);
+        if (alGetError() != AL_NO_ERROR || !asrc) break;
+        emitter_sources_[emitter_source_count_++] = asrc;
+        emitter_source_use_[i] = EmitterSourceUse{};
         alSourcef(asrc, AL_GAIN, 0.0f);
+    }
+
+    // The low pass with distance. Retail's effects manager makes one low-pass filter for every
+    // source, both of its gains at 1 (FALAudioEffectsManager's init, 0x010DBE50: alGenFilters,
+    // AL_FILTER_TYPE = AL_FILTER_LOWPASS), and applies none at all unless the extension, each of its
+    // entry points and every one of those filters is there (0x010DC099). The same here, for the
+    // sources that play sounds at a place: the pool's and the emitters'. (Retail also wants a reverb
+    // slot and an auxiliary send before it filters anything; the port has no reverb. Whether the
+    // OpenAL the game ships, Creative's wrap_oal.dll opened as "Generic Hardware", grants all of
+    // that on a retail machine is not known, so neither is whether retail's players hear the low pass.)
+    efx_ = false;
+    g_efx = EfxEntryPoints{};
+    if (alcIsExtensionPresent(dev, "ALC_EXT_EFX")) {
+        g_efx.gen_filters = reinterpret_cast<decltype(g_efx.gen_filters)>(alGetProcAddress("alGenFilters"));
+        g_efx.delete_filters = reinterpret_cast<decltype(g_efx.delete_filters)>(alGetProcAddress("alDeleteFilters"));
+        g_efx.filteri = reinterpret_cast<decltype(g_efx.filteri)>(alGetProcAddress("alFilteri"));
+        g_efx.filterf = reinterpret_cast<decltype(g_efx.filterf)>(alGetProcAddress("alFilterf"));
+        efx_ = g_efx.gen_filters && g_efx.delete_filters && g_efx.filteri && g_efx.filterf;
+    }
+    if (efx_) {
+        const auto make_filter = [&](uint32_t& out) {
+            alGetError();
+            ALuint filter = 0;
+            g_efx.gen_filters(1, &filter);
+            if (alGetError() != AL_NO_ERROR || !filter) return false;
+            out = filter;
+            g_efx.filteri(filter, kAlFilterType, kAlFilterLowpass);
+            g_efx.filterf(filter, kAlLowpassGain, 1.0f);
+            g_efx.filterf(filter, kAlLowpassGainHF, 1.0f);
+            return alGetError() == AL_NO_ERROR;
+        };
+        for (size_t i = 0; i < kSourcePoolSize && efx_; ++i) efx_ = make_filter(source_filters_[i]);
+        for (size_t i = 0; i < emitter_source_count_ && efx_; ++i) efx_ = make_filter(emitter_filters_[i]);
+        if (!efx_) {
+            for (uint32_t& filter : source_filters_) {
+                if (filter) g_efx.delete_filters(1, &filter);
+                filter = 0;
+            }
+            for (uint32_t& filter : emitter_filters_) {
+                if (filter) g_efx.delete_filters(1, &filter);
+                filter = 0;
+            }
+        }
+    }
+    if (efx_) {
+        // A filter on a source and off it again: a device that will not take one gets none.
+        alGetError();
+        set_source_low_pass(sources_[0], source_filters_[0], 0.5f);
+        clear_source_low_pass(sources_[0]);
+        efx_ = alGetError() == AL_NO_ERROR;
+    }
+    if (debug_log_) {
+        std::cout << "[Audio] " << emitter_source_count_ << " emitter sources; low-pass filters (EFX): " << (efx_ ? "yes" : "no") << std::endl;
     }
 
     return true;
@@ -313,12 +419,13 @@ void AudioEngine::cleanup_openal() {
             vo_source_ = 0;
         }
 
-        for (size_t i = 0; i < kAmbientPoolSize; ++i) {
-            if (ambient_sources_[i]) {
-                alSourceStop(ambient_sources_[i]);
-                alDeleteSources(1, &ambient_sources_[i]);
-                ambient_sources_[i] = 0;
+        for (size_t i = 0; i < kEmitterSourceBudget; ++i) {
+            if (emitter_sources_[i]) {
+                alSourceStop(emitter_sources_[i]);
+                alDeleteSources(1, &emitter_sources_[i]);
+                emitter_sources_[i] = 0;
             }
+            emitter_source_use_[i] = EmitterSourceUse{};
         }
 
         // Delete source pool
@@ -328,6 +435,19 @@ void AudioEngine::cleanup_openal() {
                 alDeleteSources(1, &sources_[i]);
                 sources_[i] = 0;
             }
+        }
+
+        // Their low-pass filters, now that no source holds one
+        if (efx_) {
+            for (uint32_t& filter : source_filters_) {
+                if (filter) g_efx.delete_filters(1, &filter);
+                filter = 0;
+            }
+            for (uint32_t& filter : emitter_filters_) {
+                if (filter) g_efx.delete_filters(1, &filter);
+                filter = 0;
+            }
+            efx_ = false;
         }
 
         // Delete buffers
@@ -383,11 +503,6 @@ size_t AudioEngine::acquire_slot() {
     return slot;
 }
 
-uint32_t AudioEngine::acquire_source() {
-    if (!has_device()) return 0;
-    return sources_[acquire_slot()];
-}
-
 void AudioEngine::invalidate_cached_buffer(const std::string& key) {
 #ifndef ME_NO_OPENAL
     if (!alc_context_ || key.empty()) return;
@@ -411,15 +526,13 @@ void AudioEngine::invalidate_cached_buffer(const std::string& key) {
                         music_stem_buffers_[i] = 0;
                     }
                 }
-                for (size_t i = 0; i < kAmbientPoolSize; ++i) {
-                    if (ambient_sources_[i]) {
+                for (size_t i = 0; i < emitter_source_count_; ++i) {
+                    if (emitter_sources_[i]) {
                         ALint cur = 0;
-                        alGetSourcei(ambient_sources_[i], AL_BUFFER, &cur);
+                        alGetSourcei(emitter_sources_[i], AL_BUFFER, &cur);
                         if (static_cast<ALuint>(cur) == b) {
-                            alSourceStop(ambient_sources_[i]);
-                            alSourcei(ambient_sources_[i], AL_BUFFER, 0);
-                            active_ambient_indices_[i] = -1;
-                            ambient_sounding_[i] = false;
+                            stop_emitter_source(i);
+                            alSourcei(emitter_sources_[i], AL_BUFFER, 0);
                         }
                     }
                 }
@@ -548,7 +661,7 @@ void AudioEngine::rebind_music_stem_buffers() {
         if (new_name != music_stem_clip_names_[i] || music_stem_buffers_[i] != buf) {
             music_stem_clip_names_[i] = new_name;
             music_stem_buffers_[i] = buf;
-            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * 0.45f);
+            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * music_group_volume() * 0.45f);
         }
         sync_music_stem(i);
     }
@@ -569,7 +682,8 @@ void AudioEngine::rebind_music_stem_buffers() {
                 }
                 ALint cur_state = 0;
                 alGetSourcei(run_wind_source_, AL_SOURCE_STATE, &cur_state);
-                if (bound && playback_started_ && cur_state != AL_PLAYING) {
+                // (Paused with the game, it is played on by the end of the pause, not from here.)
+                if (bound && playback_started_ && cur_state != AL_PLAYING && !wind_paused_) {
                     alSourcePlay(run_wind_source_);
                 }
             }
@@ -670,12 +784,33 @@ void AudioEngine::update(float dt,
                          float player_speed,
                          bool reaction_active) {
     listener_pos_ = listener_pos;
+    const float step = std::max(0.0f, dt);
+
+    // While the game is paused retail's device goes on parsing every sound on every update, but
+    // with a DeltaTime of 0 for the ones that are not of a UI sound group, and it neither starts nor
+    // updates their waves (UAudioDevice::GetSortedActiveWaveInstances, 0x00B70316; StartSources,
+    // 0x00B6EFE4): their delays, their fades and the clock they count on stand still, and what was
+    // asked for meanwhile begins with the first update after the pause.
+    if (!game_paused_ && !is_menu_music_) game_time_ += step;
+    if (!game_paused_ && !deferred_sounds_.empty()) {
+        const std::vector<DeferredSound> waiting = std::exchange(deferred_sounds_, {});
+        for (const DeferredSound& d : waiting) {
+            if (d.voice) {
+                play_vo(d.name, d.volume);
+            } else {
+                play_sound(d.name, d.volume, d.pitch);
+            }
+        }
+    }
 
     // Layered cue waves whose SoundNodeDelay has run out.
     if (!pending_voices_.empty()) {
-        const float step = std::max(0.0f, dt);
         std::vector<PendingVoice> due;
         for (auto it = pending_voices_.begin(); it != pending_voices_.end();) {
+            if (game_paused_ && !it->ui) {
+                ++it;
+                continue;
+            }
             it->voice.delay -= step;
             if (it->voice.delay <= 0.0f) {
                 due.push_back(std::move(*it));
@@ -688,20 +823,21 @@ void AudioEngine::update(float dt,
             auto cit = sound_clips_.find(p.voice.clip);
             if (cit != sound_clips_.end()) {
                 start_voice(cit->second, p.positional ? &p.position : nullptr, p.voice.volume, p.voice.pitch,
-                            p.positional ? &p.attenuation : nullptr, p.name);
+                            p.positional ? &p.attenuation : nullptr, p.name, p.ui);
             }
         }
     }
 
     // The sounds asked for at a place since the last update, now that the listener is known.
-    if (!positional_requests_.empty()) {
+    // (Not while the game is paused: no sound at a place is of a UI group.)
+    if (!positional_requests_.empty() && !game_paused_) {
         const std::vector<PositionalRequest> requests = std::exchange(positional_requests_, {});
         for (const PositionalRequest& r : requests) start_positional(r);
     }
 
     // Advance active voice-over playback timer and synchronized subtitle lines
-    if (vo_duration_ > 0.0f) {
-        vo_elapsed_ += std::max(0.0f, dt);
+    if (vo_duration_ > 0.0f && !(game_paused_ && !vo_ui_)) {
+        vo_elapsed_ += step;
         if (vo_elapsed_ >= vo_duration_) {
             vo_elapsed_ = 0.0f;
             vo_duration_ = 0.0f;
@@ -723,12 +859,16 @@ void AudioEngine::update(float dt,
     }
 
     // Automatically toggle ReactionTime (Mode 3) or IngameVO (Mode 2) SoundGroupEffects
-    if (reaction_active && sound_mode_ == ESoundGroupEffectMode::Normal) {
-        sound_mode_ = ESoundGroupEffectMode::ReactionTime;
-    } else if (!reaction_active && sound_mode_ == ESoundGroupEffectMode::ReactionTime) {
-        sound_mode_ = is_vo_playing() ? ESoundGroupEffectMode::IngameVO : ESoundGroupEffectMode::Normal;
-    } else if (!reaction_active && is_vo_playing() && sound_mode_ == ESoundGroupEffectMode::Normal) {
-        sound_mode_ = ESoundGroupEffectMode::IngameVO;
+    // (not under a pause: the sound mode is the game's script's to set, and the script is not
+    // running; a fade between two modes goes on, as retail's runs on real time, 0x00B65130).
+    if (!game_paused_) {
+        if (reaction_active && sound_mode_ == ESoundGroupEffectMode::Normal) {
+            sound_mode_ = ESoundGroupEffectMode::ReactionTime;
+        } else if (!reaction_active && sound_mode_ == ESoundGroupEffectMode::ReactionTime) {
+            sound_mode_ = is_vo_playing() ? ESoundGroupEffectMode::IngameVO : ESoundGroupEffectMode::Normal;
+        } else if (!reaction_active && is_vo_playing() && sound_mode_ == ESoundGroupEffectMode::Normal) {
+            sound_mode_ = ESoundGroupEffectMode::IngameVO;
+        }
     }
 
     // Evaluate target SoundGroup bus adjusters matching DefaultEngine.ini lines 177-209
@@ -747,6 +887,9 @@ void AudioEngine::update(float dt,
             break;
         case ESoundGroupEffectMode::Pause:
             // Mode 4: SFX=0.0, HudMusic/InGameMusic=0.3
+            // (No script of TdGame.u ever sets this mode: a pause is set_game_paused, which is
+            // TdPlayerController.SetPause's turning down of the music's group and the device's
+            // pausing of its sources. The ini's preset is kept for whoever asks for it by number.)
             target_sfx_gain = 0.0f;
             target_music_gain = 0.30f;
             target_breath_gain = 0.0f;
@@ -823,11 +966,15 @@ void AudioEngine::update(float dt,
     update_voice_gains(dt);
 
     // 2. Evaluate target Solar Fields stem volumes based on gameplay speed & state
+    // (Under a pause the level's music plays on as it was, InGameMusic being a UI sound group: the
+    // stems keep the mix they had, and their level is the group's volume, a quarter.)
     if (is_menu_music_) {
         target_stem_vols_[0] = 1.00f; // Pure Solar Fields Main Menu theme (A_M_Menu)
         target_stem_vols_[1] = 0.00f;
         target_stem_vols_[2] = 0.00f;
         target_stem_vols_[3] = 0.00f;
+    } else if (game_paused_) {
+        // (the targets as the last unpaused update left them)
     } else if (reaction_active) {
         target_stem_vols_[0] = 0.25f; // Ambient attenuated
         target_stem_vols_[1] = 0.25f; // Tension attenuated
@@ -854,9 +1001,16 @@ void AudioEngine::update(float dt,
     for (int i = 0; i < 4; ++i) {
         current_stem_vols_[i] += (target_stem_vols_[i] - current_stem_vols_[i]) * stem_lerp;
         if (music_stem_sources_[i]) {
-            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * 0.45f);
+            alSourcef(music_stem_sources_[i], AL_GAIN, current_stem_vols_[i] * music_bus_gain_ * music_group_volume() * 0.45f);
             sync_music_stem(i);
         }
+    }
+
+    // The run wind and her breathing are sounds of the game: paused with it, nothing of them
+    // starts or moves on, and the emitters below are the same.
+    if (game_paused_) {
+        update_ambient_emitters(dt);
+        return;
     }
 
     // 3. Update TdSoundNodeVelocity (1P RunWind peaking at max sprint speed 720 UU/s + max-speed wind rush)
@@ -924,223 +1078,527 @@ void AudioEngine::update(float dt,
 #endif
 }
 
-// What an emitter's cue plays with: its radii, drawn the first time the emitter is looked at, and
-// with them the layer of the cue that carries farthest (EmitterPlay).
-const AudioEngine::EmitterPlay& AudioEngine::emitter_play(size_t emitter) {
-    if (ambient_plays_.size() < ambient_emitters_.size()) ambient_plays_.resize(ambient_emitters_.size());
-    EmitterPlay& r = ambient_plays_[emitter];
-    const AmbientEmitterInfo& em = ambient_emitters_[emitter];
-    const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
-    const bool has_cue = cue_it != sound_cues_.end();
-    if (r.drawn && r.has_cue == has_cue && r.radii.size() == (has_cue ? cue_it->second.attenuations.size() : 0)) return r;
-    r = EmitterPlay{};
-    r.drawn = true;
-    r.has_cue = has_cue;
-    if (!has_cue) {
-        // A wave with no cue of its own: the class's defaults.
-        r.attenuation = default_voice_attenuation();
-        return r;
-    }
-    const SoundCueDef& cue = cue_it->second;
-    r.radii = draw_cue_radii(cue);
-    // A layer is the cue's loaded waves under one set of nodes. The one that carries farthest is the
-    // emitter's, the first the graph reaches when two carry equally far. (A concatenator's waves are
-    // not layers but one stitched clip under the cue's name. A cue that plays in rounds,
-    // next_ambient_voice, takes each round's first wave whatever is chosen here: none of the game's
-    // emitters has such a cue with layers that carry different distances.)
-    std::vector<int> layer;
-    float carries = -1.0f;
-    if (!cue.is_concatenator) {
-        for (const std::string& wave : cue.wave_names) {
-            const auto clip = sound_clips_.find(wave);
-            if (clip == sound_clips_.end() || clip->second.pcm_data.empty()) continue;
-            std::vector<int> path = wave_attenuations(cue, wave);
-            if (!r.waves.empty() && path == layer) {
-                r.waves.push_back(wave);
-                continue;
-            }
-            VoiceAttenuation attenuation = make_voice_attenuation(cue, path, r.radii, em.location, nullptr);
-            const float reach = carrying_distance(attenuation);
-            if (reach <= carries) continue;
-            carries = reach;
-            layer = std::move(path);
-            r.attenuation = std::move(attenuation);
-            r.waves.assign(1, wave);
+// The sources the port's sounds other than the emitters hold now: the pool's one-shots, a voice
+// line, the run wind while it is heard, and the music, which is one track in retail whichever of
+// the stems are up here.
+size_t AudioEngine::count_other_voices() const {
+    size_t voices = (vo_duration_ > 0.0f) ? 1 : 0;
+#ifndef ME_NO_OPENAL
+    if (has_device()) {
+        for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
+            ALint state = 0;
+            alGetSourcei(sources_[slot], AL_SOURCE_STATE, &state);
+            if (state == AL_PLAYING || state == AL_PAUSED) ++voices;
         }
+        if (current_wind_vol_ * sfx_bus_gain_ > kAudibleVolume) ++voices;
+        const float music = music_bus_gain_ * music_group_volume();
+        for (float stem : current_stem_vols_) {
+            if (stem * music > kAudibleVolume) {
+                ++voices;
+                break;
+            }
+        }
+        return voices;
     }
-    if (r.waves.empty()) r.attenuation = make_voice_attenuation(cue, wave_attenuations(cue, std::string()), r.radii, em.location, nullptr);
-    return r;
+#endif
+    // Without a device only the sounds at a place are followed.
+    for (const SourceVoice& v : source_voices_) voices += v.positional ? 1 : 0;
+    return voices;
 }
 
-// The nearest 4 AmbientSound emitters of the *_Aud.me1 sublevels that can be heard. Each plays at
-// the gain its cue's attenuation nodes give it at the listener's distance (USoundNodeAttenuation,
-// or USoundNodeAmbient for an AmbientSoundSimple), and is in the running only while that gain is
-// above nothing: retail's emitter plays on at volume 0 out of range, here it would keep one of the
-// four sources from an emitter that is heard.
-// With a menu up they are silent: retail's front end is a map of its own (TdMainMenu) with no
-// AmbientSound in it, only its music and the UI's cues, and a paused game's sounds are paused.
-void AudioEngine::update_ambient_emitters(float dt) {
-    const bool device = has_device();
-    const auto stop_source = [&](size_t slot) {
-        ambient_sounding_[slot] = false;
-        ambient_info_[slot] = PositionalVoice{};
+void AudioEngine::stop_emitter_source(size_t source) {
+    EmitterSourceUse& use = emitter_source_use_[source];
+    if (use.emitter >= 0 && static_cast<size_t>(use.emitter) < emitter_states_.size()) {
+        EmitterState& st = emitter_states_[static_cast<size_t>(use.emitter)];
+        if (use.wave >= 0 && static_cast<size_t>(use.wave) < st.waves.size()) st.waves[static_cast<size_t>(use.wave)].source = -1;
+    }
+    use = EmitterSourceUse{};
 #ifndef ME_NO_OPENAL
-        if (device && ambient_sources_[slot]) alSourceStop(ambient_sources_[slot]);
+    if (has_device() && emitter_sources_[source]) alSourceStop(emitter_sources_[source]);
 #endif
+}
+
+void AudioEngine::reset_emitters() {
+    for (size_t source = 0; source < kEmitterSourceBudget; ++source) {
+        if (emitter_source_use_[source].emitter >= 0) stop_emitter_source(source);
+    }
+    emitter_states_.clear();
+}
+
+// One node of an emitter's cue, parsed as retail parses the graph of every playing sound on every
+// audio update (USoundNode::ParseNodes, vtable slot 74). `state` is what the nodes above have left
+// in the component; `finished` is the component's bFinished, which the parse starts at true and a
+// wave that is playing, or a delay that is waiting, clears.
+void AudioEngine::parse_emitter_node(EmitterState& st, const SoundCueDef& cue, int node, EmitterParse state, std::vector<int>& path,
+                                     bool& finished) {
+    if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || static_cast<size_t>(node) >= st.nodes.size()) return;
+    const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
+    EmitterNode& payload = st.nodes[static_cast<size_t>(node)];
+    const auto in_range = [](float lo, float hi) { return lo + (hi - lo) * rand_normalized(); };
+    const auto parse_child = [&]() {
+        if (!n.children.empty()) parse_emitter_node(st, cue, n.children[0], state, path, finished);
     };
+    switch (n.kind) {
+        case SoundCueNode::Kind::Wave: {
+            // USoundNodeWave::ParseNodes (0x00B77880): the wave instance of this wave under this
+            // parent, made the first time. One that has finished is not handed in again and leaves
+            // bFinished as it is (0x00B77A63); any other takes what the nodes above it have left.
+            if (payload.wave < 0) {
+                EmitterWave made;
+                made.node = node;
+                made.clip = n.wave;
+                payload.wave = static_cast<int>(st.waves.size());
+                st.waves.push_back(std::move(made));
+            }
+            EmitterWave& w = st.waves[static_cast<size_t>(payload.wave)];
+            if (w.finished) return;
+            // (A wave the port has not loaded is as if the graph did not have it.)
+            const auto clip = sound_clips_.find(w.clip);
+            if (clip == sound_clips_.end() || clip->second.pcm_data.empty()) return;
+            w.parsed = true;
+            w.graph_volume = state.volume;
+            w.pitch = state.pitch;
+            w.seamless = state.seamless;
+            w.hook = state.hook;
+            if (w.path != path) {
+                w.path = path;
+                w.radii_stamp = ~0u;
+            }
+            finished = false;
+            return;
+        }
+        case SoundCueNode::Kind::Mixer:
+            // USoundNodeMixer::ParseNodes (0x00B767A0): no seamless looping below it, and every
+            // input parsed from the state the mixer was reached with, its volume times the input's
+            // InputVolume: the layers sound together, each shaped by the nodes of its own branch.
+            state.seamless = false;
+            for (size_t i = 0; i < n.children.size(); ++i) {
+                EmitterParse input = state;
+                input.volume *= (i < n.weights.size()) ? n.weights[i] : 1.0f;
+                parse_emitter_node(st, cue, n.children[i], input, path, finished);
+            }
+            return;
+        case SoundCueNode::Kind::Looping:
+            // USoundNodeLooping::ParseNodes (0x00B7E130): while it has rounds left it is what the
+            // waves below report their end to, and it asks for them to loop inside their source. A
+            // mixer, a random node or a delay below it takes that back, so a wave loops without a
+            // gap only when none of those is between it and its looping node; any other plays once
+            // a round (emitter_wave_finished).
+            if (payload.requires_init) {
+                payload.value = static_cast<float>(static_cast<int>(in_range(n.min_value, n.max_value)));  // UsedLoopCount
+                payload.pick = 0;                                                                          // FinishedCount
+                payload.requires_init = false;
+            }
+            if (n.loop_indefinitely || payload.value > 0.0f) {
+                state.hook = node;
+                state.seamless = true;
+            }
+            parse_child();
+            return;
+        case SoundCueNode::Kind::Delay:
+            // USoundNodeDelay::ParseNodes (0x00B7F200): no seamless looping below it; its wait is
+            // drawn at its first parse and counted from then on the game's clock, and until it is
+            // over nothing below it is parsed (no wave, no source) and the component is kept alive.
+            state.seamless = false;
+            if (payload.requires_init) {
+                payload.value = in_range(n.min_value, n.max_value);
+                payload.start = game_time_;
+                payload.requires_init = false;
+            }
+            if (static_cast<double>(payload.value) > game_time_ - payload.start) {
+                finished = false;
+                return;
+            }
+            parse_child();
+            return;
+        case SoundCueNode::Kind::Random:
+            // USoundNodeRandom::ParseNodes (0x00B7EF20) clears seamless looping as well
+            // (0x00B7EFB1) and parses one input, here the one drawn by weight at its first parse.
+            // (That it keeps the input until a loop above it has it draw again is stock Unreal
+            // Engine 3's node: the function was not read beyond the store above.)
+            state.seamless = false;
+            if (payload.requires_init) {
+                payload.pick = pick_random_child(n);
+                payload.requires_init = false;
+            }
+            if (payload.pick >= 0 && static_cast<size_t>(payload.pick) < n.children.size()) {
+                parse_emitter_node(st, cue, n.children[static_cast<size_t>(payload.pick)], state, path, finished);
+            }
+            return;
+        case SoundCueNode::Kind::Modulator:
+            // USoundNodeModulator: a volume and a pitch drawn at its first parse (stock, as above).
+            if (payload.requires_init) {
+                payload.value = in_range(n.min_value, n.max_value);
+                payload.pitch = in_range(n.min_pitch, n.max_pitch);
+                payload.requires_init = false;
+            }
+            state.volume *= payload.value;
+            state.pitch *= payload.pitch;
+            parse_child();
+            return;
+        case SoundCueNode::Kind::Attenuation:
+        case SoundCueNode::Kind::Ambient: {
+            // USoundNodeAttenuation::ParseNodes (0x00B7DD60) draws its radii at its first parse
+            // (0x00B7DE0B); what they do to the volume and to the high frequencies at the listener's
+            // distance is worked out with the wave (VoiceAttenuation). A USoundNodeAmbient
+            // (0x00B7E6B0) is that, a volume and a pitch modulation of its own and its wave, which
+            // the port loops as it always has (what that node does at its wave's end was not read).
+            const bool attenuates = n.attenuation >= 0 && static_cast<size_t>(n.attenuation) < st.radii.size();
+            if (attenuates && !st.radii_drawn[static_cast<size_t>(n.attenuation)]) {
+                st.radii[static_cast<size_t>(n.attenuation)] = draw_radii(cue.attenuations[static_cast<size_t>(n.attenuation)]);
+                st.radii_drawn[static_cast<size_t>(n.attenuation)] = 1;
+                ++st.radii_stamp;
+            }
+            if (n.kind == SoundCueNode::Kind::Ambient) {
+                if (payload.requires_init) {
+                    payload.value = in_range(n.min_value, n.max_value);
+                    payload.pitch = in_range(n.min_pitch, n.max_pitch);
+                    payload.requires_init = false;
+                }
+                state.volume *= payload.value;
+                state.pitch *= payload.pitch;
+                state.seamless = true;
+                state.hook = -1;
+            }
+            if (attenuates) path.push_back(n.attenuation);
+            parse_child();
+            if (attenuates) path.pop_back();
+            return;
+        }
+        case SoundCueNode::Kind::MixGroup:
+            // UTdSoundNodeMixGroup::ParseNodes (0x012292A0): the volume and the pitch times those
+            // of the mix groups it names (their product is in the node: load_package_audio_and_cues).
+            if (n.modulate_volume) state.volume *= n.min_value;
+            if (n.modulate_pitch) state.pitch *= n.min_pitch;
+            parse_child();
+            return;
+        case SoundCueNode::Kind::Passthrough:
+        default:
+            parse_child();
+            return;
+    }
+}
+
+// FWaveInstance::NotifyFinished (0x00B64640): the wave has played to its end. Under a looping node
+// that still has rounds, USoundNodeLooping::NotifyWaveInstanceFinished (0x00B7FE50) counts it; when
+// every wave of the round has ended the round is over: every node below the looping node is to be
+// drawn again by the next parse (a random node picks again, a delay waits again, a modulator and
+// an attenuation node draw again) and its waves are no longer finished, so that parse plays the next
+// round. A node above the looping node keeps what it drew: a delay up there is waited out once.
+void AudioEngine::emitter_wave_finished(EmitterState& st, const SoundCueDef* cue, int wave) {
+    if (wave < 0 || static_cast<size_t>(wave) >= st.waves.size()) return;
+    const int hook = st.waves[static_cast<size_t>(wave)].hook;
+    st.waves[static_cast<size_t>(wave)].finished = true;
+    if (!cue || hook < 0 || static_cast<size_t>(hook) >= cue->nodes.size() || static_cast<size_t>(hook) >= st.nodes.size()) return;
+    const SoundCueNode& loop = cue->nodes[static_cast<size_t>(hook)];
+    EmitterNode& payload = st.nodes[static_cast<size_t>(hook)];
+    if (!(loop.loop_indefinitely || payload.value > 0.0f)) return;
+    // The waves of the round: what a parse reaches below the node (USoundNode::GetNodes; a random
+    // node gives the input it has chosen and nothing else).
+    const auto count_waves = [&](const auto& self, int node) -> int {
+        if (node < 0 || static_cast<size_t>(node) >= cue->nodes.size()) return 0;
+        const SoundCueNode& c = cue->nodes[static_cast<size_t>(node)];
+        if (c.kind == SoundCueNode::Kind::Wave) {
+            const auto clip = sound_clips_.find(c.wave);
+            return (clip != sound_clips_.end() && !clip->second.pcm_data.empty()) ? 1 : 0;
+        }
+        if (c.kind == SoundCueNode::Kind::Random) {
+            const EmitterNode& chosen = st.nodes[static_cast<size_t>(node)];
+            if (chosen.requires_init || chosen.pick < 0 || static_cast<size_t>(chosen.pick) >= c.children.size()) return 0;
+            return self(self, c.children[static_cast<size_t>(chosen.pick)]);
+        }
+        int waves = 0;
+        for (int child : c.children) waves += self(self, child);
+        return waves;
+    };
+    int round_waves = 0;
+    for (int child : loop.children) round_waves += count_waves(count_waves, child);
+    if (++payload.pick != round_waves) return;
+    payload.pick = 0;
+    payload.value -= 1.0f;
+    const auto draw_again = [&](const auto& self, int node) -> void {
+        if (node < 0 || static_cast<size_t>(node) >= cue->nodes.size()) return;
+        const SoundCueNode& c = cue->nodes[static_cast<size_t>(node)];
+        st.nodes[static_cast<size_t>(node)].requires_init = true;
+        if (c.attenuation >= 0 && static_cast<size_t>(c.attenuation) < st.radii_drawn.size()) st.radii_drawn[static_cast<size_t>(c.attenuation)] = 0;
+        for (int child : c.children) self(self, child);
+    };
+    for (int child : loop.children) draw_again(draw_again, child);
+    // USoundNode::ResetWaveInstances (0x00B7FD90): the waves that reported to this node.
+    for (EmitterWave& w : st.waves) {
+        if (w.hook == hook) w.finished = false;
+    }
+}
+
+// The level's AmbientSound emitters, on every update.
+//
+// Retail: every emitter's cue plays from the moment its level comes in, and on every audio update
+// its graph is parsed again (parse_emitter_node). A cue of a sound group with a MaxUpdateDistance
+// (the indoor and outdoor props: 2000 and 3000 uu) is not parsed at all on an update that finds the
+// listener farther off than that (UAudioComponent::UpdateWaveInstances, 0x00B6FBB5), and a wave
+// whose volume comes to 0.0001 or less is not handed to the device (USoundNodeWave::ParseNodes,
+// 0x00B77B78): neither holds a source. The device sorts the waves it was handed by PlayPriority, the
+// volume the graph gave them with the distance in it and 1.0 more for a sound group with bAlwaysPlay,
+// and its sources go to the highest (UAudioDevice::GetSortedActiveWaveInstances, 0x00B70200). A
+// source whose wave is no longer among them is stopped; a wave among them that has no source gets a
+// free one and plays from its start; one that has a source keeps it and is only updated
+// (StopSources 0x00B6B340, StartSources 0x00B6EFB0). A wave that is left out is not finished for
+// that: an emitter's component has bShouldRemainActiveIfDropped (Default__AmbientSound's
+// AudioComponent0), so it is in the running again on the next update. A wave that has no source
+// does not move on: when it gets one it starts over, and a round waits for it.
+//
+// The port does that among the emitters' waves, for the sources its other sounds leave of retail's
+// 32 (count_other_voices): those are not ranked. With the front end up the emitters are silent:
+// retail's front end is a map of its own (TdMainMenu) with no AmbientSound in it. In a paused game
+// their sources are paused (set_game_paused) and nothing here runs.
+void AudioEngine::update_ambient_emitters(float dt) {
     if (is_menu_music_) {
-        for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
-            if (active_ambient_indices_[slot] == -1) continue;
-            active_ambient_indices_[slot] = -1;
-            stop_source(slot);
+        for (size_t source = 0; source < kEmitterSourceBudget; ++source) {
+            if (emitter_source_use_[source].emitter >= 0) stop_emitter_source(source);
         }
         return;
     }
-    if (ambient_emitters_.empty()) return;
+    if (game_paused_ || ambient_emitters_.empty()) return;
+    if (emitter_states_.size() > ambient_emitters_.size()) reset_emitters();
+    emitter_states_.resize(ambient_emitters_.size());
+    const bool device = has_device();
+    const float step = std::max(0.0f, dt);
+    const auto cue_of = [&](const AmbientEmitterInfo& em) -> const SoundCueDef* {
+        if (em.cue_name.empty()) return nullptr;
+        const auto it = sound_cues_.find(em.cue_name);
+        return it != sound_cues_.end() ? &it->second : nullptr;
+    };
 
-    struct Cand { int32_t idx; float dist_sq; };
-    std::vector<Cand> cands;
-    cands.reserve(ambient_emitters_.size());
-    for (size_t i = 0; i < ambient_emitters_.size(); ++i) {
-        Vec3 d = ambient_emitters_[i].location - listener_pos_;
-        float d2 = d.dot(d);
-        if (emitter_play(i).attenuation.gain(std::sqrt(d2)) > 0.0f) {
-            cands.push_back({static_cast<int32_t>(i), d2});
-        }
-    }
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist_sq < b.dist_sq; });
-
-    for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
+    // 1. The waves whose source has played to its end (UAudioDevice::Update's first loop, 0x00B7049B).
+    // A wave that plays once a round gives its source back; one that loops inside its source
+    // reports every pass (FALSoundSource::IsFinished, 0x010D8DF0) and plays on.
+    for (size_t source = 0; source < emitter_source_count_; ++source) {
+        const EmitterSourceUse use = emitter_source_use_[source];
+        if (use.emitter < 0 || static_cast<size_t>(use.emitter) >= emitter_states_.size()) continue;
+        EmitterState& st = emitter_states_[static_cast<size_t>(use.emitter)];
+        if (use.wave < 0 || static_cast<size_t>(use.wave) >= st.waves.size()) continue;
+        EmitterWave& w = st.waves[static_cast<size_t>(use.wave)];
+        bool ended = false;
 #ifndef ME_NO_OPENAL
-        const ALuint asrc = ambient_sources_[slot];
-        if (device && !asrc) continue;
+        if (device) {
+            if (w.seamless) {
+                ALfloat at = 0.0f;
+                alGetSourcef(emitter_sources_[source], AL_SEC_OFFSET, &at);
+                ended = at < w.offset;
+                w.offset = at;
+            } else {
+                ALint state = AL_STOPPED;
+                alGetSourcei(emitter_sources_[source], AL_SOURCE_STATE, &state);
+                ended = (state != AL_PLAYING && state != AL_PAUSED);
+            }
+        }
 #endif
-        if (slot >= cands.size()) {
-            if (active_ambient_indices_[slot] != -1) {
-                active_ambient_indices_[slot] = -1;
-                stop_source(slot);
+        if (!device) {
+            w.remaining -= step;
+            ended = w.remaining <= 0.0f;
+            if (ended && w.seamless) {
+                const auto clip = sound_clips_.find(w.clip);
+                const float length = clip != sound_clips_.end() ? clip->second.duration : 0.0f;
+                const float pitch = ambient_emitters_[static_cast<size_t>(use.emitter)].pitch * w.pitch * slomo_pitch_scale_;
+                w.remaining += std::max(length / std::clamp(pitch, 0.4f, 2.0f), 0.05f);
+            }
+        }
+        if (!ended) continue;
+        // (A looping wave under no looping node, a USoundNodeAmbient's, has nobody to report to.)
+        if (w.seamless && w.hook < 0) continue;
+        if (!w.seamless) stop_emitter_source(source);
+        emitter_wave_finished(st, cue_of(ambient_emitters_[static_cast<size_t>(use.emitter)]), use.wave);
+    }
+
+    // 2. Every emitter's graph, and the waves it hands in.
+    struct Candidate {
+        float priority;
+        int32_t emitter;
+        int32_t wave;
+    };
+    std::vector<Candidate> candidates;
+    std::vector<int> path;
+    for (size_t e = 0; e < ambient_emitters_.size(); ++e) {
+        const AmbientEmitterInfo& em = ambient_emitters_[e];
+        EmitterState& st = emitter_states_[e];
+        const SoundCueDef* cue = cue_of(em);
+        // A cue whose graph the port plays node by node; any other (no cue under the emitter's
+        // name, a concatenator's stitched clip) is the one wave its name resolves to.
+        const bool graph = cue && !cue->nodes.empty() && !cue->is_concatenator;
+        if (!st.started || st.has_cue != (cue != nullptr) ||
+            (cue && (st.node_count != cue->nodes.size() || st.radii.size() != cue->attenuations.size()))) {
+            for (size_t source = 0; source < kEmitterSourceBudget; ++source) {
+                if (emitter_source_use_[source].emitter == static_cast<int32_t>(e)) stop_emitter_source(source);
+            }
+            st = EmitterState{};
+            st.started = true;
+            st.has_cue = cue != nullptr;
+            if (cue) {
+                st.node_count = cue->nodes.size();
+                st.nodes.resize(cue->nodes.size());
+                st.radii.resize(cue->attenuations.size());
+                st.radii_drawn.assign(cue->attenuations.size(), 0);
+            }
+            if (!graph) {
+                float volume = 1.0f, pitch = 1.0f;
+                EmitterWave only;
+                if (const SoundClip* clip = resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, volume, pitch)) {
+                    only.clip = clip->name;
+                    // (A wave with no cue of its own has always been looped here.)
+                    only.seamless = !cue || cue->looping;
+                    if (cue) {
+                        st.radii = draw_cue_radii(*cue);
+                        st.radii_drawn.assign(cue->attenuations.size(), 1);
+                        only.path = wave_attenuations(*cue, std::string());
+                    }
+                    only.radii_stamp = ~0u;
+                    st.waves.push_back(std::move(only));
+                }
+            }
+        }
+        for (EmitterWave& w : st.waves) {
+            w.parsed = false;
+            w.wants_source = false;
+            w.active = false;
+        }
+        if (st.dead) continue;
+        const Vec3 to_listener = em.location - listener_pos_;
+        const float distance_sq = to_listener.dot(to_listener);
+        const SoundGroupProperties* group = cue ? find_sound_group(cue->sound_group) : nullptr;
+        if (group && group->max_update_distance != 0.0f && distance_sq > group->max_update_distance * group->max_update_distance) continue;
+        const float distance = std::sqrt(distance_sq);
+
+        // The component's bFinished: set before the parse, cleared by whatever is playing or
+        // waiting in the graph. Left set, the component stops (0x00B6FCF1).
+        bool finished = true;
+        if (graph) {
+            path.clear();
+            parse_emitter_node(st, *cue, 0, EmitterParse{}, path, finished);
+        } else {
+            for (EmitterWave& w : st.waves) {
+                if (w.finished) continue;
+                w.parsed = true;
+                finished = false;
+            }
+        }
+        if (finished) {
+            st.dead = true;
+            if (debug_log_) {
+                std::cout << "[Audio] emitter " << e << " '" << (!em.cue_name.empty() ? em.cue_name : em.wave_name)
+                          << "' has stopped: nothing in its cue is playing or waiting" << std::endl;
             }
             continue;
         }
-        const int32_t eidx = cands[slot].idx;
-        const auto& em = ambient_emitters_[eidx];
-        const float distance = std::sqrt(cands[slot].dist_sq);
-        const auto cue_it = em.cue_name.empty() ? sound_cues_.end() : sound_cues_.find(em.cue_name);
-        // The attenuation of a round's wave: the nodes above it in the emitter's cue, with the
-        // emitter's radii.
-        const auto round_attenuation = [&](const std::vector<int>& path) {
-            if (cue_it == sound_cues_.end()) return default_voice_attenuation();
-            return make_voice_attenuation(cue_it->second, path, emitter_play(static_cast<size_t>(eidx)).radii, em.location, nullptr);
-        };
-        auto start = [&](const SoundClip* clip, bool loop, VoiceAttenuation att, float pitch) {
-            if (!clip) return false;
+        for (size_t k = 0; k < st.waves.size(); ++k) {
+            EmitterWave& w = st.waves[k];
+            if (!w.parsed) continue;
+            if (w.radii_stamp != st.radii_stamp) {
+                w.attenuation = cue ? make_voice_attenuation(*cue, w.path, st.radii, em.location, nullptr) : default_voice_attenuation();
+                w.radii_stamp = st.radii_stamp;
+            }
+            const float distance_gain = w.attenuation.gain(distance);
+            // The volume the source would be set to, before the port's own level for the emitters.
+            const float volume = em.volume * w.graph_volume * distance_gain * sfx_bus_gain_;
+            if (w.info.name.empty()) {
+                w.info.name = !em.cue_name.empty() ? em.cue_name : em.wave_name;
+                w.info.clip = w.clip;
+                w.info.position = em.location;
+                w.info.emitter = true;
+                w.info.emitter_index = static_cast<int>(e);
+                w.info.emitter_wave = static_cast<int>(k);
+            }
+            w.info.spatialized = w.attenuation.spatialize;
+            w.info.attenuation_nodes = w.attenuation.nodes.size();
+            w.info.looping = w.seamless;
+            w.info.distance = distance;
+            w.info.distance_gain = distance_gain;
+            w.info.high_frequency_gain = source_high_frequency_gain(w.attenuation.high_frequency_gain(distance));
+            w.info.priority = w.graph_volume * distance_gain + ((group && group->always_play) ? 1.0f : 0.0f);
+            w.info.gain = volume * kEmitterLevel;
+            w.wants_source = volume > kAudibleVolume;
+            if (w.wants_source) candidates.push_back({w.info.priority, static_cast<int32_t>(e), static_cast<int32_t>(k)});
+        }
+    }
+
+    // 3. The sources go to the waves of the highest priority. (Retail's sort leaves equal ones in
+    // no particular order; here the earlier emitter's, and the earlier wave's, comes first.)
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.priority != b.priority) return a.priority > b.priority;
+        if (a.emitter != b.emitter) return a.emitter < b.emitter;
+        return a.wave < b.wave;
+    });
+    const size_t others = count_other_voices();
+    emitter_budget_ = std::min(emitter_source_count_, kMaxChannels > others ? kMaxChannels - others : size_t{0});
+    const size_t active = std::min(candidates.size(), emitter_budget_);
+    for (size_t i = 0; i < active; ++i) {
+        emitter_states_[static_cast<size_t>(candidates[i].emitter)].waves[static_cast<size_t>(candidates[i].wave)].active = true;
+    }
+    for (size_t source = 0; source < kEmitterSourceBudget; ++source) {
+        const EmitterSourceUse use = emitter_source_use_[source];
+        if (use.emitter < 0) continue;
+        const bool keeps = static_cast<size_t>(use.emitter) < emitter_states_.size() &&
+                           static_cast<size_t>(use.wave) < emitter_states_[static_cast<size_t>(use.emitter)].waves.size() &&
+                           emitter_states_[static_cast<size_t>(use.emitter)].waves[static_cast<size_t>(use.wave)].active;
+        if (!keeps) stop_emitter_source(source);
+    }
+    for (size_t i = 0; i < active; ++i) {
+        const size_t e = static_cast<size_t>(candidates[i].emitter);
+        const AmbientEmitterInfo& em = ambient_emitters_[e];
+        EmitterWave& w = emitter_states_[e].waves[static_cast<size_t>(candidates[i].wave)];
+        const auto clip = sound_clips_.find(w.clip);
+        if (clip == sound_clips_.end()) continue;
+        // The source's pitch is held between 0.4 and 2 (FALSoundSource::Update, 0x010D7217).
+        const float pitch = std::clamp(em.pitch * w.pitch * slomo_pitch_scale_, 0.4f, 2.0f);
+        bool started = false;
+        if (w.source < 0) {
+            size_t source = 0;
+            while (source < emitter_source_count_ && emitter_source_use_[source].emitter >= 0) ++source;
+            if (source >= emitter_source_count_) continue;
 #ifndef ME_NO_OPENAL
             if (device) {
-                // (OpenAL places only mono buffers; a wave that is not spatialised keeps its channels.)
-                uint32_t buf = get_or_create_buffer(*clip, /*force_mono_for_3d=*/att.spatialize);
-                if (!buf) return false;
-                alSourceStop(asrc);
-                alSourcei(asrc, AL_BUFFER, static_cast<ALint>(buf));
-                alSourcei(asrc, AL_LOOPING, loop ? AL_TRUE : AL_FALSE);
-                if (att.spatialize) {
-                    alSourcei(asrc, AL_SOURCE_RELATIVE, AL_FALSE);
-                    alSource3f(asrc, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
+                // FALSoundSource::Init (0x010DB0E0): the wave's buffer from its start, looping in
+                // the source or not, placed in the world or at the listener. (OpenAL places only
+                // mono buffers; a wave that is not spatialised keeps its channels. A bind that has
+                // not taken yet, Apple's OpenAL just after a stop, is tried again at the next update.)
+                const ALuint src = emitter_sources_[source];
+                const uint32_t buf = get_or_create_buffer(clip->second, /*force_mono_for_3d=*/w.attenuation.spatialize);
+                if (!buf || !bind_source_buffer(src, buf)) continue;
+                alSourcei(src, AL_LOOPING, w.seamless ? AL_TRUE : AL_FALSE);
+                if (w.attenuation.spatialize) {
+                    alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
+                    alSource3f(src, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
                 } else {
-                    alSourcei(asrc, AL_SOURCE_RELATIVE, AL_TRUE);
-                    alSource3f(asrc, AL_POSITION, 0.0f, 0.0f, 0.0f);
+                    alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
+                    alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
                 }
-                alSourcePlay(asrc);
             }
 #endif
-            ambient_remaining_[slot] = clip->duration / std::max(pitch, 0.01f);
-            ambient_sounding_[slot] = true;
-            ambient_logged_gain_[slot] = -1.0f;
-            ambient_info_[slot] = PositionalVoice{};
-            ambient_info_[slot].name = !em.cue_name.empty() ? em.cue_name : em.wave_name;
-            ambient_info_[slot].clip = clip->name;
-            ambient_info_[slot].position = em.location;
-            ambient_info_[slot].spatialized = att.spatialize;
-            ambient_info_[slot].attenuation_nodes = att.nodes.size();
-            ambient_info_[slot].emitter = true;
-            ambient_attenuation_[slot] = std::move(att);
-            return true;
-        };
-        if (active_ambient_indices_[slot] != eidx) {
-            active_ambient_indices_[slot] = eidx;
-            stop_source(slot);
-            // The cue's own graph says how it repeats: a wave under a SoundNodeLooping
-            // plays end to end; with a SoundNodeDelay between them each round waits first.
-            if (!next_ambient_voice(slot, em)) {
-                // One of the waves of the layer the emitter plays (EmitterPlay), or what its name
-                // resolves to when it has no layer to choose from.
-                const EmitterPlay& play = emitter_play(static_cast<size_t>(eidx));
-                const SoundClip* clip = nullptr;
-                if (!play.waves.empty()) {
-                    const auto it = sound_clips_.find(play.waves[static_cast<size_t>(std::rand()) % play.waves.size()]);
-                    if (it != sound_clips_.end()) clip = &it->second;
-                } else {
-                    float dummy_v = em.volume, dummy_p = em.pitch;
-                    clip = resolve_cue_or_clip(!em.cue_name.empty() ? em.cue_name : em.wave_name, dummy_v, dummy_p);
-                }
-                if (clip) start(clip, true, play.attenuation, em.pitch);
-            }
+            w.source = static_cast<int>(source);
+            emitter_source_use_[source] = {candidates[i].emitter, candidates[i].wave};
+            w.remaining = clip->second.duration / pitch;
+            w.offset = 0.0f;
+            w.logged_gain = -1.0f;
+            w.info.age = 0.0f;
+            started = true;
+        } else {
+            w.info.age += step;
         }
-        float voice_volume = 1.0f, voice_pitch = 1.0f;
-        if (ambient_mode_[slot] == AmbientMode::Waiting) {
-            ambient_voice_[slot].delay -= dt;
-            if (ambient_voice_[slot].delay <= 0.0f) {
-                auto it = sound_clips_.find(ambient_voice_[slot].clip);
-                // (A wave that is not loaded is skipped: the next round picks again.)
-                if (it != sound_clips_.end() &&
-                    start(&it->second, false, round_attenuation(ambient_voice_[slot].attenuations), em.pitch * ambient_voice_[slot].pitch)) {
-                    ambient_mode_[slot] = AmbientMode::Playing;
-                } else {
-                    next_ambient_voice(slot, em);
-                }
-            }
-        } else if (ambient_mode_[slot] == AmbientMode::Playing) {
-            bool playing = false;
-#ifndef ME_NO_OPENAL
-            if (device) {
-                ALint state = AL_STOPPED;
-                alGetSourcei(asrc, AL_SOURCE_STATE, &state);
-                playing = (state == AL_PLAYING);
-            }
-#endif
-            if (!device) {
-                ambient_remaining_[slot] -= dt;
-                playing = ambient_remaining_[slot] > 0.0f;
-            }
-            if (!playing) {
-                ambient_sounding_[slot] = false;
-                next_ambient_voice(slot, em);
-            }
-        }
-        if (ambient_mode_[slot] != AmbientMode::Loop) {
-            voice_volume = ambient_voice_[slot].volume;
-            voice_pitch = ambient_voice_[slot].pitch;
-        }
-        const float distance_gain = ambient_sounding_[slot] ? ambient_attenuation_[slot].gain(distance) : 0.0f;
-        const float gain = em.volume * voice_volume * sfx_bus_gain_ * 0.55f * distance_gain;
 #ifndef ME_NO_OPENAL
         if (device) {
-            alSourcef(asrc, AL_GAIN, gain);
-            alSourcef(asrc, AL_PITCH, em.pitch * voice_pitch * slomo_pitch_scale_);
+            const ALuint src = emitter_sources_[static_cast<size_t>(w.source)];
+            alSourcef(src, AL_GAIN, w.info.gain);
+            alSourcef(src, AL_PITCH, pitch);
+            set_source_low_pass(src, emitter_filters_[static_cast<size_t>(w.source)], w.info.high_frequency_gain);
+            if (started) alSourcePlay(src);
         }
-#else
-        (void)voice_pitch;
 #endif
-        if (ambient_sounding_[slot]) {
-            ambient_info_[slot].distance = distance;
-            ambient_info_[slot].distance_gain = distance_gain;
-            ambient_info_[slot].gain = gain;
-            if (debug_log_ && std::abs(gain - ambient_logged_gain_[slot]) > 0.01f) {
-                ambient_logged_gain_[slot] = gain;
-                std::cout << "[Audio] emitter " << eidx << " '" << ambient_info_[slot].name << "' wave " << ambient_info_[slot].clip
-                          << " at " << distance << " uu from the listener: " << describe_attenuation(ambient_attenuation_[slot])
-                          << " -> distance gain " << distance_gain << ", source gain " << gain
-                          << (ambient_attenuation_[slot].spatialize ? ", placed in the world" : ", not spatialised") << std::endl;
-            }
+        if (debug_log_ && (started || std::abs(w.info.gain - w.logged_gain) > 0.01f)) {
+            w.logged_gain = w.info.gain;
+            std::cout << "[Audio] emitter " << e << " '" << w.info.name << "' wave " << w.info.clip << (started ? " starts" : " now") << " at "
+                      << w.info.distance << " uu from the listener: " << describe_attenuation(w.attenuation) << " -> distance gain "
+                      << w.info.distance_gain << ", high frequencies " << w.info.high_frequency_gain << ", source gain " << w.info.gain
+                      << (w.seamless ? ", looping" : ", once a round")
+                      << (w.attenuation.spatialize ? ", placed in the world" : ", not spatialised") << std::endl;
         }
     }
 }
@@ -1178,6 +1636,21 @@ bool AudioEngine::load_package_audio_and_cues(const std::string& pkg_path,
             cue.max_audible_distance = std::max(cue.max_audible_distance, draw_radius(a.max_radius, rand_normalized()));
         }
         if (cue.max_audible_distance == 0.0f) cue.max_audible_distance = kSoundWorldMax;
+        // What a TdSoundNodeMixGroup multiplies in: the product of the Volume, and of the Pitch, of
+        // the mix groups it names (UTdSoundNodeMixGroup::ParseNodes, 0x012292A0; the ini's numbers,
+        // sound_groups.hpp). A node that names none and modulates the volume silences its branch.
+        for (SoundCueNode& node : cue.nodes) {
+            if (node.kind != SoundCueNode::Kind::MixGroup) continue;
+            float volume = node.mix_groups.empty() ? 0.0f : 1.0f, pitch = 1.0f;
+            for (const std::string& name : node.mix_groups) {
+                if (const MixGroupProperties* group = find_mix_group(name)) {
+                    volume *= group->volume;
+                    pitch *= group->pitch;
+                }
+            }
+            node.min_value = node.max_value = volume;
+            node.min_pitch = node.max_pitch = pitch;
+        }
         sound_cues_[cue.name] = cue;
         if (!cue.full_path.empty()) {
             sound_cues_[cue.full_path] = cue;
@@ -1381,17 +1854,15 @@ bool AudioEngine::load_stock_audio(const std::string& game_root) {
 
 bool AudioEngine::load_level_audio(const std::string& game_root, const std::string& map_file) {
     namespace fs = std::filesystem;
+    // The level before's emitters are stopped and forgotten with it.
+    reset_emitters();
     ambient_emitters_.clear();
-    ambient_plays_.clear();
     level_loaded_cues_.clear();
     vo_elapsed_ = 0.0f;
     vo_duration_ = 0.0f;
     active_vo_clip_.clear();
     active_vo_subtitle_.clear();
-    for (size_t i = 0; i < kAmbientPoolSize; ++i) {
-        active_ambient_indices_[i] = -1;
-        ambient_sounding_[i] = false;
-    }
+    vo_paused_ = false;
 
     // Purge any previous chapter's Solar Fields music clips so unqualified wave names
     // (ambience_01, ambience_011, Puzzle_01, chase_01, combat_01, etc.) never bleed across levels
@@ -1579,34 +2050,6 @@ size_t AudioEngine::count_sound_layers(const std::string& name) const {
     return has_sound(name) ? 1 : 0;
 }
 
-// USoundNodeLooping over a USoundNodeDelay: every round the delay is drawn again (and whatever
-// is under it: the modulation, which wave), the sound plays once, and the next round starts when
-// it ends. The first round waits too, as the cue does when the level starts it.
-bool AudioEngine::next_ambient_voice(size_t slot, const AmbientEmitterInfo& em) {
-    ambient_mode_[slot] = AmbientMode::Loop;
-    if (em.cue_name.empty()) return false;
-    auto it = sound_cues_.find(em.cue_name);
-    if (it == sound_cues_.end() || !it->second.looping || it->second.is_concatenator || it->second.nodes.empty()) return false;
-    std::vector<CueVoice> voices;
-    std::vector<int> path;
-    collect_cue_voices(it->second, 0, 0.0f, 1.0f, 1.0f, voices, path);
-    if (voices.empty()) {
-        // A round that draws nothing: a SoundNodeRandom input left empty (Birds.BirdsChirp has
-        // one) or a wave that is not loaded. In retail nothing in the graph is then playing, the
-        // component is stopped (UAudioComponent::UpdateWaveInstances) and the emitter is silent
-        // from there on. It must not fall back to looping one of the cue's waves end to end.
-        bool waits = false;
-        for (const SoundCueNode& n : it->second.nodes) waits = waits || (n.kind == SoundCueNode::Kind::Delay && n.max_value > 0.0f);
-        if (!waits) return false;
-        ambient_mode_[slot] = AmbientMode::Silent;
-        return true;
-    }
-    if (voices[0].delay <= 0.0f) return false;
-    ambient_voice_[slot] = voices[0];
-    ambient_mode_[slot] = AmbientMode::Waiting;
-    return true;
-}
-
 void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
                                      std::vector<CueVoice>& out, std::vector<int>& path) const {
     if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || out.size() >= 8) return;
@@ -1629,20 +2072,8 @@ void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float del
             return;
         case SoundCueNode::Kind::Random: {
             // USoundNodeRandom: one child, picked by weight.
-            if (n.children.empty()) return;
-            auto weight = [&n](size_t i) { return (i < n.weights.size()) ? std::max(n.weights[i], 0.0f) : 1.0f; };
-            float total = 0.0f;
-            for (size_t i = 0; i < n.children.size(); ++i) total += weight(i);
-            float pick = rand_normalized() * total;
-            size_t chosen = n.children.size() - 1;
-            for (size_t i = 0; i < n.children.size(); ++i) {
-                if (pick < weight(i)) {
-                    chosen = i;
-                    break;
-                }
-                pick -= weight(i);
-            }
-            collect_cue_voices(cue, n.children[chosen], delay, volume, pitch, out, path);
+            const int chosen = pick_random_child(n);
+            if (chosen >= 0) collect_cue_voices(cue, n.children[static_cast<size_t>(chosen)], delay, volume, pitch, out, path);
             return;
         }
         case SoundCueNode::Kind::Delay:
@@ -1672,6 +2103,13 @@ void AudioEngine::collect_cue_voices(const SoundCueDef& cue, int node, float del
                 collect_cue_voices(cue, n.children[0], delay, volume * in_range(n.min_value, n.max_value),
                                    pitch * in_range(n.min_pitch, n.max_pitch), out, path);
                 if (n.attenuation >= 0) path.pop_back();
+            }
+            return;
+        case SoundCueNode::Kind::MixGroup:
+            // DICE's TdSoundNodeMixGroup: the volume and pitch of the mix groups it names.
+            if (!n.children.empty()) {
+                collect_cue_voices(cue, n.children[0], delay, n.modulate_volume ? volume * n.min_value : volume,
+                                   n.modulate_pitch ? pitch * n.min_pitch : pitch, out, path);
             }
             return;
         case SoundCueNode::Kind::Passthrough:
@@ -1705,18 +2143,22 @@ std::vector<int> AudioEngine::wave_attenuations(const SoundCueDef& cue, const st
     return path;
 }
 
-std::vector<AudioEngine::DrawnRadii> AudioEngine::draw_cue_radii(const SoundCueDef& cue) const {
+AudioEngine::DrawnRadii AudioEngine::draw_radii(const SoundAttenuation& a) const {
     // USoundNodeAttenuation::ParseNodes draws them the first time it parses the node for a play
-    // (the payload's RequiresInit, 0x00B7DE0B): MinRadius, then MaxRadius.
+    // (the payload's RequiresInit, 0x00B7DE0B): MinRadius, MaxRadius, LPFMinRadius, LPFMaxRadius.
+    DrawnRadii d;
+    d.min_radius = draw_radius(a.min_radius, rand_normalized());
+    d.max_radius = draw_radius(a.max_radius, rand_normalized());
+    d.lpf_min_radius = draw_radius(a.lpf_min_radius, rand_normalized());
+    d.lpf_max_radius = draw_radius(a.lpf_max_radius, rand_normalized());
+    if (a.td) d.speed_of_sound = draw_radius(a.speed_of_sound, rand_normalized());
+    return d;
+}
+
+std::vector<AudioEngine::DrawnRadii> AudioEngine::draw_cue_radii(const SoundCueDef& cue) const {
     std::vector<DrawnRadii> radii;
     radii.reserve(cue.attenuations.size());
-    for (const SoundAttenuation& a : cue.attenuations) {
-        DrawnRadii d;
-        d.min_radius = draw_radius(a.min_radius, rand_normalized());
-        d.max_radius = draw_radius(a.max_radius, rand_normalized());
-        if (a.td) d.speed_of_sound = draw_radius(a.speed_of_sound, rand_normalized());
-        radii.push_back(d);
-    }
+    for (const SoundAttenuation& a : cue.attenuations) radii.push_back(draw_radii(a));
     return radii;
 }
 
@@ -1734,6 +2176,9 @@ VoiceAttenuation AudioEngine::make_voice_attenuation(const SoundCueDef& cue, con
         d.min_radius = r.min_radius;
         d.max_radius = r.max_radius;
         d.db_at_max = a.db_at_max;
+        d.low_pass = a.lowpass;
+        d.lpf_min_radius = r.lpf_min_radius;
+        d.lpf_max_radius = r.lpf_max_radius;
         if (a.td && (a.attenuate || a.delay)) {
             // UTdSoundNodeAttenuation::ParseNodes (0x0122AE80), its first parse: the distance then,
             // the hold-back it asks for with bDelay (none for a sound that starts out of range),
@@ -1746,6 +2191,11 @@ VoiceAttenuation AudioEngine::make_voice_attenuation(const SoundCueDef& cue, con
                 d.first_distance_gain = attenuation_gain(0, first_distance, r.min_radius, r.max_radius, a.db_at_max);
             }
             if (io_delay) *io_delay += hold;
+            // The node keeps that distance and that hold-back in the payload its parent shares, where
+            // the parent's ParseNodes takes them for the LPF radii it would have drawn: with the low
+            // pass on, no high frequencies from the hold-back's number of seconds outwards.
+            d.lpf_min_radius = first_distance;
+            d.lpf_max_radius = hold;
         }
         out.nodes.push_back(d);
         out.spatialize = out.spatialize || a.spatialize;
@@ -1799,11 +2249,13 @@ bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_po
     }
     // (Without a device only the sounds at a place are followed.)
     if (!has_device() && !world_pos) return true;
+    const SoundGroupProperties* group = find_sound_group(cue.sound_group);
+    const bool ui = group && group->ui_sound;
     for (size_t i = 0; i < voices.size(); ++i) {
         CueVoice& v = voices[i];
         if (v.delay <= 0.0f) {
             auto it = sound_clips_.find(v.clip);
-            if (it != sound_clips_.end()) start_voice(it->second, world_pos, v.volume, v.pitch, world_pos ? &attenuations[i] : nullptr, name);
+            if (it != sound_clips_.end()) start_voice(it->second, world_pos, v.volume, v.pitch, world_pos ? &attenuations[i] : nullptr, name, ui);
         } else {
             PendingVoice p;
             p.voice = std::move(v);
@@ -1813,6 +2265,7 @@ bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_po
                 p.attenuation = std::move(attenuations[i]);
             }
             p.name = name;
+            p.ui = ui;
             pending_voices_.push_back(std::move(p));
         }
     }
@@ -1824,14 +2277,17 @@ bool AudioEngine::play_layered_cue(const std::string& name, const Vec3* world_po
 // placed in the world only when a node above it spatialises it: the device positions a wave
 // instance whose CurrentUseSpatialization is set and makes any other source-relative, at the
 // listener (0x010DB137, 0x010D732E). OpenAL only places mono buffers, so a placed wave is mixed down.
+// A wave at a place also gets the low pass its distance asks for; a 2D one gets no filter.
 void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch,
-                              const VoiceAttenuation* attenuation, const std::string& name) {
+                              const VoiceAttenuation* attenuation, const std::string& name, bool ui) {
     const bool device = has_device();
     if (!device && !world_pos) return;
     const size_t slot = acquire_slot();
+    source_voices_[slot].ui = ui;
     float gain = volume * sfx_bus_gain_;
     const float play_pitch = std::clamp(pitch * slomo_pitch_scale_, 0.25f, 2.0f);
     bool placed = false;
+    float high_frequency_gain = kMaxHighFrequencyGain;
     if (world_pos) {
         SourceVoice& v = source_voices_[slot];
         v.positional = true;
@@ -1843,20 +2299,22 @@ void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, floa
         const float distance = (listener_pos_ - *world_pos).length();
         const float distance_gain = v.attenuation.gain(distance);
         gain *= distance_gain;
+        high_frequency_gain = source_high_frequency_gain(v.attenuation.high_frequency_gain(distance));
         v.info.name = name.empty() ? clip.name : name;
         v.info.clip = clip.name;
         v.info.position = *world_pos;
         v.info.distance = distance;
         v.info.distance_gain = distance_gain;
         v.info.gain = std::clamp(gain, 0.0f, 1.5f);
+        v.info.high_frequency_gain = high_frequency_gain;
         v.info.spatialized = placed;
         v.info.attenuation_nodes = v.attenuation.nodes.size();
         v.logged_gain = v.info.gain;
         if (debug_log_) {
             std::cout << "[Audio] '" << v.info.name << "' wave " << clip.name << " at (" << world_pos->x << ", " << world_pos->y << ", "
                       << world_pos->z << "), " << distance << " uu from the listener: " << describe_attenuation(v.attenuation)
-                      << " -> distance gain " << distance_gain << ", source gain " << v.info.gain
-                      << (placed ? ", placed in the world" : ", not spatialised") << std::endl;
+                      << " -> distance gain " << distance_gain << ", high frequencies " << high_frequency_gain << ", source gain "
+                      << v.info.gain << (placed ? ", placed in the world" : ", not spatialised") << std::endl;
         }
     }
 #ifndef ME_NO_OPENAL
@@ -1878,8 +2336,15 @@ void AudioEngine::start_voice(const SoundClip& clip, const Vec3* world_pos, floa
             alSourcei(src, AL_SOURCE_RELATIVE, AL_TRUE);
             alSource3f(src, AL_POSITION, 0.0f, 0.0f, 0.0f);
         }
+        if (world_pos) {
+            set_source_low_pass(src, source_filters_[slot], high_frequency_gain);
+        } else {
+            clear_source_low_pass(src);
+        }
         alSourcePlay(src);
     }
+#else
+    (void)high_frequency_gain;
 #endif
 }
 
@@ -1929,13 +2394,16 @@ void AudioEngine::start_positional(const PositionalRequest& request) {
 }
 
 // USoundNodeAttenuation::ParseNodes runs on every audio update for every playing sound: the radii
-// stay as drawn, the distance to the listener is taken again and the volume follows it. A sound
-// that is past its MaxRadius plays on at volume 0 (no culling happens in the node).
+// stay as drawn, the distance to the listener is taken again and the volume and the high
+// frequencies follow it. A sound that is past its MaxRadius plays on at volume 0 (no culling
+// happens in the node). A source paused with the game is not updated at all
+// (FALSoundSource::Update returns at once, 0x010D71B6).
 void AudioEngine::update_voice_gains(float dt) {
     const bool device = has_device();
+    const float step = std::max(0.0f, dt);
     for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
         SourceVoice& v = source_voices_[slot];
-        if (!v.positional) continue;
+        if (!v.positional || v.paused) continue;
         bool playing = false;
 #ifndef ME_NO_OPENAL
         if (device) {
@@ -1946,7 +2414,7 @@ void AudioEngine::update_voice_gains(float dt) {
 #endif
         if (!device) {
             playing = v.remaining > 0.0f;
-            v.remaining -= std::max(0.0f, dt);
+            v.remaining -= step;
         }
         if (!playing) {
             v = SourceVoice{};
@@ -1955,32 +2423,139 @@ void AudioEngine::update_voice_gains(float dt) {
         const float distance = (listener_pos_ - v.position).length();
         const float distance_gain = v.attenuation.gain(distance);
         const float gain = std::clamp(v.volume * distance_gain, 0.0f, 1.5f);
+        const float high_frequency_gain = source_high_frequency_gain(v.attenuation.high_frequency_gain(distance));
 #ifndef ME_NO_OPENAL
-        if (device) alSourcef(sources_[slot], AL_GAIN, gain);
+        if (device) {
+            alSourcef(sources_[slot], AL_GAIN, gain);
+            set_source_low_pass(sources_[slot], source_filters_[slot], high_frequency_gain);
+        }
 #endif
         v.info.distance = distance;
         v.info.distance_gain = distance_gain;
         v.info.gain = gain;
+        v.info.high_frequency_gain = high_frequency_gain;
+        v.info.age += step;
         if (debug_log_ && std::abs(gain - v.logged_gain) > 0.01f) {
             v.logged_gain = gain;
             std::cout << "[Audio] '" << v.info.name << "' wave " << v.info.clip << " now " << distance << " uu from the listener: distance gain "
-                      << distance_gain << ", source gain " << gain << std::endl;
+                      << distance_gain << ", high frequencies " << high_frequency_gain << ", source gain " << gain << std::endl;
         }
     }
+}
+
+// FALAudioEffectsManager::UpdateEffect (0x010DBCB0), which retail runs at the end of every update of
+// a source: the filter's gain 1, its high-frequency gain the wave's, and the filter set on the
+// source's direct path again (a source takes a filter's values when the filter is set on it).
+// (Retail sets the same filter on the source's reverb send; the port has no reverb.)
+void AudioEngine::set_source_low_pass(uint32_t src, uint32_t filter, float high_frequency_gain) {
+#ifndef ME_NO_OPENAL
+    if (!efx_ || !src || !filter) return;
+    g_efx.filterf(filter, kAlLowpassGain, 1.0f);
+    g_efx.filterf(filter, kAlLowpassGainHF, high_frequency_gain);
+    alSourcei(src, kAlDirectFilter, static_cast<ALint>(filter));
+#else
+    (void)src; (void)filter; (void)high_frequency_gain;
+#endif
+}
+
+void AudioEngine::clear_source_low_pass(uint32_t src) {
+#ifndef ME_NO_OPENAL
+    if (!efx_ || !src) return;
+    alSourcei(src, kAlDirectFilter, kAlFilterNull);
+#else
+    (void)src;
+#endif
 }
 
 std::vector<AudioEngine::PositionalVoice> AudioEngine::positional_voices() const {
     std::vector<PositionalVoice> out;
     for (const SourceVoice& v : source_voices_) {
-        if (v.positional) out.push_back(v.info);
+        if (!v.positional) continue;
+        out.push_back(v.info);
+        out.back().paused = v.paused;
     }
-    for (size_t slot = 0; slot < kAmbientPoolSize; ++slot) {
-        if (active_ambient_indices_[slot] != -1 && ambient_sounding_[slot]) out.push_back(ambient_info_[slot]);
+    for (const EmitterState& st : emitter_states_) {
+        for (const EmitterWave& w : st.waves) {
+            if (w.source < 0) continue;
+            out.push_back(w.info);
+            out.back().paused = game_paused_;
+        }
     }
     return out;
 }
 
+std::vector<AudioEngine::PositionalVoice> AudioEngine::emitter_candidates() const {
+    std::vector<PositionalVoice> out;
+    for (const EmitterState& st : emitter_states_) {
+        for (const EmitterWave& w : st.waves) {
+            if (!w.wants_source) continue;
+            out.push_back(w.info);
+            out.back().sourced = w.source >= 0;
+            out.back().paused = game_paused_;
+        }
+    }
+    return out;
+}
+
+void AudioEngine::set_master_volume(float volume) {
+#ifndef ME_NO_OPENAL
+    if (has_device()) alListenerf(AL_GAIN, std::clamp(volume, 0.0f, 1.0f));
+#else
+    (void)volume;
+#endif
+}
+
+AudioEngine::DeviceReport AudioEngine::device_report() const {
+    DeviceReport report;
+#ifndef ME_NO_OPENAL
+    if (!has_device()) return report;
+    report.device = true;
+    if (const ALCchar* name = alcGetString(static_cast<ALCdevice*>(alc_device_), ALC_DEVICE_SPECIFIER)) report.name = name;
+    report.low_pass = efx_;
+    report.emitter_sources = emitter_source_count_;
+    const auto state_of = [](ALuint src) {
+        ALint state = 0;
+        if (src) alGetSourcei(src, AL_SOURCE_STATE, &state);
+        return state;
+    };
+    report.error = alGetError() != AL_NO_ERROR;
+    for (size_t i = 0; i < emitter_source_count_; ++i) {
+        const ALint state = state_of(emitter_sources_[i]);
+        report.emitters_playing += state == AL_PLAYING ? 1 : 0;
+        report.emitters_paused += state == AL_PAUSED ? 1 : 0;
+    }
+    for (size_t i = 0; i < kSourcePoolSize; ++i) {
+        const ALint state = state_of(sources_[i]);
+        report.pool_playing += state == AL_PLAYING ? 1 : 0;
+        report.pool_paused += state == AL_PAUSED ? 1 : 0;
+    }
+    for (uint32_t stem : music_stem_sources_) report.music_playing += state_of(stem) == AL_PLAYING ? 1 : 0;
+    report.wind_paused = state_of(run_wind_source_) == AL_PAUSED;
+#endif
+    return report;
+}
+
+size_t AudioEngine::stopped_emitter_count() const {
+    size_t stopped = 0;
+    for (const EmitterState& st : emitter_states_) stopped += st.dead ? 1 : 0;
+    return stopped;
+}
+
+bool AudioEngine::is_ui_sound(const std::string& name) const {
+    const auto it = sound_cues_.find(name);
+    if (it == sound_cues_.end()) return false;
+    const SoundGroupProperties* group = find_sound_group(it->second.sound_group);
+    return group && group->ui_sound;
+}
+
 void AudioEngine::play_sound(const std::string& name, float volume, float pitch) {
+    // In a paused game only a sound of a UI sound group starts (the menu's clicks, HudSFX); any
+    // other waits for the pause to end.
+    const bool ui = is_ui_sound(name);
+    if (game_paused_ && !ui) {
+        deferred_sounds_.push_back({name, volume, pitch, false});
+        return;
+    }
     if (play_layered_cue(name, nullptr, volume, pitch)) return;
     float final_vol = volume * sfx_bus_gain_;
     float final_pitch = pitch * slomo_pitch_scale_;
@@ -1990,12 +2565,15 @@ void AudioEngine::play_sound(const std::string& name, float volume, float pitch)
 
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
-    uint32_t src = acquire_source();
+    const size_t slot = acquire_slot();
+    const uint32_t src = sources_[slot];
     if (!src) return;
+    source_voices_[slot].ui = ui;
 
     uint32_t buf = get_or_create_buffer(*clip, false);
     if (!buf) return;
 
+    clear_source_low_pass(src);
     alSourcei(src, AL_BUFFER, static_cast<ALint>(buf));
     alSourcef(src, AL_GAIN, std::clamp(final_vol, 0.0f, 1.5f));
     alSourcef(src, AL_PITCH, std::clamp(final_pitch, 0.25f, 2.0f));
@@ -2008,12 +2586,20 @@ void AudioEngine::play_sound(const std::string& name, float volume, float pitch)
 }
 
 void AudioEngine::play_vo(const std::string& name, float volume) {
+    // (Dialogue is paused with the game too, all of it but the group DialogueHUD.)
+    const bool ui = is_ui_sound(name);
+    if (game_paused_ && !ui) {
+        deferred_sounds_.push_back({name, volume, 1.0f, true});
+        return;
+    }
     float final_vol = volume;
     float final_pitch = 1.0f;
     const SoundClip* clip = resolve_cue_or_clip(name, final_vol, final_pitch);
     if (!clip) return;
     if (play_log_on_) play_log_.push_back({name, "vo", clip->duration});
 
+    vo_ui_ = ui;
+    vo_paused_ = false;
     active_vo_clip_ = clip->name;
     vo_duration_ = clip->duration;
     vo_elapsed_ = 0.0f;
@@ -2161,8 +2747,9 @@ bool AudioEngine::load_cue_bank(const std::string& game_root, const std::string&
 void AudioEngine::stop_cue(const std::string& group_and_name) {
     const size_t dot = group_and_name.rfind('.');
     const std::string bare = dot == std::string::npos ? group_and_name : group_and_name.substr(dot + 1);
-    // One asked for at a place this frame has not started yet.
+    // One asked for at a place this frame has not started yet, nor has one asked for in a paused game.
     std::erase_if(positional_requests_, [&](const PositionalRequest& r) { return r.name == group_and_name || r.name == bare; });
+    std::erase_if(deferred_sounds_, [&](const DeferredSound& d) { return d.name == group_and_name || d.name == bare; });
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;
     for (const std::string& name : {group_and_name, bare}) {
@@ -2358,13 +2945,133 @@ void AudioEngine::set_music_stems(float ambient_vol, float tension_vol, float ch
 void AudioEngine::set_menu_music(bool active) {
     if (is_menu_music_ != active) {
         is_menu_music_ = active;
+        if (active) stop_level_sounds();
         rebind_music_stem_buffers();
     }
+}
+
+// Behind the front end nothing of a level sounds: in retail it is another map (TdMainMenu), with
+// its own music and the UI's cues and nothing else. What the level was playing is stopped, a paused
+// sound included; the UI's own sounds play on.
+void AudioEngine::stop_level_sounds() {
+    std::erase_if(pending_voices_, [](const PendingVoice& p) { return !p.ui; });
+    positional_requests_.clear();
+    deferred_sounds_.clear();
+    const bool device = has_device();
+    for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
+        if (source_voices_[slot].ui) continue;
+        source_voices_[slot] = SourceVoice{};
+#ifndef ME_NO_OPENAL
+        if (device && sources_[slot]) alSourceStop(sources_[slot]);
+#endif
+    }
+    for (size_t source = 0; source < kEmitterSourceBudget; ++source) {
+        if (emitter_source_use_[source].emitter >= 0) stop_emitter_source(source);
+    }
+    if (!vo_ui_ && vo_duration_ > 0.0f) {
+        vo_elapsed_ = 0.0f;
+        vo_duration_ = 0.0f;
+        active_vo_clip_.clear();
+        active_vo_subtitle_.clear();
+        if (sound_mode_ == ESoundGroupEffectMode::IngameVO) sound_mode_ = ESoundGroupEffectMode::Normal;
+#ifndef ME_NO_OPENAL
+        if (device && vo_source_) alSourceStop(vo_source_);
+#endif
+    }
+    vo_paused_ = false;
+    // The run wind is a loop whose level follows her speed, which is nothing in a menu.
+    if (wind_paused_) {
+        wind_paused_ = false;
+#ifndef ME_NO_OPENAL
+        if (device && run_wind_source_) alSourcePlay(run_wind_source_);
+#endif
+    }
+#ifdef ME_NO_OPENAL
+    (void)device;
+#endif
+}
+
+void AudioEngine::set_game_paused(bool paused) {
+    // TdPlayerController.SetPause (TdGame.u): whenever the call has left the game as it was asked
+    // to be, SetAudioGroupVolume('InGameMusic', 0.25) for a pause and ('InGameMusic', 1.0) for its
+    // end, a repeated one included (ClientRestart's SetPause(false), at every spawn, is how the
+    // group comes to 1.0 in play). The number replaces the group's Volume
+    // (UAudioDevice::SetGroupVolume, 0x00B6DD00) and reaches the playing music at once unless a
+    // fade between two sound modes is under way.
+    ingame_music_volume_ = paused ? kInGameMusicPausedVolume : kInGameMusicPlayVolume;
+    if (game_paused_ == paused) return;
+    game_paused_ = paused;
+    const bool device = has_device();
+    if (paused) {
+        // UAudioDevice::HandlePause (0x00B652B0) on the first update of a game that is not ticking:
+        // every source that is not playing a sound of a UI sound group is paused
+        // (FALSoundSource::Pause, 0x010D67D0: alSourcePause).
+        for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
+            SourceVoice& v = source_voices_[slot];
+            if (v.ui) continue;
+            bool playing = !device && v.positional;
+#ifndef ME_NO_OPENAL
+            if (device && sources_[slot]) {
+                ALint state = 0;
+                alGetSourcei(sources_[slot], AL_SOURCE_STATE, &state);
+                playing = (state == AL_PLAYING);
+                if (playing) alSourcePause(sources_[slot]);
+            }
+#endif
+            v.paused = playing;
+        }
+#ifndef ME_NO_OPENAL
+        if (device) {
+            for (size_t source = 0; source < emitter_source_count_; ++source) {
+                if (emitter_source_use_[source].emitter >= 0) alSourcePause(emitter_sources_[source]);
+            }
+            if (run_wind_source_) {
+                ALint state = 0;
+                alGetSourcei(run_wind_source_, AL_SOURCE_STATE, &state);
+                wind_paused_ = (state == AL_PLAYING);
+                if (wind_paused_) alSourcePause(run_wind_source_);
+            }
+            if (vo_source_ && !vo_ui_) alSourcePause(vo_source_);
+        }
+#endif
+        vo_paused_ = !vo_ui_ && vo_duration_ > 0.0f;
+    } else {
+        // And on the first update of one that ticks again they are all played, which takes each up
+        // where it was paused (FALSoundSource::Play, 0x010D67A0: alSourcePlay).
+        for (size_t slot = 0; slot < kSourcePoolSize; ++slot) {
+            SourceVoice& v = source_voices_[slot];
+            if (!v.paused) continue;
+            v.paused = false;
+#ifndef ME_NO_OPENAL
+            if (device && sources_[slot]) alSourcePlay(sources_[slot]);
+#endif
+        }
+#ifndef ME_NO_OPENAL
+        if (device) {
+            const auto play_on = [](ALuint src) {
+                ALint state = 0;
+                alGetSourcei(src, AL_SOURCE_STATE, &state);
+                if (state == AL_PAUSED) alSourcePlay(src);
+            };
+            for (size_t source = 0; source < emitter_source_count_; ++source) {
+                if (emitter_source_use_[source].emitter >= 0) play_on(emitter_sources_[source]);
+            }
+            if (wind_paused_ && run_wind_source_) play_on(run_wind_source_);
+            if (vo_paused_ && vo_source_) play_on(vo_source_);
+        }
+#endif
+        wind_paused_ = false;
+        vo_paused_ = false;
+    }
+#ifdef ME_NO_OPENAL
+    (void)device;
+#endif
 }
 
 void AudioEngine::stop_all() {
     pending_voices_.clear();
     positional_requests_.clear();
+    deferred_sounds_.clear();
     for (SourceVoice& v : source_voices_) v = SourceVoice{};
 #ifndef ME_NO_OPENAL
     if (headless_ || !alc_context_) return;

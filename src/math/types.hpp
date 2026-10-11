@@ -606,7 +606,8 @@ struct SoundAttenuation {
     float db_at_max = -60.0f;                  // dBAttenuationAtMax (NaturalSound only)
     bool attenuate = true;                     // bAttenuate
     bool spatialize = true;                    // bSpatialize
-    // The low pass with distance. Read and kept; nothing applies it (docs/AUDIO_SYSTEM_RE.md 3.2).
+    // The low pass with distance: the high frequencies fall linearly from all of them at
+    // LPFMinRadius to none at LPFMaxRadius, whatever the model (low_pass_gain, audio/attenuation.hpp).
     bool lowpass = true;                       // bAttenuateWithLowPassFilter
     float lpf_min_radius[2] = {1500.0f, 1500.0f};
     float lpf_max_radius[2] = {5000.0f, 5000.0f};
@@ -623,19 +624,30 @@ struct SoundAttenuation {
 
 // One node of a SoundCue's graph, as USoundNode::ParseNodes walks it when the cue plays: a mixer
 // plays all of its inputs, a random node one weighted child, delays and modulators offset / scale
-// what is below them, an attenuation node gives what is below it its fall-off with distance. Other
-// node types (mix groups, loops, ...) pass through to their child.
+// what is below them, an attenuation node gives what is below it its fall-off with distance, a
+// looping node plays what is below it again when it has ended, a mix group node scales it by its mix
+// groups' volume and pitch. Other node types (oscillators, DICE's velocity node, ...) pass through
+// to their child.
 struct SoundCueNode {
-    enum class Kind : uint8_t { Passthrough, Wave, Mixer, Random, Delay, Modulator, Attenuation, Ambient };
+    enum class Kind : uint8_t { Passthrough, Wave, Mixer, Random, Delay, Modulator, Attenuation, Ambient, Looping, MixGroup };
     Kind kind = Kind::Passthrough;
     std::string wave;            // Wave: the clip's name
     std::vector<int> children;   // indices into SoundCueDef::nodes (-1: missing)
     std::vector<float> weights;  // Mixer: InputVolume per child; Random: Weights per child
-    float min_value = 0.0f;      // Delay: DelayDuration (s); Modulator, Ambient: VolumeModulation
+    // Delay: DelayDuration (s); Modulator, Ambient: VolumeModulation; Looping: LoopCount.
+    // MixGroup: min_value is the product of its mix groups' Volume, which the audio engine fills
+    // in from the ini's table when it takes the cue in (audio/sound_groups.hpp).
+    float min_value = 0.0f;
     float max_value = 0.0f;
-    float min_pitch = 1.0f;      // Modulator, Ambient: PitchModulation
+    float min_pitch = 1.0f;      // Modulator, Ambient: PitchModulation; MixGroup: the product of the groups' Pitch
     float max_pitch = 1.0f;
     int attenuation = -1;        // Attenuation, Ambient: index into SoundCueDef::attenuations
+    bool loop_indefinitely = true;        // Looping: bLoopIndefinitely (Default__SoundNodeLooping has it set)
+    // MixGroup (DICE's TdSoundNodeMixGroup): the MixGroups it names, [Default] where the node
+    // stores none (Default__TdSoundNodeMixGroup), and which of its three modulations are on.
+    std::vector<std::string> mix_groups;
+    bool modulate_volume = true;          // bModulateVolume
+    bool modulate_pitch = true;           // bModulatePitch
 };
 
 struct SoundCueDef {
