@@ -1,6 +1,9 @@
 #include "gl_api.hpp"
 
 #include <SDL2/SDL.h>
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/html5.h>
+#endif
 
 #include <cstring>
 #include <string>
@@ -54,6 +57,25 @@ bool load(std::vector<std::string>* missing) {
 #undef ME_GL_LOAD_OPTIONAL
     if (!ok) return false;
 
+#if defined(__EMSCRIPTEN__)
+    // WebGL 2 requires explicit extension activation for float renderability, linear float filtering, and S3TC.
+    const EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = emscripten_webgl_get_current_context();
+    if (ctx > 0) {
+        static const char* const kWebGlExts[] = {
+            "EXT_color_buffer_float",
+            "EXT_color_buffer_half_float",
+            "OES_texture_float_linear",
+            "WEBGL_compressed_texture_s3tc",
+            "WEBGL_compressed_texture_s3tc_srgb",
+            "EXT_texture_filter_anisotropic",
+            "EXT_texture_norm16",
+        };
+        for (const char* ext_name : kWebGlExts) {
+            emscripten_webgl_enable_extension(ctx, ext_name);
+        }
+    }
+#endif
+
     // "OpenGL ES 3.0 ..." / "OpenGL ES-CM 1.1" on ES; a bare version string on desktop. Apple's
     // SDL may hand out a desktop context when ES was asked for, so the string decides, not the build.
     const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
@@ -82,8 +104,14 @@ void unload() {
 }
 
 bool has_extension(const char* name) {
+    if (!name) return false;
+    const std::string want(name);
+    const std::string bare = (want.rfind("GL_", 0) == 0) ? want.substr(3) : want;
+    std::string webgl_alt;
+    if (bare == "EXT_texture_compression_s3tc") webgl_alt = "WEBGL_compressed_texture_s3tc";
+    else if (bare == "EXT_texture_compression_s3tc_srgb") webgl_alt = "WEBGL_compressed_texture_s3tc_srgb";
     for (const std::string& e : g_extensions) {
-        if (e == name) return true;
+        if (e == want || e == bare || (!webgl_alt.empty() && (e == webgl_alt || e == "GL_" + webgl_alt))) return true;
     }
     return false;
 }

@@ -13,6 +13,9 @@
 #elif defined(__APPLE__)
 #include <SDL2/SDL_metal.h>
 #define ME_PLATFORM_TITLE "macOS"
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#define ME_PLATFORM_TITLE "WebAssembly"
 #elif defined(_WIN32)
 #define ME_PLATFORM_TITLE "Windows"
 #else
@@ -4717,7 +4720,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     std::cout << "  P / F12: Screenshot PNG" << std::endl;
     std::cout << "  ESC: Pause Menu (TdSPPause / TdTutorialPause)\n" << std::endl;
 
-    while (running) {
+    auto frame_tick = [&]() {
         auto now = std::chrono::high_resolution_clock::now();
         float dt = std::chrono::duration<float>(now - last_time).count();
         last_time = now;
@@ -4924,7 +4927,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 save_exit_screenshot();
                 running = false;
             }
-            continue;
+            return;
         }
 
         InputFrame input{};
@@ -5871,13 +5874,24 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             save_exit_screenshot();
             running = false;
         }
+    };
+
+    while (running) {
+        frame_tick();
+#if defined(__EMSCRIPTEN__)
+        if (running) {
+            emscripten_sleep(16);
+        }
+#endif
     }
 
+#if !defined(__EMSCRIPTEN__)
     if (game_controller) SDL_GameControllerClose(game_controller);
     audio.shutdown();
     destroy_surface();
     SDL_DestroyWindow(window);
     SDL_Quit();
+#endif
 
     std::cout << "[Game] Shutdown cleanly." << std::endl;
     return 0;

@@ -1,6 +1,7 @@
 #include "package_manager.hpp"
 #include "ue3_props.hpp"
 #include "upk_loader.hpp"
+#include "../platform/platform.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -67,6 +68,7 @@ std::vector<std::shared_ptr<UPKPackage>> PackageManager::loaded_packages() {
 bool PackageManager::read_raw(const std::string& pkg_name, uint64_t offset, size_t size, std::vector<uint8_t>& out) {
     std::string path = find_package_path(pkg_name);
     if (path.empty()) return false;
+    ensure_asset_file(path);
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     f.seekg(0, std::ios::end);

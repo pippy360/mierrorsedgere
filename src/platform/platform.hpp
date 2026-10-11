@@ -24,6 +24,16 @@ std::string temp_dir();
 // Created on demand; empty if there is none.
 std::string cache_dir();
 
+// On WebAssembly, ensures an unhydrated virtual file (or all files directly inside a map folder)
+// has been fetched into Emscripten MEMFS before C++ opens it via std::ifstream. No-op natively.
+#if defined(__EMSCRIPTEN__)
+void ensure_asset_file(const std::string& path);
+void ensure_asset_dir(const std::string& dir);
+#else
+inline void ensure_asset_file(const std::string&) {}
+inline void ensure_asset_dir(const std::string&) {}
+#endif
+
 }  // namespace me
 
 // The touch controls' overlay (Android): what the renderers' shared HUD code draws. Here because

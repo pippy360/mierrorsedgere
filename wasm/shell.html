@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Mirror's Edge — WebAssembly (WebGL 2)</title>
+  <style>
+    :root {
+      --me-red: #e60012;
+      --me-bg: #f6f8fb;
+      --me-ink: #0f141a;
+      --me-muted: #5b6673;
+      --me-border: rgba(15, 20, 26, 0.12);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #05070a;
+      color: #ffffff;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Segoe UI, Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    #canvas-wrap {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000000;
+    }
+    canvas.emscripten {
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      outline: none;
+    }
+    /* Architectural City-of-Glass Boot Overlay */
+    #boot-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 48px 56px;
+      background: linear-gradient(135deg, #ffffff 0%, #f1f5f9 65%, #e6edf5 100%);
+      color: var(--me-ink);
+      transition: opacity 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    #boot-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .boot-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 4px solid var(--me-red);
+      padding-top: 18px;
+    }
+    .boot-brand {
+      display: flex;
+      align-items: baseline;
+      gap: 14px;
+    }
+    .boot-title {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--me-ink);
+    }
+    .boot-title span {
+      color: var(--me-red);
+    }
+    .boot-tag {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--me-muted);
+      padding: 3px 8px;
+      border: 1px solid var(--me-border);
+    }
+    .boot-center {
+      max-width: 680px;
+    }
+    .boot-headline {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--me-red);
+      margin-bottom: 10px;
+    }
+    .boot-status {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      color: var(--me-ink);
+      margin-bottom: 18px;
+    }
+    .progress-track {
+      width: 100%;
+      height: 4px;
+      background: rgba(15, 20, 26, 0.1);
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--me-red);
+      transition: width 0.15s ease-out;
+    }
+    .boot-detail {
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--me-muted);
+    }
+    #folder-picker-box {
+      display: none;
+      margin-top: 24px;
+      padding-top: 20px;
+      border-top: 1px solid var(--me-border);
+    }
+    .btn-red {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--me-red);
+      color: #ffffff;
+      border: none;
+      padding: 12px 22px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .btn-red:hover { background: #c4000f; }
+    .boot-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--me-muted);
+      border-top: 1px solid var(--me-border);
+      padding-top: 16px;
+    }
+    /* Minimal In-Game Top-Right Streaming Indicator & HUD Bar */
+    #stream-badge {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 15;
+      background: rgba(255, 255, 255, 0.94);
+      color: var(--me-ink);
+      border-left: 3px solid var(--me-red);
+      padding: 8px 14px;
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      display: none;
+    }
+    #hud-bar {
+      position: fixed;
+      top: 12px;
+      left: 12px;
+      z-index: 12;
+      display: flex;
+      gap: 6px;
+      opacity: 0.28;
+      transition: opacity 0.2s ease;
+    }
+    #hud-bar:hover { opacity: 1.0; }
+    .hud-btn {
+      background: rgba(15, 20, 26, 0.82);
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      cursor: pointer;
+    }
+    .hud-btn:hover { border-color: var(--me-red); background: var(--me-red); }
+  </style>
+</head>
+<body>
+  <div id="canvas-wrap">
+    <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+  </div>
+
+  <div id="hud-bar">
+    <button class="hud-btn" id="btn-fullscreen" title="Toggle Fullscreen">Fullscreen</button>
+    <button class="hud-btn" id="btn-shot" title="Save Screenshot PNG">PNG</button>
+  </div>
+
+  <div id="stream-badge">STREAMING PACKAGE...</div>
+
+  <div id="boot-overlay">
+    <div class="boot-header">
+      <div class="boot-brand">
+        <div class="boot-title">MIRROR<span>'</span>S EDGE</div>
+        <div class="boot-tag">WASM · WEBGL 2 · OPENAL</div>
+      </div>
+      <div class="boot-detail" id="boot-mem">EMSCRIPTEN RUNTIME</div>
+    </div>
+
+    <div class="boot-center">
+      <div class="boot-headline" id="boot-phase">INITIALIZING ENGINE</div>
+      <div class="boot-status" id="boot-status">Preparing WebAssembly runtime & shader pipeline...</div>
+      <div class="progress-track">
+        <div class="progress-bar" id="boot-bar"></div>
+      </div>
+      <div class="boot-detail" id="boot-detail">Connecting to asset stream...</div>
+
+      <div id="folder-picker-box">
+        <p style="font-size:13px; color:#334155; margin-bottom:14px; line-height:1.5;">
+          No local asset server detected on <code>/api/tree</code>. Select your retail <strong>Mirror's Edge</strong> installation folder
+          (containing <code>TdGame/CookedPC</code>) to mount directly in browser memory:
+        </p>
+        <label class="btn-red">
+          <span>Select Mirror's Edge Folder</span>
+          <input type="file" id="dir-input" webkitdirectory multiple style="display:none;" />
+        </label>
+      </div>
+    </div>
+
+    <div class="boot-footer">
+      <div>WASD Move · Space Jump/Vault · C/Ctrl Slide/Coil · Click Melee/Fire · Tab Menu</div>
+      <div id="boot-count">READY</div>
+    </div>
+  </div>
+
+  <script>
+    // Force opaque RGBX swapchain (alpha: false) matching native Metal/Vulkan/OpenGL window surfaces,
+    // preserveDrawingBuffer for crisp PNG screenshots, and high-performance GPU selection.
+    const origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, attrs) {
+      if (type === 'webgl2' || type === 'webgl' || type === 'experimental-webgl') {
+        attrs = Object.assign({}, attrs, {
+          alpha: false,
+          preserveDrawingBuffer: true,
+          powerPreference: 'high-performance'
+        });
+      }
+      return origGetContext.call(this, type, attrs);
+    };
+
+    const bootOverlay = document.getElementById('boot-overlay');
+    const bootPhase = document.getElementById('boot-phase');
+    const bootStatus = document.getElementById('boot-status');
+    const bootDetail = document.getElementById('boot-detail');
+    const bootBar = document.getElementById('boot-bar');
+    const bootCount = document.getElementById('boot-count');
+    const streamBadge = document.getElementById('stream-badge');
+    const folderPickerBox = document.getElementById('folder-picker-box');
+    const dirInput = document.getElementById('dir-input');
+
+    function setBootProgress(pct, statusText, detailText) {
+      bootBar.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+      if (statusText) bootStatus.textContent = statusText;
+      if (detailText !== undefined) bootDetail.textContent = detailText;
+    }
+
+    function showStreamBadge(msg) {
+      streamBadge.textContent = msg;
+      streamBadge.style.display = 'block';
+    }
+    function hideStreamBadge() {
+      streamBadge.style.display = 'none';
+    }
+
+    document.getElementById('btn-fullscreen').addEventListener('click', () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    });
+
+    document.getElementById('btn-shot').addEventListener('click', () => {
+      const c = document.getElementById('canvas');
+      c.toBlob((blob) => {
+        if (!blob) return;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'mirrorsedge_wasm_' + Date.now() + '.png';
+        a.click();
+      }, 'image/png');
+    });
+
+    function ensureDirTree(fsPath) {
+      const parts = fsPath.split('/').filter(Boolean);
+      parts.pop(); // remove filename
+      let cur = '';
+      for (const p of parts) {
+        cur += '/' + p;
+        try {
+          if (!FS.analyzePath(cur).exists) FS.mkdir(cur);
+        } catch (_) {}
+      }
+    }
+
+    // Decide which files are pre-hydrated before main() runs so boot into Main Menu (or ?chapter=N)
+    // is instant while every remaining package is indexed as a stub and hydrated on demand.
+    function isStartupEssential(relTdPath, targetChapterPrefix) {
+      const low = relTdPath.toLowerCase();
+      if (low.startsWith('config/')) return true;
+      if (low.startsWith('localization/int/') || low.endsWith('.int')) return true;
+      if (low.startsWith('cookedpc/script/') || low.endsWith('.u')) return true;
+      if (low.startsWith('cookedpc/ui/')) return true;
+      if (low.startsWith('cookedpc/weapons/')) return true;
+      if (low.startsWith('cookedpc/animations/')) return true;
+      if (low.startsWith('cookedpc/characters/ch_tky_crim_fixer')) return true;
+      if (low.startsWith('cookedpc/audio/a_hud') || low.startsWith('cookedpc/audio/a_faith')) return true;
+      if (targetChapterPrefix) {
+        if (low.startsWith(targetChapterPrefix)) return true;
+      } else {
+        if (low.startsWith('cookedpc/maps/menu/')) return true;
+      }
+      return false;
+    }
+
+    async function fetchBytesWithRetry(entry) {
+      if (entry.file) {
+        const buf = await entry.file.arrayBuffer();
+        return new Uint8Array(buf);
+      }
+      for (let attempt = 0; attempt < 6; ++attempt) {
+        try {
+          const resp = await fetch(entry.url);
+          if (resp.ok) {
+            const buf = await resp.arrayBuffer();
+            return new Uint8Array(buf);
+          }
+        } catch (_) {}
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+      throw new Error('Failed to fetch ' + entry.url);
+    }
+
+    async function hydrateBatch(fsPaths, onProgress) {
+      let done = 0;
+      const total = fsPaths.length;
+      if (total === 0) return;
+      const concurrency = Math.min(16, total);
+      let cursor = 0;
+
+      async function worker() {
+        while (true) {
+          const idx = cursor++;
+          if (idx >= total) break;
+          const fsPath = fsPaths[idx];
+          const entry = Module.meUnhydrated.get(fsPath);
+          if (!entry) {
+            done++;
+            continue;
+          }
+          const bytes = await fetchBytesWithRetry(entry);
+          ensureDirTree(fsPath);
+          try { FS.unlink(fsPath); } catch (_) {}
+          FS.writeFile(fsPath, bytes);
+          Module.meUnhydrated.delete(fsPath);
+          done++;
+          if (onProgress) onProgress(done, total, fsPath);
+        }
+      }
+
+      const workers = [];
+      for (let i = 0; i < concurrency; ++i) workers.push(worker());
+      await Promise.all(workers);
+    }
+
+    // Parse URL parameters so ?chapter=0..9, ?level=Maps/..., ?max_frames=N, ?mute=1 pass straight to main()
+    const urlParams = new URLSearchParams(window.location.search);
+    const cliArgs = ['--game-root', '/mirrorsedge'];
+    let targetChapterPrefix = null;
+    if (urlParams.has('chapter')) {
+      const ch = parseInt(urlParams.get('chapter'), 10);
+      cliArgs.push('--chapter', String(ch));
+      const pad = String(ch).padStart(2, '0');
+      targetChapterPrefix = 'cookedpc/maps/sp' + pad + '/';
+    }
+    if (urlParams.has('level')) {
+      const lvl = urlParams.get('level');
+      cliArgs.push('--level', lvl);
+      const dir = lvl.includes('/') ? lvl.slice(0, lvl.lastIndexOf('/') + 1).toLowerCase() : '';
+      if (dir) targetChapterPrefix = 'cookedpc/' + dir;
+    }
+    if (urlParams.has('max_frames')) {
+      cliArgs.push('--max-frames', urlParams.get('max_frames'));
+    }
+    if (urlParams.get('mute') === '1') {
+      cliArgs.push('--mute');
+    }
+    const exitShotPath = urlParams.get('exit_screenshot') || '';
+    if (exitShotPath) {
+      cliArgs.push('--exit-screenshot', exitShotPath);
+      const shotPoll = setInterval(() => {
+        try {
+          if (typeof FS !== 'undefined' && FS.analyzePath(exitShotPath).exists) {
+            clearInterval(shotPoll);
+            const pngBytes = FS.readFile(exitShotPath);
+            fetch('/api/screenshot', { method: 'POST', body: pngBytes }).catch(() => {});
+          }
+        } catch (_) {}
+      }, 100);
+    }
+
+    var Module = {
+      arguments: cliArgs,
+      meUnhydrated: new Map(),
+      canvas: (function() {
+        const c = document.getElementById('canvas');
+        c.addEventListener('webglcontextlost', (e) => {
+          e.preventDefault();
+          console.error('[WASM] WebGL context lost');
+        }, false);
+        return c;
+      })(),
+      meHydrateFile: async function(fsPath) {
+        if (!Module.meUnhydrated.has(fsPath)) return;
+        const shortName = fsPath.split('/').pop();
+        showStreamBadge('STREAMING · ' + shortName);
+        try {
+          await hydrateBatch([fsPath], null);
+        } finally {
+          hideStreamBadge();
+        }
+      },
+      meHydrateDir: async function(fsDir) {
+        let prefix = fsDir.endsWith('/') ? fsDir : (fsDir + '/');
+        const batch = [];
+        for (const k of Module.meUnhydrated.keys()) {
+          if (k.startsWith(prefix)) batch.push(k);
+        }
+        if (batch.length === 0) return;
+        const dirLabel = fsDir.split('/').filter(Boolean).pop() || 'level';
+        showStreamBadge('LOADING CHAPTER · ' + dirLabel.toUpperCase() + ' (0/' + batch.length + ')');
+        try {
+          await hydrateBatch(batch, (done, total, p) => {
+            showStreamBadge('LOADING CHAPTER · ' + dirLabel.toUpperCase() + ' (' + done + '/' + total + ') · ' + p.split('/').pop());
+          });
+        } finally {
+          hideStreamBadge();
+        }
+      },
+      preRun: [function() {
+        Module.addRunDependency('me-assets');
+        (async () => {
+          try {
+            setBootProgress(15, 'Indexing retail game directory...', 'Requesting /api/tree manifest...');
+            const resp = await fetch('/api/tree');
+            if (!resp.ok) throw new Error('No HTTP asset manifest');
+            const files = await resp.json();
+
+            const stubByte = new Uint8Array([0]);
+            const essentials = [];
+            for (const item of files) {
+              const relTd = item[0]; // relative to TdGame/
+              const size = item[1];
+              const fsPath = '/mirrorsedge/TdGame/' + relTd;
+              ensureDirTree(fsPath);
+              FS.writeFile(fsPath, stubByte);
+              Module.meUnhydrated.set(fsPath, { url: '/game/' + encodeURI(relTd), size });
+              if (isStartupEssential(relTd, targetChapterPrefix)) {
+                essentials.push(fsPath);
+              }
+            }
+
+            bootPhase.textContent = 'STREAMING CORE PACKAGES (' + files.length + ' INDEXED)';
+            await hydrateBatch(essentials, (done, total, p) => {
+              const pct = 20 + (done / Math.max(1, total)) * 78;
+              setBootProgress(pct, 'Streaming startup packages (' + done + ' / ' + total + ')...', p.split('/').pop());
+              bootCount.textContent = done + ' / ' + total + ' PACKAGES';
+            });
+
+            setBootProgress(100, 'Launching Mirror\'s Edge WebGL 2 renderer...', 'Compiling GLSL ES 3.00 shaders...');
+            setTimeout(() => bootOverlay.classList.add('hidden'), 150);
+            Module.removeRunDependency('me-assets');
+          } catch (err) {
+            bootPhase.textContent = 'SELECT LOCAL GAME FOLDER';
+            setBootProgress(0, 'Select your Mirror\'s Edge directory to launch in browser', 'Offline mode — zero server upload');
+            folderPickerBox.style.display = 'block';
+            dirInput.addEventListener('change', async (ev) => {
+              const list = Array.from(ev.target.files || []);
+              if (!list.length) return;
+              folderPickerBox.style.display = 'none';
+              const stubByte = new Uint8Array([0]);
+              const essentials = [];
+              for (const f of list) {
+                const raw = f.webkitRelativePath || f.name;
+                const tdIdx = raw.toLowerCase().indexOf('tdgame/');
+                if (tdIdx < 0) continue;
+                const relTd = raw.slice(tdIdx + 7);
+                const fsPath = '/mirrorsedge/TdGame/' + relTd;
+                ensureDirTree(fsPath);
+                FS.writeFile(fsPath, stubByte);
+                Module.meUnhydrated.set(fsPath, { file: f, size: f.size });
+                if (isStartupEssential(relTd, targetChapterPrefix)) essentials.push(fsPath);
+              }
+              bootPhase.textContent = 'MOUNTING LOCAL ASSETS';
+              await hydrateBatch(essentials, (done, total, p) => {
+                const pct = 15 + (done / Math.max(1, total)) * 83;
+                setBootProgress(pct, 'Reading local packages (' + done + ' / ' + total + ')...', p.split('/').pop());
+              });
+              setBootProgress(100, 'Launching Mirror\'s Edge WebGL 2 renderer...', 'Ready');
+              setTimeout(() => bootOverlay.classList.add('hidden'), 150);
+              Module.removeRunDependency('me-assets');
+            }, { once: true });
+          }
+        })();
+      }],
+      print: function(text) {
+        console.log(text);
+      },
+      printErr: function(text) {
+        console.warn(text);
+      }
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
