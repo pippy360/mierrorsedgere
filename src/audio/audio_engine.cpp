@@ -1563,7 +1563,6 @@ void AudioEngine::update_ambient_emitters(float dt) {
                 const ALuint src = emitter_sources_[source];
                 const uint32_t buf = get_or_create_buffer(clip->second, /*force_mono_for_3d=*/w.attenuation.spatialize);
                 if (!buf || !bind_source_buffer(src, buf)) continue;
-                alSourcei(src, AL_LOOPING, w.seamless ? AL_TRUE : AL_FALSE);
                 if (w.attenuation.spatialize) {
                     alSourcei(src, AL_SOURCE_RELATIVE, AL_FALSE);
                     alSource3f(src, AL_POSITION, em.location.x * 0.01f, em.location.y * 0.01f, em.location.z * 0.01f);
@@ -1586,6 +1585,9 @@ void AudioEngine::update_ambient_emitters(float dt) {
 #ifndef ME_NO_OPENAL
         if (device) {
             const ALuint src = emitter_sources_[static_cast<size_t>(w.source)];
+            // (Looping follows the wave at every update: a looping node that has counted its rounds
+            // out no longer asks for it, and the pass that is playing is then the wave's last.)
+            alSourcei(src, AL_LOOPING, w.seamless ? AL_TRUE : AL_FALSE);
             alSourcef(src, AL_GAIN, w.info.gain);
             alSourcef(src, AL_PITCH, pitch);
             set_source_low_pass(src, emitter_filters_[static_cast<size_t>(w.source)], w.info.high_frequency_gain);
