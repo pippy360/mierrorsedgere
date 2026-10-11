@@ -2362,3 +2362,28 @@ platform glue, and a read-only memory profile (its findings are in `TODO.md`, "M
 - **Android 17 (`sdk_gphone16k_arm64`, 16 KiB kernel page size)**:
   - `llvm-readelf -l` verified `LOAD` alignment `0x4000` (16 KiB) on both `libmain.so` and `libSDL2.so`.
   - `ME_FRAMES=40 ./run_emulator_smoke.sh /tmp/android_vk_smoke` (`-no-audio -no-window -feature Vulkan -gpu host`): **271/271 material shaders compiled**, **536/536 textures uploaded in 1.89s** (**5.5x faster** than OpenGL ES's 10.5s on the same AVD!), rendered 2400x1080 widescreen frame exported cleanly (`screenshots/android_smoke.png`), `[Game] Shutdown cleanly`.
+
+---
+
+## 43. WebAssembly & WebGL 2.0 Browser Port (`agent/wasm-port`, 2026-10-11)
+
+**Goal:** Build a complete WebAssembly (`wasm32` / Emscripten 5.0.5) + **WebGL 2.0** (`GLSL ES 3.00`) + **SDL2** + **OpenAL** browser target (`mirrorsedge_wasm.html`) capable of running the full C++20 engine directly in desktop browsers, streaming all 7.2 GB retail Unreal packages on demand via HTTP manifest hydration (`wasm/serve.py`) or offline local folder selection (`<input webkitdirectory>`), with zero static asset bundling and zero desktop regressions. Full guide in [`docs/WASM_PORT.md`](docs/WASM_PORT.md).
+
+### 43.1 Deliverables
+1. **`CMakeLists.txt` (`elseif(EMSCRIPTEN)`)**:
+   - Added complete Emscripten CMake configuration targeting `mirrorsedge_wasm.html` (`mirrorsedge_wasm.wasm`: 4.9 MB, `mirrorsedge_wasm.js`: 250 KB) with `-fexceptions` (C++ exception handling compatible with `-sASYNCIFY=1`), `-sUSE_SDL=2 -sUSE_ZLIB=1 -sUSE_OGG=1 -sUSE_VORBIS=1 -lopenal`, `-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 -sFULL_ES3=1`, `-sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=4294967296`, `-sSTACK_SIZE=8388608`, `-sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=2097152`, `-sFORCE_FILESYSTEM=1`, and `--shell-file wasm/shell.html`.
+   - Guarded native desktop CLI tools (`me_glsl`, `me_probe`, etc.) with `if(NOT ANDROID AND NOT EMSCRIPTEN)`.
+2. **On-Demand `MEMFS` Asset Streaming (`src/platform/platform.{hpp,cpp}`, `src/assets/upk_loader.cpp`, `src/assets/package_manager.cpp`, `wasm/shell.html`, `wasm/serve.py`, `wasm/play_wasm.sh`)**:
+   - `wasm/serve.py` scans `/Users/tomnom/mirrorsedge` once on startup and exposes `/api/tree` + multi-threaded byte-range streaming under `/assets/`.
+   - `wasm/shell.html` pre-populates all directory/file entries into `MEMFS` as lightweight stub nodes in `< 20 ms` so synchronous C++ filesystem enumeration (`find_maps`, `.ini` / `.int` scanning) succeeds instantaneously without network stalls, preloads core boot `.u` / `.upk` packages across 16 parallel workers, and hydrates chapter directories (`ensure_asset_dir`) and external `.upk` texture/audio packages (`ensure_asset_file`) on demand via `EM_ASYNC_JS` + Asyncify.
+   - Includes offline fallback UI allowing users to select their local `MirrorsEdge` folder via `<input webkitdirectory>`.
+3. **WebGL 2.0 & Single-Threaded WASM Compatibility (`src/renderer/gl/gl_api.cpp`, `src/renderer/opengl_renderer.cpp`, `src/main.cpp`, `src/assets/material_system.cpp`, `src/assets/level_lightmaps.cpp`, `src/ui/frontend/soft_sample.hpp`)**:
+   - Enabled WebGL 2 extensions (`EXT_color_buffer_float`, `EXT_color_buffer_half_float`, `OES_texture_float_linear`, `WEBGL_compressed_texture_s3tc`, `WEBGL_compressed_texture_s3tc_srgb`, `EXT_texture_filter_anisotropic`, `EXT_texture_norm16`) and normalized `GL_*` / bare / `WEBGL_*` extension matching.
+   - Added `__EMSCRIPTEN__` upload expansion for `TexFormat::G8` (`RGBA8` / `SRGB8_ALPHA8`) and `TexFormat::V8U8` (`GL_RGBA8_SNORM`) because WebGL 2 omits `GL_TEXTURE_SWIZZLE_R/G/B/A`.
+   - Enforced `alpha: false`, `preserveDrawingBuffer: true`, and `powerPreference: 'high-performance'` on SDL2 WebGL 2 context creation in `wasm/shell.html` so sub-1.0 HDR/post-process alpha values never composite against the HTML background.
+   - Kept `run_interactive_app()`'s full stack frame intact across frames via `emscripten_sleep(16)` inside `while (running)` (rather than unwinding stack locals via `emscripten_set_main_loop`) and guarded `std::thread` pools with `#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)`.
+
+### 43.2 Verification
+- **Emscripten Build (`emcmake cmake -B build-wasm -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build-wasm -j`)**: Compiled and linked cleanly with 0 errors and 0 warnings (`mirrorsedge_wasm.wasm` + `mirrorsedge_wasm.js` + `mirrorsedge_wasm.html`).
+- **Real Chrome WebGL 2 Pixel Readback (`?chapter=0&max_frames=150&exit_screenshot=/wasm_shot.png&mute=1`)**: Mounted 7.2 GB `/Users/tomnom/mirrorsedge` manifest in `< 20 ms`, compiled all 271 UE3 material shaders + 99 lightmaps, rendered 150 frames in WebGL 2 (`ANGLE Metal`), and exported a crisp 1280x720 PNG via `glReadPixels` matching native Metal/Vulkan/OpenGL pixel-for-pixel.
+- **Desktop Native Regression Check (`/Users/tomnom/git/mierrorsedgere/.worktrees/wasm-port/build/mirrorsedge_macos --verify-all`)**: **ALL 25 ORACLE STAGES PASS (`EXIT_CODE=0`)**.

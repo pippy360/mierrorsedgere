@@ -112,8 +112,8 @@ set(VULKAN_RENDERER_SOURCES
 option(ME_VULKAN "Build the native Vulkan renderer backend (mirrorsedge_vulkan on desktop; default backend on Android)" ON)
 
 # The headless tools: desktop only (me_glsl needs the system's SDL2; the others are of no use on a
-# phone).
-if(NOT ANDROID)
+# phone or browser).
+if(NOT ANDROID AND NOT EMSCRIPTEN)
 
 add_executable(me_replay src/tools/replay_main.cpp ${CORE_SOURCES})
 target_link_libraries(me_replay PRIVATE ZLIB::ZLIB)
@@ -475,6 +475,51 @@ add_dependencies(main SDL2)
 foreach(t main SDL2)
     target_link_options(${t} PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
 endforeach()
+
+elseif(EMSCRIPTEN)
+
+# mirrorsedge_wasm: WebAssembly + WebGL 2.0 + OpenAL + SDL2 port (docs/WASM_PORT.md).
+enable_language(C)
+
+set(ME_WASM_COMPILE_FLAGS
+    -fexceptions
+    -sUSE_SDL=2
+    -sUSE_ZLIB=1
+    -sUSE_OGG=1
+    -sUSE_VORBIS=1
+)
+target_compile_definitions(me_game_objs PRIVATE ME_NO_FFMPEG=1)
+target_compile_options(me_game_objs PRIVATE ${ME_WASM_COMPILE_FLAGS})
+
+add_executable(mirrorsedge_wasm src/main.cpp $<TARGET_OBJECTS:me_game_objs> ${OPENGL_RENDERER_SOURCES})
+target_compile_definitions(mirrorsedge_wasm PRIVATE ME_RENDERER_OPENGL=1 ME_GLES=1 ME_NO_FFMPEG=1)
+target_include_directories(mirrorsedge_wasm PRIVATE ${OPENGL_RENDERER_INCLUDE_DIR})
+target_compile_options(mirrorsedge_wasm PRIVATE ${ME_WASM_COMPILE_FLAGS})
+target_link_libraries(mirrorsedge_wasm PRIVATE openal)
+target_link_options(mirrorsedge_wasm PRIVATE
+    -fexceptions
+    -sUSE_SDL=2
+    -sUSE_ZLIB=1
+    -sUSE_OGG=1
+    -sUSE_VORBIS=1
+    -sMIN_WEBGL_VERSION=2
+    -sMAX_WEBGL_VERSION=2
+    -sFULL_ES3=1
+    -sALLOW_MEMORY_GROWTH=1
+    -sINITIAL_MEMORY=268435456
+    -sMAXIMUM_MEMORY=4294967296
+    -sSTACK_SIZE=8388608
+    -sASYNCIFY=1
+    -sASYNCIFY_STACK_SIZE=2097152
+    -sFORCE_FILESYSTEM=1
+    -sEXIT_RUNTIME=0
+    "-sEXPORTED_RUNTIME_METHODS=['FS','callMain','UTF8ToString','stringToUTF8']"
+    "--shell-file" "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
+)
+set_target_properties(mirrorsedge_wasm PROPERTIES
+    SUFFIX ".html"
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/wasm/shell.html"
+)
 
 else()
 

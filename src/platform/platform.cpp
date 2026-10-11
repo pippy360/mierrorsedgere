@@ -18,6 +18,9 @@
 // The app's own directories come from the Java side, through SDL (android/README.md).
 #include <SDL2/SDL.h>
 #endif
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -30,6 +33,8 @@ const char* platform_name() {
     return "macOS";
 #elif defined(__ANDROID__)
     return "Android";
+#elif defined(__EMSCRIPTEN__)
+    return "WebAssembly";
 #else
     return "Linux";
 #endif
@@ -165,6 +170,8 @@ std::string default_game_root() {
         if (is_game_root(c)) return c;
     }
     return candidates.empty() ? std::string("/opt/mirrorsedge") : candidates.front();
+#elif defined(__EMSCRIPTEN__)
+    return "/mirrorsedge";
 #else
     return "/Users/tomnom/mirrorsedge";
 #endif
@@ -208,5 +215,47 @@ std::string cache_dir() {
     fs::create_directories(dir, ec);
     return ec ? std::string() : dir.generic_string();
 }
+
+#if defined(__EMSCRIPTEN__)
+EM_JS(int, me_wasm_needs_hydrate_file, (const char* c_path), {
+    if (!Module.meUnhydrated) return 0;
+    const p = UTF8ToString(c_path);
+    return Module.meUnhydrated.has(p) ? 1 : 0;
+});
+
+EM_JS(int, me_wasm_needs_hydrate_dir, (const char* c_dir), {
+    if (!Module.meUnhydrated) return 0;
+    let prefix = UTF8ToString(c_dir);
+    if (!prefix.endsWith('/')) prefix += '/';
+    for (const k of Module.meUnhydrated.keys()) {
+        if (k.startsWith(prefix)) return 1;
+    }
+    return 0;
+});
+
+EM_ASYNC_JS(void, me_wasm_hydrate_file, (const char* c_path), {
+    if (Module.meHydrateFile) {
+        await Module.meHydrateFile(UTF8ToString(c_path));
+    }
+});
+
+EM_ASYNC_JS(void, me_wasm_hydrate_dir, (const char* c_dir), {
+    if (Module.meHydrateDir) {
+        await Module.meHydrateDir(UTF8ToString(c_dir));
+    }
+});
+
+void ensure_asset_file(const std::string& path) {
+    if (!path.empty() && me_wasm_needs_hydrate_file(path.c_str())) {
+        me_wasm_hydrate_file(path.c_str());
+    }
+}
+
+void ensure_asset_dir(const std::string& dir) {
+    if (!dir.empty() && me_wasm_needs_hydrate_dir(dir.c_str())) {
+        me_wasm_hydrate_dir(dir.c_str());
+    }
+}
+#endif
 
 }  // namespace me

@@ -251,28 +251,31 @@ void LightMapSets::load(PackageManager& pm, const std::vector<std::shared_ptr<UP
 
     // Decompressing the mips is the cost; the textures are independent of each other.
     const size_t total = out.size();
-    const unsigned workers = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
-    std::vector<std::thread> pool;
     std::atomic<size_t> next{0};
     std::atomic<size_t> loaded{0};
-    for (unsigned w = 0; w < workers; ++w) {
-        pool.emplace_back([&]() {
-            for (size_t i = next.fetch_add(1); i < total; i = next.fetch_add(1)) {
-                const Set& set = sets_[i / 3];
-                const auto pkg = by_path.find(set.package_path);
-                if (pkg == by_path.end()) continue;
-                SceneTexture tex;
-                // Light maps keep their full size: their texels are the lighting's resolution.
-                if (!load_texture2d(pm, *pkg->second, set.textures[i % 3], 4096, tex, nullptr) || !tex.valid()) continue;
-                tex.srgb = true;  // sampled through an sRGB lookup on PC (BasePassPixelShader.usf)
-                tex.address_x = TexAddress::Clamp;
-                tex.address_y = TexAddress::Clamp;
-                out[i] = std::move(tex);
-                loaded.fetch_add(1);
-            }
-        });
-    }
+    auto worker = [&]() {
+        for (size_t i = next.fetch_add(1); i < total; i = next.fetch_add(1)) {
+            const Set& set = sets_[i / 3];
+            const auto pkg = by_path.find(set.package_path);
+            if (pkg == by_path.end()) continue;
+            SceneTexture tex;
+            // Light maps keep their full size: their texels are the lighting's resolution.
+            if (!load_texture2d(pm, *pkg->second, set.textures[i % 3], 4096, tex, nullptr) || !tex.valid()) continue;
+            tex.srgb = true;  // sampled through an sRGB lookup on PC (BasePassPixelShader.usf)
+            tex.address_x = TexAddress::Clamp;
+            tex.address_y = TexAddress::Clamp;
+            out[i] = std::move(tex);
+            loaded.fetch_add(1);
+        }
+    };
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    worker();
+#else
+    const unsigned workers = std::max(1u, std::min(std::thread::hardware_concurrency(), 16u));
+    std::vector<std::thread> pool;
+    for (unsigned w = 0; w < workers; ++w) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
+#endif
     size_t bytes = 0;
     for (const auto& tex : out) {
         for (const auto& mip : tex.mips) bytes += mip.data.size();

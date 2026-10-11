@@ -178,7 +178,7 @@ struct GlTexFormat {
     bool compressed = false;
     bool swizzled = false;
     GLint swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
-    enum class Convert { None, DecodeBC, BgraToRgba, L8ToRgb } convert = Convert::None;
+    enum class Convert { None, DecodeBC, BgraToRgba, L8ToRgb, L8ToRgba, V8U8ToRgbaSnorm } convert = Convert::None;
     BcFormat bc = BcFormat::BC1;
 };
 
@@ -209,6 +209,12 @@ GlTexFormat gl_tex_format(TexFormat f, bool srgb, bool es, bool cpu_bc) {
             }
             break;
         case TexFormat::G8:
+#if defined(__EMSCRIPTEN__)
+            // WebGL 2 omits GL_TEXTURE_SWIZZLE_R/G/B/A (spec 6.13): expand L8 to (L, L, L, 255).
+            r.internal = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+            r.format = GL_RGBA;
+            r.convert = GlTexFormat::Convert::L8ToRgba;
+#else
             if (srgb && es) {
                 r.internal = GL_SRGB8;
                 r.format = GL_RGB;
@@ -220,8 +226,16 @@ GlTexFormat gl_tex_format(TexFormat f, bool srgb, bool es, bool cpu_bc) {
                 r.swizzle[0] = r.swizzle[1] = r.swizzle[2] = GL_RED;
                 r.swizzle[3] = GL_ONE;
             }
+#endif
             break;
         case TexFormat::V8U8:
+#if defined(__EMSCRIPTEN__)
+            // WebGL 2 omits GL_TEXTURE_SWIZZLE_*: upload (U, V, 127, 127) as GL_RGBA8_SNORM.
+            r.internal = GL_RGBA8_SNORM;
+            r.format = GL_RGBA;
+            r.type = GL_BYTE;
+            r.convert = GlTexFormat::Convert::V8U8ToRgbaSnorm;
+#else
             r.internal = GL_RG8_SNORM;
             r.format = GL_RG;
             r.type = GL_BYTE;
@@ -230,6 +244,7 @@ GlTexFormat gl_tex_format(TexFormat f, bool srgb, bool es, bool cpu_bc) {
             r.swizzle[1] = GL_GREEN;
             r.swizzle[2] = GL_ONE;
             r.swizzle[3] = GL_ONE;
+#endif
             break;
         default: break;
     }
@@ -260,6 +275,28 @@ const uint8_t* convert_level(const GlTexFormat& fmt, int w, int h, const uint8_t
             if (size < n) return nullptr;
             scratch.resize(n * 3);
             for (size_t i = 0; i < n; ++i) scratch[i * 3 + 0] = scratch[i * 3 + 1] = scratch[i * 3 + 2] = src[i];
+            return scratch.data();
+        }
+        case GlTexFormat::Convert::L8ToRgba: {
+            const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (size < n) return nullptr;
+            scratch.resize(n * 4);
+            for (size_t i = 0; i < n; ++i) {
+                scratch[i * 4 + 0] = scratch[i * 4 + 1] = scratch[i * 4 + 2] = src[i];
+                scratch[i * 4 + 3] = 255;
+            }
+            return scratch.data();
+        }
+        case GlTexFormat::Convert::V8U8ToRgbaSnorm: {
+            const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (size < n * 2) return nullptr;
+            scratch.resize(n * 4);
+            for (size_t i = 0; i < n; ++i) {
+                scratch[i * 4 + 0] = src[i * 2 + 0];
+                scratch[i * 4 + 1] = src[i * 2 + 1];
+                scratch[i * 4 + 2] = 127;
+                scratch[i * 4 + 3] = 127;
+            }
             return scratch.data();
         }
     }
@@ -979,8 +1016,12 @@ struct OpenGLRenderer::Impl {
         return env && env[0] != '\0' && env[0] != '0';
     }
 
-    // The ES versions tried, newest first: 3.2, 3.1, 3.0 (the emulator's host translator gives 3.0).
+    // The ES versions tried, newest first: 3.2, 3.1, 3.0 (WebGL 2 is strictly ES 3.0).
+#if defined(__EMSCRIPTEN__)
+    static constexpr int kEsVersions[][2] = {{3, 0}};
+#else
     static constexpr int kEsVersions[][2] = {{3, 2}, {3, 1}, {3, 0}};
+#endif
 
     static void set_context_attributes(int es_try = 0) {
         if (want_es()) {
@@ -1097,8 +1138,14 @@ struct OpenGLRenderer::Impl {
         }
         has_anisotropy = gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic");
         if (is_es) {
+#if defined(__EMSCRIPTEN__)
+            // Exposure targets are filtered with linear_sampler: require OES_texture_float_linear for R32F, else use R16F.
+            has_color_float = gl::has_extension("GL_EXT_color_buffer_float") && gl::has_extension("GL_OES_texture_float_linear");
+            has_color_half = gl::has_extension("GL_EXT_color_buffer_float") || gl::has_extension("GL_EXT_color_buffer_half_float");
+#else
             has_color_float = gl::has_extension("GL_EXT_color_buffer_float");
             has_color_half = has_color_float || gl::has_extension("GL_EXT_color_buffer_half_float");
+#endif
             has_norm16 = gl::has_extension("GL_EXT_texture_norm16");
             // The shadow array. Some ES drivers (the Android emulator's translator among them) apply
             // GL_MAX_3D_TEXTURE_SIZE to 2D array textures, and a 4096 x 4096 x 3 depth array is 200 MB on

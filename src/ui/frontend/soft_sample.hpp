@@ -68,8 +68,12 @@ inline void sample(const Image& img, float u, float v, float out[4], bool linear
 inline float saturate(float x) { return std::clamp(x, 0.0f, 1.0f); }
 
 inline int worker_count() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    return 1;
+#else
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
     return static_cast<int>(std::min<unsigned>(hw, 16u));
+#endif
 }
 
 // The threads the renderer's row loops run on. They are started once: a frame has a dozen such

@@ -13,6 +13,7 @@
 #include "../anim/anim_system.hpp"
 #include "../game/level_script.hpp"
 #include "../physics/collision_world.hpp"
+#include "../platform/platform.hpp"
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
@@ -562,6 +563,7 @@ UPKPackage::UPKPackage(const std::string& file_path) {
 bool UPKPackage::load_from_file(const std::string& file_path) {
     file_path_ = file_path;
     valid_ = false;
+    ensure_asset_file(file_path);
 
     std::ifstream file(file_path, std::ios::binary);
     if (!file.is_open()) {
@@ -5277,6 +5279,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         return false;
     }
 
+    ensure_asset_dir(main_path.parent_path().string());
     auto master_pkg = std::make_shared<UPKPackage>(main_path.string());
     if (!master_pkg->is_valid()) {
         return false;

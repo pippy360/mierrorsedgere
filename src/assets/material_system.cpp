@@ -1681,10 +1681,15 @@ void MaterialBuilder::load_textures() {
             }
         }
     };
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    (void)threads;
+    worker();
+#else
     std::vector<std::thread> pool;
     pool.reserve(threads);
     for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
+#endif
     for (auto& e : errors) {
         if (lib_.errors.size() < 256) lib_.errors.push_back(std::move(e));
     }
