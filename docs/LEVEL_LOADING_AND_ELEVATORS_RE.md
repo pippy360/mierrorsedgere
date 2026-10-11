@@ -67,7 +67,7 @@ Across all campaign chapters, elevators are constructed from four synchronized U
    - Highlighted in Runner Vision red; triggered by proximity or pressing Use (`E`).
 4. **Matinee Trajectory (`SeqAct_Interp` -> `InterpGroup` -> `InterpTrackMove`)**:
    - `SeqAct_Interp` connects via `VariableLinks` (`SeqVar_Object.ObjValue`) to the target `InterpActor` cab (e.g., `mainlift`, `gate_elevator`, `Elevator_Cab`).
-   - Its `InterpData` -> `InterpGroup` -> `InterpTrackMove` stores `PosTrack` (`InterpCurveVector` keyframes of `InVal` time in seconds and `OutVal` 3D vector coordinates) and `MoveFrame` (`IMF_World` or `IMF_RelativeToInitial`).
+   - Its `InterpData` -> `InterpGroup` -> `InterpTrackMove` stores `PosTrack` (`InterpCurveVector` keyframes of `InVal` time in seconds and `OutVal` 3D vector coordinates) and `MoveFrame` (`IMF_World` or `IMF_RelativeToInitial`). The enum is in that order and the class's defaults leave it at 0, so a track that saves no `MoveFrame` is in the world's frame: three lifts are (`Factory_Arena_Spt:Area_elevator`, `Scraper_Lobby-Shaft_Spt:ElevatorShaft` and `ElevatorHatch`), and read as relative they ran off to twice their coordinates.
    - Verified real `.me1` examples extracted by `UPKPackage::extract_elevators()`:
      - `Escape_Intro-Off_Spt:mainlift` (`S_Elevator_01`): `Z = 10608 -> 12288`, `Duration = 5.0s`
      - `Escape_Off-R1_Slc:InterpActor_2` (`S_Elevator_01`): `Z = 12288 -> 5500`, `Duration = 35.0s`

@@ -742,7 +742,7 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
     m_last_checkpoint_pos = spawn_pos;
     m_last_checkpoint_yaw = spawn_yaw;
-    m_respawn_pos = spawn_pos;
+    m_respawn_pos = start_spot_over_feet(spawn_pos);
     m_respawn_yaw = spawn_yaw;
     m_death_timer = 0.0f;
     m_death_total_duration = 1.35f;
@@ -750,13 +750,86 @@ void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
 
 // SeqAct_TdCheckpoint, through the level script: the checkpoint the player respawns at and is
 // counted as having reached. Replaces the proximity test of update_checkpoints_and_volumes.
-void ParkourController::set_checkpoint(const Vec3& feet, float yaw_deg, int index, const std::string& name) {
-    m_last_checkpoint_pos = feet;
+void ParkourController::set_checkpoint(const Vec3& start_location, float yaw_deg, int index, const std::string& name) {
+    // (The void baseline is a height she has stood at: her feet at the spot.)
+    m_last_checkpoint_pos = start_spot_feet(start_location);
     m_last_checkpoint_yaw = yaw_deg;
-    m_respawn_pos = feet;
+    m_respawn_pos = start_location;
     m_respawn_yaw = yaw_deg;
     m_telemetry.active_checkpoint = index;
     m_telemetry.active_checkpoint_name = name;
+}
+
+void ParkourController::relocate(const Vec3& feet, float yaw) {
+    const Vec3 respawn = m_respawn_pos;
+    const float respawn_yaw = m_respawn_yaw;
+    const int index = m_telemetry.active_checkpoint;
+    const std::string name = m_telemetry.active_checkpoint_name;
+    reset(feet, yaw);
+    m_respawn_pos = respawn;
+    m_respawn_yaw = respawn_yaw;
+    m_telemetry.active_checkpoint = index;
+    m_telemetry.active_checkpoint_name = name;
+}
+
+void ParkourController::restart_at_checkpoint(LevelScene& scene) {
+    restart_level_at(m_respawn_pos, m_respawn_yaw, scene);
+}
+
+void ParkourController::settle_lifts_for_restart(LevelScene& scene, const Vec3& start_location) {
+    for (ElevatorInstance& elev : scene.elevators) {
+        const Vec3 he = elev.cab_half_extents;
+        // In the cab as it stands at `cab_pos`, or on its roof (The Shard's shaft is restarted there).
+        const auto holds = [&](const Vec3& cab_pos) {
+            const Vec3 floor_centre = cab_pos + elev.cab_local_offset;
+            return std::abs(start_location.x - floor_centre.x) <= he.x + 30.0f && std::abs(start_location.y - floor_centre.y) <= he.y + 30.0f &&
+                   start_location.z >= floor_centre.z - 30.0f && start_location.z <= floor_centre.z + he.z * 2.0f + 260.0f;
+        };
+        // (A short run's two boxes overlap: then the cab whose floor is the nearer under the spot.)
+        const auto under = [&](const Vec3& cab_pos) { return std::abs(start_location.z - kPawnCollisionHeight - (cab_pos.z + elev.cab_local_offset.z)); };
+        const bool at_end = holds(elev.end_pos) && (!holds(elev.start_pos) || under(elev.end_pos) < under(elev.start_pos));
+        elev.state = at_end ? ElevatorState::IdleEnd : ElevatorState::IdleStart;
+        elev.current_pos = elev.prev_pos = at_end ? elev.end_pos : elev.start_pos;
+        elev.timer = 0.0f;
+        elev.door_open_Start = at_end ? 0.0f : 1.0f;
+        elev.door_open_End = at_end ? 1.0f : 0.0f;
+        elev.streaming_triggered = at_end;
+        pose_elevator_parts(elev);
+        for (ElevatorPart& part : elev.parts) part.prev_offset = part.offset;
+    }
+}
+
+void ParkourController::restart_level_at(const Vec3& start_location, float yaw_deg, LevelScene& scene) {
+    settle_lifts_for_restart(scene, start_location);
+    restart_at(start_location, yaw_deg, scene);
+}
+
+void ParkourController::restart_at(const Vec3& start_location, float yaw_deg, const LevelScene& scene) {
+    // How far under her feet (her centre at the spot) a floor is still where she is put, with no
+    // fall to show: a checkpoint's own cylinder is 96 high and most stand on their floor, 6 under
+    // those feet, and some are placed a little over it.
+    constexpr float kStartSpotDrop = 60.0f;
+    relocate(start_spot_feet(start_location), yaw_deg);
+    // The floor under the spot, felt for from the spot's middle with a capsule short enough to
+    // stand inside the spot's own cylinder under any ceiling; from higher up when the spot's
+    // middle is itself under the floor.
+    bool placed = false;
+    for (int attempt = 0; attempt < 2 && !placed; ++attempt) {
+        const float lift = attempt == 0 ? 0.0f : kPawnCollisionHeight;
+        m_telemetry.position.z = start_location.z + lift;
+        FloorHit floor;
+        if (check_ground(scene, lift + kPawnCollisionHeight + kStartSpotDrop, 2.0f * kPawnRadius, floor)) {
+            m_telemetry.position.z = floor.z;
+            m_base_actor = floor.actor_index;
+            placed = true;
+        }
+    }
+    if (!placed) {
+        m_telemetry.position.z = start_location.z - kPawnCollisionHeight;
+        leave_ground(EMovement::MOVE_Falling);
+    }
+    m_smooth_last_z = m_telemetry.position.z;
+    m_last_checkpoint_pos = m_telemetry.position;
 }
 
 void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw, float pitch,
@@ -778,8 +851,14 @@ void ParkourController::anchor(const Vec3& feet, const Vec3& velocity, float yaw
     if (state.jump) m_pre_jump_momentum = state.pre_jump_momentum;
 }
 
+void ParkourController::hand_over_at_spot(const Vec3& start_location, float yaw, const LevelScene& scene) {
+    restart_at(start_location, yaw, scene);
+    m_handover_lift = kHandoverLift;
+    m_telemetry.camera_mesh_offset.z = m_handover_lift;
+}
+
 void ParkourController::hand_over(const Vec3& root_end, float yaw, const LevelScene& scene) {
-    reset(root_end + Vec3(0.0f, 0.0f, 2.0f), yaw);
+    relocate(root_end + Vec3(0.0f, 0.0f, 2.0f), yaw);
     // Onto her hover over the floor under her now, not by a fall in the first frames of play.
     FloorHit floor;
     if (check_ground(scene, 2.0f + kMaxStepHeight, kPawnHeight, floor)) {
@@ -6655,14 +6734,11 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
             m_telemetry.death_anim_progress = std::clamp(
                 1.0f - (m_death_timer / std::max(0.10f, m_death_total_duration)), 0.0f, 1.0f);
             if (m_death_timer <= 0.0f) {
-                // The level script's checkpoint when it has one; the drifting void baseline otherwise.
-                const Vec3 respawn = scene.script_checkpoints ? m_respawn_pos : m_last_checkpoint_pos;
-                const float respawn_yaw = scene.script_checkpoints ? m_respawn_yaw : m_last_checkpoint_yaw;
-                const int keep_index = m_telemetry.active_checkpoint;
-                const std::string keep_name = m_telemetry.active_checkpoint_name;
-                reset(respawn, respawn_yaw);
-                m_telemetry.active_checkpoint = keep_index;
-                m_telemetry.active_checkpoint_name = keep_name;
+                // TdSPStoryGame.RestartPlayer: at the active checkpoint (the level script's, or the
+                // one last passed in a level without a script), as the level began there, the lifts
+                // back where a restart has them. Not at the void baseline below, whose height is the
+                // lowest floor she has stood on since.
+                restart_at_checkpoint(scene);
                 m_telemetry.respawned = true;
                 if (!scene.script_checkpoints) m_telemetry.active_subtitle = "Respawned at Checkpoint";
             }
@@ -6678,6 +6754,8 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
                 m_telemetry.active_checkpoint = static_cast<int>(i);
                 m_last_checkpoint_pos = scene.checkpoints[i];
                 m_last_checkpoint_yaw = m_telemetry.yaw_deg;
+                m_respawn_pos = scene.checkpoints_are_feet ? start_spot_over_feet(scene.checkpoints[i]) : scene.checkpoints[i];
+                m_respawn_yaw = m_telemetry.yaw_deg;
                 if (i < scene.checkpoint_infos.size()) {
                     const auto& cp = scene.checkpoint_infos[i];
                     m_telemetry.active_checkpoint_name = cp.checkpoint_name;
@@ -6713,6 +6791,37 @@ void ParkourController::update_checkpoints_and_volumes(LevelScene& scene) {
 // Drives the real elevator InterpActors: the cab and the actors attached to it follow the cab
 // PosTrack, the sliding doors follow their door matinees. A pawn standing on a moving part
 // (Pawn.Base) is carried with it, exactly like UE3 based movement.
+//
+// Pose the real InterpActors: the cab (and everything based on it) is displaced along the cab
+// PosTrack; sliding door leaves move along their door-matinee open offsets.
+void ParkourController::pose_elevator_parts(ElevatorInstance& elev) {
+    const Vec3 cab_offset = elev.current_pos - elev.start_pos;
+    float cab_doors_open = 0.0f;
+    if (elev.state == ElevatorState::IdleStart || elev.state == ElevatorState::DoorsClosing) {
+        cab_doors_open = elev.door_open_Start;
+    } else if (elev.state == ElevatorState::DoorsOpening || elev.state == ElevatorState::IdleEnd) {
+        cab_doors_open = elev.door_open_End;
+    }
+    for (auto& part : elev.parts) {
+        part.prev_offset = part.offset;
+        switch (part.role) {
+            case ElevatorPartRole::Cab:
+            case ElevatorPartRole::CabAttached:
+                part.offset = cab_offset;
+                break;
+            case ElevatorPartRole::CabDoor:
+                part.offset = cab_offset + part.door_open_offset * cab_doors_open;
+                break;
+            case ElevatorPartRole::StartDoor:
+                part.offset = part.door_open_offset * elev.door_open_Start;
+                break;
+            case ElevatorPartRole::EndDoor:
+                part.offset = part.door_open_offset * elev.door_open_End;
+                break;
+        }
+    }
+}
+
 void ParkourController::update_elevators(const InputFrame& input, float dt, LevelScene& scene) {
     m_telemetry.in_elevator = false;
     m_telemetry.active_elevator_idx = -1;
@@ -6849,33 +6958,7 @@ void ParkourController::update_elevators(const InputFrame& input, float dt, Leve
             }
         }
 
-        // Pose the real InterpActors: the cab (and everything based on it) is displaced along the cab
-        // PosTrack; sliding door leaves move along their door-matinee open offsets.
-        const Vec3 cab_offset = elev.current_pos - elev.start_pos;
-        float cab_doors_open = 0.0f;
-        if (elev.state == ElevatorState::IdleStart || elev.state == ElevatorState::DoorsClosing) {
-            cab_doors_open = elev.door_open_Start;
-        } else if (elev.state == ElevatorState::DoorsOpening || elev.state == ElevatorState::IdleEnd) {
-            cab_doors_open = elev.door_open_End;
-        }
-        for (auto& part : elev.parts) {
-            part.prev_offset = part.offset;
-            switch (part.role) {
-                case ElevatorPartRole::Cab:
-                case ElevatorPartRole::CabAttached:
-                    part.offset = cab_offset;
-                    break;
-                case ElevatorPartRole::CabDoor:
-                    part.offset = cab_offset + part.door_open_offset * cab_doors_open;
-                    break;
-                case ElevatorPartRole::StartDoor:
-                    part.offset = part.door_open_offset * elev.door_open_Start;
-                    break;
-                case ElevatorPartRole::EndDoor:
-                    part.offset = part.door_open_offset * elev.door_open_End;
-                    break;
-            }
-        }
+        pose_elevator_parts(elev);
 
         // UE3 based movement: a pawn standing on a moving InterpActor rides with it.
         if (m_telemetry.grounded && m_base_actor >= 0) {

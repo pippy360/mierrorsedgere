@@ -2067,7 +2067,9 @@ void UPKPackage::extract_elevators(
             raw_keys.push_back(kf);
         }
 
-        std::string mf = prop_name(tprops, "MoveFrame", "IMF_RelativeToInitial");
+        // EInterpTrackMoveFrame is { IMF_World, IMF_RelativeToInitial } and InterpTrackMove's defaults
+        // leave it at 0: a track that saves no MoveFrame has its keys in the world's frame.
+        std::string mf = prop_name(tprops, "MoveFrame", "IMF_World");
         bool is_world_frame = (mf == "IMF_World");
 
         if (is_door_group) {
@@ -5286,6 +5288,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     out_scene.collision.reset();
     out_scene.kill_z = -1.0e30f;
     out_scene.checkpoints.clear();
+    out_scene.checkpoints_are_feet = false;
     out_scene.subtitles.clear();
     out_scene.checkpoint_infos.clear();
     out_scene.streaming_actions.clear();
@@ -5849,6 +5852,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
         };
         for (const auto& st : kTutorialStages) {
             out_scene.checkpoints.push_back(st.pos);
+            out_scene.checkpoints_are_feet = true;
             out_scene.subtitles.emplace_back(st.subtitle);
         }
 

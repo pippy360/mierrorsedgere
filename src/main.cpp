@@ -1589,6 +1589,228 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     return pass;
 }
 
+// -----------------------------------------------------------------------------
+// Where a restart puts the player (TdSPStoryGame.RestartPlayer): at every place a level can restart
+// her (the TdCheckpoints of a level with a script, the listed stages of one without) she is put as
+// a restart puts her and left alone until she rests. --verify-respawn runs it over every chapter;
+// the oracle over two levels it has loaded. ME_RESPAWN_DEBUG=1 lists every place and every lift,
+// ME_RESPAWN_AROUND=1 what is round a failing one; --verify-respawn takes ME_RESPAWN_RULE=<units>,
+// her feet that far over the checkpoint's place with no search for a floor (35 was the rule once).
+// -----------------------------------------------------------------------------
+struct RespawnCheck {
+    int checkpoints = 0;
+    int stood = 0;      // put on the floor under the spot, and still there
+    int in_cab = 0;     // put into a lift's cab (it takes her off, or stands at the top of its run)
+    int fell = 0;       // nothing under the spot within reach: she fell, and lived
+    int fell_dead = 0;  // ... and died of it
+    int known = 0;      // the places of kRestartsOnMovers
+    int failed = 0;     // put standing, and not left standing there
+    float worst_drift = 0.0f;
+};
+
+// Checkpoints whose place the port cannot yet make sense of (map, name, why). Reported, not counted.
+static const char* const kRestartsOnMovers[][3] = {
+    {"Stormdrain_p", "construction", "stands on Jacknife's hanging platform, which the port does not have there (TODO.md, World Matinees move nothing)"},
+    {"Subway_p", "Train_Ride_End", "stands on a train the port leaves hidden where it is placed (TODO.md, World Matinees move nothing)"},
+    {"Scraper_p", "Scraper_Start", "its spot is 140 under the plaza's floor; she is pushed up onto it"},
+};
+
+static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const me::MovementConfig& move_cfg, const std::string& label,
+                                              const char* rule_spec = nullptr) {
+    using namespace me;
+    static const bool debug = std::getenv("ME_RESPAWN_DEBUG") != nullptr;
+    RespawnCheck out;
+    LevelScene world = scene;  // the lifts and doors move as she is stepped
+    // Where she is put is what is looked at, not who is waiting there for her.
+    world.enemies.clear();
+    world.helicopters.clear();
+
+    // The places a death restarts her in this level, each a start spot's Location.
+    struct Spot {
+        std::string name;
+        Vec3 location;
+        float yaw = 0.0f;
+    };
+    std::vector<Spot> spots;
+    if (scene.script_checkpoints) {
+        // (The chapter's list also holds the time trials' and the tutorial's gates, which nobody restarts at.)
+        for (const LevelCheckpointInfo& cp : scene.checkpoint_infos) {
+            if (cp.object_name.rfind("TdCheckpoint", 0) == 0) spots.push_back({cp.checkpoint_name, cp.location, cp.rotation.to_degrees().y});
+        }
+    } else {
+        for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
+            spots.push_back({"stage " + std::to_string(i + 1),
+                             scene.checkpoints_are_feet ? ParkourController::start_spot_over_feet(scene.checkpoints[i]) : scene.checkpoints[i],
+                             scene.player_spawn_yaw});
+        }
+    }
+
+    for (const Spot& cp : spots) {
+        ParkourController controller(move_cfg);
+        if (rule_spec) {
+            controller.reset(cp.location + Vec3(0.0f, 0.0f, static_cast<float>(std::atof(rule_spec))), cp.yaw);
+        } else {
+            controller.restart_level_at(cp.location, cp.yaw, world);
+            controller.set_checkpoint(cp.location, cp.yaw, 0, cp.name);
+        }
+        const Vec3 feet = controller.get_telemetry().position;
+        const bool placed = controller.get_telemetry().grounded;
+        // Room for her capsule where she is put: nothing between her knees and the top of her head.
+        bool roofed = false;
+        if (world.collision) {
+            const CollisionHit above = world.collision->line_check(feet + Vec3(0.0f, 0.0f, 40.0f), feet + Vec3(0.0f, 0.0f, 2.0f * kPawnCollisionHeight), COLL_BlockNonZeroExtent);
+            roofed = above.hit;
+        }
+        // Three seconds, and on for as long again three times while she is still on her way down (a
+        // restart at the top of a shaft she is meant to drop through).
+        bool died = false;
+        for (int f = 0; f < 720; ++f) {
+            controller.step(InputFrame{}, 1.0f / 60.0f, world);
+            died = died || controller.get_telemetry().falling_to_death || controller.get_telemetry().health <= 0.0f;
+            if (f >= 179 && (controller.get_telemetry().grounded || died)) break;
+        }
+        const PlayerTelemetry& t = controller.get_telemetry();
+        const float drop = feet.z - t.position.z;
+        const float drift = (t.position - feet).length_xy();
+        const char* known = nullptr;
+        for (const auto& k : kRestartsOnMovers) {
+            if (label.find(k[0]) != std::string::npos && cp.name == k[1]) known = k[2];
+        }
+        // She is put standing and stays (on the floor under the spot, at her hover over it); or into a
+        // lift's cab; or, with nothing under the spot, she falls from it (the Prologue's Cops
+        // checkpoint is the top of the shaft she drops down).
+        bool ok = true;
+        ++out.checkpoints;
+        if (known) {
+            ++out.known;
+        } else if (roofed) {
+            ok = false;
+        } else if (t.in_elevator) {
+            ok = !died && drift < 8.0f;
+            out.in_cab += ok ? 1 : 0;
+        } else if (placed) {
+            ok = !died && t.grounded && std::abs(drop) < 1.0f && drift < 8.0f;
+            out.stood += ok ? 1 : 0;
+        } else {
+            (died ? out.fell_dead : out.fell) += 1;
+        }
+        out.failed += ok ? 0 : 1;
+        if (ok && !known && (placed || t.in_elevator)) out.worst_drift = std::max(out.worst_drift, drift);
+
+        if (debug || !ok || known || (!placed && died)) {
+            if (!ok && world.collision) {
+                // What is under the spot: the level's floor, and what the port keeps apart or never moves.
+                const CollisionHit under = world.collision->line_check(cp.location, cp.location - Vec3(0.0f, 0.0f, 4000.0f), COLL_BlockNonZeroExtent);
+                std::cout << "  [respawn]   under the spot: " << (under.hit ? "the level " + std::to_string(cp.location.z - under.location.z) + " below (actor " + std::to_string(under.actor) + ")" : std::string("no level floor within 4000"));
+                for (size_t ai = 0; ai < world.actors.size(); ++ai) {
+                    const LevelActor& a = world.actors[ai];
+                    if (!(a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0)) continue;
+                    const AABB& b = a.world_bounds;
+                    if (b.min_pt.x > b.max_pt.x || cp.location.x < b.min_pt.x - 30.0f || cp.location.x > b.max_pt.x + 30.0f || cp.location.y < b.min_pt.y - 30.0f ||
+                        cp.location.y > b.max_pt.y + 30.0f || b.max_pt.z > cp.location.z + 100.0f || b.max_pt.z < cp.location.z - 600.0f) {
+                        continue;
+                    }
+                    std::cout << "; " << a.class_name << " " << a.source_package << ":" << a.unique_name << " (" << a.mesh_name << ") top " << cp.location.z - b.max_pt.z
+                              << " below" << (a.elevator >= 0 ? ", a lift's part" : a.barge_door >= 0 ? ", a door" : "") << (a.is_hidden ? ", hidden" : "");
+                }
+                std::cout << std::endl;
+                if (std::getenv("ME_RESPAWN_AROUND")) {
+                    // The floor round the spot, every 30 units: what a capsule stands on (C) and what only a line meets (L).
+                    for (int gy = 2; gy >= -2; --gy) {
+                        std::cout << "  [respawn]     y " << (gy >= 0 ? "+" : "") << gy * 30 << ":";
+                        for (int gx = -3; gx <= 3; ++gx) {
+                            const Vec3 from = cp.location + Vec3(gx * 30.0f, gy * 30.0f, 0.0f);
+                            const CollisionHit c = world.collision->line_check(from, from - Vec3(0.0f, 0.0f, 400.0f), COLL_BlockNonZeroExtent);
+                            const CollisionHit l = world.collision->line_check(from, from - Vec3(0.0f, 0.0f, 400.0f), COLL_BlockZeroExtent | COLL_ShadowCast);
+                            std::cout << "  C" << (c.hit ? std::to_string(static_cast<int>(cp.location.z - c.location.z)) : std::string("-")) << "/L"
+                                      << (l.hit ? std::to_string(static_cast<int>(cp.location.z - l.location.z)) : std::string("-"));
+                        }
+                        std::cout << std::endl;
+                    }
+                }
+            }
+            std::cout << "  [respawn] " << label << " '" << cp.name << "' at (" << cp.location.x << ", " << cp.location.y << ", " << cp.location.z
+                      << "): put at feet z " << feet.z << (placed ? " on a floor" : " in the air") << ", then at (" << t.position.x << ", " << t.position.y
+                      << ", " << t.position.z << "), drop " << drop << ", drift " << drift << (t.grounded ? "" : ", in the air") << (t.in_elevator ? ", in a cab" : "")
+                      << ", " << move_state_name(t.move_state) << (roofed ? ", something in her capsule where she is put" : "") << (died ? ", DEAD" : "")
+                      << (known ? std::string("  (known: ") + known + ")" : ok ? std::string() : std::string("  <-- FAIL")) << std::endl;
+        }
+    }
+    return out;
+}
+
+// A death goes back to where a restart goes, whatever she has stood on since. She is restarted at
+// `home` (which makes it the active checkpoint: by set_checkpoint in a level with a script, by
+// walking onto it in one without), moved to `elsewhere` as a teleport moves her, left to stand
+// there a second (the void baseline follows her down), and her health is taken. Returns how far
+// from where `home` put her the restart leaves her, or -1 when she does not come back.
+static float death_returns_to(const me::LevelScene& scene, const me::MovementConfig& move_cfg, const me::Vec3& home, const me::Vec3& elsewhere) {
+    using namespace me;
+    LevelScene world = scene;
+    world.enemies.clear();
+    world.helicopters.clear();
+    ParkourController controller(move_cfg);
+    controller.restart_level_at(home, 0.0f, world);
+    if (scene.script_checkpoints) controller.set_checkpoint(home, 0.0f, 0, "home");
+    const Vec3 put = controller.get_telemetry().position;
+    for (int f = 0; f < 30; ++f) controller.step(InputFrame{}, 1.0f / 60.0f, world);
+    controller.restart_at(elsewhere, 0.0f, world);
+    for (int f = 0; f < 60; ++f) controller.step(InputFrame{}, 1.0f / 60.0f, world);
+    if ((controller.get_telemetry().position - put).length() < 100.0f) return -1.0f;  // she never left
+    controller.get_telemetry().health = 0.0f;
+    for (int f = 0; f < 300; ++f) {
+        controller.step(InputFrame{}, 1.0f / 60.0f, world);
+        if (controller.get_telemetry().respawned) return (controller.get_telemetry().position - put).length();
+    }
+    return -1.0f;
+}
+
+static int run_verify_respawn(const std::string& game_root) {
+    using namespace me;
+    MovementConfig move_cfg;
+    load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+    static const char* const kMaps[] = {"Maps/SP00/Tutorial_p.me1", "Maps/SP01/Edge_p.me1",   "Maps/SP01/Escape_p.me1", "Maps/SP02/Stormdrain_p.me1",
+                                        "Maps/SP03/Cranes_p.me1",   "Maps/SP04/Subway_p.me1", "Maps/SP05/Mall_p.me1",   "Maps/SP06/Factory_p.me1",
+                                        "Maps/SP07/Boat_p.me1",     "Maps/SP08/Convoy_p.me1", "Maps/SP09/Scraper_p.me1"};
+    RespawnCheck all;
+    bool loaded = true;
+    for (const char* map : kMaps) {
+        LevelScene scene;
+        if (!load_level_scene(game_root, map, scene)) {
+            std::cout << "[Respawn] " << map << ": not loaded" << std::endl;
+            loaded = false;
+            continue;
+        }
+        if (std::getenv("ME_RESPAWN_DEBUG")) {
+            for (const ElevatorInstance& e : scene.elevators) {
+                std::cout << "  [respawn] lift " << e.name << ": (" << e.start_pos.x << ", " << e.start_pos.y << ", " << e.start_pos.z << ") -> ("
+                          << e.end_pos.x << ", " << e.end_pos.y << ", " << e.end_pos.z << "), " << (e.move_frame_world ? "world keys" : "relative keys")
+                          << ", " << e.parts.size() << " parts" << std::endl;
+                for (const ElevatorPart& part : e.parts) {
+                    std::cout << "  [respawn]   part " << part.actor_name << " role " << static_cast<int>(part.role) << " opens by (" << part.door_open_offset.x
+                              << ", " << part.door_open_offset.y << ", " << part.door_open_offset.z << ")" << std::endl;
+                }
+            }
+        }
+        const RespawnCheck r = check_checkpoint_respawns(scene, move_cfg, map, std::getenv("ME_RESPAWN_RULE"));
+        std::cout << "[Respawn] " << map << (scene.script_checkpoints ? "" : " (no script: its listed stages)") << ": " << r.checkpoints << " places: "
+                  << r.stood << " stand where they are put, " << r.in_cab << " in a lift's cab, " << r.fell << " fall and live, " << r.fell_dead
+                  << " fall and die, " << r.known << " known, " << r.failed << " failed" << std::endl;
+        all.checkpoints += r.checkpoints;
+        all.stood += r.stood;
+        all.in_cab += r.in_cab;
+        all.fell += r.fell;
+        all.fell_dead += r.fell_dead;
+        all.known += r.known;
+        all.failed += r.failed;
+        all.worst_drift = std::max(all.worst_drift, r.worst_drift);
+    }
+    std::cout << "[Respawn] " << all.checkpoints << " places in " << (sizeof(kMaps) / sizeof(kMaps[0])) << " maps: " << all.stood
+              << " stand where they are put, " << all.in_cab << " in a lift's cab, " << all.fell << " fall and live, " << all.fell_dead
+              << " fall and die, " << all.known << " known, " << all.failed << " failed; largest drift " << all.worst_drift << " uu" << std::endl;
+    return loaded && all.failed == 0 && all.fell_dead == 0 ? 0 : 1;
+}
+
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
@@ -3331,10 +3553,52 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     // Stage 24: the player's bullets against an enemy's posed bodies (oracle_enemy_bodies above).
     std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
     const bool s24_pass = oracle_enemy_bodies(renderer, sim_scene, move_cfg);
+    // Stage 25: where a restart at a checkpoint puts her (check_checkpoint_respawns above), in the
+    // two levels loaded here; --verify-respawn does every chapter.
+    std::cout << "[Oracle Stage 25] Testing Restarts at the Checkpoints (TdSPStoryGame.RestartPlayer)..." << std::endl;
+    bool s25_pass = false;
+    {
+        const RespawnCheck tutorial = check_checkpoint_respawns(sp00_scene, move_cfg, "Tutorial_p");
+        const RespawnCheck edge = check_checkpoint_respawns(sp01_scene, move_cfg, "Edge_p");
+        // Every stage of the Training Area and nine of the Prologue's ten checkpoints stand her on
+        // their floor; the tenth, Cops, is the top of the shaft she drops down (how that fall ends
+        // is not this stage's to judge).
+        // A death: in the Training Area back at the last stage she walked onto, from a stage's start
+        // that lies lower and comes earlier in the list (so that it does not become the active one);
+        // in the Prologue back at After_Intro from Rooftop_Action's place, 1896 lower.
+        float tutorial_back = -1.0f, tutorial_lower = 0.0f;
+        for (size_t i = sp00_scene.checkpoints.size(); i-- > 1 && tutorial_back < 0.0f;) {
+            for (size_t j = 0; j < i && tutorial_back < 0.0f; ++j) {
+                if (sp00_scene.checkpoints[j].z > sp00_scene.checkpoints[i].z - 200.0f) continue;
+                tutorial_lower = sp00_scene.checkpoints[i].z - sp00_scene.checkpoints[j].z;
+                tutorial_back = death_returns_to(sp00_scene, move_cfg, ParkourController::start_spot_over_feet(sp00_scene.checkpoints[i]),
+                                                 ParkourController::start_spot_over_feet(sp00_scene.checkpoints[j]));
+            }
+        }
+        float edge_back = -1.0f;
+        {
+            const LevelCheckpointInfo* home = nullptr;
+            const LevelCheckpointInfo* away = nullptr;
+            for (const LevelCheckpointInfo& cp : sp01_scene.checkpoint_infos) {
+                if (cp.checkpoint_name == "After_Intro") home = &cp;
+                if (cp.checkpoint_name == "Rooftop_Action") away = &cp;
+            }
+            if (home && away) edge_back = death_returns_to(sp01_scene, move_cfg, home->location, away->location);
+        }
+        const bool deaths_ok = tutorial_back >= 0.0f && tutorial_back < 2.0f && edge_back >= 0.0f && edge_back < 2.0f;
+        s25_pass = tutorial.failed == 0 && edge.failed == 0 && tutorial.checkpoints >= 19 && tutorial.stood == tutorial.checkpoints &&
+                   edge.checkpoints == 10 && edge.stood == 9 && deaths_ok;
+        std::cout << "  -> Stage 25 Result: " << (s25_pass ? "PASS" : "FAIL") << " (Tutorial_p: " << tutorial.stood << " of " << tutorial.checkpoints
+                  << " stages stand her where they put her; Edge_p: " << edge.stood << " of " << edge.checkpoints << " checkpoints stand, "
+                  << edge.fell + edge.fell_dead << " falls, " << tutorial.failed + edge.failed << " failed, largest drift "
+                  << std::max(tutorial.worst_drift, edge.worst_drift) << " uu; Death=" << (deaths_ok ? "OK" : "FAIL") << " [Tutorial_p: after standing "
+                  << tutorial_lower << " lower she is back " << tutorial_back << " uu from her stage's start; Edge_p: back " << edge_back
+                  << " uu from After_Intro's])" << std::endl;
+    }
 
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -3899,9 +4163,30 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     float handover_yaw = 0.0f;
     bool handover_set = false;
     auto hand_over = [&](const LevelIntroSequence& seq) {
-        if (handover_set) controller.hand_over(handover_pos - Vec3(0.0f, 0.0f, 2.0f), handover_yaw, active_scene);
+        if (handover_set) controller.hand_over_at_spot(handover_pos, handover_yaw, active_scene);
         else controller.hand_over(seq.end_feet_pos, seq.end_yaw_deg, active_scene);
         handover_set = false;
+    };
+    // Load last checkpoint (TdPlayerController.CanLoadFromLastCheckpoint): the level starts over at
+    // the active checkpoint, its script with it; the script's own actors are put back before she
+    // is set down among them.
+    auto load_last_checkpoint = [&]() {
+        if (script.load_from_checkpoint_disabled()) return;
+        cutscene_player.stop();
+        controller.get_telemetry().intro_active = false;
+        controller.get_telemetry().tutorial_text.clear();
+        controller.get_telemetry().sign_text.clear();
+        restore_script_actors(active_scene);
+        if (const ScriptActor* cp = script.active_checkpoint()) controller.restart_level_at(cp->location, cp->yaw_deg, active_scene);
+        script.reload_checkpoint();
+    };
+    // In a level without a script: the level begun again at one of its listed checkpoints.
+    auto restart_at_listed_checkpoint = [&](int cp, float yaw) {
+        const Vec3 spot = active_scene.checkpoints.empty()     ? ParkourController::start_spot_over_feet(active_scene.player_spawn_pos)
+                          : active_scene.checkpoints_are_feet ? ParkourController::start_spot_over_feet(active_scene.checkpoints[static_cast<size_t>(cp)])
+                                                              : active_scene.checkpoints[static_cast<size_t>(cp)];
+        controller.restart_level_at(spot, yaw, active_scene);
+        controller.set_checkpoint(spot, yaw, cp, std::string());
     };
     // A cutscene a key stops in a level without a script to stop it: the player stands at the
     // level's start, and a fade that had taken the picture out (the training area's pan fades to
@@ -3932,8 +4217,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     }
                 }
             }
-            controller.set_checkpoint(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.yaw_deg, index, cp.checkpoint_name);
-            if (teleport) controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.yaw_deg);
+            // (SeqAct_TdCheckpoint with a teleport: TdCheckpoint.HandlePawnTeleport.)
+            if (teleport) controller.restart_at(cp.location, cp.yaw_deg, active_scene);
+            controller.set_checkpoint(cp.location, cp.yaw_deg, index, cp.checkpoint_name);
         };
         host.level_completed = [&](const std::string& next_level, const std::string& next_checkpoint) {
             if (pending_transition.pending) return;
@@ -4011,12 +4297,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             // any other is where the pawn stands when the Matinee hands over.
             if (const LevelIntroSequence* seq = cutscene_player.active_sequence(active_scene)) {
                 if ((location - seq->actor_location).length() < 1.0f) return;
-                handover_pos = location + Vec3(0.0f, 0.0f, 2.0f);
+                handover_pos = location;
                 handover_yaw = yaw_deg;
                 handover_set = true;
                 return;
             }
-            controller.reset(location + Vec3(0.0f, 0.0f, 2.0f), yaw_deg);
+            // Actor.OnTeleport: SetLocation(the destination's Location), the capsule's centre.
+            controller.restart_at(location, yaw_deg, active_scene);
         };
         host.player_fail = [&]() {
             if (cutscene_player.is_playing() || into_cutscene_pending || script.cinematic_mode()) return;
@@ -4064,8 +4351,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 // The pawn spawns at the checkpoint (TdSPStoryGame.FindPlayerStart), as retail's does;
                 // the intro's Kismet teleports it from there onto its mark. (Without a script the
                 // level's spawn is the intro's end, for the hand-over.)
-                if (cp->location.length_xy() > 1.0f) controller.reset(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg);
-                controller.set_checkpoint(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg, index, cp->checkpoint_name);
+                if (cp->location.length_xy() > 1.0f) controller.restart_level_at(cp->location, cp->yaw_deg, active_scene);
+                controller.set_checkpoint(cp->location, cp->yaw_deg, index, cp->checkpoint_name);
             }
             ScriptPlayerState ps;
             ps.position = controller.get_telemetry().position;
@@ -4172,7 +4459,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 const LevelCheckpointInfo& cp = active_scene.checkpoint_infos[c];
                 if (lower(cp.checkpoint_name) != lower(checkpoint_name)) continue;
                 stream_level_to_checkpoint(game_root, active_scene, static_cast<int>(c));
-                controller.reset(cp.location + Vec3(0.0f, 0.0f, 35.0f), cp.rotation.to_degrees().y);
+                controller.restart_level_at(cp.location, cp.rotation.to_degrees().y, active_scene);
                 controller.get_telemetry().active_checkpoint = static_cast<int>(c);
                 controller.get_telemetry().active_checkpoint_name = cp.checkpoint_name;
                 break;
@@ -4587,12 +4874,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     reaction_toggled = !reaction_toggled;
                     controller.get_telemetry().reaction_active = reaction_toggled;
                 } else if (row == 4) {
-                    controller.get_telemetry().intro_active = false;
-                    cutscene_player.stop();
-                    int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
-                                        std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
-                    Vec3 spawn = active_scene.checkpoints.empty() ? active_scene.player_spawn_pos : active_scene.checkpoints[cp];
-                    controller.reset(spawn, active_scene.player_spawn_yaw);
+                    if (script.valid()) {
+                        load_last_checkpoint();
+                    } else {
+                        controller.get_telemetry().intro_active = false;
+                        cutscene_player.stop();
+                        int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
+                                            std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
+                        restart_at_listed_checkpoint(cp, active_scene.player_spawn_yaw);
+                    }
                     set_menu_active(false);
                 } else if (row == 5) {
                     running = false;
@@ -4844,32 +5134,18 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 } else if (key == SDLK_h) {
                     input.spawn_combat_squad = true;
                 } else if (key == SDLK_r && script.valid()) {
-                    // Load last checkpoint (TdPlayerController.CanLoadFromLastCheckpoint): the
-                    // level starts over at the active checkpoint, its script with it.
-                    if (!script.load_from_checkpoint_disabled()) {
-                        cutscene_player.stop();
-                        controller.get_telemetry().intro_active = false;
-                        if (const ScriptActor* cp = script.active_checkpoint()) {
-                            controller.reset(cp->location + Vec3(0.0f, 0.0f, 35.0f), cp->yaw_deg);
-                        }
-                        controller.get_telemetry().tutorial_text.clear();
-                        controller.get_telemetry().sign_text.clear();
-                        restore_script_actors(active_scene);
-                        script.reload_checkpoint();
-                    }
+                    load_last_checkpoint();
                 } else if (key == SDLK_r) {
                     controller.get_telemetry().intro_active = false;
                     cutscene_player.stop();
                     int cp = std::clamp(controller.get_telemetry().active_checkpoint, 0,
                                         std::max(0, static_cast<int>(active_scene.checkpoints.size()) - 1));
-                    Vec3 spawn = active_scene.checkpoints.empty() ? active_scene.player_spawn_pos : active_scene.checkpoints[cp];
                     float yaw = active_scene.player_spawn_yaw;
                     if (cp + 1 < static_cast<int>(active_scene.checkpoints.size())) {
-                        Vec3 d = active_scene.checkpoints[cp + 1] - spawn;
+                        Vec3 d = active_scene.checkpoints[cp + 1] - active_scene.checkpoints[cp];
                         yaw = std::atan2(d.y, d.x) * RAD2DEG;
                     }
-                    controller.reset(spawn, yaw);
-                    controller.get_telemetry().active_checkpoint = cp;
+                    restart_at_listed_checkpoint(cp, yaw);
                     if (cp < static_cast<int>(active_scene.subtitles.size()) && !active_scene.subtitles[cp].empty()) {
                         controller.get_telemetry().active_subtitle = active_scene.subtitles[cp];
                     }
@@ -4879,14 +5155,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                         int delta_cp = (key == SDLK_RIGHTBRACKET || key == SDLK_n) ? 1 : -1;
                         int next_cp = std::clamp(controller.get_telemetry().active_checkpoint + delta_cp,
                                                  0, static_cast<int>(active_scene.checkpoints.size()) - 1);
-                        Vec3 spawn = active_scene.checkpoints[next_cp];
                         float yaw = active_scene.player_spawn_yaw;
                         if (next_cp + 1 < static_cast<int>(active_scene.checkpoints.size())) {
-                            Vec3 d = active_scene.checkpoints[next_cp + 1] - spawn;
+                            Vec3 d = active_scene.checkpoints[next_cp + 1] - active_scene.checkpoints[next_cp];
                             yaw = std::atan2(d.y, d.x) * RAD2DEG;
                         }
-                        controller.reset(spawn, yaw);
-                        controller.get_telemetry().active_checkpoint = next_cp;
+                        restart_at_listed_checkpoint(next_cp, yaw);
                         if (next_cp < static_cast<int>(active_scene.subtitles.size()) && !active_scene.subtitles[next_cp].empty()) {
                             controller.get_telemetry().active_subtitle = active_scene.subtitles[next_cp];
                         }
@@ -5065,7 +5339,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     controller.set_position(from + (to - from) * u);
                     controller.set_velocity(Vec3(0.0f, 0.0f, 0.0f));
                     if (u >= 1.0f) {
-                        controller.reset(to, into_cutscene_yaw);
+                        controller.relocate(to, into_cutscene_yaw);
                         into_cutscene_pending = false;
                         script.into_cutscene_finished();
                     }
@@ -5093,6 +5367,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     cutscene_player.stop();
                     t.intro_active = false;
                     restore_script_actors(active_scene);  // the panes are whole again
+                    controller.restart_at_checkpoint(active_scene);  // onto the level as it is now
                     script.reload_checkpoint();
                 }
                 ScriptPlayerState ps;
@@ -5465,6 +5740,7 @@ int main(int argc, char* argv[]) {
     bool verify_script = false;  // the level script's stage of the oracle, alone
     bool verify_sound = false;   // and the sound attenuation stage
     bool verify_bodies = false;  // the enemies' bodies stage of the oracle, alone
+    bool verify_respawn = false; // a restart at every checkpoint of every chapter
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
     std::string cue_dump;      // --dump-sound-cues <file>
@@ -5502,6 +5778,8 @@ int main(int argc, char* argv[]) {
             verify_sound = true;
         } else if (arg == "--verify-bodies") {
             verify_bodies = true;
+        } else if (arg == "--verify-respawn") {
+            verify_respawn = true;
         } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
@@ -5538,6 +5816,7 @@ int main(int argc, char* argv[]) {
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
                       << "  --verify-sound           Run only its sound attenuation stage (gain with distance, per cue)\n"
                       << "  --verify-bodies          Run only its stage of bullets against the enemies' posed bodies\n"
+                      << "  --verify-respawn         Restart at every checkpoint of every chapter and see where she ends up\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
@@ -5576,6 +5855,7 @@ int main(int argc, char* argv[]) {
         if (!renderer.init_headless(1280, 720)) return 1;
         return measure_intro_handover(renderer, game_root, handover_map, true).valid ? 0 : 1;
     }
+    if (verify_respawn) return run_verify_respawn(game_root);
     if (verify_bodies) {
         me::Renderer renderer;
         renderer.set_game_root(game_root);

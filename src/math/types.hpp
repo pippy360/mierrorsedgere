@@ -1961,6 +1961,9 @@ struct LevelScene {
     std::vector<KismetLookAtPoint> kismet_lookat_points;
     std::vector<KismetLevelTransition> kismet_level_transitions;
     std::vector<Vec3> checkpoints;
+    // What `checkpoints` holds: the checkpoint actors' places (their cylinders' centres), or, for the
+    // Training Area's list of stages, where her feet stand at each stage's start.
+    bool checkpoints_are_feet = false;
     std::vector<LevelCheckpointInfo> checkpoint_infos;
     std::vector<LevelStreamingActionInfo> streaming_actions;
     std::vector<std::string> all_streaming_packages;
