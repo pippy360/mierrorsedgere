@@ -946,6 +946,78 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
 }
 
 // -----------------------------------------------------------------------------
+// --emitter-walk: the level emitters of the eleven maps, heard with no audio device from 100, 150,
+// 1000 and 2000 uu above each of them in turn, a quarter of a second at every place: how many
+// emitter voices sound there, how many of those are at a distance gain of nothing or next to it, and
+// how many emitters they belong to. The walk of MODLOG.md sections 38 and 41.
+// -----------------------------------------------------------------------------
+static int run_emitter_walk(const std::string& game_root) {
+    using namespace me;
+    static const char* const kMaps[] = {
+        "Maps/SP00/Tutorial_p.me1",   "Maps/SP01/Edge_p.me1",    "Maps/SP01/Escape_p.me1", "Maps/SP02/Stormdrain_p.me1",
+        "Maps/SP03/Cranes_p.me1",     "Maps/SP04/Subway_p.me1",  "Maps/SP05/Mall_p.me1",   "Maps/SP06/Factory_p.me1",
+        "Maps/SP07/Boat_p.me1",       "Maps/SP08/Convoy_p.me1",  "Maps/SP09/Scraper_p.me1"};
+    constexpr size_t kMost = 40;  // the histogram's last column: that many voices or more
+    struct Count {
+        size_t emitters = 0, places = 0, voices = 0, silent = 0, quiet = 0, heard_emitters = 0, most = 0;
+        size_t by_voices[kMost + 1] = {};
+    };
+    AudioEngine audio;
+    audio.init(true);
+    audio.load_stock_audio(game_root);
+    const Vec3 ahead(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    Count total;
+    const auto print = [](const char* name, const Count& c) {
+        std::cout << "[Walk] " << name << ": " << c.emitters << " emitters, " << c.places << " places, " << c.voices << " emitter voices sound ("
+                  << c.silent << " at distance gain 0, " << c.quiet << " at 0.002 or less), of " << c.heard_emitters
+                  << " emitters; most at one place " << c.most << "; places by voices";
+        for (size_t n = 0; n <= kMost; ++n) {
+            if (c.by_voices[n]) std::cout << " " << n << (n == kMost ? "+" : "") << ":" << c.by_voices[n];
+        }
+        std::cout << std::endl;
+    };
+    for (const char* map : kMaps) {
+        audio.stop_all();
+        audio.load_level_audio(game_root, map);
+        const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
+        Count c;
+        c.emitters = emitters.size();
+        for (const float height : {100.0f, 150.0f, 1000.0f, 2000.0f}) {
+            for (const AmbientEmitterInfo& em : emitters) {
+                audio.update(0.25f, em.location + Vec3(0.0f, 0.0f, height), ahead, up, 0.0f, false);
+                size_t voices = 0;
+                std::vector<Vec3> from;
+                for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+                    if (!v.emitter) continue;
+                    ++voices;
+                    if (v.distance_gain <= 0.0f) ++c.silent;
+                    if (v.distance_gain <= 0.002f) ++c.quiet;
+                    bool known = false;
+                    for (const Vec3& p : from) known = known || (p - v.position).length() < 0.01f;
+                    if (!known) from.push_back(v.position);
+                }
+                ++c.places;
+                c.voices += voices;
+                c.heard_emitters += from.size();
+                c.most = std::max(c.most, voices);
+                ++c.by_voices[std::min(voices, kMost)];
+            }
+        }
+        print(map, c);
+        total.emitters += c.emitters;
+        total.places += c.places;
+        total.voices += c.voices;
+        total.silent += c.silent;
+        total.quiet += c.quiet;
+        total.heard_emitters += c.heard_emitters;
+        total.most = std::max(total.most, c.most);
+        for (size_t n = 0; n <= kMost; ++n) total.by_voices[n] += c.by_voices[n];
+    }
+    print("all eleven maps", total);
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
 // --dump-sound-cues <file>: every SoundCue of every package under CookedPC as the loader reads it,
 // one JSON object a line: the cue's attenuation nodes (class, model, the stored radius pairs, flags,
 // where each sits in the graph) and how many of its waves have none, one or two of them above. For
@@ -5927,6 +5999,7 @@ int main(int argc, char* argv[]) {
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
     std::string cue_dump;      // --dump-sound-cues <file>
+    bool emitter_walk = false; // --emitter-walk
     std::string script_json = "";
     int initial_chapter = 0;
     std::string custom_level = "";
@@ -5957,6 +6030,8 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "--dump-sound-cues") {
             if (i + 1 < argc) cue_dump = argv[++i];
+        } else if (arg == "--emitter-walk") {
+            emitter_walk = true;
         } else if (arg == "--verify-script") {
             verify_script = true;
         } else if (arg == "--verify-sound") {
@@ -6010,6 +6085,7 @@ int main(int argc, char* argv[]) {
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
                       << "  --dump-sound-cues <file> Write every sound cue's attenuation nodes as the loader reads them, headless\n"
+                      << "  --emitter-walk           Count the emitter voices heard above every level emitter of the eleven maps, headless\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
                       << "  --test-replay <trace>    Replay physics trace headless\n"
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
@@ -6036,6 +6112,7 @@ int main(int argc, char* argv[]) {
     if (!cue_dump.empty()) {
         return run_dump_sound_cues(game_root, cue_dump);
     }
+    if (emitter_walk) return run_emitter_walk(game_root);
     if (verify_sound) {
         std::cout << "[Oracle Stage 23] Testing Sound Attenuation with Distance (the cues' own curves, per wave)..." << std::endl;
         return oracle_sound_attenuation(game_root) ? 0 : 1;
