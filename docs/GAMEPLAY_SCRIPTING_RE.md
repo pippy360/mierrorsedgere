@@ -34,6 +34,24 @@ on a load, every loaded level's `SeqEvent_LevelLoaded` fires, then the active ch
 (`ResetLevel` with `bReloadScriptLevels`) and fires the same events again, so a chapter's Kismet
 state starts over from the checkpoint.
 
+**Where a restart puts her.** `TdSPStoryGame.RestartPlayer` spawns the pawn at the start spot
+(`SpawnDefaultPawnFor(NewPlayer, StartSpot)`: `StartSpot.Location`), and
+`TdCheckpoint.HandlePawnTeleport` is `Pawn.SetLocation(Location)`, `SetPhysics(PHYS_Falling)`. An
+actor's `Location` is its cylinder's centre: her capsule's centre goes to the checkpoint's, and she
+falls from there. A `TdCheckpoint`'s own cylinder is 96 high (`CollisionHeight=96` on all 184 of
+the campaign) and hers is 90, so over a checkpoint that stands on its floor her feet start 6 over
+that floor; most do, some are placed up to a few dozen units higher, and a few stand in a lift's
+cab or over a drop that is meant (the Prologue's `Cops` is the top of the shaft she comes down).
+The port (`ParkourController::restart_at`) puts her on the floor under the spot when there is one
+within 60 of where her feet would be, and otherwise lets her fall from the spot. Until 2026-10-11
+it took the checkpoint's place plus 35 for her feet, 125 too high: her head stood in any ceiling
+lower than 311 over the floor. A restart of the level (`restart_level_at`: a death, the R key, a
+chapter begun at a checkpoint) also puts the lifts back, which are the script levels': each where
+the level has it, but one whose cab at the far end of its run is round the spot (Heat's
+`Pursuit_chase`, The Shard's `Elevator_shaft`), which waits there. `--verify-respawn` restarts at
+every checkpoint of every chapter; the oracle's stage 25 at the Training Area's and the
+Prologue's.
+
 A `TdCheckpoint` carries `CheckpointName`, `DefaultCheckpoint` and `StreamingLevels`, the
 sublevels resident while it is active. All 183 `SeqEvt_TdCheckpointLoaded` events of the campaign
 are in the persistent maps, next to their checkpoints.

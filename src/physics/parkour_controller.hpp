@@ -34,6 +34,8 @@ struct LinearCurve {
 // her. (The band is not kept: she is always put at its middle.) A recording's capsule centre is
 // 90 over these feet on a floor and off it (tools/retail/trace.py).
 inline constexpr float kPawnFloorHover = 3.15f;
+// TdPawn's CylinderComponent: CollisionHeight 90. An actor's Location is its cylinder's centre.
+inline constexpr float kPawnCollisionHeight = 90.0f;
 
 // How far from EnemyBot::position a posed bot's bodies are looked for by a trigger pull's first
 // reject (ParkourController::pose_enemies_for_shot). Standing, walking or aiming they end 185 to 188
@@ -56,9 +58,22 @@ public:
     // and the view is let down onto her own standing pose as retail's is (parkour_controller.cpp,
     // kHandoverLift).
     void hand_over(const Vec3& root_end, float yaw, const LevelScene& scene);
+    // The game puts her at a start spot (TdSPStoryGame.RestartPlayer at a TdCheckpoint,
+    // TdCheckpoint.HandlePawnTeleport, a SeqAct_Teleport's destination): her capsule's centre goes
+    // to the spot's Location and she falls from there (PHYS_Falling), the engine first making room
+    // for her where the spot stands lower over its floor than her capsule's half height (FindSpot).
+    // Here: on the floor under the spot when one is within kStartSpotDrop of where her feet would
+    // be, else in the air with her centre at the spot.
+    void restart_at(const Vec3& start_location, float yaw_deg, const LevelScene& scene);
+    // The same, with the level put back as a restart has it (TdSPStoryGame.ResetLevel reloads the
+    // script levels, and the lifts are theirs): every lift stands where the level begins with it,
+    // but one whose cab at the far end of its run is round the start spot, which waits there with
+    // its doors open (in the game the checkpoint's own events have run it; a checkpoint in a cab at
+    // its top is how Heat's and Pirandello Kruger's lifts leave her off).
+    void restart_level_at(const Vec3& start_location, float yaw_deg, LevelScene& scene);
     // The active checkpoint as the level script sets it (SeqAct_TdCheckpoint): where the player
-    // respawns, and which one the HUD counts. `feet` is the pawn's feet.
-    void set_checkpoint(const Vec3& feet, float yaw_deg, int index, const std::string& name);
+    // respawns, and which one the HUD counts. `start_location` is the TdCheckpoint's Location.
+    void set_checkpoint(const Vec3& start_location, float yaw_deg, int index, const std::string& name);
 
     // Retail replay harness (tools/retail/replay.py, src/tools/replay_main.cpp): reset the pawn to a
     // recorded retail frame - feet, velocity, view - and hand it the state retail's PlayerMove carries
@@ -128,6 +143,13 @@ public:
     // cylinder and a dead one is met by nothing, as before there were bodies.
     void set_enemy_body_poser(EnemyBodyPoser poser) { m_enemy_body_poser = std::move(poser); }
 
+    // Where her feet are when the game puts her at a start spot (a TdCheckpoint, a PlayerStart, a
+    // teleport's destination): GameInfo.SpawnDefaultPawnFor spawns the pawn at StartSpot.Location, and
+    // TdCheckpoint.HandlePawnTeleport sets the pawn's Location to the checkpoint's. That is the
+    // capsule's centre, CollisionHeight (90) over its bottom. A checkpoint's own cylinder is 96 high
+    // and stands on the floor, so this is 6 over that floor, and she drops the rest onto her hover.
+    [[nodiscard]] static Vec3 start_spot_feet(const Vec3& actor_location) { return actor_location - Vec3(0.0f, 0.0f, kPawnCollisionHeight); }
+
     // A trigger pull, as the weapons' fire does it, in its two steps.
     // pose_enemies_for_shot: every enemy a bullet can meet (enemy_stops_bullets: the living, and the
     // dead who are drawn on) that the pull can reach (within `spread`, the tangent of the cone's
@@ -172,6 +194,8 @@ private:
     void update_health_and_regen(float dt);
     void update_checkpoints_and_volumes(LevelScene& scene);
     void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
+    static void pose_elevator_parts(ElevatorInstance& elev);
+    static void settle_lifts_for_restart(LevelScene& scene, const Vec3& start_location);
     void update_barge_doors(const InputFrame& input, float dt, LevelScene& scene);
     // TdMove_Barge (MOVE_Barge). CanDoMove: a zero-extent trace from the pawn's centre along `dir`
     // for `dist`; returns the closed door it hits first (-1 = none) and the hit point.
@@ -574,6 +598,7 @@ private:
     // checkpoint itself, not the void baseline above, which follows the pawn down.
     Vec3 m_respawn_pos{0.0f, 0.0f, 100.0f};
     float m_respawn_yaw = 0.0f;
+    bool m_respawn_at_spot = false;  // m_respawn_pos is a start spot's Location (restart_at), not her feet
     float m_death_timer = 0.0f;
     float m_death_total_duration = 1.35f;
 };

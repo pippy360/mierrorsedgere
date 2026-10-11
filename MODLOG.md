@@ -2153,3 +2153,69 @@ eleven maps' 129 story characters 366 to 30,265 uu from where they are placed (a
 `AnimSystem::pose_enemy_bodies`, run again here), and a shot at one of them there goes through her. Whether
 retail's `SkeletalMeshActor` stops a bullet at all is not known, so that was left, and is in `TODO.md`.
 `ME_SHOW_BODIES=1` still builds 9,168 vertices each frame for every bot within 3000 uu, in view or not.
+
+---
+
+## 40. Where a restart puts her: the checkpoint's centre, the lifts with it (agent/respawn-position, 2026-10-11)
+
+The user's report: respawning often put the player where she fell and died, or inside geometry.
+
+### 40.1 What the game does
+- `TdSPStoryGame.RestartPlayer` spawns the pawn at `StartSpot.Location` (`SpawnDefaultPawnFor`), and
+  `TdCheckpoint.HandlePawnTeleport` sets the pawn's `Location` to the checkpoint's and its physics to falling.
+  That is the capsule's centre. Her `CollisionHeight` is 90; a `TdCheckpoint`'s cylinder is 96 high on all 184
+  of the campaign, and stands on its floor more often than not (the Prologue's `After_Intro`: 8520 over a roof
+  at 8424).
+- `TdSPStoryGame.ResetLevel` sets `bReloadScriptLevels`: the script levels, the lifts with them, are loaded
+  again before the checkpoint's events run.
+- `EInterpTrackMoveFrame` is `{ IMF_World, IMF_RelativeToInitial }` and `InterpTrackMove`'s defaults leave it at
+  0 (`Engine.u`, decompiled): a track with no `MoveFrame` saved has world keys.
+
+### 40.2 What was wrong
+- **The height.** Every restart took the checkpoint's place plus 35 for her feet: 125 over where the game has
+  them, 131 over the floor of a checkpoint that stands on one. She dropped that far each time, and under any
+  ceiling lower than 311 over the floor her head and shoulders started inside it.
+- **Lifts read in the wrong frame.** The loader took a track with no `MoveFrame` for a relative one. Three
+  lifts' keys are world places: Heat's `Area_elevator` ran from (-1604, 5772, -3072) to (-3208, 11543, -4496)
+  instead of straight up to -1424, The Shard's `ElevatorShaft` from (-5568, 8408, 448) to (-11136, 16816,
+  13616) instead of up to 13168, and its `ElevatorHatch` likewise. A restart in the lobby's cab carried her
+  10,084 units sideways through the building in three seconds.
+- **Lifts left where they were.** A restart left every lift as she had last used it. A checkpoint that is in a
+  cab at the top of its run (Heat's `Pursuit_chase`) or on its roof (The Shard's `Elevator_shaft`) dropped her
+  down the shaft: 1413 and 1634 units, dead both times.
+
+### 40.3 Changes
+- `ParkourController::restart_at` (`src/physics/parkour_controller.*`): her centre at the spot; the floor under
+  it is felt for with a short capsule from the spot's middle (from higher when that is under the floor), and
+  she is put on it when it is within 60 of where her feet would be, else left to fall from the spot.
+  `restart_level_at` first puts the lifts back (`settle_lifts_for_restart`, with the parts posed by
+  `pose_elevator_parts`, taken out of `update_elevators`). `set_checkpoint` takes the checkpoint's place and
+  the death restart goes through `restart_level_at`.
+- `src/main.cpp`: the level's start at a checkpoint, a chapter begun at one, the R key and a death use
+  `restart_level_at`; `SeqAct_TdCheckpoint`'s teleport and `SeqAct_Teleport` use `restart_at` (`Actor.OnTeleport`
+  is `SetLocation` too; it took the destination plus 2 for her feet).
+- `src/assets/upk_loader.cpp`: a move track with no `MoveFrame` is `IMF_World`.
+- **Check** (`src/main.cpp`): `check_checkpoint_respawns` restarts at each `TdCheckpoint` of a level (the bots
+  and helicopters put away) and steps her with no input until she rests or twelve seconds pass. Oracle stage
+  25 runs it on the two levels the oracle has loaded; `--verify-respawn` on every chapter (a minute).
+  `ME_RESPAWN_DEBUG=1` lists every checkpoint and lift, `ME_RESPAWN_AROUND=1` what is round a failing one,
+  `ME_RESPAWN_RULE=<units>` tries a fixed height over the checkpoint's place.
+
+### 40.4 Checked (Windows)
+- **Every chapter, the old height** (`ME_RESPAWN_RULE=35`, with the lifts' frames already right): none of the
+  184 ends where she was put. 176 drop, by 10 to 1413 units (the median 93; 69 of them by 120 to 135), 8 start
+  with something in her capsule, 3 die.
+- **Every chapter, now:** 172 stand where they are put (largest drift 0.04 uu), 7 are in a lift's cab and are
+  carried, 2 fall and live (the Prologue's `Cops`, which is the top of the vent shaft she drops down, where
+  she ends hanging from a ledge 484 below; Kate's `Subway_Tunnels`, 116 over its floor), 3 are known and
+  named (`construction`, `Train_Ride_End`, and The Shard's `Scraper_Start`, whose spot is 140 under the
+  plaza's floor: she is pushed up onto it), 0 fail.
+- **The lifts:** the three listed above now run straight up; the other 22 are unchanged.
+- **Oracle:** `--verify-all` passes its 25 stages.
+- **macOS:** the app compiles and links on `macos-15`. Not run.
+
+### 40.5 Not done
+Nothing was played by hand. The two checkpoints on things the port does not move still drop her; a level
+begun without a script still starts 131 over its floor (`LevelScene::player_spawn_pos`); the restart rule for
+the lifts is a stand-in for the checkpoints' own events, which the port's script does not yet run on lifts. In
+`TODO.md`.

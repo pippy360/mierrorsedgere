@@ -2067,7 +2067,9 @@ void UPKPackage::extract_elevators(
             raw_keys.push_back(kf);
         }
 
-        std::string mf = prop_name(tprops, "MoveFrame", "IMF_RelativeToInitial");
+        // EInterpTrackMoveFrame is { IMF_World, IMF_RelativeToInitial } and InterpTrackMove's defaults
+        // leave it at 0: a track that saves no MoveFrame has its keys in the world's frame.
+        std::string mf = prop_name(tprops, "MoveFrame", "IMF_World");
         bool is_world_frame = (mf == "IMF_World");
 
         if (is_door_group) {
