@@ -16,13 +16,17 @@ ME_GL_OPTIONAL_FUNCTIONS(ME_GL_DEFINE)
 
 namespace {
 bool g_loaded = false;
+bool g_es = false;
+int g_major = 0;
+int g_minor = 0;
 std::vector<std::string> g_extensions;
 
-// Resolves `name`, trying the ARB / EXT / KHR spellings too: the same function is exported
-// under its extension name on drivers that predate its promotion to core.
+// Resolves `name`, trying the ARB / EXT / KHR / OES spellings too: the same function is exported
+// under its extension name on drivers that predate its promotion to core, and OpenGL ES drivers
+// export extension entry points (glDebugMessageCallbackKHR, glGetQueryObjectui64vEXT) that way only.
 void* resolve(const char* name) {
     if (void* p = SDL_GL_GetProcAddress(name)) return p;
-    static const char* const suffixes[] = {"ARB", "EXT", "KHR"};
+    static const char* const suffixes[] = {"ARB", "EXT", "KHR", "OES"};
     for (const char* suffix : suffixes) {
         const std::string alt = std::string(name) + suffix;
         if (void* p = SDL_GL_GetProcAddress(alt.c_str())) return p;
@@ -33,6 +37,8 @@ void* resolve(const char* name) {
 
 bool load(std::vector<std::string>* missing) {
     g_loaded = false;
+    g_es = false;
+    g_major = g_minor = 0;
     g_extensions.clear();
     bool ok = true;
 #define ME_GL_LOAD(type, name)                                      \
@@ -47,6 +53,16 @@ bool load(std::vector<std::string>* missing) {
     ME_GL_OPTIONAL_FUNCTIONS(ME_GL_LOAD_OPTIONAL)
 #undef ME_GL_LOAD_OPTIONAL
     if (!ok) return false;
+
+    // "OpenGL ES 3.0 ..." / "OpenGL ES-CM 1.1" on ES; a bare version string on desktop. Apple's
+    // SDL may hand out a desktop context when ES was asked for, so the string decides, not the build.
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+    g_es = version && std::strncmp(version, "OpenGL ES", 9) == 0;
+    GLint major = 0, minor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &major);
+    glGetIntegerv(GL_MINOR_VERSION, &minor);
+    g_major = major;
+    g_minor = minor;
 
     GLint count = 0;
     glGetIntegerv(GL_NUM_EXTENSIONS, &count);
@@ -71,6 +87,10 @@ bool has_extension(const char* name) {
     }
     return false;
 }
+
+bool is_es() { return g_es; }
+int version_major() { return g_major; }
+int version_minor() { return g_minor; }
 
 }  // namespace gl
 }  // namespace me

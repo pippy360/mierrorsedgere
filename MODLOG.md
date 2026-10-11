@@ -2242,3 +2242,99 @@ begun without a script still starts 131 over its floor (`LevelScene::player_spaw
 the lifts is a stand-in for the checkpoints' own events, which the port's script does not yet run on lifts;
 where she is put is not checked for room (a start spot under its floor); the Training Area restarts at the
 last stage walked onto, not at the challenge's start the game would pick. In `TODO.md`.
+## 41. The Android port: OpenGL ES 3.0 from the OpenGL backend, in SDL's activity (agent/android-port, 2026-10-11)
+
+The game builds for Android (arm64-v8a, minSdk 26) as `libmain.so` under SDL2's `SDLActivity`, drawn by
+`opengl_renderer.cpp` on an OpenGL ES 3.0 context, with on-screen touch controls. `docs/ANDROID_PORT.md` is
+the account; `android/README.md` the build and run instructions. The desktop builds are unchanged in
+behaviour. Three agents worked the branch in one worktree: the ES renderer and translator, the project and
+platform glue, and a read-only memory profile (its findings are in `TODO.md`, "Memory for phones").
+
+### 41.1 Changes
+- **`MslToGlsl` dialects** (`msl_to_glsl.*`): `set_dialect(GlslDialect::ES, 300)` emits `#version 300 es`
+  with `precision highp` for `float`, `int` and the six sampler types the shaders use, in both stages;
+  integer literals handed to `uint` / `float` helper parameters are spelled `0u` / `0.0` (GLSL ES has no
+  implicit conversion; `sun_shadow_pcf(maps, 0, ...)` was the one case). `preamble_header()` for the
+  renderer's stand-in depth-only fragment stage. The desktop output is byte-identical to before.
+- **The ES path of `OpenGLRenderer`** (`opengl_renderer.cpp`, `gl/gl_api.*`), compile-time `ME_GLES` or run-time
+  `ME_GLES=1`, everything after context creation keyed on `gl::is_es()`: ES profile 3.2 → 3.1 → 3.0;
+  `glDrawBuffers` / `glClearDepthf` / `glDepthRangef`; per-component swizzles; no seamless-cube-map enable;
+  BGRA8 swapped to RGBA and sRGB L8 expanded to RGB on the CPU; `RGBA16F` targets behind
+  `GL_EXT_color_buffer_float` / `_half_float`, `RGBA16` metering targets behind `GL_EXT_texture_norm16` else
+  `RGBA16F`, `R32F` exposure else `R16F`; depth textures read without comparison through a nearest sampler
+  (ES 3.0 §3.8.13 completeness); timer queries only with `GL_EXT_disjoint_timer_query`; the device's limits
+  queried, printed and respected (unit assignment two-pass within `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS`;
+  init refuses with a named limit when short). The loader requires only what GL 4.1 core and ES 3.0 share
+  (`glDrawBuffers`, `glDepthRangef`, `glClearDepthf` added; `glDrawBuffer`, `glDepthRange`, `glClearDepth`,
+  `glGetQueryObjectui64v` optional; `OES` tried as a suffix), with `gl::is_es()` / `version_major()`.
+- **DXT on the CPU** (`bc_decode.hpp`, new): BC1 / BC2 / BC3 blocks to RGBA8, every mip, when the driver has
+  no S3TC (or `ME_DXT_CPU=1`; and for sRGB DXT alone when it has S3TC but no sRGB S3TC). `ME_TEX_DROP_MIPS=<n>`
+  leaves out the n largest levels of material and light-map textures.
+- **The shadow array's size** is the renderer's at run time on ES: the emulator's translator applies
+  `GL_MAX_3D_TEXTURE_SIZE` (2048) to 2D array textures and refuses the 4096³ depth array with
+  `GL_INVALID_VALUE` (probed: 2048 x 2048 x 3 and 1024 x 1024 x 3 D32F pass, every 4096-wide format fails,
+  one layer or three). `Impl::shadow_map_size` = min(`kSunShadowMapSize`, `GL_MAX_3D_TEXTURE_SIZE`,
+  `GL_MAX_TEXTURE_SIZE`) on ES (`ME_SHADOW_SIZE=<n>` overrides), used for the array, the shadow viewports and
+  the modulated-shadow atlas: `layout_mod_shadows`, `collect_mod_shadows` and `fill_mod_shadow_uniforms`
+  (`mod_shadow.hpp`) take `map_size` (default `kSunShadowMapSize`, so Metal and Direct3D are as they were)
+  and keep only the shadows whose cells fit. The shaders measure the texel from the texture.
+- **`me_glsl --es [300|310|320]`** (`glsl_main.cpp`): emits the ES dialect and validates every shader with
+  the NDK's `glslc` (`--target-env=opengl`, path `ME_GLSLC`), 64 files a run; glslc wants 310 at least, so
+  300 sources are checked as 310 (a superset for what is emitted). `LIMIT` lines for a vertex shader over 15
+  varying vectors or a fragment shader over 16 samplers.
+- **The app** (`android/`): Gradle 8.11.1 / AGP 8.8.1 project, `externalNativeBuild` over the root
+  `CMakeLists.txt` (new `elseif(ANDROID)` branch: `main` shared library with `ME_RENDERER_OPENGL=1
+  ME_GLES=1 ME_NO_FFMPEG=1`; SDL2 2.32.10 shared, OpenAL Soft 1.24.3 (OpenSL ES) / libogg 1.3.6 /
+  libvorbis 1.3.7 static, from sources `fetch_deps.sh` downloads into the ignored `android/third_party/`;
+  the headless tools skipped), `MirrorsEdgeActivity extends SDLActivity` (libraries `SDL2`, `main`; the
+  command line from the intent extra `args` or `<files>/me_args.txt`), manifest landscape / immersive /
+  `glEsVersion 0x30000`, `run_emulator_smoke.sh`. `local.properties` names Homebrew's CMake (`cmake.dir`),
+  the SDK having none.
+- **Platform glue**: `platform.cpp` Android root (`<external files>/mirrorsedge`, then `/sdcard/mirrorsedge`),
+  temp and cache directories; `android_log.*` pipes stdout / stderr to logcat (tag `mirrorsedge`); `main.cpp`
+  keeps `main` as `SDL_main` on Android (no `SDL_MAIN_HANDLED`), `chdir`s to the external files directory,
+  takes `SDLK_AC_BACK` as Escape, ignores SDL's touch-synthesized mouse events in play (the menus still
+  take them as clicks), and gains `--exit-screenshot <png>` on every platform (the frame `--max-frames`
+  ends on); `cutscene_player.cpp` under `ME_NO_FFMPEG` reports Bink movies unavailable and the game goes on
+  to the in-engine intro as when a `.bik` is missing.
+- **Touch controls** (`touch_controls.*`, `touch_overlay.hpp`, `overlay_ui.inl`'s `draw_touch_overlay`):
+  a move stick on the left 40 % of the screen, look by drag on the right, JUMP / CROUCH / ACTION / ATTACK /
+  180 / RT buttons and MENU, each finger tracked by id; drawn by the shared HUD code through a global the
+  game loop publishes each frame (`ME_TOUCH=1` shows them on a desktop). A JUMP tap in a cutscene or hint
+  card is a Space press; MENU is Escape.
+
+### 41.2 Checked
+- **The emulator** (AVD `Medium_Phone`, API 37 arm64, 8 GB; "Android Emulator OpenGL ES Translator" over
+  Apple's OpenGL 4.1 on an M5 Pro: OpenGL ES 3.0, GLSL ES 3.00, `GL_EXT_color_buffer_float`, no S3TC, no
+  `KHR_debug`, no timer query, `GL_MAX_3D_TEXTURE_SIZE` 2048; limits 48 combined units, 16 per fragment
+  stage, 31 varying vectors, 80 uniform buffer bindings): `./gradlew assembleDebug` → 6.4 MB APK
+  (`libSDL2.so` 1.9 MB, `libmain.so` 5.2 MB, `libc++_shared.so` 1.3 MB). `--chapter 0 --max-frames 400
+  --exit-screenshot screenshots/android_smoke.png` with the training area and Prologue assets pushed
+  (3.2 GB): the level loads as on the desktop (2403 meshes, 582,078 collision triangles, 378 materials,
+  536 textures, 99 light maps), **271/271 material shaders compile** on the emulator's compiler, the
+  textures are CPU-decoded and resident in 10.5 s, the opening pan plays with Merc's line, 400 frames
+  render at about 13–15 fps, the PNG is written (the rooftops, light maps, shadows, haze, the billboard and
+  "Press SPACE to skip" all in place), `[Game] Shutdown cleanly`. Memory during play: 2.1 GB native heap,
+  2.4 GB PSS (GPU memory is the host's on the emulator).
+- **Shaders offline**: `me_glsl --es` validates the 14 built-in programs and 5,573 / 5,573 material shaders
+  of the eleven maps (Tutorial_p 271, Edge_p 380, Stormdrain_p 526, Cranes_p 468, Subway_p 632, Mall_p 588,
+  Factory_p 573, Boat_p 429, Convoy_p 474, Scraper_p 543, Escape_p 689), no `LIMIT` lines; `--es 310
+  --builtin-only` 14/14.
+- **CPU DXT decode against the GPU's** (`mirrorsedge_opengl`, `--intro-shots Maps/SP00/Tutorial_p.me1
+  1.0,6.0` with and without `ME_DXT_CPU=1`): MAD 0.44 and 0.30 / 255, 90–94 % of pixels within 1, the
+  0.3–0.6 % over 8 at specular highlights where a ±1 normal-map texel is amplified; the decoder exact on
+  hand-built BC1 (four-colour and punch-through), BC2 and BC3 blocks.
+- **The desktop is as it was**: `mirrorsedge_macos --verify-all` and `mirrorsedge_opengl --verify-all` pass
+  every stage from this tree (run from scratch directories); the GLSL 4.10 `me_glsl --dump-all` writes is
+  identical before and after (20 built-in files, 292 files of chapter 0); all desktop targets build.
+  `--exit-screenshot` verified on `mirrorsedge_opengl`.
+- **A Pixel 9** (Android 17, Mali-G715, OpenGL ES 3.2, 12 GB, 2424 x 1080), the same APK: the level loads,
+  271/271 material shaders compile on Mali's compiler, the 536 textures are resident in 2.3–2.7 s, the
+  training area plays with the HUD, subtitles and the touch overlay (the stick answering a finger);
+  5.4 GB PSS, 3.5 GB of it graphics. Android 15's 16 KB page-size warning showed on the first install:
+  `libSDL2.so` was linked 4 KB-aligned (SDL's CMake sets its own link flags); `main` and `SDL2` are now
+  linked with `-z max-page-size=16384` and the APK stores the libraries uncompressed and 16 KB-aligned
+  (`useLegacyPackaging false`); `llvm-readelf -l` shows 0x4000 on all three and `zipalign -c -P 16` passes.
+- **Not run**: a level played through on the phone; the touch layout tuned with fingers; an Adreno device;
+  background / foreground; a release build. The Metal backend's windowed screenshot path was found blank
+  (pre-existing; `TODO.md`).

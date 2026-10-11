@@ -1,15 +1,16 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// Metal Shading Language -> GLSL (OpenGL 4.1 core, `#version 410 core`).
+// Metal Shading Language -> GLSL (OpenGL 4.1 core, `#version 410 core`; or, with
+// set_dialect(GlslDialect::ES), GLSL ES 3.00 / 3.10 / 3.20 for OpenGL ES on Android).
 //
 // The renderer's shaders exist once, as MSL: the built-in passes
 // (renderer/builtin_shaders_msl.hpp), the sun shadow lookup (renderer/sun_shadow.hpp)
 // and the UE3 material shaders that assets/material_system.cpp generates. The
-// OpenGL renderer (renderer/opengl_renderer.hpp, the Linux backend) feeds that same
-// text through this translator, so a shader changed for Metal changes on Linux too.
-// It is the GLSL counterpart of renderer/msl_to_hlsl.hpp and covers the same subset
-// of MSL.
+// OpenGL renderer (renderer/opengl_renderer.hpp, the Linux and Android backend) feeds
+// that same text through this translator, so a shader changed for Metal changes on
+// Linux too. It is the GLSL counterpart of renderer/msl_to_hlsl.hpp and covers the
+// same subset of MSL.
 //
 // OpenGL 4.1 is the target because it is what every Linux driver (Mesa included)
 // and macOS offer, so the backend can be checked on the macOS development machine.
@@ -115,12 +116,31 @@ struct GlslShader {
     std::vector<GlslSamplerUnit> samplers;
 };
 
+// The GLSL the translator writes.
+//   Desktop: `#version 410 core` (the default; what Linux and macOS compile).
+//   ES:      `#version 300 es` (or 310 / 320 when asked), for OpenGL ES 3.x on Android. Both
+//            stages get `precision highp` defaults for float, int and every sampler type the
+//            shaders use. GLSL ES has no implicit int -> float / int -> uint conversions, so
+//            integer literals passed where a helper takes a float or uint are spelt out.
+//            Everything else (names, blocks, samplers, the clip-space fix-up) is the same, so
+//            the renderer binds the two dialects alike.
+enum class GlslDialect { Desktop, ES };
+
 class MslToGlsl {
 public:
     MslToGlsl();
     ~MslToGlsl();
     MslToGlsl(const MslToGlsl&) = delete;
     MslToGlsl& operator=(const MslToGlsl&) = delete;
+
+    // Selects the dialect emit() / emit_from() write. `version` 0 picks the dialect's default
+    // (410 for Desktop, 300 for ES); ES accepts 300, 310 and 320. May be called at any time.
+    void set_dialect(GlslDialect dialect, int version = 0);
+    [[nodiscard]] GlslDialect dialect() const;
+    [[nodiscard]] int version() const;
+    // The `#version` line and precision defaults a shader of the current dialect starts with
+    // (what emit() puts first); for hand-written stand-ins such as an empty fragment stage.
+    [[nodiscard]] std::string preamble_header() const;
 
     // Adds MSL source: structs, constants, helper functions and entry points.
     bool add_source(const std::string& msl, std::string* error = nullptr);

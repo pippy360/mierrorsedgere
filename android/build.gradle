@@ -1,0 +1,6 @@
+// Top-level build file: the Android Gradle plugin version. 8.8.1 wants Gradle 8.10.2 or newer
+// (the wrapper pins 8.11.1) and a JDK 17; Android Studio's bundled JBR does
+// (JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home").
+plugins {
+    id 'com.android.application' version '8.8.1' apply false
+}

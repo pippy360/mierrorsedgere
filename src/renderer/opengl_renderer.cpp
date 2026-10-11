@@ -1,4 +1,5 @@
 #include "opengl_renderer.hpp"
+#include "bc_decode.hpp"
 #include "builtin_shaders_msl.hpp"
 #include "gl/gl_api.hpp"
 #include "hud_font.hpp"
@@ -41,6 +42,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace me {
@@ -49,12 +51,23 @@ using namespace me::gl;
 
 namespace {
 
+// ME_GLES=1 (compile definition, the Android build) asks for an OpenGL ES 3.x context instead of
+// OpenGL 4.1 core. Setting the environment variable ME_GLES does the same at run time, for a
+// desktop driver that offers ES contexts (Mesa). What the context turns out to be (gl::is_es())
+// decides everything after that, so an ES context on a desktop build behaves the same.
+#ifdef ME_GLES
+constexpr bool kBuildForES = true;
+#else
+constexpr bool kBuildForES = false;
+#endif
+
 // A texture the shaders can sample.
 struct GpuTexture {
     GLuint name = 0;
     GLenum target = GL_TEXTURE_2D;
     int width = 0;
     int height = 0;
+    bool depth = false;  // a depth format: ES samples it with NEAREST unless through a comparison sampler
     GpuTexture() = default;
     GpuTexture(const GpuTexture&) = delete;
     GpuTexture& operator=(const GpuTexture&) = delete;
@@ -152,6 +165,12 @@ void parallel_for(size_t count, Fn&& fn) {
 // How a decoded UE3 texture format is uploaded. L8 and V8U8 keep their one or two channels and
 // are widened by a texture swizzle, as on Metal: L8 reads as (L, L, L, 1), V8U8 as (U, V, 1, 1).
 // An sRGB L8 goes into an SRGB8 texture through the red channel (core OpenGL has no sRGB R8).
+//
+// OpenGL ES differs in what it takes from the CPU, so some formats are converted on the way in
+// (`convert`): no GL_BGRA client format (the bytes are swapped to RGBA), no GL_RED data for an
+// SRGB8 texture (the L8 is expanded to RGB), and on a device without S3TC (most phones) the BC
+// blocks are decoded to RGBA8 (renderer/bc_decode.hpp). `cpu_bc` asks for the last on any API
+// (ME_DXT_CPU=1, to compare against the GPU's decoding).
 struct GlTexFormat {
     GLenum internal = 0;
     GLenum format = GL_RGBA;
@@ -159,33 +178,48 @@ struct GlTexFormat {
     bool compressed = false;
     bool swizzled = false;
     GLint swizzle[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+    enum class Convert { None, DecodeBC, BgraToRgba, L8ToRgb } convert = Convert::None;
+    BcFormat bc = BcFormat::BC1;
 };
 
-GlTexFormat gl_tex_format(TexFormat f, bool srgb) {
+GlTexFormat gl_tex_format(TexFormat f, bool srgb, bool es, bool cpu_bc) {
     GlTexFormat r;
     switch (f) {
         case TexFormat::DXT1:
-            r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
-            r.compressed = true;
-            break;
         case TexFormat::DXT3:
-            r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT : GL_COMPRESSED_RGBA_S3TC_DXT3_EXT;
-            r.compressed = true;
-            break;
         case TexFormat::DXT5:
-            r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
-            r.compressed = true;
+            r.bc = (f == TexFormat::DXT1) ? BcFormat::BC1 : (f == TexFormat::DXT3) ? BcFormat::BC2 : BcFormat::BC3;
+            if (cpu_bc) {
+                r.internal = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+                r.convert = GlTexFormat::Convert::DecodeBC;
+            } else {
+                r.compressed = true;
+                if (f == TexFormat::DXT1) r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT1_EXT : GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
+                if (f == TexFormat::DXT3) r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT3_EXT : GL_COMPRESSED_RGBA_S3TC_DXT3_EXT;
+                if (f == TexFormat::DXT5) r.internal = srgb ? GL_COMPRESSED_SRGB_ALPHA_S3TC_DXT5_EXT : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+            }
             break;
         case TexFormat::BGRA8:
             r.internal = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
-            r.format = GL_BGRA;
+            if (es) {
+                r.format = GL_RGBA;
+                r.convert = GlTexFormat::Convert::BgraToRgba;
+            } else {
+                r.format = GL_BGRA;
+            }
             break;
         case TexFormat::G8:
-            r.internal = srgb ? GL_SRGB8 : GL_R8;
-            r.format = GL_RED;
-            r.swizzled = true;
-            r.swizzle[0] = r.swizzle[1] = r.swizzle[2] = GL_RED;
-            r.swizzle[3] = GL_ONE;
+            if (srgb && es) {
+                r.internal = GL_SRGB8;
+                r.format = GL_RGB;
+                r.convert = GlTexFormat::Convert::L8ToRgb;
+            } else {
+                r.internal = srgb ? GL_SRGB8 : GL_R8;
+                r.format = GL_RED;
+                r.swizzled = true;
+                r.swizzle[0] = r.swizzle[1] = r.swizzle[2] = GL_RED;
+                r.swizzle[3] = GL_ONE;
+            }
             break;
         case TexFormat::V8U8:
             r.internal = GL_RG8_SNORM;
@@ -202,6 +236,36 @@ GlTexFormat gl_tex_format(TexFormat f, bool srgb) {
     return r;
 }
 
+// Applies `fmt.convert` to one mip level (`w` x `h`, `src` of `size` bytes). Returns the bytes to
+// upload: `src` itself when nothing is converted, else `scratch`. Null on a short or bad level.
+const uint8_t* convert_level(const GlTexFormat& fmt, int w, int h, const uint8_t* src, size_t size, std::vector<uint8_t>& scratch) {
+    switch (fmt.convert) {
+        case GlTexFormat::Convert::None: return src;
+        case GlTexFormat::Convert::DecodeBC:
+            return bc_decode_rgba8(fmt.bc, w, h, src, size, scratch) ? scratch.data() : nullptr;
+        case GlTexFormat::Convert::BgraToRgba: {
+            const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (size < n * 4) return nullptr;
+            scratch.resize(n * 4);
+            for (size_t i = 0; i < n; ++i) {
+                scratch[i * 4 + 0] = src[i * 4 + 2];
+                scratch[i * 4 + 1] = src[i * 4 + 1];
+                scratch[i * 4 + 2] = src[i * 4 + 0];
+                scratch[i * 4 + 3] = src[i * 4 + 3];
+            }
+            return scratch.data();
+        }
+        case GlTexFormat::Convert::L8ToRgb: {
+            const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+            if (size < n) return nullptr;
+            scratch.resize(n * 3);
+            for (size_t i = 0; i < n; ++i) scratch[i * 3 + 0] = scratch[i * 3 + 1] = scratch[i * 3 + 2] = src[i];
+            return scratch.data();
+        }
+    }
+    return nullptr;
+}
+
 GLenum gl_address_mode(TexAddress a) {
     switch (a) {
         case TexAddress::Clamp: return GL_CLAMP_TO_EDGE;
@@ -212,18 +276,23 @@ GLenum gl_address_mode(TexAddress a) {
 
 // Uniform block binding points: vertex-stage MSL buffer(n) -> n, fragment-stage buffer(n) -> 16 + n.
 // The two stages have separate slot spaces in MSL (FrameUniforms is vertex buffer(1) and fragment
-// buffer(0)); the block names the translator emits (VSBn / FSBn) say which.
+// buffer(0)); the block names the translator emits (VSBn / FSBn) say which. The fragment slots in
+// use are 0..2, so 19 binding points are needed (OpenGL ES 3.0 guarantees 24, desktop 4.1 36).
 constexpr GLuint kFragmentBlockBase = 16;
+constexpr GLuint kUniformBindingsNeeded = kFragmentBlockBase + 3;
 GLuint block_binding(bool vertex_stage, int slot) {
     return static_cast<GLuint>(slot) + (vertex_stage ? 0u : kFragmentBlockBase);
 }
 
 // Texture image units: a combined sampler for MSL texture(n) lives on unit n; a texture sampled
-// through two different samplers in one shader gets a second unit from kExtraUnitBase up.
+// through two different samplers in one shader gets a second unit from kExtraUnitBase up, or,
+// on a device with fewer units (OpenGL ES 3.0 guarantees 32 combined), any unit the program
+// does not use for a texture slot (link_program). kMaxUnits bounds the tables; the queried
+// GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS bounds what is used.
 constexpr int kTextureSlots = 32;    // MSL texture(0..29) are in use
 constexpr int kSamplerSlots = 16;    // MSL sampler(0..15)
 constexpr int kExtraUnitBase = 32;
-constexpr int kMaxUnits = 48;        // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS is at least 48 since 3.3
+constexpr int kMaxUnits = 48;        // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS is at least 48 since 3.3 (and ES 3.1)
 
 void APIENTRY gl_debug_callback(GLenum /*source*/, GLenum type, GLuint id, GLenum severity, GLsizei length,
                                 const GLchar* message, const void* user) {
@@ -248,9 +317,20 @@ struct OpenGLRenderer::Impl {
     SDL_GLContext context = nullptr;
     bool debug = false;                // ME_GL_DEBUG=1
     std::atomic<int> debug_messages_printed{0};
+    bool is_es = false;                // the context is OpenGL ES (gl::is_es())
     bool has_s3tc = false;
+    bool has_s3tc_srgb = false;        // the sRGB S3TC formats (desktop: with S3TC; ES: GL_EXT_texture_compression_s3tc_srgb)
+    bool cpu_bc = false;               // decode BC1/2/3 on the CPU (no S3TC, or ME_DXT_CPU=1)
     bool has_anisotropy = false;
-    GLint max_units = kMaxUnits;
+    bool has_color_float = true;       // RGBA16F / R32F render targets (ES: GL_EXT_color_buffer_float)
+    bool has_color_half = true;        // RGBA16F / R16F render targets (ES: ... or GL_EXT_color_buffer_half_float)
+    bool has_norm16 = true;            // GL_RGBA16 render targets (ES: GL_EXT_texture_norm16)
+    int shadow_map_size = kSunShadowMapSize;  // the shadow array's side: kSunShadowMapSize, or what the device allows (ES)
+    bool has_timer_query = true;       // GL_TIME_ELAPSED (ES: GL_EXT_disjoint_timer_query)
+    int drop_mips = 0;                 // ME_TEX_DROP_MIPS=<n>: the n largest levels of material textures are not uploaded
+    GLint max_units = kMaxUnits;       // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, capped at kMaxUnits
+    GLint max_fragment_units = 16;     // GL_MAX_TEXTURE_IMAGE_UNITS
+    GLint max_varying_vectors = 15;    // GL_MAX_VARYING_VECTORS
     std::string adapter_name;
     std::string game_root;
 
@@ -331,6 +411,8 @@ struct OpenGLRenderer::Impl {
 
     // Samplers (sampler objects)
     GLuint linear_sampler = 0;        // clamp, top mip only: post-processing and UI
+    GLuint depth_nearest_sampler = 0; // clamp, NEAREST: what ES reads depth textures through (flush_bindings)
+    std::unordered_set<GLuint> compare_samplers;  // the sampler objects with a comparison function
     GLuint mat_samplers[3][3] = {};   // [TexAddress X][TexAddress Y]
     GLuint mat_cube_sampler = 0;
     GLuint scene_copy_sampler = 0;
@@ -547,6 +629,7 @@ struct OpenGLRenderer::Impl {
     // -------------------------------------------------------------------------
     GLuint tex_slot[kTextureSlots] = {};
     GLenum tex_slot_target[kTextureSlots] = {};
+    bool tex_slot_depth[kTextureSlots] = {};
     GLuint smp_slot[kSamplerSlots] = {};
     struct UnitState {
         GLuint tex = 0;
@@ -560,6 +643,7 @@ struct OpenGLRenderer::Impl {
         if (slot < 0 || slot >= kTextureSlots) return;
         tex_slot[slot] = t ? t->name : 0;
         tex_slot_target[slot] = t ? t->target : GL_TEXTURE_2D;
+        tex_slot_depth[slot] = t && t->depth;
     }
     void bind_textures(int first, std::initializer_list<const GpuTexture*> textures) {
         int slot = first;
@@ -589,6 +673,13 @@ struct OpenGLRenderer::Impl {
             GLuint sampler = u.fixed_sampler;
             if (sampler == 0 && u.sampler_slot >= 0 && u.sampler_slot < kSamplerSlots) sampler = smp_slot[u.sampler_slot];
             if (sampler == 0) sampler = linear_sampler;  // a texture only measured, or an unset slot
+            // OpenGL ES (3.0 §3.8.13) declares a depth texture incomplete, sampling as zero, when
+            // it is filtered linearly without a comparison (ANGLE enforces it). Depth is read at
+            // the fragment's own texel (post passes) or as a per-texel compare, so the point
+            // sample is the texel the linear one would have been centred on.
+            if (is_es && tex != 0 && tex_slot_depth[u.texture_slot] && !compare_samplers.count(sampler)) {
+                sampler = depth_nearest_sampler;
+            }
             if (sampler != s.sampler) {
                 glBindSampler(u.unit, sampler);
                 s.sampler = sampler;
@@ -633,6 +724,7 @@ struct OpenGLRenderer::Impl {
         const auto now = std::chrono::steady_clock::now();
         if (prof_last_frame.time_since_epoch().count() != 0) prof_wall_seconds += std::chrono::duration<double>(now - prof_last_frame).count();
         prof_last_frame = now;
+        if (!has_timer_query) return;  // ES without GL_EXT_disjoint_timer_query: wall-clock only
         if (!prof_queries[0]) glGenQueries(2, prof_queries);
         const int slot = static_cast<int>(frame_index & 1u);
         if (prof_query_pending[slot]) {
@@ -642,10 +734,10 @@ struct OpenGLRenderer::Impl {
             ++prof_gpu_frames;
             prof_query_pending[slot] = false;
         }
-        glBeginQuery(GL_TIME_ELAPSED, prof_queries[slot]);
+        glBeginQuery(GL_TIME_ELAPSED, prof_queries[slot]);  // == GL_TIME_ELAPSED_EXT on ES
     }
     void prof_gpu_end() {
-        if (!profile || !prof_queries[0]) return;
+        if (!profile || !has_timer_query || !prof_queries[0]) return;
         glEndQuery(GL_TIME_ELAPSED);
         prof_query_pending[frame_index & 1u] = true;
     }
@@ -759,7 +851,8 @@ struct OpenGLRenderer::Impl {
             cur_viewport[1] = h;
         }
         if (min_depth != cur_depth_range[0] || max_depth != cur_depth_range[1]) {
-            glDepthRange(min_depth, max_depth);
+            if (glDepthRange) glDepthRange(min_depth, max_depth);  // desktop
+            else glDepthRangef(min_depth, max_depth);               // ES (core in 4.1 too)
             cur_depth_range[0] = min_depth;
             cur_depth_range[1] = max_depth;
         }
@@ -879,14 +972,32 @@ struct OpenGLRenderer::Impl {
         return env && env[0] != '\0' && env[0] != '0';
     }
 
-    static void set_context_attributes() {
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-        // Forward-compatible is what macOS needs for a core profile; the debug flag is optional.
-        int flags = SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG;
-        if (want_debug()) flags |= SDL_GL_CONTEXT_DEBUG_FLAG;
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, flags);
+    // ME_GLES (compile definition or environment variable) asks for an OpenGL ES context.
+    static bool want_es() {
+        if (kBuildForES) return true;
+        const char* env = std::getenv("ME_GLES");
+        return env && env[0] != '\0' && env[0] != '0';
+    }
+
+    // The ES versions tried, newest first: 3.2, 3.1, 3.0 (the emulator's host translator gives 3.0).
+    static constexpr int kEsVersions[][2] = {{3, 2}, {3, 1}, {3, 0}};
+
+    static void set_context_attributes(int es_try = 0) {
+        if (want_es()) {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kEsVersions[es_try][0]);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, kEsVersions[es_try][1]);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            // No forward-compatible flag on ES (EGL rejects it); the debug flag is optional.
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, want_debug() ? SDL_GL_CONTEXT_DEBUG_FLAG : 0);
+        } else {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            // Forward-compatible is what macOS needs for a core profile; the debug flag is optional.
+            int flags = SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG;
+            if (want_debug()) flags |= SDL_GL_CONTEXT_DEBUG_FLAG;
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, flags);
+        }
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
         SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
         SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
@@ -900,6 +1011,7 @@ struct OpenGLRenderer::Impl {
     // Creates the context on `given` or, for null, on a hidden window of its own (the headless oracle).
     bool create_context(SDL_Window* given) {
         debug = want_debug();
+        const bool es = want_es();
         if (!given) {
             if (!SDL_WasInit(SDL_INIT_VIDEO)) {
                 if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
@@ -923,39 +1035,46 @@ struct OpenGLRenderer::Impl {
         window = given;
         // The version, profile and flags are read when the context is made (the window's pixel
         // format was fixed by prepare_window_attributes() before the window was created).
-        set_context_attributes();
-        context = SDL_GL_CreateContext(window);
-        if (!context && debug) {
-            // Not every driver gives a debug context; the game runs without one.
-            std::cerr << "[OpenGLRenderer] ME_GL_DEBUG: no debug context (" << SDL_GetError() << "), trying without." << std::endl;
-            SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+        const int tries = es ? static_cast<int>(sizeof(kEsVersions) / sizeof(kEsVersions[0])) : 1;
+        for (int t = 0; t < tries && !context; ++t) {
+            set_context_attributes(t);
             context = SDL_GL_CreateContext(window);
+            if (!context && debug) {
+                // Not every driver gives a debug context; the game runs without one.
+                std::cerr << "[OpenGLRenderer] ME_GL_DEBUG: no debug context (" << SDL_GetError() << "), trying without." << std::endl;
+                SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, es ? 0 : SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+                context = SDL_GL_CreateContext(window);
+            }
         }
         if (!context) {
-            std::cerr << "[OpenGLRenderer] No OpenGL 4.1 core context: " << SDL_GetError() << std::endl;
+            std::cerr << "[OpenGLRenderer] No " << (es ? "OpenGL ES 3.0" : "OpenGL 4.1 core") << " context: " << SDL_GetError() << std::endl;
             return false;
         }
         SDL_GL_MakeCurrent(window, context);
         std::vector<std::string> missing;
         if (!gl::load(&missing)) {
-            std::cerr << "[OpenGLRenderer] The driver lacks OpenGL 4.1 core functions:";
+            std::cerr << "[OpenGLRenderer] The driver lacks " << (es ? "OpenGL ES 3.0" : "OpenGL 4.1 core") << " functions:";
             for (const std::string& m : missing) std::cerr << " " << m;
             std::cerr << std::endl;
             return false;
         }
+        is_es = gl::is_es();
         const char* renderer_str = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
         const char* version_str = reinterpret_cast<const char*>(glGetString(GL_VERSION));
         const char* glsl_str = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
         adapter_name = renderer_str ? renderer_str : "unknown renderer";
         std::cout << "[OpenGLRenderer] " << adapter_name << ", OpenGL " << (version_str ? version_str : "?") << ", GLSL "
                   << (glsl_str ? glsl_str : "?") << std::endl;
-        GLint major = 0, minor = 0;
-        glGetIntegerv(GL_MAJOR_VERSION, &major);
-        glGetIntegerv(GL_MINOR_VERSION, &minor);
-        if (major * 10 + minor < 41) {
-            std::cerr << "[OpenGLRenderer] OpenGL " << major << "." << minor << " context; 4.1 core is needed." << std::endl;
+        const int major = gl::version_major();
+        const int minor = gl::version_minor();
+        if (is_es ? (major * 10 + minor < 30) : (major * 10 + minor < 41)) {
+            std::cerr << "[OpenGLRenderer] OpenGL " << (is_es ? "ES " : "") << major << "." << minor << " context; "
+                      << (is_es ? "ES 3.0" : "4.1 core") << " is needed." << std::endl;
             return false;
         }
+        // The shaders are written in the context's dialect: GLSL ES 3.00 for an ES context (3.10 /
+        // 3.20 add nothing the shaders need, and 3.00 is what every ES 3.x driver takes).
+        builtin_shaders.set_dialect(is_es ? GlslDialect::ES : GlslDialect::Desktop);
         // ME_VSYNC=0 lets the frame rate run free (to measure it); otherwise the display's.
         if (!headless) {
             const char* vsync = std::getenv("ME_VSYNC");
@@ -963,19 +1082,100 @@ struct OpenGLRenderer::Impl {
         }
 
         has_s3tc = gl::has_extension("GL_EXT_texture_compression_s3tc");
-        has_anisotropy = gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic");
+        // Desktop S3TC drivers expose the sRGB formats with GL_EXT_texture_sRGB (universal); ES needs
+        // GL_EXT_texture_compression_s3tc_srgb (or NV_sRGB_formats) for them.
+        has_s3tc_srgb = has_s3tc && (!is_es || gl::has_extension("GL_EXT_texture_compression_s3tc_srgb") ||
+                                     gl::has_extension("GL_NV_sRGB_formats"));
+        const char* dxt_cpu = std::getenv("ME_DXT_CPU");
+        cpu_bc = !has_s3tc || (dxt_cpu && dxt_cpu[0] != '\0' && dxt_cpu[0] != '0');
         if (!has_s3tc) {
-            std::cerr << "[OpenGLRenderer] No GL_EXT_texture_compression_s3tc: the level's DXT textures will be missing." << std::endl;
+            std::cout << "[OpenGLRenderer] No GL_EXT_texture_compression_s3tc: DXT textures are decoded on the CPU." << std::endl;
+        } else if (cpu_bc) {
+            std::cout << "[OpenGLRenderer] ME_DXT_CPU: DXT textures are decoded on the CPU." << std::endl;
+        } else if (!has_s3tc_srgb) {
+            std::cout << "[OpenGLRenderer] No sRGB S3TC formats: sRGB DXT textures are decoded on the CPU." << std::endl;
+        }
+        has_anisotropy = gl::has_extension("GL_EXT_texture_filter_anisotropic") || gl::has_extension("GL_ARB_texture_filter_anisotropic");
+        if (is_es) {
+            has_color_float = gl::has_extension("GL_EXT_color_buffer_float");
+            has_color_half = has_color_float || gl::has_extension("GL_EXT_color_buffer_half_float");
+            has_norm16 = gl::has_extension("GL_EXT_texture_norm16");
+            // The shadow array. Some ES drivers (the Android emulator's translator among them) apply
+            // GL_MAX_3D_TEXTURE_SIZE to 2D array textures, and a 4096 x 4096 x 3 depth array is 200 MB on
+            // a phone besides; the map is made as large as the device allows up to kSunShadowMapSize
+            // (ME_SHADOW_SIZE=<n> overrides). The lookups measure the texel from the texture itself.
+            GLint max_3d = kSunShadowMapSize, max_tex = kSunShadowMapSize;
+            glGetIntegerv(GL_MAX_3D_TEXTURE_SIZE, &max_3d);
+            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+            shadow_map_size = std::min<int>(kSunShadowMapSize, std::min<int>(max_3d, max_tex));
+            if (const char* env = std::getenv("ME_SHADOW_SIZE")) {
+                const int wanted = std::atoi(env);
+                if (wanted >= 256) shadow_map_size = std::min<int>(wanted, max_tex);
+            }
+            shadow_map_size = std::max(256, shadow_map_size);
+            if (shadow_map_size != kSunShadowMapSize) {
+                std::cout << "[OpenGLRenderer] Shadow map " << shadow_map_size << "x" << shadow_map_size << " (GL_MAX_3D_TEXTURE_SIZE "
+                          << max_3d << ")" << std::endl;
+            }
+            has_timer_query = gl::has_extension("GL_EXT_disjoint_timer_query") && glGetQueryObjectui64v != nullptr;
+            if (!has_color_half) {
+                std::cerr << "[OpenGLRenderer] This OpenGL ES driver has neither GL_EXT_color_buffer_float nor "
+                             "GL_EXT_color_buffer_half_float: the HDR scene (RGBA16F) cannot be rendered to." << std::endl;
+                return false;
+            }
+            if (!has_color_float) {
+                std::cout << "[OpenGLRenderer] No GL_EXT_color_buffer_float: the exposure is kept in R16F instead of R32F." << std::endl;
+            }
+            if (!has_norm16) std::cout << "[OpenGLRenderer] No GL_EXT_texture_norm16: the exposure is metered through RGBA16F." << std::endl;
+            if (profile && !has_timer_query) {
+                std::cout << "[OpenGLRenderer] No GL_EXT_disjoint_timer_query: ME_RENDER_PROF reports no GPU time." << std::endl;
+            }
+        } else {
+            has_timer_query = glGetQueryObjectui64v != nullptr;
+        }
+        if (const char* drop = std::getenv("ME_TEX_DROP_MIPS")) {
+            drop_mips = std::max(0, std::atoi(drop));
+            if (drop_mips > 0) std::cout << "[OpenGLRenderer] ME_TEX_DROP_MIPS: the " << drop_mips << " largest mip level(s) of material textures are skipped." << std::endl;
         }
         glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &max_units);
         max_units = std::min<GLint>(max_units, kMaxUnits);
+        glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_fragment_units);
+        glGetIntegerv(GL_MAX_VARYING_VECTORS, &max_varying_vectors);
         glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &uniform_offset_alignment);
         if (uniform_offset_alignment < 16) uniform_offset_alignment = 16;
-        GLint max_blocks = 0;
+        GLint max_blocks = 0, max_vs_blocks = 0, max_fs_blocks = 0, max_block_size = 0;
         glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &max_blocks);
-        if (max_blocks < static_cast<GLint>(kFragmentBlockBase) + 3) {
-            std::cerr << "[OpenGLRenderer] Only " << max_blocks << " uniform buffer binding points." << std::endl;
+        glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, &max_vs_blocks);
+        glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_BLOCKS, &max_fs_blocks);
+        glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &max_block_size);
+        if (is_es) {
+            std::cout << "[OpenGLRenderer] Limits: " << max_units << " combined texture units, " << max_fragment_units
+                      << " per fragment stage, " << max_varying_vectors << " varying vectors, " << max_blocks
+                      << " uniform buffer bindings (" << max_vs_blocks << " vertex + " << max_fs_blocks << " fragment blocks, "
+                      << max_block_size << " bytes each)" << std::endl;
+        }
+        // What the shaders need: 19 binding points (fragment buffer(0..2) at 16..18), 2 blocks a stage
+        // (FrameUniforms + screen size / material uniforms + SceneUniforms: 3 in the fragment stage),
+        // the material uniform block of 256 x 16 bytes, and up to 11 varying vectors / 11 fragment
+        // samplers (me_glsl --es reports any shader above the ES 3.0 minimums).
+        if (max_blocks < static_cast<GLint>(kUniformBindingsNeeded)) {
+            std::cerr << "[OpenGLRenderer] Only " << max_blocks << " uniform buffer binding points; " << kUniformBindingsNeeded
+                      << " are needed." << std::endl;
             return false;
+        }
+        if (max_vs_blocks < 2 || max_fs_blocks < 3) {
+            std::cerr << "[OpenGLRenderer] Only " << max_vs_blocks << " vertex / " << max_fs_blocks
+                      << " fragment uniform blocks per stage; 2 / 3 are needed." << std::endl;
+            return false;
+        }
+        if (max_block_size < kMaxMaterialUniforms * 16) {
+            std::cerr << "[OpenGLRenderer] Uniform blocks of at most " << max_block_size << " bytes; the material uniforms need "
+                      << kMaxMaterialUniforms * 16 << "." << std::endl;
+            return false;
+        }
+        if (max_units < kTextureSlots) {
+            std::cout << "[OpenGLRenderer] " << max_units << " texture units: MSL texture slots at or above that are remapped per program."
+                      << std::endl;
         }
 
         if (debug && glDebugMessageCallback) {
@@ -989,7 +1189,7 @@ struct OpenGLRenderer::Impl {
         // State that never changes.
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+        if (!is_es) glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);  // ES has no such enable: it is seamless throughout
         glGenVertexArrays(1, &empty_vao);
         glBindVertexArray(empty_vao);
         cur_vao = empty_vao;
@@ -1067,42 +1267,80 @@ struct OpenGLRenderer::Impl {
                 if (index != GL_INVALID_INDEX) glUniformBlockBinding(out.prog, index, block_binding(sh->vertex_stage, b.buffer_slot));
             }
         }
-        // Units: MSL texture(n) on unit n; a second sampler on the same texture takes a spare unit.
+        // Units: MSL texture(n) on unit n; a second sampler on the same texture takes a spare unit
+        // from kExtraUnitBase up. On a device with fewer units than kMaxUnits (ES 3.0: 32) the slots
+        // from max_units up, and the extras, take any unit the program leaves free. Two passes, so a
+        // slot's own unit is never given away to an extra first.
+        struct Pending {
+            const GlslSamplerUnit* s = nullptr;
+            GLint loc = -1;
+            int unit = -1;
+        };
+        std::vector<Pending> pending;
         bool taken[kMaxUnits] = {};
-        int next_extra = kExtraUnitBase;
-        out.units.clear();
-        glUseProgram(out.prog);
+        size_t fragment_samplers = 0;
         for (const GlslShader* sh : {&vsh, &fsh}) {
             for (const GlslSamplerUnit& s : sh->samplers) {
                 const GLint loc = glGetUniformLocation(out.prog, s.uniform.c_str());
                 if (loc < 0) continue;  // optimised away
-                int unit = -1;
-                if (s.texture_slot >= 0 && s.texture_slot < kTextureSlots && s.texture_slot < max_units && !taken[s.texture_slot]) {
-                    unit = s.texture_slot;
-                } else {
-                    while (next_extra < max_units && taken[next_extra]) ++next_extra;
-                    if (next_extra < max_units) unit = next_extra;
-                }
-                if (unit < 0 || s.texture_slot < 0 || s.texture_slot >= kTextureSlots) {
+                if (s.texture_slot < 0 || s.texture_slot >= kTextureSlots) {
                     if (error) *error = "no texture unit for " + s.uniform;
-                    glUseProgram(current_program ? current_program->prog : 0);
                     glDeleteProgram(out.prog);
                     out.prog = 0;
                     return false;
                 }
-                taken[unit] = true;
-                UnitBinding u;
-                u.unit = static_cast<GLuint>(unit);
-                u.texture_slot = s.texture_slot;
-                u.sampler_slot = s.static_sampler ? -1 : s.sampler_slot;
-                if (s.static_sampler) {
-                    for (const GlslStaticSampler& ss : translator.static_samplers()) {
-                        if (ss.slot == s.sampler_slot) u.fixed_sampler = static_sampler_object(ss);
-                    }
+                if (!sh->vertex_stage) ++fragment_samplers;
+                Pending p;
+                p.s = &s;
+                p.loc = loc;
+                if (s.texture_slot < max_units && !taken[s.texture_slot]) {
+                    p.unit = s.texture_slot;
+                    taken[p.unit] = true;
                 }
-                out.units.push_back(u);
-                glUniform1i(loc, unit);
+                pending.push_back(p);
             }
+        }
+        if (fragment_samplers > static_cast<size_t>(max_fragment_units)) {
+            if (error) {
+                *error = "the fragment stage samples " + std::to_string(fragment_samplers) + " textures; this device allows " +
+                         std::to_string(max_fragment_units);
+            }
+            glDeleteProgram(out.prog);
+            out.prog = 0;
+            return false;
+        }
+        int next_extra = std::min<int>(kExtraUnitBase, max_units);
+        for (Pending& p : pending) {
+            if (p.unit >= 0) continue;
+            while (next_extra < max_units && taken[next_extra]) ++next_extra;
+            if (next_extra >= max_units) {  // wrap: any unit below kExtraUnitBase the program does not use
+                next_extra = 0;
+                while (next_extra < max_units && taken[next_extra]) ++next_extra;
+            }
+            if (next_extra >= max_units) {
+                if (error) *error = "no texture unit for " + p.s->uniform + " (" + std::to_string(max_units) + " units)";
+                glDeleteProgram(out.prog);
+                out.prog = 0;
+                return false;
+            }
+            p.unit = next_extra;
+            taken[p.unit] = true;
+        }
+        out.units.clear();
+        glUseProgram(out.prog);
+        for (const Pending& p : pending) {
+            const GlslSamplerUnit& s = *p.s;
+            UnitBinding u;
+            u.unit = static_cast<GLuint>(p.unit);
+            u.texture_slot = s.texture_slot;
+            u.sampler_slot = s.static_sampler ? -1 : s.sampler_slot;
+            if (s.static_sampler) {
+                for (const GlslStaticSampler& ss : translator.static_samplers()) {
+                    if (ss.slot == s.sampler_slot) u.fixed_sampler = static_sampler_object(ss);
+                }
+            }
+            out.units.push_back(u);
+            glUniform1i(p.loc, p.unit);
         }
         glUseProgram(current_program ? current_program->prog : 0);
         return true;
@@ -1169,7 +1407,7 @@ struct OpenGLRenderer::Impl {
             fs = builtin_shaders.emit(pixel_fn);
         } else {
             fs.entry = "depth_only";
-            fs.source = "#version 410 core\nvoid main() {}\n";
+            fs.source = builtin_shaders.preamble_header() + "void main() {}\n";
         }
         const GLuint fs_obj = compile(fs, &err);
         if (!fs_obj) {
@@ -1221,6 +1459,7 @@ struct OpenGLRenderer::Impl {
         if (compare) {
             glSamplerParameteri(s, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
             glSamplerParameteri(s, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+            compare_samplers.insert(s);
         } else {
             glSamplerParameteri(s, GL_TEXTURE_COMPARE_MODE, GL_NONE);
         }
@@ -1251,6 +1490,8 @@ struct OpenGLRenderer::Impl {
         }
         // Linear Texture Sampler (made first: link_program() falls back to it for unsampled textures)
         linear_sampler = make_sampler(GL_LINEAR, GL_LINEAR, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, 0.0f);
+        // What ES reads depth textures through when no comparison is asked for (flush_bindings).
+        depth_nearest_sampler = make_sampler(GL_NEAREST, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, 0.0f);
 
         if (!make_program("shadow_vertex", nullptr, VertexKind::Scene, shadow_program)) return false;
         if (!make_program("sky_vertex", "sky_fragment", VertexKind::None, sky_program)) return false;
@@ -1316,6 +1557,7 @@ struct OpenGLRenderer::Impl {
         t->target = GL_TEXTURE_2D;
         t->width = w;
         t->height = h;
+        t->depth = format == GL_DEPTH_COMPONENT || format == GL_DEPTH_STENCIL;
         glGenTextures(1, &t->name);
         glBindTexture(GL_TEXTURE_2D, t->name);
         glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(internal), w, h, 0, format, type, data);
@@ -1419,9 +1661,13 @@ struct OpenGLRenderer::Impl {
     }
 
     // Uploads one decoded UE3 texture (2D or cube, full mip chain). Must run on the context's thread.
-    UITexture upload_scene_texture(const SceneTexture& st) {
+    // `material`: a level texture (material or light map), which ME_TEX_DROP_MIPS may shrink by
+    // leaving its largest levels out; the UI's textures are always uploaded whole.
+    UITexture upload_scene_texture(const SceneTexture& st, bool material = false) {
         if (!st.valid()) return nullptr;
-        const GlTexFormat fmt = gl_tex_format(st.format, st.srgb);
+        // sRGB BC needs the sRGB S3TC formats; where only the linear ones exist, decode on the CPU.
+        const bool decode = cpu_bc || (st.srgb && !has_s3tc_srgb);
+        const GlTexFormat fmt = gl_tex_format(st.format, st.srgb, is_es, decode);
         if (fmt.internal == 0) return nullptr;
         if (fmt.compressed && !has_s3tc) return nullptr;
 
@@ -1435,7 +1681,10 @@ struct OpenGLRenderer::Impl {
             }
         }
         if (levels <= 0 || levels == INT_MAX) return nullptr;
-        const TextureMip& top = st.is_cube ? st.faces[0][0] : st.mips[0];
+        // ME_TEX_DROP_MIPS: level `first` becomes level 0. Compressed levels under 4 texels across
+        // are still whole blocks, so any level can be the top one.
+        const int first = material ? std::min(drop_mips, levels - 1) : 0;
+        const TextureMip& top = st.is_cube ? st.faces[0][static_cast<size_t>(first)] : st.mips[static_cast<size_t>(first)];
 
         auto t = std::make_shared<GpuTexture>();
         t->target = st.is_cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
@@ -1443,21 +1692,34 @@ struct OpenGLRenderer::Impl {
         t->height = top.height;
         glGenTextures(1, &t->name);
         glBindTexture(t->target, t->name);
+        std::vector<uint8_t> scratch;
         for (int f = 0; f < face_count; ++f) {
             const std::vector<TextureMip>& chain = st.is_cube ? st.faces[static_cast<size_t>(f)] : st.mips;
             const GLenum face_target = st.is_cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + static_cast<GLenum>(f) : GL_TEXTURE_2D;
-            for (int i = 0; i < levels; ++i) {
+            for (int i = first; i < levels; ++i) {
                 const TextureMip& m = chain[static_cast<size_t>(i)];
+                const GLint level = i - first;
                 if (fmt.compressed) {
                     const GLsizei bytes = static_cast<GLsizei>(tex_row_bytes(st.format, m.width) * tex_rows(st.format, m.height));
-                    glCompressedTexImage2D(face_target, i, fmt.internal, m.width, m.height, 0, bytes, m.data.data());
+                    glCompressedTexImage2D(face_target, level, fmt.internal, m.width, m.height, 0, bytes, m.data.data());
                 } else {
-                    glTexImage2D(face_target, i, static_cast<GLint>(fmt.internal), m.width, m.height, 0, fmt.format, fmt.type, m.data.data());
+                    const uint8_t* pixels = convert_level(fmt, m.width, m.height, m.data.data(), m.data.size(), scratch);
+                    if (!pixels) {
+                        glBindTexture(t->target, 0);
+                        return nullptr;
+                    }
+                    glTexImage2D(face_target, level, static_cast<GLint>(fmt.internal), m.width, m.height, 0, fmt.format, fmt.type, pixels);
                 }
             }
         }
-        glTexParameteri(t->target, GL_TEXTURE_MAX_LEVEL, levels - 1);
-        if (fmt.swizzled) glTexParameteriv(t->target, GL_TEXTURE_SWIZZLE_RGBA, fmt.swizzle);
+        glTexParameteri(t->target, GL_TEXTURE_MAX_LEVEL, levels - 1 - first);
+        if (fmt.swizzled) {
+            // One parameter per channel: GL_TEXTURE_SWIZZLE_RGBA is desktop only, these are in both.
+            glTexParameteri(t->target, GL_TEXTURE_SWIZZLE_R, fmt.swizzle[0]);
+            glTexParameteri(t->target, GL_TEXTURE_SWIZZLE_G, fmt.swizzle[1]);
+            glTexParameteri(t->target, GL_TEXTURE_SWIZZLE_B, fmt.swizzle[2]);
+            glTexParameteri(t->target, GL_TEXTURE_SWIZZLE_A, fmt.swizzle[3]);
+        }
         return t;
     }
 
@@ -1472,6 +1734,7 @@ struct OpenGLRenderer::Impl {
         mat_vertex_shader = 0;
         mat_vertex_ok = false;
         material_shaders = std::make_unique<MslToGlsl>();
+        material_shaders->set_dialect(builtin_shaders.dialect(), builtin_shaders.version());
         if (n == 0) return;
 
         std::string err;
@@ -1544,12 +1807,12 @@ struct OpenGLRenderer::Impl {
         mat_textures.assign(n_tex, nullptr);
         size_t uploaded = 0;
         for (size_t i = 0; i < n_tex; ++i) {
-            mat_textures[i] = upload_scene_texture(lib->textures[i]);
+            mat_textures[i] = upload_scene_texture(lib->textures[i], true);
             if (mat_textures[i]) ++uploaded;
         }
         lm_textures.assign(lib->lightmap_textures.size(), nullptr);
         for (size_t i = 0; i < lm_textures.size(); ++i) {
-            if (lib->lightmap_textures[i].valid()) lm_textures[i] = upload_scene_texture(lib->lightmap_textures[i]);
+            if (lib->lightmap_textures[i].valid()) lm_textures[i] = upload_scene_texture(lib->lightmap_textures[i], true);
         }
         compile_material_shaders(*lib);
         upload_material_uniforms(*lib);
@@ -1678,12 +1941,15 @@ struct OpenGLRenderer::Impl {
         GLuint fbo = 0;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        // glDrawBuffers, not glDrawBuffer: ES has only the plural form (same effect for one buffer).
         if (color) {
             glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color->name, 0);
-            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            const GLenum attachment = GL_COLOR_ATTACHMENT0;
+            glDrawBuffers(1, &attachment);
             glReadBuffer(GL_COLOR_ATTACHMENT0);
         } else {
-            glDrawBuffer(GL_NONE);
+            const GLenum none = GL_NONE;
+            glDrawBuffers(1, &none);
             glReadBuffer(GL_NONE);
         }
         if (depth) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth->name, 0);
@@ -1706,6 +1972,10 @@ struct OpenGLRenderer::Impl {
         t.h = std::max(1, h);
         t.tex = make_texture_2d(t.w, t.h, internal, format, type, nullptr);
         t.fbo = make_framebuffer(t.tex.get(), nullptr);
+        if (!t.fbo) {
+            std::cerr << "[OpenGLRenderer] A " << t.w << "x" << t.h << " render target of internal format 0x" << std::hex << internal
+                      << std::dec << " is not framebuffer complete on this driver." << std::endl;
+        }
         return t.fbo != 0;
     }
 
@@ -1723,21 +1993,32 @@ struct OpenGLRenderer::Impl {
         scene_fbo = make_framebuffer(scene_hdr_tex.get(), depth_tex.get());
         scene_color_fbo = make_framebuffer(scene_hdr_tex.get(), nullptr);
         bool ok = scene_fbo != 0 && scene_color_fbo != 0;
+        if (!ok) {
+            std::cerr << "[OpenGLRenderer] The RGBA16F + DEPTH_COMPONENT32F scene framebuffer is not complete"
+                      << (is_es ? " (GL_EXT_color_buffer_float / _half_float is needed on OpenGL ES)" : "") << std::endl;
+        }
 
         offscreen_color_tex = make_texture_2d(width, height, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         offscreen_fbo = make_framebuffer(offscreen_color_tex.get(), nullptr);
+        if (!offscreen_fbo) std::cerr << "[OpenGLRenderer] The RGBA8 off-screen framebuffer is not complete" << std::endl;
         ok = ok && offscreen_fbo != 0;
 
-        // The post-process chain's own targets.
+        // The post-process chain's own targets. On ES without GL_EXT_texture_norm16 the metering's
+        // 16-bit fixed point becomes half float (11 significant bits, over the same [0, 1]); without
+        // GL_EXT_color_buffer_float the 1 x 1 exposure is a half instead of a float.
+        const GLenum meter_internal = has_norm16 ? GL_RGBA16 : GL_RGBA16F;
+        const GLenum meter_type = has_norm16 ? GL_UNSIGNED_SHORT : GL_HALF_FLOAT;
+        const GLenum exposure_internal = has_color_float ? GL_R32F : GL_R16F;
+        const GLenum exposure_type = has_color_float ? GL_FLOAT : GL_HALF_FLOAT;
         ok = ok && make_color_target(scene_hazed, width, height, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT);
         for (auto& p : picture) ok = ok && make_color_target(p, width, height, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE);
         ok = ok && make_color_target(scene_effect, width, height, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT);
         ok = ok && make_color_target(filter_a, width / kFilterDownsample, height / kFilterDownsample, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT);
         ok = ok && make_color_target(filter_b, width / kFilterDownsample, height / kFilterDownsample, GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT);
         for (int i = 0; i < kMeterSteps; ++i) {
-            ok = ok && make_color_target(meter[i], kMeterSizes[i], kMeterSizes[i], GL_RGBA16, GL_RGBA, GL_UNSIGNED_SHORT);
+            ok = ok && make_color_target(meter[i], kMeterSizes[i], kMeterSizes[i], meter_internal, GL_RGBA, meter_type);
         }
-        for (auto& e : exposure) ok = ok && make_color_target(e, 1, 1, GL_R32F, GL_RED, GL_FLOAT);
+        for (auto& e : exposure) ok = ok && make_color_target(e, 1, 1, exposure_internal, GL_RED, exposure_type);
         exposure_sim_time = -1.0f;
 
         // Copies of the opaque scene (UE3 "resolved" SceneColor / SceneDepth) sampled by
@@ -1750,20 +2031,33 @@ struct OpenGLRenderer::Impl {
         if (ok && !shadow_depth_tex) {
             auto t = std::make_shared<GpuTexture>();
             t->target = GL_TEXTURE_2D_ARRAY;
-            t->width = t->height = kSunShadowMapSize;
+            t->width = t->height = shadow_map_size;
+            t->depth = true;
             glGenTextures(1, &t->name);
             glBindTexture(GL_TEXTURE_2D_ARRAY, t->name);
-            glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT32F, kSunShadowMapSize, kSunShadowMapSize, 3,  // kSunShadowNearSlice, kSunShadowFarSlice, kModShadowSlice
+            glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT32F, shadow_map_size, shadow_map_size, 3,  // kSunShadowNearSlice, kSunShadowFarSlice, kModShadowSlice
                          0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+            const GLenum array_error = glGetError();
+            if (array_error != GL_NO_ERROR) {
+                std::cerr << "[OpenGLRenderer] glTexImage3D(DEPTH_COMPONENT32F " << shadow_map_size << "x" << shadow_map_size
+                          << "x3) failed: GL error 0x" << std::hex << array_error << std::dec << std::endl;
+            }
             glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, 0);
             shadow_depth_tex = t;
             for (int slice = 0; ok && slice < 3; ++slice) {
                 glGenFramebuffers(1, &shadow_fbo[slice]);
                 glBindFramebuffer(GL_FRAMEBUFFER, shadow_fbo[slice]);
                 glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, t->name, 0, slice);
-                glDrawBuffer(GL_NONE);
+                const GLenum none = GL_NONE;
+                glDrawBuffers(1, &none);
                 glReadBuffer(GL_NONE);
-                ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+                const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                ok = status == GL_FRAMEBUFFER_COMPLETE;
+                if (!ok) {
+                    std::cerr << "[OpenGLRenderer] The " << shadow_map_size << "x" << shadow_map_size
+                              << " x3 DEPTH_COMPONENT32F shadow array, slice " << slice << ": framebuffer status 0x" << std::hex
+                              << status << std::dec << std::endl;
+                }
             }
             shadow_far_valid = false;
         }
@@ -2410,7 +2704,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
             std::memcpy(near_vp_saved, uniforms.sun_view_proj, sizeof(near_vp_saved));
             set_matrix(uniforms.sun_view_proj, cascade_vp);
 
-            set_viewport(static_cast<float>(kSunShadowMapSize), static_cast<float>(kSunShadowMapSize), 0.0f, 1.0f);
+            set_viewport(static_cast<float>(impl->shadow_map_size), static_cast<float>(impl->shadow_map_size), 0.0f, 1.0f);
             use_program(impl->shadow_program);
             impl->set_depth(Impl::DepthState::Write);
             impl->set_cull(false);
@@ -2490,11 +2784,11 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         }
         const bool body_casts = !bink_video_active && impl->anim_system.is_loaded();
         collect_mod_shadows(active_scene, impl->light_envs, shadow_view, body_casts ? &telemetry.position : nullptr,
-                            telemetry.yaw_deg, impl->mod_enemy_ready, telemetry.sim_time, impl->mod_shadows);
+                            telemetry.yaw_deg, impl->mod_enemy_ready, telemetry.sim_time, impl->mod_shadows, impl->shadow_map_size);
         if (!impl->mod_shadows.empty()) {
             impl->set_render_target(impl->shadow_fbo[kModShadowSlice]);
             // The whole slice is cleared, whatever viewport the last pass left.
-            set_viewport(static_cast<float>(kSunShadowMapSize), static_cast<float>(kSunShadowMapSize), 0.0f, 1.0f);
+            set_viewport(static_cast<float>(impl->shadow_map_size), static_cast<float>(impl->shadow_map_size), 0.0f, 1.0f);
             impl->clear_depth();
             float sun_vp_saved[16];
             std::memcpy(sun_vp_saved, uniforms.sun_view_proj, sizeof(sun_vp_saved));
@@ -2769,7 +3063,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         // The dynamic objects' shadows multiply the lit scene, before fog and translucency (mod_shadow.hpp).
         if (!impl->mod_shadows.empty()) {
             ModShadowUniformsGPU shadow_constants;
-            fill_mod_shadow_uniforms(impl->mod_shadows, shadow_constants);
+            fill_mod_shadow_uniforms(impl->mod_shadows, shadow_constants, impl->shadow_map_size);
             impl->update_constants(impl->cb_post, &shadow_constants, sizeof(shadow_constants));
             impl->bind_uniform_block(block_binding(false, 1), impl->cb_post);
             impl->set_render_target(impl->scene_color_fbo);  // the depth buffer is read, not tested

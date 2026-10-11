@@ -4,6 +4,10 @@
 
 #include <SDL2/SDL.h>
 
+// ME_NO_FFMPEG (the Android build): no Bink decoding. play_bink_movie() reports the movie as
+// unavailable and the game goes on to the in-engine intro / the level, as it does when the movie
+// file is missing. Everything else here (Matinee intros, level cutscenes, subtitles) is unchanged.
+#if !defined(ME_NO_FFMPEG)
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -13,6 +17,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
 }
+#endif
 
 #include <filesystem>
 #include <fstream>
@@ -77,6 +82,7 @@ static std::string read_text_file_any_encoding(const std::string& path) {
 } // namespace
 
 struct CutscenePlayer::DecoderImpl {
+#if !defined(ME_NO_FFMPEG)
     AVFormatContext* fmt_ctx = nullptr;
     AVCodecContext* video_ctx = nullptr;
     AVCodecContext* audio_ctx = nullptr;
@@ -86,6 +92,7 @@ struct CutscenePlayer::DecoderImpl {
     AVPacket* pkt = nullptr;
     int video_stream_idx = -1;
     int audio_stream_idx = -1;
+#endif
     bool eof_reached = false;
 
     SDL_AudioDeviceID sdl_audio_dev = 0;
@@ -221,6 +228,29 @@ void CutscenePlayer::load_movie_subtitle_cues(const std::string& txt_path) {
     }
 }
 
+#if defined(ME_NO_FFMPEG)
+
+bool CutscenePlayer::open_bink_streams(const std::string& bik_path) {
+    close_bink_streams();
+    (void)bik_path;
+    std::cout << "[Cutscene] Bink playback unavailable (built without FFmpeg)" << std::endl;
+    return false;
+}
+
+void CutscenePlayer::close_bink_streams() {
+    if (!dec_) return;
+    if (dec_->sdl_audio_dev != 0) {
+        SDL_ClearQueuedAudio(dec_->sdl_audio_dev);
+    }
+    dec_->eof_reached = true;
+}
+
+void CutscenePlayer::decode_until_time(float /*target_sec*/) {}
+
+bool CutscenePlayer::seek_and_decode_bink_frame(float /*target_sec*/) { return false; }
+
+#else
+
 bool CutscenePlayer::open_bink_streams(const std::string& bik_path) {
     close_bink_streams();
 
@@ -350,7 +380,14 @@ void CutscenePlayer::close_bink_streams() {
     dec_->eof_reached = true;
 }
 
+#endif  // ME_NO_FFMPEG
+
 bool CutscenePlayer::play_bink_movie(const std::string& movie_name, bool chain_in_engine_intro) {
+#if defined(ME_NO_FFMPEG)
+    (void)chain_in_engine_intro;
+    std::cout << "[Cutscene] Bink playback unavailable (built without FFmpeg): " << movie_name << std::endl;
+    return false;
+#else
     std::string key = to_lower_copy(movie_name);
     if (key.size() > 4 && key.substr(key.size() - 4) == ".bik") {
         key = key.substr(0, key.size() - 4);
@@ -383,6 +420,7 @@ bool CutscenePlayer::play_bink_movie(const std::string& movie_name, bool chain_i
               << ", Duration=" << duration_sec_ << "s, Subtitles="
               << current_cues_.size() << ")" << std::endl;
     return true;
+#endif
 }
 
 void CutscenePlayer::pose_intro_doors(LevelScene& scene, float elapsed_sec) {
@@ -541,6 +579,7 @@ void CutscenePlayer::stop() {
     cutscene_index_ = -1;
 }
 
+#if !defined(ME_NO_FFMPEG)
 void CutscenePlayer::decode_until_time(float target_sec) {
     if (!dec_ || !dec_->fmt_ctx || !dec_->video_ctx || dec_->eof_reached) return;
 
@@ -631,6 +670,7 @@ bool CutscenePlayer::seek_and_decode_bink_frame(float target_sec) {
     }
     return (frame_serial_ > 0 && !rgba_buffer_.empty());
 }
+#endif  // !ME_NO_FFMPEG
 
 void CutscenePlayer::update(float dt, const LevelScene& scene, PlayerTelemetry& io_telemetry) {
     if (mode_ == ECutsceneMode::None) {

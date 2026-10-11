@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <set>
@@ -535,9 +536,21 @@ Unit parse_unit(const Toks& t) {
     return u;
 }
 
-// Everything a GLSL shader starts with: Metal built-ins GLSL lacks or spells differently.
-const char* const kPreamble = R"glsl(#version 410 core
-// Generated from Metal Shading Language by me::MslToGlsl (src/renderer/msl_to_glsl.cpp).
+// Everything a GLSL shader starts with, after the dialect's `#version` line (preamble_header):
+// Metal built-ins GLSL lacks or spells differently.
+const char* const kDesktopHeader = "#version 410 core\n";
+// GLSL ES: default precisions for both stages. The fragment stage has no default float
+// precision, and sampler types other than sampler2D / samplerCube have none in either stage.
+const char* const kEsPrecision = R"glsl(precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp sampler2DArray;
+precision highp sampler2DShadow;
+precision highp sampler2DArrayShadow;
+precision highp samplerCube;
+precision highp samplerCubeShadow;
+)glsl";
+const char* const kPreambleBody = R"glsl(// Generated from Metal Shading Language by me::MslToGlsl (src/renderer/msl_to_glsl.cpp).
 float saturate(float x) { return clamp(x, 0.0, 1.0); }
 vec2 saturate(vec2 x) { return clamp(x, 0.0, 1.0); }
 vec3 saturate(vec3 x) { return clamp(x, 0.0, 1.0); }
@@ -561,6 +574,12 @@ vec3 select(vec3 a, vec3 b, bvec3 c) { return mix(a, b, c); }
 vec4 select(vec4 a, vec4 b, bvec4 c) { return mix(a, b, c); }
 )glsl";
 
+bool is_float_scalar_type(const std::string& msl_type) { return map_type(msl_type) == "float"; }
+bool is_unsigned_type(const std::string& msl_type) {
+    const std::string g = map_type(msl_type);
+    return g == "uint" || g.rfind("uvec", 0) == 0;
+}
+
 }  // namespace
 
 struct MslToGlsl::Impl {
@@ -568,6 +587,14 @@ struct MslToGlsl::Impl {
     std::map<std::string, size_t> struct_index;
     std::vector<GlslStaticSampler> samplers;
     std::map<std::string, std::map<std::string, std::string>> sampler_alias;  // function -> MSL name -> static name
+    GlslDialect dialect = GlslDialect::Desktop;
+    int version = 410;
+
+    [[nodiscard]] bool es() const { return dialect == GlslDialect::ES; }
+    [[nodiscard]] std::string header() const {
+        if (!es()) return kDesktopHeader;
+        return "#version " + std::to_string(version) + " es\n" + kEsPrecision;
+    }
 
     [[nodiscard]] bool is_struct(const std::string& name) const { return struct_index.count(name) != 0; }
 
@@ -596,6 +623,30 @@ struct MslToGlsl::Impl {
                 return &f;
             }
             return nullptr;
+        }
+
+        // The MSL parameter types of the helper(s) named `name` taking `nargs` arguments, or an
+        // empty vector when there is none. Where overloads (a template's instances) disagree on a
+        // position's type, that position is "".
+        [[nodiscard]] std::vector<std::string> param_types(const std::string& name, size_t nargs) const {
+            std::vector<std::string> types;
+            bool any = false;
+            auto consider = [&](const Func& f) {
+                if (f.stage != Func::Helper || f.name != name || f.params.size() != nargs) return;
+                if (!any) {
+                    any = true;
+                    for (const Param& p : f.params) types.push_back(p.type);
+                    return;
+                }
+                for (size_t i = 0; i < nargs; ++i) {
+                    if (types[i] != f.params[i].type) types[i].clear();
+                }
+            };
+            if (extra) {
+                for (const Func& f : *extra) consider(f);
+            }
+            for (const Func& f : impl->unit.funcs) consider(f);
+            return types;
         }
     };
 
@@ -901,6 +952,11 @@ struct MslToGlsl::Impl {
             erase(t, i + 1, i + 4);
         }
 
+        // GLSL ES converts nothing implicitly: `helper(maps, 0, ...)` for a uint parameter, or
+        // `helper(1)` for a float one, needs the literal spelt in the parameter's type. Done
+        // before the texture rewrite below drops sampler arguments, so positions still match.
+        if (es()) match_call_literals(t, table);
+
         walk_texture_uses(t, scope, table, true);
 
         // `T a[N] = {...}` -> `T a[N] = T[N](...)`
@@ -1024,6 +1080,54 @@ struct MslToGlsl::Impl {
             const bool right_unsigned = is_unsigned(leading_type(i + 1, t.size()));
             if (right_unsigned && is_int_literal(t[start]) && start + 1 == i) t[start].text += "u";
             if (left_unsigned && is_int_literal(t[i + 1])) t[i + 1].text += "u";
+        }
+    }
+
+    // GLSL ES only: an integer literal given to a helper whose parameter is `uint` becomes `0u`,
+    // one given for a `float` parameter `0.0`. Desktop GLSL (4.10) converts both by itself; GLSL
+    // ES rejects the call ("no matching overloaded function"). A literal with a unary minus is
+    // handled; anything else is left to the compiler.
+    void match_call_literals(Toks& t, const FuncTable& table) const {
+        auto is_int_literal = [](const Tok& k) {
+            if (k.kind != Tok::Number) return false;
+            const bool hex = k.text.rfind("0x", 0) == 0 || k.text.rfind("0X", 0) == 0;
+            const char last = k.text.back();
+            if (last == 'u' || last == 'U') return false;
+            if (hex) return true;
+            return k.text.find_first_of(".eEfF") == std::string::npos;
+        };
+        for (size_t i = 0; i + 1 < t.size(); ++i) {
+            if (!is_ident(t[i]) || t[i].glsl || !is(t[i + 1], "(")) continue;
+            if (i > 0 && is(t[i - 1], ".")) continue;  // a texture method
+            const size_t close = match_close(t, i + 1);
+            // The arguments' token ranges, split at the commas of this call.
+            std::vector<std::pair<size_t, size_t>> args;
+            size_t from = i + 2;
+            int depth = 0;
+            for (size_t k = i + 2; k < close; ++k) {
+                if (t[k].kind != Tok::Punct) continue;
+                if (is(t[k], "(") || is(t[k], "[") || is(t[k], "{")) ++depth;
+                if (is(t[k], ")") || is(t[k], "]") || is(t[k], "}")) --depth;
+                if (is(t[k], ",") && depth == 0) {
+                    args.emplace_back(from, k);
+                    from = k + 1;
+                }
+            }
+            if (from < close || !args.empty()) args.emplace_back(from, close);
+            const std::vector<std::string> types = table.param_types(t[i].text, args.size());
+            if (types.empty()) continue;
+            for (size_t j = 0; j < args.size(); ++j) {
+                size_t lit = args[j].first;
+                if (lit < args[j].second && (is(t[lit], "-") || is(t[lit], "+"))) ++lit;
+                if (lit + 1 != args[j].second || !is_int_literal(t[lit])) continue;
+                if (is_unsigned_type(types[j])) {
+                    t[lit].text += "u";
+                } else if (is_float_scalar_type(types[j])) {
+                    const bool hex = t[lit].text.rfind("0x", 0) == 0 || t[lit].text.rfind("0X", 0) == 0;
+                    if (hex) t[lit].text = std::to_string(std::strtoul(t[lit].text.c_str(), nullptr, 16));
+                    t[lit].text += ".0";
+                }
+            }
         }
     }
 
@@ -1348,7 +1452,7 @@ struct MslToGlsl::Impl {
 
     [[nodiscard]] std::string library_glsl(const std::set<std::string>& helpers, const FuncTable& table) const {
         std::ostringstream o;
-        o << kPreamble;
+        o << header() << kPreambleBody;
         for (const Item& item : unit.items) {
             switch (item.kind) {
                 case Item::StructItem: o << struct_glsl(unit.structs[item.index]); break;
@@ -1366,6 +1470,19 @@ struct MslToGlsl::Impl {
 
 MslToGlsl::MslToGlsl() : impl_(std::make_unique<Impl>()) {}
 MslToGlsl::~MslToGlsl() = default;
+
+void MslToGlsl::set_dialect(GlslDialect dialect, int version) {
+    impl_->dialect = dialect;
+    if (dialect == GlslDialect::ES) {
+        impl_->version = (version == 310 || version == 320) ? version : 300;
+    } else {
+        impl_->version = version > 0 ? version : 410;
+    }
+}
+
+GlslDialect MslToGlsl::dialect() const { return impl_->dialect; }
+int MslToGlsl::version() const { return impl_->version; }
+std::string MslToGlsl::preamble_header() const { return impl_->header(); }
 
 bool MslToGlsl::add_source(const std::string& msl, std::string* error) {
     try {

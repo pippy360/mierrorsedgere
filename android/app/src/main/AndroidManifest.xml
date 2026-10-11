@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    android:installLocation="auto">
+
+    <!-- OpenGL ES 3.0: what the renderer needs (ME_GLES), and what the emulator offers. -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <!-- No storage permission: the assets live in the app's own external files directory
+         (Android/data/com.pippy360.mierrorsedgere/files), which the app owns and adb can reach. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:label="@string/app_name"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true"
+        android:isGame="true"
+        android:appCategory="game"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+
+        <activity
+            android:name=".MirrorsEdgeActivity"
+            android:label="@string/app_name"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:alwaysRetainTaskState="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- SDL's hint: let the activity manage its own libraries (SDLActivity.getLibraries). -->
+            <meta-data android:name="SDL_ENV.SDL_ANDROID_BLOCK_ON_PAUSE" android:value="1" />
+        </activity>
+    </application>
+
+</manifest>

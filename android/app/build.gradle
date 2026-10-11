@@ -1,0 +1,85 @@
+// The Android app: a Gradle project around the CMake build at the repository root.
+// Build with ./gradlew assembleDebug (android/README.md); the native side is CMakeLists.txt's
+// `elseif(ANDROID)` branch, run by the NDK's clang through externalNativeBuild.
+plugins {
+    id 'com.android.application'
+}
+
+// The CMake that runs the native build. The SDK has none installed (ndk/ only), so it is the one
+// on the PATH (Homebrew's, 4.x works) unless local.properties has cmake.dir=<install prefix>,
+// which the Android Gradle plugin honours (it wants <prefix>/bin/cmake and finds ninja next to
+// it or on the PATH).
+def sdlJavaDir = new File(rootDir, "third_party/SDL2/android-project/app/src/main/java")
+if (!sdlJavaDir.isDirectory()) {
+    throw new GradleException("SDL2's Java sources are missing at ${sdlJavaDir}: run android/fetch_deps.sh first")
+}
+
+android {
+    namespace 'com.pippy360.mierrorsedgere'
+    compileSdk 35
+    ndkVersion '27.0.12077973'
+
+    defaultConfig {
+        applicationId 'com.pippy360.mierrorsedgere'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                // -O2 is in CMakeLists.txt for every configuration; Debug still gets symbols.
+                arguments '-DANDROID_STL=c++_shared',
+                          '-DANDROID_PLATFORM=android-26',
+                          '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
+                          "-DME_ANDROID_THIRD_PARTY=${rootDir}/third_party"
+                targets 'main', 'SDL2'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../CMakeLists.txt')
+            // Any CMake 3.22+ (the SDK's, if one is installed, or the one cmake.dir / the PATH names).
+            version '3.22.1+'
+        }
+    }
+
+    sourceSets {
+        main {
+            // SDL's Java side (org.libsdl.app.SDLActivity and friends) straight from the fetched
+            // SDL2 source tree: not copied, not committed.
+            java.srcDirs += sdlJavaDir
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // Signed with the debug key so `adb install` works; a release keystore is not part of the repository.
+            signingConfig signingConfigs.debug
+        }
+        debug {
+            // A debug build that is still playable: the native code is -O2 either way (CMakeLists.txt).
+            jniDebuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packagingOptions {
+        jniLibs {
+            // Stored uncompressed and zip-aligned to 16 KB (the plugin's default for this version), so
+            // the loader maps them straight out of the APK; with the 16 KB-aligned link in
+            // CMakeLists.txt this is what Android 15's page-size check wants.
+            useLegacyPackaging false
+        }
+    }
+}

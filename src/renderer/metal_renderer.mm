@@ -11,6 +11,7 @@
 #include "../anim/anim_system.hpp"
 #include "../assets/scene_materials.hpp"
 #include "../cutscene/cutscene_player.hpp"
+#include "../platform/platform.hpp"
 #include "../ui/main_menu.hpp"
 
 #import <Foundation/Foundation.h>

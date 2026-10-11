@@ -25,3 +25,7 @@ std::string temp_dir();
 std::string cache_dir();
 
 }  // namespace me
+
+// The touch controls' overlay (Android): what the renderers' shared HUD code draws. Here because
+// every backend includes this header, and the overlay code (renderer/overlay_ui.inl) cannot.
+#include "touch_overlay.hpp"

@@ -1,7 +1,16 @@
+#if !defined(__ANDROID__)
+// The desktop builds run main() themselves. On Android SDL's Java side (SDLActivity) calls
+// SDL_main, which <SDL2/SDL_main.h> renames main to.
 #define SDL_MAIN_HANDLED
+#endif
 #include <cstdlib>
 #include <SDL2/SDL.h>
-#if defined(__APPLE__)
+#if defined(__ANDROID__)
+#include <SDL2/SDL_main.h>
+#include <unistd.h>
+#include "platform/android_log.hpp"
+#define ME_PLATFORM_TITLE "Android"
+#elif defined(__APPLE__)
 #include <SDL2/SDL_metal.h>
 #define ME_PLATFORM_TITLE "macOS"
 #elif defined(_WIN32)
@@ -9,6 +18,7 @@
 #else
 #define ME_PLATFORM_TITLE "Linux"
 #endif
+#include "platform/touch_controls.hpp"
 #if defined(_WIN32) && defined(ME_RENDERER_OPENGL)
 // The OpenGL backend built on Windows to check it (docs/LINUX_PORT.md): on a laptop with two GPUs
 // an OpenGL context goes to the integrated one unless the executable asks otherwise this way.
@@ -3954,7 +3964,8 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
 // -----------------------------------------------------------------------------
 static int run_interactive_app(const std::string& game_root, int initial_chapter,
                               const std::string& custom_level, int max_frames,
-                              bool start_in_main_menu, const std::string& trace_path) {
+                              bool start_in_main_menu, const std::string& trace_path,
+                              const std::string& exit_screenshot) {
     using namespace me;
     std::cout << "\n============================================================" << std::endl;
     std::cout << "  MIRROR'S EDGE NATIVE " << platform_upper() << " - INTERACTIVE LAUNCH" << std::endl;
@@ -3965,6 +3976,13 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     // Window sizes in points and the drawable in pixels, as on a Retina display.
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
 #endif
+#if defined(__ANDROID__)
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    // A tap is a finger to the touch controls, and a synthesized mouse click to the menus; the
+    // other way round (mouse -> touch) is not wanted.
+    SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "1");
+#endif
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
         std::cerr << "[SDL ERROR] Initialization failed: " << SDL_GetError() << std::endl;
         return 1;
@@ -3972,7 +3990,19 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
     int win_w = 1280;
     int win_h = 720;
-#if defined(ME_RENDERER_OPENGL)
+#if defined(__ANDROID__)
+    // The whole display, in landscape; the drawable's pixel size comes from SDL_GL_GetDrawableSize.
+    const char* window_title = "Mirror's Edge (Native Android OpenGL ES)";
+    const Uint32 window_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALLOW_HIGHDPI;
+    {
+        SDL_DisplayMode mode{};
+        if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0) {
+            win_w = std::max(mode.w, mode.h);
+            win_h = std::min(mode.w, mode.h);
+        }
+    }
+    Renderer::prepare_window_attributes();
+#elif defined(ME_RENDERER_OPENGL)
     // The OpenGL backend (Linux, or macOS when built to check it): the window carries the
     // GL context the renderer creates in init_with_window().
     const char* window_title = "Mirror's Edge (Native " ME_PLATFORM_TITLE " OpenGL)";
@@ -4076,6 +4106,11 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
         }
     }
+
+    // The touch controls (Android, or ME_TOUCH=1): a stick, a look area and buttons over the HUD.
+    TouchControls touch;
+    touch.set_active(TouchControls::should_activate());
+    if (touch.active()) std::cout << "[Touch] On-screen controls active" << std::endl;
 
     // Load active level & Cutscene Player
     LevelScene active_scene;
@@ -4559,6 +4594,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     auto last_time = std::chrono::high_resolution_clock::now();
 
     const auto trace_start = std::chrono::steady_clock::now();
+    // --exit-screenshot <path>: the frame the run ends on (--max-frames), as a PNG, for a look at
+    // a run on a machine without a screen (the Android emulator, a CI box).
+    auto save_exit_screenshot = [&]() {
+        if (exit_screenshot.empty()) return;
+        const fs::path parent = fs::path(exit_screenshot).parent_path();
+        if (!parent.empty()) ensure_dir(parent.string());
+        const bool ok = renderer.save_screenshot_png(exit_screenshot);
+        std::cout << "[Game] exit screenshot " << (ok ? "written: " : "FAILED: ") << exit_screenshot << std::endl;
+    };
     auto write_trace = [&](const PlayerTelemetry& t, bool in_frontend) {
         if (!trace_file.is_open()) return;
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - trace_start).count();
@@ -4610,6 +4654,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
     int prev_checkpoint = 0;
     int intro_handover_frames = 0;  // frames since a cutscene handed the player over
     bool prev_use_held = false;     // the Use key last frame, for its press edge (SeqEvent_TdUsed)
+    bool prev_touch_jump = false;   // the touch JUMP / RT buttons last frame, for their edges
+    bool prev_touch_reaction = false;
     bool level_intro_running = false;
     bool prev_falling_to_death = false;
     bool prev_fall_death_impact = false;
@@ -4655,12 +4701,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             while (SDL_PollEvent(&fev)) {
                 if (fev.type == SDL_QUIT) {
                     running = false;
+                } else if (fev.type == SDL_APP_WILLENTERBACKGROUND || fev.type == SDL_APP_DIDENTERFOREGROUND) {
+                    // Android: the app leaves / returns to the screen; no finger is still down.
+                    touch.reset();
+                } else if (fev.type == SDL_FINGERDOWN || fev.type == SDL_FINGERUP || fev.type == SDL_FINGERMOTION) {
+                    // The menus take the synthesized mouse events; the fingers are tracked so none
+                    // is left "down" when play resumes.
+                    touch.handle_event(fev, drawable_w, drawable_h);
                 } else if (fev.type == SDL_WINDOWEVENT) {
                     if (fev.window.event == SDL_WINDOWEVENT_RESIZED || fev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                         get_drawable_size(&drawable_w, &drawable_h);
                         renderer.resize(drawable_w, drawable_h);
                     }
                 } else if ((fev.type == SDL_KEYDOWN && fev.key.repeat == 0) || fev.type == SDL_KEYUP) {
+                    // Android's Back button is Escape to the menus.
+                    if (fev.key.keysym.sym == SDLK_AC_BACK) fev.key.keysym.sym = SDLK_ESCAPE;
                     if (fev.type == SDL_KEYDOWN && fev.key.keysym.sym == SDLK_F12 &&
                         frontend->scene_name() != "TdKeyMappings") {
                         auto t = std::time(nullptr);
@@ -4829,12 +4884,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             // (The level may have begun play above, from the menu, with its script asking for sounds at a
             // place: they start here, heard from where she stands. A menu has no running speed.)
             update_audio(dt, 0.0f, false);
+            (void)touch.consume(dt);  // the menu took the taps as clicks; no edge is kept for play
+            touch.publish_overlay(drawable_w, drawable_h, /*visible=*/false);
             renderer.render_frame(active_scene, controller.get_telemetry());
             write_trace(controller.get_telemetry(), /*in_frontend=*/frontend_active);
 
             ++frame_counter;
             if (max_frames > 0 && frame_counter >= max_frames) {
                 std::cout << "[Game] Reached max-frames limit (" << max_frames << "). Exiting cleanly." << std::endl;
+                save_exit_screenshot();
                 running = false;
             }
             continue;
@@ -4949,6 +5007,12 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
                 running = false;
+            } else if (ev.type == SDL_APP_WILLENTERBACKGROUND || ev.type == SDL_APP_DIDENTERFOREGROUND) {
+                // Android: the app leaves / returns to the screen. No finger is still down; the
+                // audio device is SDL's / OpenAL's to suspend.
+                touch.reset();
+            } else if (ev.type == SDL_FINGERDOWN || ev.type == SDL_FINGERUP || ev.type == SDL_FINGERMOTION) {
+                touch.handle_event(ev, drawable_w, drawable_h);
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_RESIZED || ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                     get_drawable_size(&drawable_w, &drawable_h);
@@ -4969,6 +5033,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                             renderer.set_selected_menu_row(row);
                         }
                     }
+                } else if (ev.motion.which == SDL_TOUCH_MOUSEID) {
+                    // A finger's synthesized mouse motion: the touch controls' look, not the mouse's.
                 } else if (SDL_GetRelativeMouseMode() == SDL_TRUE && !cutscene_player.is_playing()) {
                     float sens = 0.15f * (static_cast<float>(kSensPresets[sens_preset_idx]) / 100.0f);
                     input.look_yaw_delta += float(ev.motion.xrel) * sens;
@@ -5014,6 +5080,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                     } else if (ev.button.button == SDL_BUTTON_RIGHT) {
                         set_menu_active(false);
                     }
+                } else if (ev.button.which == SDL_TOUCH_MOUSEID) {
+                    // A tap (synthesized from a finger): the touch controls' business in play; only
+                    // the menus above take it as a click.
                 } else if (!renderer.is_menu_open() && SDL_GetRelativeMouseMode() != SDL_TRUE) {
                     SDL_SetRelativeMouseMode(SDL_TRUE);
                     SDL_ShowCursor(SDL_DISABLE);
@@ -5046,6 +5115,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 }
             } else if (ev.type == SDL_KEYDOWN && !ev.key.repeat) {
                 SDL_Keycode key = ev.key.keysym.sym;
+                if (key == SDLK_AC_BACK) key = SDLK_ESCAPE;  // Android's Back button
                 if (key == SDLK_ESCAPE) {
                     if (renderer.is_menu_open()) {
                         set_menu_active(false);
@@ -5190,7 +5260,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         Uint32 mouse_buttons = SDL_GetMouseState(nullptr, nullptr);
         if ((mouse_buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) && frame_counter >= 15 &&
             !renderer.is_menu_open() && !cutscene_player.is_playing() &&
-            SDL_GetRelativeMouseMode() == SDL_TRUE &&
+            SDL_GetRelativeMouseMode() == SDL_TRUE && !touch.active() &&  // (a finger is a left button to SDL)
             controller.get_weapon().equipped) {
             input.fire = true;
         }
@@ -5241,6 +5311,57 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_Y)) input.disarm = true;
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) input.reaction_time = true;
             if (SDL_GameControllerGetButton(game_controller, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) input.turn_180 = true;
+        }
+
+        // Touch controls (src/platform/touch_controls.hpp): the stick overrides the keys while a
+        // finger is on it, the look drag adds to the mouse's, the buttons are held like keys. MENU
+        // and a JUMP tap while a cutscene or hint card is up go through the keyboard paths above
+        // as Escape / Space presses, so the menus and skips behave as with a keyboard.
+        if (touch.active()) {
+            const TouchInput ti = touch.consume(dt);
+            auto push_key = [](SDL_Keycode sym, SDL_Scancode scancode) {
+                SDL_Event e{};
+                e.type = SDL_KEYDOWN;
+                e.key.state = SDL_PRESSED;
+                e.key.keysym.sym = sym;
+                e.key.keysym.scancode = scancode;
+                SDL_PushEvent(&e);
+                e.type = SDL_KEYUP;
+                e.key.state = SDL_RELEASED;
+                SDL_PushEvent(&e);
+            };
+            if (ti.stick_active) {
+                input.forward = ti.forward;
+                input.strafe = ti.strafe;
+            }
+            if (!renderer.is_menu_open() && !cutscene_player.is_playing()) {
+                const float sens = static_cast<float>(kSensPresets[sens_preset_idx]) / 100.0f;
+                input.look_yaw_delta += ti.look_yaw_delta_deg * sens;
+                input.look_pitch_delta += ti.look_pitch_delta_deg * sens;
+            }
+            const bool jump_edge = ti.jump && !prev_touch_jump;
+            prev_touch_jump = ti.jump;
+            if (jump_edge && (cutscene_player.is_playing() || splash_hint_open || renderer.is_menu_open())) {
+                push_key(SDLK_SPACE, SDL_SCANCODE_SPACE);
+            } else if (ti.jump && !suppress_space_until_release) {
+                input.jump = true;
+            }
+            if (ti.crouch) input.crouch = true;
+            if (ti.turn_180) input.turn_180 = true;
+            if (ti.attack) {
+                if (controller.get_weapon().equipped) input.fire = true;
+                else input.melee = true;
+            }
+            if (ti.action) {
+                input.disarm = true;
+                input.use = true;
+            }
+            if (ti.reaction && !prev_touch_reaction) {
+                reaction_toggled = !reaction_toggled;
+                input.reaction_time = reaction_toggled;
+            }
+            prev_touch_reaction = ti.reaction;
+            if (ti.menu_pressed_edge) push_key(SDLK_ESCAPE, SDL_SCANCODE_ESCAPE);
         }
 
         // SeqAct_TdDisablePlayerInput: the script holds the player's movement and look (a cutscene
@@ -5711,12 +5832,14 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Render frame
+        touch.publish_overlay(drawable_w, drawable_h, /*visible=*/!renderer.is_menu_open());
         renderer.render_frame(active_scene, tel);
         write_trace(tel, /*in_frontend=*/false);
 
         ++frame_counter;
         if (max_frames > 0 && frame_counter >= max_frames) {
             std::cout << "[Game] Reached max-frames limit (" << max_frames << "). Exiting cleanly." << std::endl;
+            save_exit_screenshot();
             running = false;
         }
     }
@@ -5735,6 +5858,23 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 // Main Entrypoint & CLI Parsing
 // -----------------------------------------------------------------------------
 int main(int argc, char* argv[]) {
+#if defined(__ANDROID__)
+    // Everything printed goes to logcat (tag "mirrorsedge"), and the working directory is the
+    // app's external files directory: `screenshots/` and the oracle's files land there, where
+    // `adb pull` reaches them (android/README.md).
+    me::install_android_log_redirect();
+    if (const char* external = SDL_AndroidGetExternalStoragePath()) {
+        std::error_code ec;
+        fs::create_directories(external, ec);
+        if (chdir(external) != 0) std::cerr << "[Android] chdir(" << external << ") failed" << std::endl;
+        else std::cout << "[Android] working directory: " << external << std::endl;
+    } else if (const char* internal = SDL_AndroidGetInternalStoragePath()) {
+        if (chdir(internal) == 0) std::cout << "[Android] working directory: " << internal << std::endl;
+    }
+    std::cout << "[Android] args:";
+    for (int i = 1; i < argc; ++i) std::cout << " " << argv[i];
+    std::cout << std::endl;
+#endif
     std::string game_root = me::default_game_root();
     bool verify_all = false;
     bool verify_script = false;  // the level script's stage of the oracle, alone
@@ -5750,6 +5890,7 @@ int main(int argc, char* argv[]) {
     int max_frames = 0;
     bool start_in_main_menu = true;
     std::string trace_path;
+    std::string exit_screenshot;  // --exit-screenshot <png>: the last frame when --max-frames ends the run
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -5804,6 +5945,8 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) max_frames = std::atoi(argv[++i]);
         } else if (arg == "--trace") {
             if (i + 1 < argc) trace_path = argv[++i];
+        } else if (arg == "--exit-screenshot") {
+            if (i + 1 < argc) exit_screenshot = argv[++i];
         } else if (arg == "--game-root") {
             if (i + 1 < argc) game_root = argv[++i];
         } else if (arg == "--help" || arg == "-h") {
@@ -5827,6 +5970,7 @@ int main(int argc, char* argv[]) {
                       << "  --level <path>           Load custom level package\n"
                       << "  --max-frames <N>         Exit after rendering N frames\n"
                       << "  --trace <file>           Write the camera and every sound played, one JSON line per frame\n"
+                      << "  --exit-screenshot <png>  With --max-frames: save the last frame there before exiting\n"
                       << "  --game-root <dir>        Set retail game assets directory (default: " << me::default_game_root() << ")\n"
                       << "  --help, -h               Show this help message\n";
             return 0;
@@ -5881,5 +6025,6 @@ int main(int argc, char* argv[]) {
         return run_oracle_verification(game_root, script_json);
     }
 
-    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu, trace_path);
+    return run_interactive_app(game_root, initial_chapter, custom_level, max_frames, start_in_main_menu, trace_path,
+                               exit_screenshot);
 }

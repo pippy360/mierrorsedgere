@@ -705,6 +705,90 @@
             draw_ui_text(verts, prompt, banner_x + 20.0f, h - 35.0f, 1.8f, ui_color(0.98f, 0.98f, 0.98f, 1.0f));
         }
         draw_script_text(verts, telemetry);
+        draw_touch_overlay(verts);
+    }
+
+    // The touch controls (src/platform/touch_controls.hpp), when the game loop published them for
+    // this frame: the move stick, the look area's buttons and MENU, as translucent shapes with
+    // the HUD font's labels. Nothing when they are inactive (every desktop build).
+    void draw_touch_overlay(std::vector<HUDVertex>& verts) {
+        const TouchOverlayState* overlay = touch_overlay_for_drawing();
+        if (!overlay) return;
+        // Laid out for the drawable; if the renderer's size differs (a resize this frame), scale.
+        const float sx = overlay->width > 0 ? float(width) / float(overlay->width) : 1.0f;
+        const float sy = overlay->height > 0 ? float(height) / float(overlay->height) : 1.0f;
+
+        auto push_tri = [&](float x0, float y0, float x1, float y1, float x2, float y2, UIColor c) {
+            HUDVertex v0 = {{x0, y0}, c};
+            HUDVertex v1 = {{x1, y1}, c};
+            HUDVertex v2 = {{x2, y2}, c};
+            verts.push_back(v0); verts.push_back(v1); verts.push_back(v2);
+        };
+        // A filled 16-gon, and a ring of the same (outer radius r, width t).
+        auto fill_disc = [&](float cx, float cy, float r, UIColor c) {
+            constexpr int n = 16;
+            for (int i = 0; i < n; ++i) {
+                const float a0 = 6.2831853f * float(i) / float(n);
+                const float a1 = 6.2831853f * float(i + 1) / float(n);
+                push_tri(cx, cy, cx + r * std::cos(a0), cy + r * std::sin(a0), cx + r * std::cos(a1), cy + r * std::sin(a1), c);
+            }
+        };
+        auto ring = [&](float cx, float cy, float r, float t, UIColor c) {
+            constexpr int n = 16;
+            const float ri = std::max(0.0f, r - t);
+            for (int i = 0; i < n; ++i) {
+                const float a0 = 6.2831853f * float(i) / float(n);
+                const float a1 = 6.2831853f * float(i + 1) / float(n);
+                const float c0 = std::cos(a0), s0 = std::sin(a0), c1 = std::cos(a1), s1 = std::sin(a1);
+                push_tri(cx + ri * c0, cy + ri * s0, cx + r * c0, cy + r * s0, cx + r * c1, cy + r * s1, c);
+                push_tri(cx + ri * c0, cy + ri * s0, cx + r * c1, cy + r * s1, cx + ri * c1, cy + ri * s1, c);
+            }
+        };
+        // The HUD font is 5x7 cells at `scale` pixels: centre a label in a shape.
+        auto label = [&](const std::string& text, float cx, float cy, float scale, UIColor c) {
+            const float tw = float(text.size()) * (5.0f * scale + 1.15f * scale) - 1.15f * scale;
+            draw_ui_text(verts, text, cx - tw * 0.5f, cy - 3.5f * scale, scale, c);
+        };
+
+        const UIColor fill_idle = ui_color(0.04f, 0.06f, 0.09f, 0.32f);
+        const UIColor fill_down = ui_color(0.902f, 0.078f, 0.078f, 0.55f);
+        const UIColor edge_idle = ui_color(1.0f, 1.0f, 1.0f, 0.55f);
+        const UIColor edge_down = ui_color(1.0f, 1.0f, 1.0f, 0.95f);
+        const UIColor text_col = ui_color(1.0f, 1.0f, 1.0f, 0.92f);
+        const float px = float(height) / 720.0f;  // a HUD pixel at this resolution
+
+        for (const TouchWidget& wd : overlay->widgets) {
+            const float x = wd.x * sx;
+            const float y = wd.y * sy;
+            if (wd.is_stick) {
+                const float r = wd.r * sy;
+                fill_disc(x, y, r, ui_color(0.04f, 0.06f, 0.09f, wd.pressed ? 0.30f : 0.18f));
+                ring(x, y, r, std::max(1.5f, 2.0f * px), wd.pressed ? edge_down : edge_idle);
+                const float kr = r * 0.38f;
+                fill_disc(wd.knob_x * sx, wd.knob_y * sy, kr,
+                          wd.pressed ? ui_color(0.902f, 0.078f, 0.078f, 0.75f) : ui_color(1.0f, 1.0f, 1.0f, 0.35f));
+                if (!wd.pressed) label(wd.label, x, y + r + 12.0f * px, 1.4f * px, ui_color(1.0f, 1.0f, 1.0f, 0.6f));
+                continue;
+            }
+            if (wd.shape == TouchWidget::Shape::Circle) {
+                const float r = wd.r * sy;
+                fill_disc(x, y, r, wd.pressed ? fill_down : fill_idle);
+                ring(x, y, r, std::max(1.5f, 2.0f * px), wd.pressed ? edge_down : edge_idle);
+                const float scale = std::clamp(r / (3.5f * float(std::max<size_t>(3, wd.label.size()))), 1.2f * px, 2.6f * px);
+                label(wd.label, x, y, scale, text_col);
+            } else {
+                const float w = wd.w * sx;
+                const float h = wd.h * sy;
+                draw_ui_quad(verts, x, y, w, h, wd.pressed ? fill_down : fill_idle);
+                const float t = std::max(1.5f, 2.0f * px);
+                const UIColor e = wd.pressed ? edge_down : edge_idle;
+                draw_ui_quad(verts, x, y, w, t, e);
+                draw_ui_quad(verts, x, y + h - t, w, t, e);
+                draw_ui_quad(verts, x, y, t, h, e);
+                draw_ui_quad(verts, x + w - t, y, t, h, e);
+                label(wd.label, x + w * 0.5f, y + h * 0.5f, std::clamp(h / 9.0f, 1.2f * px, 2.6f * px), text_col);
+            }
+        }
     }
 
     // Wraps `text` into lines of at most `max_chars` at the spaces.
