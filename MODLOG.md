@@ -2338,3 +2338,27 @@ platform glue, and a read-only memory profile (its findings are in `TODO.md`, "M
 - **Not run**: a level played through on the phone; the touch layout tuned with fingers; an Adreno device;
   background / foreground; a release build. The Metal backend's windowed screenshot path was found blank
   (pre-existing; `TODO.md`).
+
+---
+
+## 42. Native Vulkan 1.0 Renderer (`VulkanRenderer`) on Desktop & Android + Silent Testing (`agent/vulkan-renderer`, 2026-10-11)
+
+**Goal:** Implement a complete, standalone native **Vulkan 1.0+** renderer backend (`me::VulkanRenderer`, selectable via `ME_RENDERER_VULKAN=1` / `-DME_VULKAN=ON` / `-PmeVulkan=true`) that compiles all built-in and UE3 material shaders to SPIR-V across **Desktop** (`mirrorsedge_vulkan` on macOS via MoltenVK, Linux, Windows) and **Android** (`libmain.so`, 16 KiB page-aligned `arm64-v8a` APK, default backend on Android), with strict zero-audio muting (`--mute`, `ME_MUTE=1`, and `-no-audio`) across all automated and interactive test runs. Full architecture notes are in [`docs/VULKAN_PORT.md`](docs/VULKAN_PORT.md).
+
+### 42.1 Deliverables
+1. **`src/renderer/msl_to_glsl.{hpp,cpp}` (`GlslDialect::Vulkan`) & `src/tools/glsl_main.cpp` (`--vulkan`)**:
+   - Added `#version 450` SPIR-V code generation with explicit `layout(location = N)` stage inputs/outputs, explicit `layout(set = 0, binding = N, std140)` UBO blocks (`0..15` vertex, `16..31` fragment) and `layout(set = 0, binding = N)` combined image samplers (`32..79`), `uint(gl_VertexIndex)` for `[[vertex_id]]`, and Vulkan clip-space `gl_Position.y = -gl_Position.y;` with native `[0, w]` depth preserved.
+   - Offline compiler validation (`./build/me_glsl --vulkan`): **14/14 built-in shaders** and **5,573/5,573 UE3 material shaders** across all 11 campaign chapters compile via `glslc --target-env=vulkan1.0` with **0 errors and 0 warnings**.
+2. **`src/renderer/vk/vk_backend.{hpp,cpp}` & `src/renderer/vulkan_renderer.{hpp,cpp}`**:
+   - Full dynamic `VK_NO_PROTOTYPES` Vulkan 1.0 instance/surface/device/swapchain loader with `VK_KHR_portability_enumeration` / `VK_KHR_portability_subset`, per-swapchain-image render-done semaphores, automatic subresource layout tracking barriers, overflow-safe transient ring & staging buffers, CPU `bc_decode_rgba8` decompression for crisp cross-vendor mip chains down to `1x1`, cubemap & 2D shadow array views, and persistent disk/worker-pool SPIR-V compilation (`shaderc` on desktop; NDK's bundled `glslang` + `SPIRV` C interface on Android).
+   - Wired `mirrorsedge_vulkan` target + `./play_vulkan.sh` on desktop and default `ME_VULKAN=ON` (`-PmeVulkan=true`) in `android/app/build.gradle` with 16 KiB ELF `LOAD` page alignment (`-Wl,-z,max-page-size=16384`).
+3. **`src/main.cpp` & `android/run_emulator_smoke.sh`**:
+   - Added `--mute` CLI flag, `ME_MUTE=1` environment variable, automatic muting whenever `max_frames > 0 || !exit_screenshot.empty()`, `SDL_WINDOW_VULKAN` + `SDL_Vulkan_GetDrawableSize`, and `-no-audio -no-window -feature Vulkan -gpu host` in `android/run_emulator_smoke.sh`.
+
+### 42.2 Oracle & Device Verification
+- **Desktop (`Apple M5 Pro`, MoltenVK 1.0.357)**:
+  - `ME_MUTE=1 ./build/mirrorsedge_vulkan --verify-all`: **ALL 25 ORACLE STAGES PASS (`EXIT_CODE=0`)** across all chapters (`271/271` SP00 shaders, `380/380` SP01 shaders, `689/689` Escape shaders, `588/588` Mall shaders).
+  - Windowed 2560x1440 run (`ME_MUTE=1 ./build/mirrorsedge_vulkan --mute --chapter 0 --max-frames 20 --exit-screenshot /tmp/vk_windowed_rooftop.png`): clean swapchain presentation, crystal-sharp textures/shadows/HUD, clean shutdown.
+- **Android 17 (`sdk_gphone16k_arm64`, 16 KiB kernel page size)**:
+  - `llvm-readelf -l` verified `LOAD` alignment `0x4000` (16 KiB) on both `libmain.so` and `libSDL2.so`.
+  - `ME_FRAMES=40 ./run_emulator_smoke.sh /tmp/android_vk_smoke` (`-no-audio -no-window -feature Vulkan -gpu host`): **271/271 material shaders compiled**, **536/536 textures uploaded in 1.89s** (**5.5x faster** than OpenGL ES's 10.5s on the same AVD!), rendered 2400x1080 widescreen frame exported cleanly (`screenshots/android_smoke.png`), `[Game] Shutdown cleanly`.

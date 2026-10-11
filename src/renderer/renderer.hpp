@@ -7,7 +7,12 @@
 // ME_RENDERER_OPENGL selects the OpenGL backend explicitly; it is the default on
 // Linux and can be built on macOS too (CMake option ME_OPENGL) to check it there.
 
-#if defined(ME_RENDERER_OPENGL) || (!defined(_WIN32) && !defined(__APPLE__))
+#if defined(ME_RENDERER_VULKAN)
+#include "vulkan_renderer.hpp"
+namespace me {
+using Renderer = VulkanRenderer;
+}
+#elif defined(ME_RENDERER_OPENGL) || (!defined(_WIN32) && !defined(__APPLE__))
 #ifndef ME_RENDERER_OPENGL
 #define ME_RENDERER_OPENGL 1
 #endif

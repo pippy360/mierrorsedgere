@@ -591,7 +591,9 @@ struct MslToGlsl::Impl {
     int version = 410;
 
     [[nodiscard]] bool es() const { return dialect == GlslDialect::ES; }
+    [[nodiscard]] bool vulkan() const { return dialect == GlslDialect::Vulkan; }
     [[nodiscard]] std::string header() const {
+        if (vulkan()) return "#version " + std::to_string(version) + "\n";
         if (!es()) return kDesktopHeader;
         return "#version " + std::to_string(version) + " es\n" + kEsPrecision;
     }
@@ -1270,7 +1272,7 @@ struct MslToGlsl::Impl {
                 call_args.push_back("me_in");
             } else if (p.attr == "vertex_id") {
                 args.push_back("uint " + name);
-                call_args.push_back("uint(gl_VertexID)");
+                call_args.push_back(vulkan() ? "uint(gl_VertexIndex)" : "uint(gl_VertexID)");
             } else if (p.attr == "front_facing") {
                 args.push_back("bool " + name);
                 call_args.push_back("gl_FrontFacing");
@@ -1295,7 +1297,13 @@ struct MslToGlsl::Impl {
                 // argument's name through a #define that lasts for that function only.
                 const std::string block = std::string(stage) + "B" + std::to_string(p.attr_index);
                 const std::string member = block + "_" + name;
-                globals << "layout(std140) uniform " << block << " { " << map_type(p.type) << " " << member;
+                if (vulkan()) {
+                    const int binding = (vertex ? kVulkanVsUboBindingBase : kVulkanFsUboBindingBase) + p.attr_index;
+                    globals << "layout(set = 0, binding = " << binding << ", std140) uniform " << block << " { "
+                            << map_type(p.type) << " " << member;
+                } else {
+                    globals << "layout(std140) uniform " << block << " { " << map_type(p.type) << " " << member;
+                }
                 if (p.is_ptr) globals << "[" << std::max(1, pointer_array_size) << "]";
                 globals << "; };\n";
                 block_aliases.emplace_back(name, member);
@@ -1331,10 +1339,21 @@ struct MslToGlsl::Impl {
         const std::string body = translate_body(f.body, scope, table);
         for (size_t i = 0; i < units.units.size(); ++i) {
             const GlslSamplerUnit& u = units.units[i];
+            if (vulkan()) {
+                globals << "layout(set = 0, binding = " << (kVulkanSamplerBindingBase + static_cast<int>(i)) << ") ";
+            }
             globals << "uniform " << sampler_type(units.textures.at(units.unit_tex[i]).second, u.shadow) << " " << u.uniform
                     << ";\n";
         }
         out.samplers = units.units;
+
+        auto varying_slot_count = [](const Member& m) -> int {
+            if (m.array.size() >= 3 && m.array.front() == '[' && m.array.back() == ']') {
+                const int n = std::atoi(m.array.c_str() + 1);
+                if (n > 0) return n;
+            }
+            return 1;
+        };
 
         // Attributes, varyings and the colour output.
         std::ostringstream io;
@@ -1361,14 +1380,17 @@ struct MslToGlsl::Impl {
             }
         } else if (stage_in) {
             main << "    " << stage_in->name << " me_in;\n";
+            int var_loc = 0;
             for (const Member& m : stage_in->members) {
                 if (m.attr == "position") {
                     main << "    me_in." << rename_ident(m.name) << " = gl_FragCoord;\n";
                     continue;
                 }
                 const bool flat = m.attr == "flat" || is_integer_type(m.type);
+                if (vulkan()) io << "layout(location = " << var_loc << ") ";
                 io << (flat ? "flat in " : "in ") << map_type(m.type) << " v_" << m.name << m.array << ";\n";
                 main << "    me_in." << rename_ident(m.name) << " = v_" << m.name << ";\n";
+                var_loc += varying_slot_count(m);
             }
         }
 
@@ -1379,23 +1401,29 @@ struct MslToGlsl::Impl {
             if (is_struct(f.ret)) {
                 const Struct& s = unit.structs[struct_index.at(f.ret)];
                 main << "    " << s.name << " me_out = " << call << ";\n";
+                int var_loc = 0;
                 for (const Member& m : s.members) {
                     if (m.attr == "position") {
                         main << "    gl_Position = me_out." << rename_ident(m.name) << ";\n";
                         continue;
                     }
                     const bool flat = m.attr == "flat" || is_integer_type(m.type);
+                    if (vulkan()) io << "layout(location = " << var_loc << ") ";
                     io << (flat ? "flat out " : "out ") << map_type(m.type) << " v_" << m.name << m.array << ";\n";
                     main << "    v_" << m.name << " = me_out." << rename_ident(m.name) << ";\n";
+                    var_loc += varying_slot_count(m);
                 }
             } else if (map_type(f.ret) == "vec4") {
                 main << "    gl_Position = " << call << ";\n";
             } else {
                 throw TranslateError(f.name + " must return a struct or float4");
             }
-            // Metal clip space (y up, z in [0, 1], rows top-down) to OpenGL's: see msl_to_glsl.hpp.
+            // Metal clip space (y up, z in [0, 1], rows top-down): Vulkan has y down, z in [0, 1];
+            // OpenGL has y up (rows bottom-up), z in [-1, 1].
             main << "    gl_Position.y = -gl_Position.y;\n";
-            main << "    gl_Position.z = 2.0 * gl_Position.z - gl_Position.w;\n";
+            if (!vulkan()) {
+                main << "    gl_Position.z = 2.0 * gl_Position.z - gl_Position.w;\n";
+            }
         } else {
             const std::string ret = map_type(f.ret);
             if (ret == "vec4") {
@@ -1475,6 +1503,8 @@ void MslToGlsl::set_dialect(GlslDialect dialect, int version) {
     impl_->dialect = dialect;
     if (dialect == GlslDialect::ES) {
         impl_->version = (version == 310 || version == 320) ? version : 300;
+    } else if (dialect == GlslDialect::Vulkan) {
+        impl_->version = version > 0 ? version : 450;
     } else {
         impl_->version = version > 0 ? version : 410;
     }
