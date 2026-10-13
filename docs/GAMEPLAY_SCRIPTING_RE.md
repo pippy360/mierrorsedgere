@@ -273,3 +273,125 @@ Not as the game: the damage classes are told apart as bullet, barge and blow onl
 another subclass is not met); a punch or kick on the ground deals none; the glass has no physics (no
 shards beyond the particle effects); a door the port opens itself (`LevelScene::barge_doors`) does not run
 its sequence.
+
+## 9. World Matinees: the actors they move
+
+The story maps' scripts hold 1,191 `SeqAct_Interp`s whose Matinee has a movement track (`InterpTrackMove`)
+bound to a placed actor in the packages the port loads. Before this section the port played those tracks
+only for the lifts and the barge doors, which have state machines of their own; every other `InterpActor`
+stayed where the level placed it. Research: the main checkout's ignored `build/re/open2/movers/`
+(`notes.md`, with a second reader's verdicts in `verify.md`, which overrides it).
+
+**Who moves the actor.** A movement track does nothing when its Matinee is updated (`UInterpTrackMove`'s
+`UpdateTrack` is the empty base function). The actor moves itself, once a tick, while its `Physics` is
+`PHYS_Interpolating` (an `InterpActor`'s default): `AActor::physInterpolating` (0x00ef9870) looks through
+the actor's `LatentActions` for a `SeqAct_Interp` with a group for it (`FindInterpMoveTrack`, 0x00e51960),
+takes that group's first movement track and calls `AActor::MoveWithInterpMoveTrack` (0x00f04130). That asks
+the track where the actor is at the Matinee's current `Position` and goes there with `UWorld::MoveActor`
+(0x00c12050): a move that is placed, not swept. For an actor that collides it first asks
+`UWorld::CheckEncroachment` (0x00c12f50) about whoever is in the way. With no Matinee on it an actor stays
+where the last one left it; nothing puts it back until the level is loaded again (a restart reloads the
+script levels: `TdSPStoryGame.ResetLevel` sets `WorldInfo.bReloadScriptLevels`).
+
+**Where the track puts it** (`UInterpTrackMove::GetLocationAtTime`, 0x00e41340). The keys at a time
+(`GetKeyTransformAtTime`, 0x00e41080) are a position from `PosTrack` and a rotation from `EulerTrack`,
+both `FInterpCurveVector`s evaluated as 0x00e40ae0 does (linear, constant, or a cubic whose tangents are per
+unit of time; the cooked curves never set `InterpMethod`). The Euler angles go through
+`FRotator::MakeFromEuler` (0x0116f040: degrees to rotation units, truncated); a track with
+`bUseQuatInterpolation` turns by the shortest way between two keys instead. In the port's column-vector
+matrices:
+
+```
+World(t) = Base * Initial * Rel(t)                 IMF_RelativeToInitial
+World(t) = Base * Rel(t)                           IMF_World (the default when MoveFrame is not saved)
+Initial  = inverse(Base) * Actor * inverse(Rel(T0))   UInterpTrackInstMove::CalcInitialTransform, 0x00e51ad0
+```
+
+`T0` is the Matinee's `Position` when it is initialised (0 when a rewind resets the transforms), `Actor`
+where the actor stands at that moment and `Base` the transform of what it is attached to
+(`GetBaseMatrix`, 0x00e3c6d0; the identity for nothing). A relative track therefore goes on from wherever
+its actor stands, with the key transform of that moment divided out: it is "placed pose plus key" only for
+a Matinee first played from 0 with an identity first key (New Eden's lift hull has a first key far from
+zero).
+
+**Playback** (`USeqAct_Interp`):
+- `Play` (0x00e51d70): with `bForceStartPos` a Matinee that is not playing jumps to `ForceStartPosition`;
+  with `bRewindOnPlay` it goes back to its start (when not playing, or playing with
+  `bRewindIfAlreadyPlaying`), its movement tracks first taking where their actors stand as the new start
+  if `bNoResetOnRewind`. With neither it goes on from its `Position`: one that ran to its end ends again
+  at once. `Reverse` plays it backwards, `Stop` clears `bIsPlaying` and `bPaused` and keeps the
+  `Position`, `Pause` holds it, `Change Dir` turns it round.
+- `StepInterp` (0x00e51dd0): the `Position` moves by `dt * PlayRate`; the event keys passed fire their
+  outputs (`(from, to]` forwards, `[to, from)` backwards); past the end (or the start, backwards) a looping
+  Matinee goes round and any other stops there. `PlayRate` and `ForceStartPosition` come from the property
+  or a linked float variable; a `SeqVar_RandomFloat` is drawn anew between its `Min` and `Max` each time it
+  is read (stock Unreal Engine 3, not read in this executable; `SeqAct_Delay` reads it the same way).
+- `SetPosition(InterpLength, bJump)` (0x00e4f960), a cutscene's skip: the event keys in between do not
+  fire, the actors are put at the end at once, and the op fires `Completed`.
+- `DeActivated` (0x00e44f80): output 1 (`Aborted`, the end of a reverse play) when the `Position` is at the
+  start, output 0 (`Completed`) when it is at the end, neither for a Matinee stopped part way. An op that
+  never built its instances (a `Stop` or `Pause` on an idle Matinee) fires nothing. The op leaves its
+  actors' `LatentActions`; they stay where the last update left them.
+
+**Attached actors** go with their base (`UWorld::MoveActor` moves an actor's `Attached`); a track on an
+attached actor is relative to its base's transform.
+
+**The player and a mover.** She is based on what she stands on (`Pawn.Base`) and goes with it, turned with
+it when it turns (her view is not turned: whether the game turns it was not read). A mover that comes at her
+asks `CheckEncroachment`: first she is pushed (`bPushedByEncroachers`, `Actor`'s default, which the pawn
+keeps) by the mover's own move, plus, when it turned, 1.5 times the way her place is carried by the turn,
+slid along the level; a pawn still in it is tried once more, a cylinder's radius away from its surface and a
+tenth of that up. Then `InterpActor.EncroachingOn` decides: only a mover that moves towards her (or one that
+only turns) says anything; a falling pawn on a rising mover is set on top of it (`bLandingPawn`) and the
+mover goes on; otherwise a mover with `bStopOnEncroach` stops where it was. The `SeqEvent_Mover` events this
+tells are not run.
+
+**How the port does it.**
+
+| Where | What |
+|---|---|
+| `src/game/matinee_move.hpp` | The track evaluation above: the curve, `MakeFromEuler`, the quaternion path, `CalcInitialTransform`, `GetLocationAtTime`. |
+| `src/game/level_script.cpp` | The move tracks are read with their Matinee; `Play`, `Reverse`, `Stop`, `Pause`, `Change Dir`, looping, rewind, forced start and the outputs by the rules above; the host's `interp_*` callbacks tell the movers. |
+| `src/game/script_movers.hpp` | `update_script_movers`: every mover's physics tick, once a frame after the script's update, bases before what they carry; `bind_scene_movers`, `reset_script_movers`. |
+| `src/assets/upk_loader.cpp` | `assign_script_movers`: `LevelScene::movers` (the placed `InterpActor`s a script's movement track is bound to, and what is attached to them) and `LevelScene::matinee_moves`; `build_script_mover_geometry`: each mover's triangles in a collision world of its own, where the level placed it; `release_script_doors`. |
+| `src/physics/parkour_controller.cpp` | Every query visits the movers (taken there by the inverse of the mover's `delta`, brought back by it); `carried_by_mover`, `encroached_by_mover`. |
+| renderers (Direct3D 11, OpenGL, Metal, Vulkan), `light_environment.hpp`, `impact_effects.hpp` | A mover's mesh is drawn with its `delta`; its light environment, its decals and the bullet holes on it go with it. |
+
+The port's own choices: a lift's parts keep the port's lift machine (`LevelScene::elevators`), which the
+script's Matinees do not move (`settle_lifts_for_restart` stays for them). A door she barges (one the
+script listens on for damage), one a player's cutscene swings, and a door-like actor no Matinee touches
+stay `LevelScene::barge_doors`; a door only Matinees move (Flight's office door, opened by a remote event)
+becomes one of the script's movers. No actor is moved by both. Only `InterpActor`s and what is attached to
+them are moved: skeletal mesh actors, emitters, lights and triggers that a track names stay where they are.
+The same `InterpActor` cooked into two packages (a `_Slc` and a `_Spt`, as the lifts are) is one mover.
+
+**Checked** (oracle stage 29, `--verify-movers`, which then counts the Matinees by chapter;
+`ME_MOVER_DEBUG=1` lists them):
+- *Evaluation:* Flight's office door turns from yaw 270 to 140.63 and its place moves 0.002; New Eden's lift
+  hull is off by 0.000 at 0 s and 1279.999 up at 10 s; Ropeburn's first train ends at y -34095.973;
+  Pirandello Kruger's construction lift (world-framed, four keys) ends 0.003 from its start and is 1648.001
+  away at its furthest; a turn from 0 to 270 is at 135 half way by its angles, -45 by quaternion.
+- *Playback:* the end reached after 16 ticks of 0.01 s and `Completed` the tick after; played again with no
+  rewind, it ends at once; reversed to 0 and `Aborted` there; `Stop` at 0.05 fires nothing; a `Stop` on an
+  idle Matinee is silent; paused at 0.07 and resumed; a loop went round twice in 50 s and still plays; a
+  forced start at 3.0 with rate 2.0, played again by its own `Completed`, rewinds; a linked `PlayRate`
+  drew 1.048 from 1..2.
+- *The door:* shut, it stands on the line and a walk at it gets 35.7 short; open (-129.37 degrees about its
+  hinge, 0.002 off), a walk gets 841.9 past; shutting on her pushes her 81.4 and the door stays at 0 degrees
+  (`bStopOnEncroach`).
+- *Riding:* Heat's window-cleaner gondola goes 1352.003 uu and she 1352.003 with it, standing on it all the
+  way; reversed it is back at its start. Jacknife's girder starts 4886.6 up (`ForceStartPosition`) and rises
+  880.3 in 5 s with her on it.
+- *Census:* 835 of the 1,191 Matinees move the script's movers, 193 only what the port's lifts and doors
+  move, 163 only actors that are not moved (skeletal mesh actors, a few emitters, triggers and static mesh
+  actors); of the 463 with something that blocks, 278 are moved and 185 are the lifts' and doors'. 1,204
+  movers, 389 with collision.
+- *Restarts* (`--verify-respawn` with the level's script run as a restart runs it): 202 places, 190 stand,
+  7 in a lift's cab, 2 fall and live, 3 known, 0 failed. Jacknife's `construction` (on the girder its events
+  raise) and Ropeburn's `Train_Ride_End` (on the train) left the known list; The Shard's `Scraper_Start`
+  (140 under the plaza's floor) is the one place still known for that reason.
+
+**Not done:** the event and sound keys at Time 0 still do not fire (the key test is `(from, to]` from a
+`Position` that starts at 0: `TODO.md`); a world Matinee's sound track and its other tracks (float,
+vector, colour, visibility, anim control) do nothing; `SeqEvent_Mover` is not run; a skeletal mesh actor a
+track names is not moved; a based pawn's view does not turn with its base.
