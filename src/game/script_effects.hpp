@@ -25,6 +25,7 @@
 #include "../physics/collision_world.hpp"
 #include "impact_effects.hpp"
 #include "level_script.hpp"
+#include "script_movers.hpp"
 
 #include <cmath>
 #include <string>
@@ -36,15 +37,28 @@ inline bool is_script_actor(const LevelActor& a, const ScriptActor& sa) {
     return a.unique_name == sa.name && to_lower(a.source_package) == to_lower(sa.package);
 }
 
-// What an actor collides with, in its flags and in the collision world (SeqAct_ChangeCollision).
+// The actor that is drawn and collided with for actor `index`: itself, or, for the second copy of
+// a mover cooked into another package, the mover's own actor.
+inline size_t script_actor_index(const LevelScene& scene, size_t index) {
+    const LevelActor& a = scene.actors[index];
+    if (!a.mover_copy || a.mover < 0 || static_cast<size_t>(a.mover) >= scene.movers.size()) return index;
+    return static_cast<size_t>(scene.movers[static_cast<size_t>(a.mover)].actor_index);
+}
+
+// What an actor collides with, in its flags and in the collision world (SeqAct_ChangeCollision):
+// the level's, or its own for an actor the script's Matinees move.
 inline void set_actor_collision(LevelScene& scene, size_t index, bool collidable, bool blocks_traces) {
     LevelActor& a = scene.actors[index];
     a.is_collidable = collidable;
     a.blocks_traces = blocks_traces;
-    if (!scene.collision) return;
     uint8_t channels = 0;
     if (a.is_collidable) channels |= COLL_BlockNonZeroExtent;
     if (a.blocks_traces) channels |= COLL_BlockZeroExtent;
+    if (a.mover >= 0 && static_cast<size_t>(a.mover) < scene.movers.size()) {
+        if (CollisionWorld* own = scene.movers[static_cast<size_t>(a.mover)].collision.get()) own->set_actor_channels(static_cast<int32_t>(index), channels);
+        return;
+    }
+    if (!scene.collision) return;
     scene.collision->set_actor_channels(static_cast<int32_t>(index), channels);
 }
 
@@ -62,6 +76,7 @@ inline void restore_script_actors(LevelScene& scene) {
     scene.dynamic_decals.clear();
     scene.spawned_effects.clear();
     scene.actor_damage.clear();
+    reset_script_movers(scene);  // every actor a Matinee moved is where the level places it
 }
 
 // Gives `host` the callbacks that act on `scene`, which has to outlive the host.
@@ -111,14 +126,15 @@ inline void bind_scene_effects(ScriptHost& host, LevelScene& scene) {
     };
     host.change_collision = [s, set_collision](const ScriptActor& sa, bool collide_actors, bool block_actors) {
         for (size_t i = 0; i < s->actors.size(); ++i) {
-            if (is_script_actor(s->actors[i], sa)) set_collision(i, collide_actors, block_actors);
+            if (is_script_actor(s->actors[i], sa)) set_collision(script_actor_index(*s, i), collide_actors, block_actors);
         }
     };
     // SeqAct_ToggleHidden / SeqAct_Destroy on a mesh: 0 hide, 1 show, 2 the other way, 3 destroyed.
     host.hide_actor = [s, set_collision](const ScriptActor& sa, int action) {
-        for (size_t i = 0; i < s->actors.size(); ++i) {
+        for (size_t k = 0; k < s->actors.size(); ++k) {
+            if (!is_script_actor(s->actors[k], sa)) continue;
+            const size_t i = script_actor_index(*s, k);
             LevelActor& a = s->actors[i];
-            if (!is_script_actor(a, sa)) continue;
             const bool hide = action == 0 || action == 3 || (action == 2 && !a.is_hidden);
             a.is_hidden = hide;
             if (action == 3) set_collision(i, false, false);
@@ -135,6 +151,8 @@ inline void bind_scene_effects(ScriptHost& host, LevelScene& scene) {
             }
         }
     };
+    // Its Matinees' movement tracks (game/script_movers.hpp).
+    bind_scene_movers(host, scene);
 }
 
 // Tells the script of the damage the scene's actors took since the last call (the bullets', the

@@ -287,6 +287,19 @@ struct Mat4 {
             m[2] * v.x + m[6] * v.y + m[10] * v.z
         );
     }
+
+    // The inverse of a rotation and a translation (no scale): the rotation transposed.
+    [[nodiscard]] Mat4 rigid_inverse() const {
+        Mat4 r = identity();
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) r.m[col * 4 + row] = m[row * 4 + col];
+        }
+        const Vec3 t = r.transform_vector(Vec3(m[12], m[13], m[14]));
+        r.m[12] = -t.x;
+        r.m[13] = -t.y;
+        r.m[14] = -t.z;
+        return r;
+    }
 };
 
 // -----------------------------------------------------------------------------
@@ -561,6 +574,9 @@ struct MeshBuffer {
     int32_t elevator = -1;
     int32_t elevator_part = -1;
     int32_t barge_door = -1;
+    // An actor a Matinee of the level's script moves (LevelScene::movers[mover]): vertices where the
+    // level placed it, drawn with that mover's `delta`.
+    int32_t mover = -1;
     // A dynamic object (a lift's part, a door, an InterpActor or KActor the port leaves in place):
     // never light-mapped, lit as `lighting` says.
     bool dynamic_lit = false;
@@ -822,6 +838,13 @@ struct LevelActor {
     bool is_blocking_volume = false;
     int32_t elevator = -1;       // >= 0: moving part of LevelScene::elevators[elevator]
     int32_t barge_door = -1;     // >= 0: hinged door part of LevelScene::barge_doors[barge_door]
+    // >= 0: a Matinee of the level's script moves it (LevelScene::movers[mover]). An actor has one of
+    // the three at most: a lift's part and a door she barges are moved by the port's own machines.
+    int32_t mover = -1;
+    // The same InterpActor cooked into a second package (as a lift's is): the first one's mover
+    // stands for both, and this one is neither drawn nor collided with.
+    bool mover_copy = false;
+    bool stop_on_encroach = true;  // InterpActor.bStopOnEncroach
     bool is_runner_vision = false;
     bool is_checkpoint = false;
     bool is_trigger = false;
@@ -1348,6 +1371,66 @@ struct BargeDoorInstance {
     bool barged = false;                   // True when slammed open via MOVE_Barge
     std::vector<DoorPart> parts;           // Door leaf mesh, attached closer bar, and hidden doorway slab
     Mat4 model_matrix = Mat4::identity();  // T(hinge_pos) * Rz(open_angle_rad) * T(-hinge_pos)
+};
+
+// -----------------------------------------------------------------------------
+// What a Matinee of the level's script moves (SeqAct_Interp + InterpTrackMove on a placed actor;
+// docs/GAMEPLAY_SCRIPTING_RE.md section 9, src/game/matinee_move.hpp, src/game/script_movers.hpp)
+// -----------------------------------------------------------------------------
+// One key of a move track's PosTrack or EulerTrack (an FInterpCurveVector point).
+struct MoveCurveKey {
+    float time = 0.0f;  // InVal
+    Vec3 value{0.0f, 0.0f, 0.0f};
+    Vec3 arrive{0.0f, 0.0f, 0.0f};
+    Vec3 leave{0.0f, 0.0f, 0.0f};
+    // EInterpCurveMode as the executable reads it: 0 CIM_Linear, 2 CIM_Constant, anything else a
+    // cubic with the stored tangents (auto, user and break evaluate alike).
+    uint8_t mode = 0;
+};
+
+// An InterpTrackMove.
+struct MoveTrack {
+    std::vector<MoveCurveKey> pos;
+    std::vector<MoveCurveKey> euler;  // roll, pitch, yaw in degrees
+    bool relative = false;            // IMF_RelativeToInitial; IMF_World is the class's default
+    bool quat = false;                // bUseQuatInterpolation
+};
+
+// A placed InterpActor that one or more Matinees move. Its triangles (drawn and collided with) stay
+// where the level placed it; `delta` carries them to where it is now. Matrices are column-vector, as
+// all of the port's are: a point goes through the rightmost first.
+struct ScriptMover {
+    int32_t actor_index = -1;     // LevelScene::actors
+    int32_t mesh_index = -1;      // its MeshBuffer, -1 when it is never drawn
+    int32_t base = -1;            // the mover its Actor.Base is, -1 none (or one that never moves)
+    Mat4 base_static = Mat4::identity(); // the transform of a Base that never moves; the identity with no Base
+    Mat4 placed = Mat4::identity();      // FRotationTranslationMatrix(Rotation, Location) as cooked
+    Mat4 placed_inv = Mat4::identity();
+    Mat4 actor_tm = Mat4::identity();    // where the actor is now
+    Mat4 rel_tm = Mat4::identity();      // ...in its base's frame (RelativeLocation, RelativeRotation)
+    Mat4 delta = Mat4::identity();       // actor_tm * inverse(placed): the model matrix and the collision frame
+    Mat4 delta_inv = Mat4::identity();
+    bool moved = false;           // delta is not the identity
+    bool pure_yaw = true;         // ...and turns about the vertical only (a box query stays a box)
+    Vec3 velocity{0.0f, 0.0f, 0.0f};     // Actor.Velocity: the last move over its time
+    bool stop_on_encroach = true;        // InterpActor.bStopOnEncroach
+    bool blocking_suspended = false;     // CheckEncroachment clears bBlockActors while it pushes the pawn
+    // Triangles where the level placed it; null for one that collides with nothing and never will.
+    std::shared_ptr<CollisionWorld> collision;
+    AABB local_box;               // their bounds there
+    AABB world_box;               // ...and where the mover is now
+    // Actor.LatentActions: the Matinee groups playing on it (LevelScene::matinee_moves), first activated
+    // first. The first one moves it (AActor::physInterpolating, FindInterpMoveTrack).
+    std::vector<int32_t> latent;
+};
+
+// One movement track of one SeqAct_Interp, bound to one mover (a UInterpTrackInstMove).
+struct MatineeMove {
+    int32_t node = -1;   // ScriptGraph::nodes: the SeqAct_Interp
+    int32_t move = -1;   // ScriptMatinee::moves of its Matinee
+    int32_t mover = -1;  // LevelScene::movers
+    Mat4 initial = Mat4::identity();  // InitialTM, from the op's InitInterp until it deactivates
+    float position = 0.0f;            // the op's Position as the script last set it
 };
 
 // -----------------------------------------------------------------------------
@@ -1888,7 +1971,8 @@ struct DynamicDecal {
     float life = 30.0f;  // DecalManager.DecalLifeSpan
     std::vector<Vertex> vertices;
     // What it lies on, when that moves (the decal is attached to its HitComponent's actor): 0 the
-    // level, 1 a part of a lift (elevators[mover].parts[part]), 2 a door (barge_doors[mover]).
+    // level, 1 a part of a lift (elevators[mover].parts[part]), 2 a door (barge_doors[mover]), 3 an
+    // actor the script's Matinees move (movers[mover]).
     // The vertices are then in the mover's place as the level has it, and go with it when drawn.
     uint8_t mover_kind = 0;
     int32_t mover = -1;
@@ -2037,6 +2121,9 @@ struct LevelScene {
     std::vector<std::string> loaded_sublevel_packages;
     std::vector<ElevatorInstance> elevators;
     std::vector<BargeDoorInstance> barge_doors;
+    // The actors the script's Matinees move, and each movement track bound to one of them.
+    std::vector<ScriptMover> movers;
+    std::vector<MatineeMove> matinee_moves;
     std::vector<SceneCaptureReflectInfo> reflection_captures;
     std::vector<ReflectionVolumeInfo> reflection_volumes;
     std::vector<SoundClip> sounds;
@@ -2046,6 +2133,17 @@ struct LevelScene {
     PostProcessSettings post;
     std::vector<HeightFogLayer> height_fog;  // highest first, at most four
 };
+
+// Whether a scene mesh is moving geometry, which a renderer keeps out of what it draws once and
+// keeps (the far shadow cascade): a lift's part, a door, or an actor of the script's that a Matinee
+// has moved or is playing on. (One that only starts to move later leaves its old shadow in a kept
+// cascade until that is drawn again.)
+inline bool scene_mesh_moves(const LevelScene& scene, const MeshBuffer& mb) {
+    if (mb.elevator >= 0 || mb.barge_door >= 0) return true;
+    if (mb.mover < 0 || static_cast<size_t>(mb.mover) >= scene.movers.size()) return false;
+    const ScriptMover& m = scene.movers[static_cast<size_t>(mb.mover)];
+    return m.moved || !m.latent.empty();
+}
 
 } // namespace me
 

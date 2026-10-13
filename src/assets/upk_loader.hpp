@@ -245,6 +245,26 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
 // (or an Elevator's mid-shaft SeqAct_MultiLevelStreaming transition).
 bool stream_level_to_checkpoint(const std::string& game_root, LevelScene& scene, int checkpoint_idx);
 
+// How the level script's movement tracks fare in a loaded level, for the oracle's report: of the
+// SeqAct_Interp ops that have a track bound to a placed actor (cameras aside), how many move one of
+// LevelScene::movers, how many are bound only to what the port's own machines move (a lift's part,
+// a door she barges), and how many only to actors of a class that is not moved; and the same of
+// those with a bound InterpActor that blocks her.
+struct ScriptMoverCensus {
+    int matinees = 0;
+    int moved = 0;
+    int machines = 0;
+    int other = 0;
+    int blocking = 0;
+    int blocking_moved = 0;
+    int blocking_machines = 0;
+    std::vector<std::pair<std::string, int>> other_classes;  // bindings by class
+    std::vector<std::string> blocking_unmoved;               // "package:op" of each blocking one that nothing moves
+    std::vector<std::pair<std::string, int>> by_package;     // the ops counted, by package stem
+    std::vector<std::string> counted;                        // each as "package:op:m|x|o" (moved, the machines', other)
+};
+ScriptMoverCensus script_mover_census(const LevelScene& scene);
+
 // The saved properties of a script class's default object ("Default__Class") and of the defaults it
 // inherits, nearest first: what a cooked object that saves only its differences falls back on.
 // Empty before a level has been loaded, or for a class the script packages do not have.

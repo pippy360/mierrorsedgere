@@ -1649,6 +1649,13 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 std::memcpy(&uniforms.model, door_model.m, sizeof(float) * 16);
                 return true;
             }
+            // An actor the script's Matinees move: from where the level placed it to where it is now.
+            if (mb.mover >= 0 && static_cast<size_t>(mb.mover) < active_scene.movers.size() &&
+                active_scene.movers[static_cast<size_t>(mb.mover)].moved) {
+                const Mat4& mover_model = active_scene.movers[static_cast<size_t>(mb.mover)].delta;
+                std::memcpy(&uniforms.model, mover_model.m, sizeof(float) * 16);
+                return true;
+            }
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
             return false;
         };
@@ -1686,7 +1693,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     const auto& mesh = active_scene.meshes[i];
                     if (mesh.vertices.empty() || !impl_->cached_mesh_buffers[i]) continue;
                     if (mesh_hidden(mesh)) continue;
-                    if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
+                    if (!dynamic_casters && scene_mesh_moves(active_scene, mesh)) continue;
                     if (mesh.is_decal) continue;
                     bool moved = apply_scene_mesh_model(i);
                     if (moved || sh_prev_moved) [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];

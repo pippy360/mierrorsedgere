@@ -549,6 +549,8 @@ public:
             }
         } else if (mb.barge_door >= 0 && static_cast<size_t>(mb.barge_door) < scene.barge_doors.size()) {
             origin = scene.barge_doors[static_cast<size_t>(mb.barge_door)].model_matrix.transform_point(origin);
+        } else if (mb.mover >= 0 && static_cast<size_t>(mb.mover) < scene.movers.size()) {
+            origin = scene.movers[static_cast<size_t>(mb.mover)].delta.transform_point(origin);
         }
     }
 

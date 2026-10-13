@@ -80,6 +80,13 @@ struct ScriptMatinee {
         int action = 0;
     };
     std::vector<Toggle> toggles;
+    // InterpTrackMove of each group that has one. The actors it moves are those linked to the
+    // SeqAct_Interp's variable link of the group's name (LevelScene::matinee_moves binds them).
+    struct Move {
+        std::string group;
+        MoveTrack track;
+    };
+    std::vector<Move> moves;
     int player_cutscene = -1;                           // index into LevelScene::cutscenes, -1 if the pawn is not in it
 };
 
@@ -130,13 +137,15 @@ struct ScriptGraph {
         std::string label;  // EventName, InputLabel, OutputLabel, FindVarName, VariableLabel, VarName
         std::string text;   // TutorialMessage, SupersMessage, a subtitle's text, NextLevelName
         std::string text2;  // NextCheckpointName, CustomButtonCallOut
-        float f = 0.0f;     // FloatValue, Duration, FadeTime, PlayRate, DamageAmount
-        float f2 = 0.0f;    // ValueB
+        float f = 0.0f;     // FloatValue, Duration, FadeTime, PlayRate, DamageAmount, SeqVar_RandomFloat.Min
+        float f2 = 0.0f;    // ValueB, ForceStartPosition, SeqVar_RandomFloat.Max
         int i = 0;          // IntValue, Value, IncrementAmount, LinkCount, HintNumber, AutoCloseCount
         bool b = false;     // bValue, bOpen, FadeOut, bLooping, teleportPawnToCheckpoint, bDisablePlayerMoveInput
         bool b2 = false;    // skipSaveToDisk, bDisablePlayerLookInput, bRewindOnPlay, bRequireAccept
         bool b3 = false;    // bSetCinematicMode, bRewindIfAlreadyPlaying, bTriggerSlomo, bShouldBeDisabled
-        bool b4 = false;    // bDisableSkipCutscenes, bPauseGame
+        bool b4 = false;    // bDisableSkipCutscenes, bPauseGame, bIsSkippable
+        bool b5 = false;    // bNoResetOnRewind
+        bool b6 = false;    // bForceStartPos
         Vec3 color{0.0f, 0.0f, 0.0f};  // FadeColor
         std::string cue;    // SeqAct_TdPlaySound / SeqAct_PlaySound: "Group.Name"
         std::string cue_bank;
@@ -235,6 +244,19 @@ struct ScriptHost {
     std::function<void(const std::string& package, int32_t factory_export, const ScriptActor& at)> spawn_effect;
     // SeqAct_ChangeCollision / SeqAct_Toggle on collision/volume actors
     std::function<void(const ScriptActor& actor, bool collide_actors, bool block_actors)> change_collision;
+    // A SeqAct_Interp's movement tracks (game/script_movers.hpp). `node` is the op in ScriptGraph::nodes.
+    // interp_init: USeqAct_Interp::InitInterp, as the op activates on Play, Reverse or Change Dir:
+    //   each track's InitialTM from where its actor is and the Position the Matinee has (before any rewind).
+    // interp_reset_initial: ResetMovementInitialTransforms (a rewind with bNoResetOnRewind).
+    // interp_position: the op's Position was set (UpdateInterp); its actors go there when they next move.
+    // interp_started / interp_finished: Activated and DeActivated: the op joins and leaves its actors' LatentActions.
+    // interp_jump: SetPosition: the Position is set and the actors are put there at once.
+    std::function<void(int node, float position)> interp_init;
+    std::function<void(int node)> interp_reset_initial;
+    std::function<void(int node, float position)> interp_position;
+    std::function<void(int node)> interp_started;
+    std::function<void(int node)> interp_finished;
+    std::function<void(int node, float position)> interp_jump;
     // Line checks for SeqEvent_LOS (bCheckForObstructions): true when the way is clear
     std::function<bool(const Vec3& from, const Vec3& to)> line_clear;
     // Logging
@@ -292,6 +314,17 @@ public:
     [[nodiscard]] std::string playing() const;
     [[nodiscard]] double time() const { return time_; }
 
+    // For the oracle and the test switches: an impulse on one of an op's inputs, as a link gives it
+    // (a SeqAct_Interp's are 0 Play, 1 Reverse, 2 Stop, 3 Pause, 4 Change Dir), and what a
+    // SeqAct_Interp is doing: its Position, whether it plays, whether the op is active, and how
+    // often its output `index` (0 Completed, 1 the one that fires at Position 0) has fired.
+    void activate_input(int node, int input);
+    [[nodiscard]] float interp_position(int node) const { return state_[static_cast<size_t>(node)].position; }
+    [[nodiscard]] bool interp_playing(int node) const { return state_[static_cast<size_t>(node)].playing; }
+    [[nodiscard]] bool interp_reversed(int node) const { return state_[static_cast<size_t>(node)].reversed; }
+    [[nodiscard]] bool op_active(int node) const { return state_[static_cast<size_t>(node)].active; }
+    [[nodiscard]] int interp_fired(int node, int index) const { return state_[static_cast<size_t>(node)].fired[index & 1]; }
+
 private:
     struct State {
         bool active = false;
@@ -311,11 +344,17 @@ private:
         float remaining = 0.0f;
         bool delay_running = false;
         uint64_t started_tick = 0;
-        // SeqAct_Interp
+        // SeqAct_Interp: Position, bIsPlaying, bPaused, bReversePlayback, and whether the op holds its
+        // instances (InterpData is set from InitInterp to TermInterp). PlayRate and ForceStartPosition
+        // are the properties, or what a variable linked to them last published.
         float position = 0.0f;
         bool playing = false;
+        bool paused = false;
+        bool reversed = false;
         bool initialised = false;
-        bool aborted = false;
+        float play_rate = 1.0f;
+        float force_start = 0.0f;
+        int fired[2] = {0, 0};
         // SeqAct_Gate / SeqAct_Switch / SeqAct_RandomSwitch
         bool open = true;
         int index = 1;
@@ -346,9 +385,12 @@ private:
     bool player_sees(const ScriptGraph::Node& ev, const ScriptActor& actor, const ScriptPlayerState& player) const;
     bool var_is_player(int var) const;
     void interp_play(int node);
-    void interp_stop(int node, bool aborted);
+    void interp_stop(int node);
     void interp_step(int node, float dt);
+    void interp_set_position(int node, float position);
+    void interp_stopped_playing(int node);
     void fire_matinee_keys(int node, float previous, float position);
+    float var_float(int var);
     void check_events(const ScriptPlayerState& player);
     void log(const std::string& line) const;
 

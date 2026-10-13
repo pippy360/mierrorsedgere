@@ -12,6 +12,7 @@
 #include "ue3_props.hpp"
 #include "../anim/anim_system.hpp"
 #include "../game/level_script.hpp"
+#include "../game/matinee_move.hpp"
 #include "../physics/bot_fire.hpp"
 #include "../physics/collision_world.hpp"
 #include "../platform/platform.hpp"
@@ -1254,6 +1255,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
         bool b_hidden = false;
         if (const auto* p = get_prop("bHidden")) b_hidden = p->bool_val;
         if (const auto* p = get_prop("bInteractable")) a.interactable = p->bool_val;
+        if (const auto* p = get_prop("bStopOnEncroach")) a.stop_on_encroach = p->bool_val;  // InterpActor: True unless saved
 
         // InterpActor (elevators, doors, buttons, moving platforms) frequently stores its
         // mesh reference in ReplicatedMesh on the Actor / Archetype.
@@ -2145,10 +2147,14 @@ void UPKPackage::extract_elevators(
         elev.start_pos = is_world_frame ? raw_keys.front().pos
                                         : (chosen_cab ? chosen_cab->location : raw_keys.front().pos);
 
+        // A relative track goes on from where its actor stands, with the first key's own transform
+        // divided out (UInterpTrackInstMove::CalcInitialTransform, 0x00e51ad0): the way from the
+        // first key, in the cab's frame. (New Eden's lift hull has a first key far from zero.)
+        const ActorTransform cab_axes(Vec3(0.0f, 0.0f, 0.0f), elev.rotation, Vec3(1.0f, 1.0f, 1.0f));
         for (const auto& rk : raw_keys) {
             ElevatorKeyframe wk;
             wk.time = rk.time;
-            wk.pos = is_world_frame ? rk.pos : (elev.start_pos + rk.pos);
+            wk.pos = is_world_frame ? rk.pos : (elev.start_pos + cab_axes.apply(rk.pos - raw_keys.front().pos));
             elev.keyframes.push_back(wk);
         }
         elev.end_pos = elev.keyframes.back().pos;
@@ -3866,6 +3872,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         LevelActor& a = actors[i];
         if (std::abs(a.location.x) > 150000.0f || std::abs(a.location.y) > 150000.0f) continue;
         if (a.elevator >= 0 || a.barge_door >= 0) continue;  // moving InterpActor / door: built dynamically
+        if (a.mover_copy) continue;                          // the mover it is a second copy of stands for it
 
         const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
         if (!a.mesh_name.empty() && !sm) {
@@ -3873,7 +3880,8 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             missing_names[to_lower(a.mesh_name)]++;
         }
         if (!a.brush_triangles.empty()) ++blocking_volumes;
-        append_actor_collision(a, static_cast<int32_t>(i), sm, out_collision);
+        // A mover's triangles go with it: they are kept apart (build_script_mover_geometry).
+        if (a.mover < 0) append_actor_collision(a, static_cast<int32_t>(i), sm, out_collision);
         if (!sm) continue;
 
         // What the level's script shows and hides is built whether or not it starts hidden.
@@ -3884,17 +3892,19 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             continue;
         }
         ++placed_meshes;
-        if ((a.dynamic_class || switched) && emitter.use_materials()) {
-            // A buffer of its own, so that it can be given its own light, or left out while hidden.
+        if (((a.dynamic_class || switched) && emitter.use_materials()) || a.mover >= 0) {
+            // A buffer of its own, so that it can be given its own light, left out while hidden, or
+            // drawn where a Matinee has moved it.
             MeshBuffer mb;
             mb.name = "UE3_Dynamic_" + a.source_package + "_" + a.unique_name;
             mb.is_runner_vision = a.is_runner_vision;
-            mb.dynamic_lit = a.dynamic_class;
+            mb.dynamic_lit = a.dynamic_class && emitter.use_materials();
             mb.lighting = a.lighting;
             mb.actor = switched ? static_cast<int32_t>(i) : -1;
+            mb.mover = a.mover;
             std::map<int32_t, std::vector<Vertex>> bins;
             const AABB own_box = emitter.emit(a, *sm, bins, mb.vertices);
-            MeshEmitter::flush(mb, bins);
+            if (emitter.use_materials()) MeshEmitter::flush(mb, bins);
             if (mb.vertices.empty()) continue;
             mb.bounds = own_box;
             if (valid_box(own_box)) {
@@ -3992,7 +4002,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             size_t made = 0;
             if (decal.project_on_static_meshes) {
                 for (const LevelActor& a : actors) {
-                    if (a.is_hidden || a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0 || !a.accepts_decals ||
+                    if (a.is_hidden || a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0 || a.mover >= 0 || !a.accepts_decals ||
                         !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
                         continue;
                     }
@@ -4095,12 +4105,18 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                         continue;
                     }
                     receiver = &actors[it->second];
+                    // (The second copy of a mover is not drawn: nor are the decals cooked on it.)
+                    if (receiver->mover_copy) {
+                        ++orphaned;
+                        continue;
+                    }
                     // On what moves, is lit apart or is shown and hidden by the level's script: a buffer
                     // of its own, drawn as that receiver is. The engine asks nothing of a stored
                     // receiver's owner (AttachToStaticReceivers, 0x00fc7020); the triangles are in the
                     // component's space and are drawn with its transform as it is each frame (the static
                     // mesh proxy's decal draw, 0x00db6d80), so a door's decals swing with the door.
-                    if (receiver->dynamic_class || receiver->elevator >= 0 || receiver->barge_door >= 0 || receiver->script_switched) {
+                    if (receiver->dynamic_class || receiver->elevator >= 0 || receiver->barge_door >= 0 || receiver->mover >= 0 ||
+                        receiver->script_switched) {
                         if (no_dynamic) continue;
                         auto& apart = on_dynamic[{decal.sort_order, it->second}];
                         if (apart.first.empty()) apart.second = AABB(Vec3(1e30f, 1e30f, 1e30f), Vec3(-1e30f, -1e30f, -1e30f));
@@ -4466,6 +4482,282 @@ void build_barge_door_geometry(LevelScene& scene, const std::unordered_map<std::
             door.closed_bounds = AABB(door.hinge_pos - Vec3(90.0f, 90.0f, 20.0f),
                                       door.hinge_pos + Vec3(90.0f, 90.0f, 240.0f));
         }
+    }
+}
+
+// What the level script's movement tracks are bound to: for every SeqAct_Interp, every group of
+// its Matinee that has an InterpTrackMove, and every actor on the op's variable link of that
+// group's name, the place of that actor in LevelScene::actors.
+struct ScriptMoveBinding {
+    int node = -1;
+    int move = -1;
+    int32_t actor = -1;
+};
+
+std::vector<ScriptMoveBinding> script_move_bindings(const LevelScene& scene, std::map<std::string, int>* unplaced_classes) {
+    std::vector<ScriptMoveBinding> out;
+    if (!scene.script) return out;
+    const ScriptGraph& graph = *scene.script;
+    std::unordered_map<std::string, int32_t> by_name;
+    for (size_t i = 0; i < scene.actors.size(); ++i) {
+        by_name.emplace(to_lower(scene.actors[i].source_package) + ":" + scene.actors[i].unique_name, static_cast<int32_t>(i));
+    }
+    for (size_t ni = 0; ni < graph.nodes.size(); ++ni) {
+        const ScriptGraph::Node& n = graph.nodes[ni];
+        if (n.cls != "SeqAct_Interp" || n.matinee < 0) continue;
+        const ScriptMatinee& m = graph.matinees[static_cast<size_t>(n.matinee)];
+        for (size_t mv = 0; mv < m.moves.size(); ++mv) {
+            const std::string group = to_lower(m.moves[mv].group);
+            for (const ScriptGraph::VarLink& link : n.vars) {
+                if (to_lower(link.desc) != group) continue;
+                for (int v : link.vars) {
+                    if (v < 0 || static_cast<size_t>(v) >= graph.nodes.size()) continue;
+                    const ScriptGraph::Node* var = &graph.nodes[static_cast<size_t>(v)];
+                    if (var->cls == "SeqVar_Named") {
+                        // The variable of that name in the same package.
+                        const ScriptGraph::Node* found = nullptr;
+                        for (const ScriptGraph::Node& c : graph.nodes) {
+                            if (c.package == var->package && c.cls == "SeqVar_Object" && !c.label.empty() && to_lower(c.label) == to_lower(var->label)) found = &c;
+                        }
+                        if (!found) continue;
+                        var = found;
+                    }
+                    if (var->cls != "SeqVar_Object" || var->actor < 0) continue;
+                    const ScriptActor& sa = graph.actors[static_cast<size_t>(var->actor)];
+                    const auto it = by_name.find(sa.package + ":" + sa.name);
+                    if (it == by_name.end()) {
+                        if (unplaced_classes) ++(*unplaced_classes)[sa.cls];
+                        continue;
+                    }
+                    out.push_back({static_cast<int>(ni), static_cast<int>(mv), it->second});
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Which doors stay the port's own (LevelScene::barge_doors) in a level that has a script. A door
+// she opens by barging it is one the script listens on for damage (the door's own Kismet, which the
+// port's door machine stands for); one a player's cutscene swings is posed from that cutscene's
+// baked track; and a door-like actor that no Matinee touches at all stays what the port made of it.
+// A door that only Matinees move (Flight's office door, opened by a remote event) is the script's:
+// it is given back here and becomes one of LevelScene::movers. No actor is moved by both.
+size_t release_script_doors(LevelScene& scene, const std::vector<ScriptMoveBinding>& bindings) {
+    if (!scene.script || scene.barge_doors.empty()) return 0;
+    const ScriptGraph& graph = *scene.script;
+    std::set<std::string> listened;
+    for (int ev : graph.damage_events) {
+        const ScriptActor& sa = graph.actors[static_cast<size_t>(graph.nodes[static_cast<size_t>(ev)].originator)];
+        listened.insert(sa.package + ":" + sa.name);
+    }
+    std::set<int32_t> bound;
+    for (const ScriptMoveBinding& b : bindings) bound.insert(b.actor);
+    std::vector<Vec3> swung;
+    for (const IntroDoorSwing& s : scene.level_intro.door_swings) swung.push_back(s.hinge);
+    for (const LevelIntroSequence& c : scene.cutscenes) {
+        for (const IntroDoorSwing& s : c.door_swings) swung.push_back(s.hinge);
+    }
+    std::vector<int32_t> remap(scene.barge_doors.size(), -1);
+    std::vector<BargeDoorInstance> kept;
+    for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
+        const BargeDoorInstance& door = scene.barge_doors[d];
+        bool barged = false, moved = false;
+        for (const DoorPart& part : door.parts) {
+            const LevelActor& a = scene.actors[static_cast<size_t>(part.actor_index)];
+            barged = barged || listened.count(to_lower(a.source_package) + ":" + a.unique_name) > 0;
+            moved = moved || bound.count(part.actor_index) > 0;
+        }
+        for (const Vec3& h : swung) barged = barged || (h - door.hinge_pos).length() < 8.0f;
+        if (moved && !barged) continue;
+        remap[d] = static_cast<int32_t>(kept.size());
+        kept.push_back(door);
+    }
+    const size_t released = scene.barge_doors.size() - kept.size();
+    for (LevelActor& a : scene.actors) {
+        if (a.barge_door >= 0) a.barge_door = remap[static_cast<size_t>(a.barge_door)];
+    }
+    scene.barge_doors.swap(kept);
+    return released;
+}
+
+// LevelScene::movers and LevelScene::matinee_moves: the placed InterpActors the script's movement
+// tracks are bound to (an InterpActor is PHYS_Interpolating, which is what lets a track move an
+// actor: AActor::performPhysics, 0x00efabb0), and what is attached to one of them (Actor.Base),
+// which goes with it. A lift's part and a door of the port's own are left to their machines. The
+// same InterpActor cooked into two packages (a *_Slc and a *_Spt, as the lifts are) is one mover.
+void assign_script_movers(LevelScene& scene) {
+    scene.movers.clear();
+    scene.matinee_moves.clear();
+    if (!scene.script) return;
+    std::map<std::string, int> other_classes;
+    const std::vector<ScriptMoveBinding> bindings = script_move_bindings(scene, &other_classes);
+    const size_t released = release_script_doors(scene, bindings);
+    auto& actors = scene.actors;
+
+    const auto same_placement = [](const LevelActor& x, const LevelActor& y) {
+        return x.class_name == y.class_name && to_lower(x.mesh_name) == to_lower(y.mesh_name) && (x.location - y.location).length() < 1.0f &&
+               std::abs(x.rotation.pitch - y.rotation.pitch) < 1.0f && std::abs(x.rotation.yaw - y.rotation.yaw) < 1.0f &&
+               std::abs(x.rotation.roll - y.rotation.roll) < 1.0f;
+    };
+    size_t copies = 0;
+    const auto mover_of = [&](int32_t ai) {
+        LevelActor& a = actors[static_cast<size_t>(ai)];
+        if (a.mover >= 0) return a.mover;
+        for (size_t k = 0; k < scene.movers.size(); ++k) {
+            const LevelActor& first = actors[static_cast<size_t>(scene.movers[k].actor_index)];
+            if (first.source_package == a.source_package || !same_placement(first, a)) continue;
+            a.mover = static_cast<int32_t>(k);
+            a.mover_copy = true;
+            ++copies;
+            return a.mover;
+        }
+        ScriptMover m;
+        m.actor_index = ai;
+        m.stop_on_encroach = a.stop_on_encroach;
+        a.mover = static_cast<int32_t>(scene.movers.size());
+        scene.movers.push_back(std::move(m));
+        return a.mover;
+    };
+
+    size_t lift_groups = 0, door_groups = 0, mover_groups = 0;
+    std::set<int> nodes_all, nodes_moving;
+    for (const ScriptMoveBinding& b : bindings) {
+        const LevelActor& a = actors[static_cast<size_t>(b.actor)];
+        nodes_all.insert(b.node);
+        if (a.elevator >= 0) {
+            ++lift_groups;
+        } else if (a.barge_door >= 0) {
+            ++door_groups;
+        } else if (a.class_name != "InterpActor") {
+            ++other_classes[a.class_name];
+        } else {
+            MatineeMove mm;
+            mm.node = b.node;
+            mm.move = b.move;
+            mm.mover = mover_of(b.actor);
+            const bool known = std::any_of(scene.matinee_moves.begin(), scene.matinee_moves.end(), [&](const MatineeMove& o) {
+                return o.node == mm.node && o.move == mm.move && o.mover == mm.mover;
+            });
+            if (!known) scene.matinee_moves.push_back(mm);
+            ++mover_groups;
+            nodes_moving.insert(b.node);
+        }
+    }
+
+    // What is attached to a mover goes with it (UWorld::MoveActor moves an actor's Attached).
+    std::unordered_map<std::string, int32_t> by_name;
+    for (size_t i = 0; i < actors.size(); ++i) by_name.emplace(to_lower(actors[i].source_package) + ":" + actors[i].unique_name, static_cast<int32_t>(i));
+    const auto base_of = [&](const LevelActor& a) -> int32_t {
+        if (a.base_name.empty()) return -1;
+        const auto it = by_name.find(to_lower(a.source_package) + ":" + a.base_name);
+        return it == by_name.end() ? -1 : it->second;
+    };
+    size_t attached = 0;
+    for (int pass = 0; pass < 4; ++pass) {
+        bool any = false;
+        for (size_t i = 0; i < actors.size(); ++i) {
+            LevelActor& a = actors[i];
+            if (a.mover >= 0 || a.elevator >= 0 || a.barge_door >= 0 || a.mesh_name.empty()) continue;
+            if (a.class_name != "InterpActor" && a.class_name != "StaticMeshActor") continue;
+            const int32_t base = base_of(a);
+            if (base < 0 || actors[static_cast<size_t>(base)].mover < 0) continue;
+            const size_t before = scene.movers.size();
+            mover_of(static_cast<int32_t>(i));
+            attached += scene.movers.size() > before ? 1 : 0;
+            any = true;
+        }
+        if (!any) break;
+    }
+
+    // Each mover's base, and the movers put in an order that has every base before what it carries.
+    for (ScriptMover& m : scene.movers) {
+        const LevelActor& a = actors[static_cast<size_t>(m.actor_index)];
+        const int32_t base = base_of(a);
+        if (base < 0) continue;
+        const LevelActor& b = actors[static_cast<size_t>(base)];
+        if (b.mover >= 0 && b.mover != a.mover) m.base = b.mover;
+        else m.base_static = rotation_translation_matrix(b.rotation, b.location);
+    }
+    std::vector<int> depth(scene.movers.size(), 0);
+    for (size_t k = 0; k < scene.movers.size(); ++k) {
+        int at = scene.movers[k].base;
+        for (int guard = 0; at >= 0 && guard < 8; ++guard) {
+            ++depth[k];
+            at = scene.movers[static_cast<size_t>(at)].base;
+        }
+    }
+    std::vector<int32_t> order(scene.movers.size());
+    for (size_t k = 0; k < order.size(); ++k) order[k] = static_cast<int32_t>(k);
+    std::stable_sort(order.begin(), order.end(), [&](int32_t x, int32_t y) { return depth[static_cast<size_t>(x)] < depth[static_cast<size_t>(y)]; });
+    std::vector<int32_t> new_index(order.size(), -1);
+    std::vector<ScriptMover> sorted;
+    sorted.reserve(order.size());
+    for (size_t k = 0; k < order.size(); ++k) {
+        new_index[static_cast<size_t>(order[k])] = static_cast<int32_t>(k);
+        sorted.push_back(std::move(scene.movers[static_cast<size_t>(order[k])]));
+    }
+    for (ScriptMover& m : sorted) {
+        if (m.base >= 0) m.base = new_index[static_cast<size_t>(m.base)];
+    }
+    scene.movers.swap(sorted);
+    for (LevelActor& a : actors) {
+        if (a.mover >= 0) a.mover = new_index[static_cast<size_t>(a.mover)];
+    }
+    for (MatineeMove& mm : scene.matinee_moves) mm.mover = new_index[static_cast<size_t>(mm.mover)];
+
+    // Where each stands as the level begins.
+    for (ScriptMover& m : scene.movers) {
+        const LevelActor& a = actors[static_cast<size_t>(m.actor_index)];
+        m.placed = rotation_translation_matrix(a.rotation, a.location);
+        m.placed_inv = m.placed.rigid_inverse();
+        m.actor_tm = m.placed;
+        const Mat4 base = m.base >= 0 ? scene.movers[static_cast<size_t>(m.base)].actor_tm : m.base_static;
+        m.rel_tm = base.rigid_inverse() * m.placed;
+    }
+
+    std::cout << "[Level] Script movers: " << nodes_all.size() << " Matinees with a movement track on a placed actor, " << nodes_moving.size()
+              << " of them move " << scene.movers.size() << " actors (" << mover_groups << " track bindings, " << attached
+              << " actors attached to a mover, " << copies << " second copies in another package); left to the port's own machines: " << lift_groups
+              << " bindings on lift parts, " << door_groups << " on doors she barges (" << released << " doors given to the script)";
+    if (!other_classes.empty()) {
+        std::cout << "; not moved:";
+        for (const auto& [cls, count] : other_classes) std::cout << " " << cls << " " << count;
+    }
+    std::cout << std::endl;
+}
+
+// The collision of each mover, its triangles where the level placed the actor (a query goes there
+// by the inverse of the mover's `delta`), and its MeshBuffer.
+void build_script_mover_geometry(LevelScene& scene, const std::unordered_map<std::string, StaticMeshAsset>& mesh_lib) {
+    size_t colliding = 0, blocking = 0, drawn = 0;
+    for (size_t k = 0; k < scene.movers.size(); ++k) {
+        ScriptMover& m = scene.movers[k];
+        LevelActor& a = scene.actors[static_cast<size_t>(m.actor_index)];
+        const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
+        if (a.is_collidable || a.blocks_traces || a.script_collision) {
+            auto cw = std::make_shared<CollisionWorld>();
+            append_actor_collision(a, m.actor_index, sm, *cw);
+            cw->build();
+            if (!cw->empty()) {
+                m.local_box = cw->bounds();
+                m.world_box = m.local_box;
+                m.collision = std::move(cw);
+                ++colliding;
+                blocking += a.is_collidable ? 1 : 0;
+            }
+        }
+        if (sm && !valid_box(a.world_bounds)) a.world_bounds = transformed_mesh_bounds(a, *sm);
+    }
+    for (size_t i = 0; i < scene.meshes.size(); ++i) {
+        const MeshBuffer& mb = scene.meshes[i];
+        if (mb.mover < 0 || mb.is_decal || static_cast<size_t>(mb.mover) >= scene.movers.size()) continue;
+        scene.movers[static_cast<size_t>(mb.mover)].mesh_index = static_cast<int32_t>(i);
+        ++drawn;
+    }
+    if (!scene.movers.empty()) {
+        std::cout << "[Level] Script movers: " << drawn << " drawn, " << colliding << " with collision of their own (" << blocking
+                  << " block her now)" << std::endl;
     }
 }
 
@@ -5478,6 +5770,8 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             out_scene.script_checkpoints = true;
         }
     }
+    // The actors the script's Matinees move, and the doors that are the script's rather than the port's.
+    assign_script_movers(out_scene);
 
     // Link each extracted elevator to the checkpoints at its start and destination floors so
     // riding the elevator streams in the destination zone's sub-packages (SeqAct_MultiLevelStreaming)
@@ -5686,6 +5980,15 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             ++listening;
             bargeable += a->interactable ? 1 : 0;
         }
+        // What the script does to the second copy of a mover it does to the mover.
+        for (size_t i = 0; i < out_scene.actors.size(); ++i) {
+            const LevelActor& copy = out_scene.actors[i];
+            if (!copy.mover_copy || copy.mover < 0) continue;
+            LevelActor& first = out_scene.actors[static_cast<size_t>(out_scene.movers[static_cast<size_t>(copy.mover)].actor_index)];
+            first.script_collision = first.script_collision || copy.script_collision;
+            first.script_switched = first.script_switched || copy.script_switched;
+            first.script_damage = first.script_damage || copy.script_damage;
+        }
         for (LevelActor& a : out_scene.actors) {
             a.initial_hidden = a.is_hidden;
             a.initial_collidable = a.is_collidable;
@@ -5702,6 +6005,7 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
     collision->build();
     build_elevator_part_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
     build_barge_door_geometry(out_scene, mesh_library, pm ? &material_paths : nullptr, material_uvs.get());
+    build_script_mover_geometry(out_scene, mesh_library);
     // The decals of a lift's part or of a door go where that goes (MeshBuffer::decal_receiver), and
     // every such buffer is lit from its receiver's place, not from the decal's own small box.
     for (MeshBuffer& mb : out_scene.meshes) {
@@ -5730,12 +6034,14 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             }
         } else if (a.barge_door >= 0 && static_cast<size_t>(a.barge_door) < out_scene.barge_doors.size()) {
             mb.barge_door = a.barge_door;
+        } else if (a.mover >= 0 && static_cast<size_t>(a.mover) < out_scene.movers.size()) {
+            mb.mover = a.mover;
         }
         if (valid_box(a.world_bounds)) mb.bounds = a.world_bounds;
         if (std::getenv("ME_DECAL_DEBUG")) {
             std::cout << "[Level]   decals on " << a.source_package << ":" << a.unique_name << " (" << a.mesh_name << ") at ("
                       << a.location.x << ", " << a.location.y << ", " << a.location.z << "): " << mb.vertices.size() / 3 << " triangles, "
-                      << (mb.elevator >= 0 ? "a lift's part" : mb.barge_door >= 0 ? "a door" : "left in place")
+                      << (mb.elevator >= 0 ? "a lift's part" : mb.barge_door >= 0 ? "a door" : mb.mover >= 0 ? "moved by the script's Matinees" : "left in place")
                       << (mb.actor >= 0 ? ", shown and hidden by the script" : "") << std::endl;
         }
     }
@@ -6024,6 +6330,53 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
               << out_scene.reflection_volumes.size() << " TdReflectionVolumes" << std::endl;
 
     return true;
+}
+
+ScriptMoverCensus script_mover_census(const LevelScene& scene) {
+    ScriptMoverCensus out;
+    if (!scene.script) return out;
+    struct Op {
+        bool moved = false, machine = false, other = false, blocks = false;
+    };
+    std::map<int, Op> ops;
+    std::map<std::string, int> classes;
+    for (const ScriptMoveBinding& b : script_move_bindings(scene, nullptr)) {
+        const LevelActor& a = scene.actors[static_cast<size_t>(b.actor)];
+        if (a.class_name == "CameraActor") continue;
+        Op& op = ops[b.node];
+        if (a.elevator >= 0 || a.barge_door >= 0) {
+            op.machine = true;
+        } else if (a.mover >= 0) {
+            op.moved = true;
+        } else {
+            op.other = true;
+            ++classes[a.class_name];
+        }
+        // (A copy's own triangles are not built: what it blocks is asked of the actor that stands for it.)
+        const LevelActor& shown = a.mover_copy && a.mover >= 0 ? scene.actors[static_cast<size_t>(scene.movers[static_cast<size_t>(a.mover)].actor_index)] : a;
+        op.blocks = op.blocks || (a.class_name == "InterpActor" && shown.initial_collidable);
+    }
+    std::map<std::string, int> packages;
+    for (const auto& [node, op] : ops) {
+        const ScriptGraph::Node& counted = scene.script->nodes[static_cast<size_t>(node)];
+        ++packages[scene.script->packages[static_cast<size_t>(counted.package)]];
+        out.counted.push_back(scene.script->packages[static_cast<size_t>(counted.package)] + ":" + counted.name + (op.moved ? ":m" : op.machine ? ":x" : ":o"));
+        ++out.matinees;
+        out.moved += op.moved ? 1 : 0;
+        out.machines += !op.moved && op.machine ? 1 : 0;
+        out.other += !op.moved && !op.machine ? 1 : 0;
+        if (!op.blocks) continue;
+        ++out.blocking;
+        out.blocking_moved += op.moved ? 1 : 0;
+        out.blocking_machines += !op.moved && op.machine ? 1 : 0;
+        if (!op.moved && !op.machine) {
+            const ScriptGraph::Node& n = scene.script->nodes[static_cast<size_t>(node)];
+            out.blocking_unmoved.push_back(scene.script->packages[static_cast<size_t>(n.package)] + ":" + n.name);
+        }
+    }
+    out.other_classes.assign(classes.begin(), classes.end());
+    out.by_package.assign(packages.begin(), packages.end());
+    return out;
 }
 
 bool stream_level_to_checkpoint(const std::string& /*game_root*/, LevelScene& scene, int checkpoint_idx) {
