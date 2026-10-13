@@ -2443,7 +2443,8 @@ pause). `docs/AUDIO_SYSTEM_RE.md` sections 3.2 and 3.3 have the rules.
   every node below the looping node is drawn again and the next parse plays the next round. A node above
   the looping node is never drawn again: a delay up there is waited out once.
 - **Mix groups.** `UTdSoundNodeMixGroup::ParseNodes` (0x012292A0) multiplies the volume and the pitch of what
-  is below it by those of the mix groups it names: `AmbientPropSounds`, 0.9, on every `A_Prop_*` cue. It is
+  is below it by those of the mix groups it names: `AmbientPropSounds`, 0.9, on the `A_Prop_*` cues that name
+  it (three store no mix group and keep Default's 1.0). It is
   part of the volume a wave is ranked by.
 - **The cues.** The 1,650 emitters of the `*_Aud` sublevels play 94 cues. The 767 layered props are a mix
   group over a mixer of two branches, each an attenuation node, a modulator, a random node and a looping

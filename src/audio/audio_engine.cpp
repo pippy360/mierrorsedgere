@@ -791,7 +791,9 @@ void AudioEngine::update(float dt,
     // updates their waves (UAudioDevice::GetSortedActiveWaveInstances, 0x00B70316; StartSources,
     // 0x00B6EFE4): their delays, their fades and the clock they count on stand still, and what was
     // asked for meanwhile begins with the first update after the pause.
-    if (!game_paused_ && !is_menu_music_) game_time_ += step;
+    // The clock runs at the game's time dilation: in reaction time at the controller's
+    // MovementConfig::reaction_time_dilation (WorldInfo.TimeDilation), so a delay waits longer.
+    if (!game_paused_ && !is_menu_music_) game_time_ += step * (reaction_active ? MovementConfig{}.reaction_time_dilation : 1.0f);
     if (!game_paused_ && !deferred_sounds_.empty()) {
         const std::vector<DeferredSound> waiting = std::exchange(deferred_sounds_, {});
         for (const DeferredSound& d : waiting) {
