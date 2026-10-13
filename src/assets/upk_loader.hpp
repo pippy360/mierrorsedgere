@@ -158,6 +158,7 @@ struct BspRenderBin {
     std::string material;
     int32_t lightmap_set = -1;
     std::vector<Vertex> vertices;
+    std::string package;  // package_name_of() the level package whose BSP it is (a decal's own-level test)
 };
 
 class UPKPackage {

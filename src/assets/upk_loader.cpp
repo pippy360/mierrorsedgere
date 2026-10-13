@@ -3133,17 +3133,19 @@ void UPKPackage::extract_bsp_render_geometry(std::vector<BspRenderBin>& out_bins
     constexpr uint32_t PF_TwoSided  = 0x00000100u;
     constexpr uint32_t PF_Portal    = 0x04000000u;
 
+    // A bin is this package's own: a decal is clipped only onto the BSP of its own level.
+    const std::string package = package_name_of(*this);
     std::unordered_map<std::string, size_t> bin_index;
     const auto bin_name = [](const std::string& mat_path, int32_t set) { return to_lower(mat_path) + "#" + std::to_string(set); };
     for (size_t i = 0; i < out_bins.size(); ++i) {
-        bin_index.emplace(bin_name(out_bins[i].material, out_bins[i].lightmap_set), i);
+        if (out_bins[i].package == package) bin_index.emplace(bin_name(out_bins[i].material, out_bins[i].lightmap_set), i);
     }
     auto get_bin = [&](const std::string& mat_path, int32_t set) -> std::vector<Vertex>& {
         const std::string key = bin_name(mat_path, set);
         auto it = bin_index.find(key);
         if (it != bin_index.end()) return out_bins[it->second].vertices;
         const size_t idx = out_bins.size();
-        out_bins.push_back(BspRenderBin{mat_path, set, {}});
+        out_bins.push_back(BspRenderBin{mat_path, set, {}, package});
         bin_index.emplace(key, idx);
         return out_bins.back().vertices;
     };
@@ -3988,7 +3990,11 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         static const bool no_computed = std::getenv("ME_NO_COMPUTED_DECALS") != nullptr;  // to see a picture without them
         static const bool no_dynamic = std::getenv("ME_NO_DYNAMIC_DECALS") != nullptr;    // nor those on what is drawn apart
         std::vector<Vertex> decal_scratch;
-        // What lies in a decal's box, found and clipped: the level's static meshes and BSP.
+        // What lies in a decal's box, found and clipped: the static meshes and BSP of the decal's own
+        // level. UDecalComponent's receiver test (moverdecals N3, MirrorsEdge.exe 0x00fc766f) asks
+        // Receiver.Owner.Outer == DecalActor.Outer: a decal on the floor of a streamed level next door
+        // is not drawn (Boat_Cont's DecalActor_10 on the yard's ground of another package: in five
+        // intro frames retail draws nothing there).
         // (`apart`: what lies on an actor the script shows and hides goes to that actor's own buffer.)
         const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box,
                                          bool apart = false) {
@@ -4004,7 +4010,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             if (decal.project_on_static_meshes) {
                 for (const LevelActor& a : actors) {
                     if (a.is_hidden || a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0 || a.mover >= 0 || !a.accepts_decals ||
-                        !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
+                        a.source_package != decal.package || !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
                         continue;
                     }
                     const StaticMeshAsset* sm = find_mesh(mesh_lib, a);
@@ -4036,7 +4042,9 @@ void build_level_geometry(std::vector<LevelActor>& actors,
                 }
             }
             if (decal.project_on_bsp && bsp_render_bins) {
-                for (const BspRenderBin& bin : *bsp_render_bins) made += emitter.project_decal(decal, bin.vertices, nullptr, bins, box);
+                for (const BspRenderBin& bin : *bsp_render_bins) {
+                    if (bin.package == decal.package) made += emitter.project_decal(decal, bin.vertices, nullptr, bins, box);
+                }
             }
             return made;
         };
