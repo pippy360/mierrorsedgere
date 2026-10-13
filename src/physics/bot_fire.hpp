@@ -365,6 +365,13 @@ inline const AimTemplate& find_aim_template(std::string_view archetype) {
 // partner's hits are never held back by her aim.
 inline bool is_tutorial_template(const AimTemplate& t) { return t.pawn == EBotPawnClass::Tutorial; }
 
+// Whether the template's bot carries a riot shield: its ShieldClass (TdBotPawn.SetupTemplate makes
+// that inventory and TdInv_Shield.Activate hangs its RiotShield component on the mesh's
+// ShieldSocket). Of DefaultAITemplates.ini's templates AITemplate_RiotCop alone names one
+// (TdGame.TdInv_Shield), and its mesh, CH_TKY_Cop_Riot.SK_TKY_Cop_Riot, is the only one with a
+// ShieldSocket.
+inline bool template_carries_shield(const AimTemplate& t) { return std::string_view(t.name) == "RiotCop"; }
+
 // A helicopter's riders (TdVehicle_Helicopter.AddGunner -> TdPawn.SetAsGunner: seated at a socket,
 // their collision off). Their fire is the door gun's, which the helicopter has here
 // (HelicopterInstance::gunner): the bot the level's factory makes for one fires nothing of his own.

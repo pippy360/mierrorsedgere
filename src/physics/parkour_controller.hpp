@@ -198,6 +198,7 @@ public:
         bool posed = false;      // met on his posed bodies, not on his cylinder
         uint8_t body = 0;        // then: which body of the asset, and its bone
         std::string bone;
+        bool shield = false;     // met on the riot shield he carries (bone Shield_Root), not on him
     };
     void pose_enemies_for_shot(const LevelScene& scene, const Vec3& from, const Vec3& toward, float range, float spread,
                                std::vector<EnemyBodySet>& out) const;
@@ -541,6 +542,10 @@ private:
     float m_snatch_attach = 0.0f;  // when in the move the weapon becomes hers to hold
     bool m_snatch_fail = false;    // TdMove_Disarm.StartMiss: the grab that gets nothing
     float m_snatch_ended = 1.0f;   // since the last disarm ended
+    // The bot the disarm under way is taken from (LevelScene::enemies; -1 none). As it ends his
+    // inventory is thrown away (TdMove_Disarmed.OnCustomAnimEnd: InvManager.DiscardInventory), the
+    // riot shield with it.
+    int32_t m_disarmed_bot = -1;
     bool m_jump_consumed = false;
 
     // TdMove_Barge

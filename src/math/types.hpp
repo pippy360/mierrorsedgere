@@ -979,8 +979,9 @@ struct BulletTracer {
     // gets the sound alone; 3 somebody who gets nothing (a bot shot by another bot, dying or dead,
     // or the tutorial's; the player while the bot's aim is still off, TdAimBot.IsHitRelevant).
     // 4 is no person: an actor that is no part of the level and whose body names no physical
-    // material (the helicopter's placeholder box), which gets the weapon's DefaultImpactMaterial
-    // effect and sound and no bullet hole.
+    // material (the helicopter's placeholder box), or what a living bot carries that names none
+    // (a riot shield), which gets the weapon's DefaultImpactMaterial effect and sound and no bullet
+    // hole (a dead bot's shield gets 3).
     uint8_t pawn_hit = 0;
     // Where it went into him is end_pos; the surface there, as HitInfo has it: its normal (out of
     // the body; zero: not known) and its material.
@@ -1076,6 +1077,12 @@ struct EnemyBot {
     bool disarm_window = false;
     float attack_timer = 0.0f;
     std::string weapon_name = "Colt1911";
+    // TdBotPawn.myShield: the riot shield on his left hand (the template's ShieldClass, TdInv_Shield,
+    // which AITemplate_RiotCop alone names: template_carries_shield in physics/bot_fire.hpp). It is
+    // drawn and stops bullets while he has it (anim/anim_system.hpp, physics/body_shapes.hpp); a
+    // disarm takes it off him as the move ends (TdMove_Disarmed.OnCustomAnimEnd: DiscardInventory),
+    // a death does not.
+    bool has_shield = false;
     // The weapon still in his hands while it is being taken off him, and for how much longer
     // (TdMove_Disarm: hers is attached to her hand only as the move ends, a shotgun's part way in).
     std::string disarm_weapon;

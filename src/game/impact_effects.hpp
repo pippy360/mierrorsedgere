@@ -42,7 +42,8 @@
 // A bot takes no decal, here as in the game. Where the bullet went into him, the surface's normal
 // there and its material come with the tracer (BulletTracer::pawn_normal, pawn_surface), from the
 // body of his that the controller's line met. A helicopter's box (physics/bot_fire.hpp) names no
-// material: the default material's effect and sound, and no hole (BulletTracer::pawn_hit 4).
+// material, nor do a riot shield's materials and triangles (physics/body_shapes.hpp): the default
+// material's effect and sound, and no hole (BulletTracer::pawn_hit 4).
 // -----------------------------------------------------------------------------
 
 #include "../math/types.hpp"
@@ -414,9 +415,10 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         const int ammo = std::min<int>(tracer.ammo, 3);
 
         // An actor that is no part of the level and whose body names no physical material (the
-        // helicopter's placeholder box; HitInfo.PhysMaterial is the engine's default one, which
-        // has no impact properties): GetImpactEffect and GetImpactSound find nothing on it or up
-        // its parents and fall to the weapon's DefaultImpactMaterial. A skeletal mesh takes no hole.
+        // helicopter's placeholder box, a living riot cop's shield; HitInfo.PhysMaterial is the
+        // engine's default one, which has no impact properties): GetImpactEffect and
+        // GetImpactSound find nothing on it or up its parents and fall to the weapon's
+        // DefaultImpactMaterial. A skeletal mesh takes no hole.
         if (tracer.pawn_hit == 4) {
             if (physical.empty()) continue;
             const std::string heard = play(-1, tracer.end_pos);
@@ -427,7 +429,7 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
                 if (effect >= 0) spawn_effect(scene, effect, tracer.end_pos, reflected(ray, n), false);
             }
             if (debug) {
-                std::cout << "[Impact] on a helicopter at (" << tracer.end_pos.x << ", " << tracer.end_pos.y << ", " << tracer.end_pos.z
+                std::cout << "[Impact] on no person's material (a helicopter's box, a riot shield) at (" << tracer.end_pos.x << ", " << tracer.end_pos.y << ", " << tracer.end_pos.z
                           << "), normal (" << tracer.pawn_normal.x << ", " << tracer.pawn_normal.y << ", " << tracer.pawn_normal.z << "): effect "
                           << (effect >= 0 ? scene.particle_templates[static_cast<size_t>(effect)].path : std::string("none")) << ", sound " << heard
                           << ", no decal" << std::endl;

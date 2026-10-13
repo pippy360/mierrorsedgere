@@ -1847,6 +1847,7 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         bot.home_position = bot_at;
         bot.yaw_deg = -90.0f;
         bot.anim_state = EEnemyAnimState::AimFire;
+        bot.has_shield = template_carries_shield(find_aim_template(archetype));  // the riot cop's
         return bot;
     };
     bool pass = true;
@@ -6234,6 +6235,8 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         if (given(4)) bot_turn = static_cast<float>(std::atof(field[4].c_str()));
         if (given(5)) bot.anim_timer = static_cast<float>(std::atof(field[5].c_str()));
         if (given(6)) bot.active_anim_seq = field[6];
+        // What the template gives him beside the weapon: the riot cop's shield.
+        bot.has_shield = template_carries_shield(find_aim_template(bot.archetype));
         scene.enemies.clear();
         scene.enemies.push_back(bot);
         shot_bot = true;
@@ -6386,8 +6389,10 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
                 if (shot_bot) {
                     std::cout << "[Shots] a shot " << s[0] << " across, " << s[1] << " up: ";
                     if (met) {
-                        std::cout << (shot.posed ? "the bot's " + shot.bone + " (body " + std::to_string(shot.body) + ")" : std::string("the bot's cylinder"))
-                                  << (shot.head ? ", PM_Character_Head" : ", PM_Character_Body") << ", " << shot.distance << " uu off at ("
+                        std::cout << (shot.shield  ? "the bot's riot shield (" + shot.bone + ", no physical material)"
+                                      : shot.posed ? "the bot's " + shot.bone + " (body " + std::to_string(shot.body) + ")" + (shot.head ? ", PM_Character_Head" : ", PM_Character_Body")
+                                                   : std::string("the bot's cylinder") + (shot.head ? ", PM_Character_Head" : ", PM_Character_Body"))
+                                  << ", " << shot.distance << " uu off at ("
                                   << shot.location.x << ", " << shot.location.y << ", " << shot.location.z << "), normal (" << shot.normal.x << ", "
                                   << shot.normal.y << ", " << shot.normal.z << ")" << std::endl;
                     } else {
@@ -6416,6 +6421,13 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
                     tr.from_player = true;
                     tr.pawn_hit = 4;  // the weapon's default impact effect and sound, no hole
                     tr.pawn_normal = on_heli.normal;
+                } else if (met && shot.shield) {
+                    // His riot shield: the weapon's default impact effect and sound, no hole; nothing
+                    // on one who is dead.
+                    tr.end_pos = shot.location;
+                    tr.from_player = true;
+                    tr.pawn_hit = scene.enemies[static_cast<size_t>(shot.enemy)].alive ? 4 : 3;
+                    tr.pawn_normal = shot.normal;
                 } else if (met) {
                     tr.end_pos = shot.location;
                     tr.from_player = true;
