@@ -3411,7 +3411,7 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
         for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
             spots.push_back({"stage " + std::to_string(i + 1),
                              scene.checkpoints_are_feet ? ParkourController::start_spot_over_feet(scene.checkpoints[i]) : scene.checkpoints[i],
-                             scene.player_spawn_yaw});
+                             scene.player_spawn_yaw, {}});
         }
     }
 
