@@ -27,6 +27,7 @@
 
 #include "../math/types.hpp"
 #include "../physics/collision_world.hpp"
+#include "../physics/scene_lines.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -165,7 +166,7 @@ inline float hull_area_in_view(std::vector<P2> pts, float w, float h) {
 // reads back from the box's occlusion query. 1 when the view is inside the box or touches it (the
 // game issues no query then, and takes 1).
 inline float lens_flare_coverage(const LensFlareTemplate& t, const Vec3& location, const LensFlareView& view,
-                                 const CollisionWorld* collision) {
+                                 const SceneLines* collision) {
     using lensflare_detail::P2;
     const Vec3 centre = location + t.box_center;
     const Vec3 half = t.box_extent * 1.1f + Vec3(1.1f, 1.1f, 1.1f);
@@ -285,7 +286,8 @@ inline void build_lens_flare_quads(const LevelScene& scene, const LensFlareView&
             say(source, "outside its cone");
             continue;
         }
-        const float coverage = lens_flare_coverage(t, source.location, view, scene.collision.get());
+        const SceneLines lines{&scene};
+        const float coverage = lens_flare_coverage(t, source.location, view, &lines);
         if (coverage <= 0.0f) {  // no pixel of the box passed: nothing of the flare is drawn
             say(source, "hidden; its box uncovered would take",
                 lens_flare_coverage(t, source.location, view, nullptr));

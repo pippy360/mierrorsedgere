@@ -148,6 +148,23 @@ public:
     // dmt: 0 = Bullet (TdDmgType_Bullet), 1 = Melee (TdDmgType_Melee), 2 = FallDamage (DmgType_Fell)
     void apply_damage(float amount, int dmt = 0, const Vec3& hit_dir_world = Vec3(0.0f, 0.0f, 0.0f));
 
+    // The actors the level script's Matinees move (LevelScene::movers, game/script_movers.hpp).
+    // The actor she stands on (Pawn.Base), -1 for none: a mover that is her base carries her.
+    [[nodiscard]] int32_t base_actor() const { return m_telemetry.grounded ? m_base_actor : -1; }
+    // The mover she stands on has moved by `step` (a rigid transform of its own points): she goes
+    // with it, as UWorld::MoveActor moves what is based on the actor it moves: swept through the
+    // level, which stops her where it is in the way.
+    void carried_by_mover(const LevelScene& scene, const Mat4& step);
+    // UWorld::CheckEncroachment (0x00c12f50) for her, the mover `mover` of `scene` standing at its new
+    // place already, `step` what took it there. In its way she is first pushed out of it (the mover's
+    // own move, and half as much again of what a turn does to her place, slid along the level with
+    // the mover let through; if that is not enough, a cylinder's radius away from it and a little
+    // up), and then moved back until she rests against it. Only when she is still in it after that
+    // is InterpActor.EncroachingOn asked: a mover that moves towards her stops if its bStopOnEncroach
+    // says so (a falling pawn under a rising mover is set on top of it instead), any other goes
+    // through her. True when the move is refused.
+    bool encroached_by_mover(LevelScene& scene, size_t mover, const Mat4& step);
+
     // The player's bullets against the enemies (body_shapes.hpp). The game's shot can meet a bot only
     // in the bodies of his physics asset, placed by his bones as they are (UPhysicsAsset::LineCheck).
     // The controller has no skeletons: it asks whoever poses the drawn ones, through this (the

@@ -261,6 +261,7 @@ static bool oracle_script_effects(const std::string& game_root, me::Renderer* re
             update_impact_effects(scene, 1.0f / 30.0f, ps.position);
             deliver_actor_damage(script, scene);
             script.update(1.0f / 30.0f, ps);
+            update_script_movers(scene, 1.0f / 30.0f);
             now += 1.0f / 30.0f;
         }
     };
@@ -3367,6 +3368,7 @@ struct RespawnCheck {
     int checkpoints = 0;
     int stood = 0;      // put on the floor under the spot, and still there
     int in_cab = 0;     // put into a lift's cab (it takes her off, or stands at the top of its run)
+    int on_mover = 0;   // on an actor the script's Matinees move, which the checkpoint's events put there or which carries her
     int fell = 0;       // nothing under the spot within reach: she fell, and lived
     int fell_dead = 0;  // ... and died of it
     int known = 0;      // the places of kRestartsOnMovers
@@ -3375,9 +3377,10 @@ struct RespawnCheck {
 };
 
 // Checkpoints whose place the port cannot yet make sense of (map, name, why). Reported, not counted.
+// (Jacknife's `construction` and Ropeburn's `Train_Ride_End` were here until the harness ran the
+// level's script as a restart does: the first stands on a girder the checkpoint's events raise
+// under her, the second on a train they give its collision.)
 static const char* const kRestartsOnMovers[][3] = {
-    {"Stormdrain_p", "construction", "stands on Jacknife's hanging platform, which the port does not have there (TODO.md, World Matinees move nothing)"},
-    {"Subway_p", "Train_Ride_End", "stands on a train the port leaves hidden where it is placed (TODO.md, World Matinees move nothing)"},
     {"Scraper_p", "Scraper_Start", "its spot is 140 under the plaza's floor; she is pushed up onto it"},
 };
 
@@ -3396,19 +3399,42 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
         std::string name;
         Vec3 location;
         float yaw = 0.0f;
+        std::vector<std::string> levels;  // TdCheckpoint.StreamingLevels: the sublevels in play there
     };
     std::vector<Spot> spots;
     if (scene.script_checkpoints) {
         // (The chapter's list also holds the time trials' and the tutorial's gates, which nobody restarts at.)
         for (const LevelCheckpointInfo& cp : scene.checkpoint_infos) {
-            if (cp.object_name.rfind("TdCheckpoint", 0) == 0) spots.push_back({cp.checkpoint_name, cp.location, cp.rotation.to_degrees().y});
+            if (cp.object_name.rfind("TdCheckpoint", 0) == 0) spots.push_back({cp.checkpoint_name, cp.location, cp.rotation.to_degrees().y, cp.streaming_levels});
         }
     } else {
         for (size_t i = 0; i < scene.checkpoints.size(); ++i) {
             spots.push_back({"stage " + std::to_string(i + 1),
                              scene.checkpoints_are_feet ? ParkourController::start_spot_over_feet(scene.checkpoints[i]) : scene.checkpoints[i],
-                             scene.player_spawn_yaw});
+                             scene.player_spawn_yaw, {}});
         }
+    }
+
+    // In a level with a script a restart is the level's own (TdSPStoryGame.ResetLevel: the script levels
+    // are loaded again, then TriggerEventsOnLevelReload): every actor the script moved, hid or changed is
+    // as the level places it, and the level-loaded events and the checkpoint's own run its Kismet from
+    // the start, with the sublevels of that checkpoint in play. As the game loop does it on a death.
+    LevelScript script;
+    const bool scripted = !rule_spec && scene.script_checkpoints && world.script && world.script->valid();
+    const std::vector<std::string> default_levels = world.loaded_sublevel_packages;
+    if (scripted) {
+        ScriptHost host;
+        bind_scene_effects(host, world);
+        host.stream_levels = [&world, &script](const std::vector<std::string>& levels, bool load) {
+            auto& streamed = world.loaded_sublevel_packages;
+            for (const std::string& l : levels) {
+                auto it = std::find_if(streamed.begin(), streamed.end(), [&](const std::string& s) { return lower(s) == lower(l); });
+                if (load && it == streamed.end()) streamed.push_back(l);
+                if (!load && it != streamed.end()) streamed.erase(it);
+            }
+            script.set_loaded_packages(streamed);
+        };
+        script.init(world.script, host);
     }
 
     for (const Spot& cp : spots) {
@@ -3416,8 +3442,14 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
         if (rule_spec) {
             controller.reset(cp.location + Vec3(0.0f, 0.0f, static_cast<float>(std::atof(rule_spec))), cp.yaw);
         } else {
+            if (scripted) {
+                restore_script_actors(world);
+                world.loaded_sublevel_packages = cp.levels.empty() ? default_levels : cp.levels;
+                script.set_loaded_packages(world.loaded_sublevel_packages);
+            }
             controller.restart_level_at(cp.location, cp.yaw, world);
             controller.set_checkpoint(cp.location, cp.yaw, 0, cp.name);
+            if (scripted) script.begin_play(cp.name);
         }
         const Vec3 feet = controller.get_telemetry().position;
         const bool placed = controller.get_telemetry().grounded;
@@ -3433,11 +3465,23 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
         for (int f = 0; f < 720; ++f) {
             controller.step(InputFrame{}, 1.0f / 60.0f, world);
             died = died || controller.get_telemetry().falling_to_death || controller.get_telemetry().health <= 0.0f;
+            if (scripted) {
+                ScriptPlayerState ps;
+                ps.position = controller.get_telemetry().position;
+                ps.eye = ps.position + Vec3(0.0f, 0.0f, controller.get_telemetry().eye_height);
+                ps.view_dir = Rotator::from_degrees(0.0f, cp.yaw, 0.0f).forward();
+                ps.dead = died;
+                script.update(1.0f / 60.0f, ps);
+                update_script_movers(world, 1.0f / 60.0f, &controller);
+            }
             if (f >= 179 && (controller.get_telemetry().grounded || died)) break;
         }
         const PlayerTelemetry& t = controller.get_telemetry();
         const float drop = feet.z - t.position.z;
         const float drift = (t.position - feet).length_xy();
+        // Standing on something the script's Matinees move (which may have carried her since).
+        const int32_t base = controller.base_actor();
+        const bool on_mover = base >= 0 && static_cast<size_t>(base) < world.actors.size() && world.actors[static_cast<size_t>(base)].mover >= 0;
         const char* known = nullptr;
         for (const auto& k : kRestartsOnMovers) {
             if (label.find(k[0]) != std::string::npos && cp.name == k[1]) known = k[2];
@@ -3454,6 +3498,11 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
         } else if (t.in_elevator) {
             ok = !died && drift < 8.0f;
             out.in_cab += ok ? 1 : 0;
+        } else if (on_mover && (!placed || std::abs(drop) >= 1.0f || drift >= 8.0f)) {
+            // On one of the script's movers that the checkpoint's events put under her, or that carries her:
+            // not far down onto one, nor carried far from the spot.
+            ok = !died && drop < 200.0f && drift < 50.0f;
+            out.on_mover += ok ? 1 : 0;
         } else if (placed) {
             ok = !died && t.grounded && std::abs(drop) < 1.0f && drift < 8.0f;
             out.stood += ok ? 1 : 0;
@@ -3498,10 +3547,13 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
             std::cout << "  [respawn] " << label << " '" << cp.name << "' at (" << cp.location.x << ", " << cp.location.y << ", " << cp.location.z
                       << "): put at feet z " << feet.z << (placed ? " on a floor" : " in the air") << ", then at (" << t.position.x << ", " << t.position.y
                       << ", " << t.position.z << "), drop " << drop << ", drift " << drift << (t.grounded ? "" : ", in the air") << (t.in_elevator ? ", in a cab" : "")
+                      << (on_mover ? ", on " + world.actors[static_cast<size_t>(base)].source_package + ":" + world.actors[static_cast<size_t>(base)].unique_name + ", which the script moves" : std::string())
                       << ", " << move_state_name(t.move_state) << (roofed ? ", something in her capsule where she is put" : "") << (died ? ", DEAD" : "")
                       << (known ? std::string("  (known: ") + known + ")" : ok ? std::string() : std::string("  <-- FAIL")) << std::endl;
         }
     }
+    // The copy shares its collision worlds with `scene`: what the scripts switched there is put back.
+    if (scripted) restore_script_actors(world);
     return out;
 }
 
@@ -3560,11 +3612,12 @@ static int run_verify_respawn(const std::string& game_root) {
         }
         const RespawnCheck r = check_checkpoint_respawns(scene, move_cfg, map, std::getenv("ME_RESPAWN_RULE"));
         std::cout << "[Respawn] " << map << (scene.script_checkpoints ? "" : " (no script: its listed stages)") << ": " << r.checkpoints << " places: "
-                  << r.stood << " stand where they are put, " << r.in_cab << " in a lift's cab, " << r.fell << " fall and live, " << r.fell_dead
-                  << " fall and die, " << r.known << " known, " << r.failed << " failed" << std::endl;
+                  << r.stood << " stand where they are put, " << r.in_cab << " in a lift's cab, " << r.on_mover << " on something the script moves, " << r.fell
+                  << " fall and live, " << r.fell_dead << " fall and die, " << r.known << " known, " << r.failed << " failed" << std::endl;
         all.checkpoints += r.checkpoints;
         all.stood += r.stood;
         all.in_cab += r.in_cab;
+        all.on_mover += r.on_mover;
         all.fell += r.fell;
         all.fell_dead += r.fell_dead;
         all.known += r.known;
@@ -3572,9 +3625,621 @@ static int run_verify_respawn(const std::string& game_root) {
         all.worst_drift = std::max(all.worst_drift, r.worst_drift);
     }
     std::cout << "[Respawn] " << all.checkpoints << " places in " << (sizeof(kMaps) / sizeof(kMaps[0])) << " maps: " << all.stood
-              << " stand where they are put, " << all.in_cab << " in a lift's cab, " << all.fell << " fall and live, " << all.fell_dead
-              << " fall and die, " << all.known << " known, " << all.failed << " failed; largest drift " << all.worst_drift << " uu" << std::endl;
+              << " stand where they are put, " << all.in_cab << " in a lift's cab, " << all.on_mover << " on something the script moves, " << all.fell
+              << " fall and live, " << all.fell_dead << " fall and die, " << all.known << " known, " << all.failed << " failed; largest drift " << all.worst_drift
+              << " uu" << std::endl;
     return loaded && all.failed == 0 && all.fell_dead == 0 ? 0 : 1;
+}
+
+// -----------------------------------------------------------------------------
+// Oracle stage 29: the level script's Matinees on the actors they move (docs/GAMEPLAY_SCRIPTING_RE.md
+// section 9; game/matinee_move.hpp, game/script_movers.hpp).
+//   Eval:     the track evaluation against cooked keys worked out from the data: Flight's office door
+//             (a world-framed turn), New Eden's lift hull (a relative track whose first key is far
+//             from zero), Ropeburn's first train, Pirandello Kruger's construction lift (a world
+//             track that ends on its first key), and the curve's rules on keys made here.
+//   Playback: the executable's rules on those Matinees: Completed a tick after the end, Play again
+//             without a rewind, Reverse, a Stop part way, a Stop on an idle one, Pause twice, a
+//             loop, ForceStartPosition, a rewind, a linked PlayRate.
+//   Door:     Flight's office door by its remote events: open, a line and a walk through the doorway,
+//             shut again, and shut on her standing in its swing.
+//   Ride:     Heat's gondola carrying her its whole way; Jacknife's girder raising her.
+// --verify-movers runs it alone and then counts, chapter by chapter, what the Matinees move.
+// -----------------------------------------------------------------------------
+static bool oracle_matinee_movers(const std::string& game_root, const me::MovementConfig& move_cfg) {
+    using namespace me;
+    namespace fs = std::filesystem;
+    const auto lower_of = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v;
+    };
+    // One package's Kismet alone: its Matinees and their keys, with no level round them.
+    const auto lone_graph = [&](const char* rel) -> std::shared_ptr<ScriptGraph> {
+        fs::path path = fs::path(game_root) / "TdGame" / "CookedPC" / rel;
+        if (!fs::exists(path)) path = fs::path(game_root) / "CookedPC" / rel;
+        if (!fs::exists(path)) path = fs::path(game_root) / rel;
+        auto pkg = std::make_shared<UPKPackage>(path.string());
+        if (!pkg->is_valid()) return nullptr;
+        auto graph = std::make_shared<ScriptGraph>();
+        std::vector<std::string> warnings;
+        graph->load({pkg}, {}, warnings);
+        return graph;
+    };
+    const auto find_op = [&](const ScriptGraph& g, const std::string& package, const std::string& name) {
+        for (size_t i = 0; i < g.nodes.size(); ++i) {
+            const ScriptGraph::Node& n = g.nodes[i];
+            if (n.cls == "SeqAct_Interp" && n.name == name && g.packages[static_cast<size_t>(n.package)] == package) return static_cast<int>(i);
+        }
+        return -1;
+    };
+    // The movement track of the op's group that the named actor is linked to.
+    const auto track_of = [&](const ScriptGraph& g, int op, const std::string& actor) -> const MoveTrack* {
+        if (op < 0 || g.nodes[static_cast<size_t>(op)].matinee < 0) return nullptr;
+        const ScriptGraph::Node& n = g.nodes[static_cast<size_t>(op)];
+        for (const ScriptMatinee::Move& move : g.matinees[static_cast<size_t>(n.matinee)].moves) {
+            for (const ScriptGraph::VarLink& link : n.vars) {
+                if (lower_of(link.desc) != lower_of(move.group)) continue;
+                for (int v : link.vars) {
+                    if (v < 0 || g.nodes[static_cast<size_t>(v)].actor < 0) continue;
+                    if (g.actors[static_cast<size_t>(g.nodes[static_cast<size_t>(v)].actor)].name == actor) return &move.track;
+                }
+            }
+        }
+        return nullptr;
+    };
+    const auto origin = [](const Mat4& m) { return Vec3(m.m[12], m.m[13], m.m[14]); };
+    const auto yaw_of = [](const Mat4& m) { return std::atan2(m.m[1], m.m[0]) * RAD2DEG; };
+    const auto turn_between = [](float a, float b) { return std::abs(std::remainder(a - b, 360.0f)); };
+    const Mat4 unit = Mat4::identity();
+    std::ostringstream note;
+    note << std::fixed << std::setprecision(3);
+
+    // --- Eval ---
+    bool eval_ok = true;
+    const std::shared_ptr<ScriptGraph> office = lone_graph("Maps/SP01/Escape_Off.me1");
+    const std::shared_ptr<ScriptGraph> trains = lone_graph("Maps/SP04/Subway_Train_Spt.me1");
+    {
+        // Flight's office door: IMF_World, the place constant, yaw 270 at 0 and 140.63049 from 0.1 s
+        // (49152 and 25601 rotation units as MakeFromEuler truncates them).
+        const MoveTrack* t = office ? track_of(*office, find_op(*office, "escape_off", "SeqAct_Interp_0"), "InterpActor_13") : nullptr;
+        Mat4 w0, w1;
+        const bool ok = t && !t->relative && move_track_transform(*t, unit, unit, 0.0f, w0) && move_track_transform(*t, unit, unit, 0.15f, w1) &&
+                        turn_between(yaw_of(w0), 270.0f) < 0.01f && turn_between(yaw_of(w1), 140.63049f) < 0.01f &&
+                        (origin(w0) - Vec3(4214.003f, 7543.999f, 12672.0f)).length() < 0.02f && (origin(w1) - origin(w0)).length() < 0.02f;
+        eval_ok = eval_ok && ok;
+        if (t) note << "office door yaw " << (yaw_of(w0) < 0.0f ? yaw_of(w0) + 360.0f : yaw_of(w0)) << " -> " << yaw_of(w1) << ", moved " << (origin(w1) - origin(w0)).length();
+        else note << "office door: no track";
+    }
+    {
+        // New Eden's lift hull: relative, keys (-41823.95, 7719.99, -1151.99) -> (-41823.96, 7719.99, 127.99): it
+        // rises 1280 from where it stands, and stands where it is at the start.
+        const std::shared_ptr<ScriptGraph> mall = lone_graph("Maps/SP05/Mall_Mall_Spt.me1");
+        const MoveTrack* t = mall ? track_of(*mall, find_op(*mall, "mall_mall_spt", "SeqAct_Interp_26"), "InterpActor_1") : nullptr;
+        Mat4 w0, w1;
+        const Mat4 initial = t ? move_initial_transform(*t, unit, 0.0f) : unit;
+        const bool ok = t && t->relative && move_track_transform(*t, initial, unit, 0.0f, w0) && move_track_transform(*t, initial, unit, 10.0f, w1) &&
+                        origin(w0).length() < 0.02f && (origin(w1) - Vec3(0.0f, 0.0f, 1280.0f)).length() < 0.02f;
+        eval_ok = eval_ok && ok;
+        if (t) note << "; lift hull at 0 s off by " << origin(w0).length() << ", at 10 s up " << origin(w1).z;
+        else note << "; lift hull: no track";
+    }
+    {
+        // Ropeburn's first train: its last key 34095.97 along -Y of the frame it is placed in.
+        const MoveTrack* t = trains ? track_of(*trains, find_op(*trains, "subway_train_spt", "SeqAct_Interp_10"), "InterpActor_27") : nullptr;
+        Mat4 w;
+        const Mat4 initial = t ? move_initial_transform(*t, unit, 0.0f) : unit;
+        const bool ok = t && t->relative && move_track_transform(*t, initial, unit, 18.0f, w) && std::abs(origin(w).y + 34095.97f) < 0.05f &&
+                        std::abs(origin(w).x) < 0.05f && std::abs(origin(w).z) < 0.05f;
+        eval_ok = eval_ok && ok;
+        if (t) note << "; train at its end y " << origin(w).y;
+        else note << "; train: no track";
+    }
+    {
+        // Pirandello Kruger's construction lift: world-framed, four keys, back on its first at the end.
+        const std::shared_ptr<ScriptGraph> arena = lone_graph("Maps/SP06/Factory_Arena_Spt.me1");
+        const int op = arena ? find_op(*arena, "factory_arena_spt", "SeqAct_Interp_6") : -1;
+        const MoveTrack* t = arena ? track_of(*arena, op, "InterpActor_7") : nullptr;
+        const float length = t ? arena->matinees[static_cast<size_t>(arena->nodes[static_cast<size_t>(op)].matinee)].length : 0.0f;
+        Mat4 w0, w1, at;
+        float furthest = 0.0f;
+        for (int k = 0; t && k <= 400; ++k) {
+            if (move_track_transform(*t, unit, unit, length * static_cast<float>(k) / 400.0f, at)) furthest = std::max(furthest, (origin(at) - t->pos.front().value).length());
+        }
+        const bool ok = t && !t->relative && t->pos.size() == 4 && move_track_transform(*t, unit, unit, 0.0f, w0) &&
+                        move_track_transform(*t, unit, unit, length, w1) && (origin(w0) - t->pos.front().value).length() < 0.01f &&
+                        (origin(w1) - origin(w0)).length() < 0.01f && furthest > 1640.0f && furthest < 1660.0f;
+        eval_ok = eval_ok && ok;
+        if (t) note << "; construction lift ends " << (origin(w1) - origin(w0)).length() << " from its start, " << furthest << " away at its furthest";
+        else note << "; construction lift: no track";
+    }
+    {
+        // The curve itself: a held segment ends at the next key's own time, the last key is reached at
+        // its time; a line; a cubic with level tangents; and the two ways of turning from yaw 0 to 270.
+        const auto key = [](float time, float x, uint8_t mode) {
+            MoveCurveKey k;
+            k.time = time;
+            k.value = Vec3(x, 0.0f, 0.0f);
+            k.mode = mode;
+            return k;
+        };
+        const std::vector<MoveCurveKey> held = {key(0.0f, 0.0f, 0), key(1.0f, 5.0f, 2), key(2.0f, 9.0f, 0)};
+        const std::vector<MoveCurveKey> cubic = {key(0.0f, 0.0f, 1), key(1.0f, 10.0f, 1)};
+        MoveTrack turn;
+        turn.euler = {key(0.0f, 0.0f, 0), key(1.0f, 0.0f, 0)};
+        turn.euler[1].value = Vec3(0.0f, 0.0f, 270.0f);
+        const float by_euler = yaw_of(move_key_transform(turn, 0.5f));
+        turn.quat = true;
+        const float by_quat = yaw_of(move_key_transform(turn, 0.5f));
+        const bool ok = eval_move_curve(held, 0.5f).x == 2.5f && eval_move_curve(held, 1.0f).x == 5.0f && eval_move_curve(held, 1.999f).x == 5.0f &&
+                        eval_move_curve(held, 2.0f).x == 9.0f && eval_move_curve(held, 3.0f).x == 9.0f && eval_move_curve(held, -1.0f).x == 0.0f &&
+                        std::abs(eval_move_curve(cubic, 0.5f).x - 5.0f) < 1.0e-4f && std::abs(eval_move_curve(cubic, 0.25f).x - 1.5625f) < 1.0e-4f &&
+                        turn_between(by_euler, 135.0f) < 0.01f && turn_between(by_quat, -45.0f) < 0.01f;
+        eval_ok = eval_ok && ok;
+        note << "; yaw 0 to 270 half way: " << by_euler << " by its angles, " << by_quat << " by quaternion";
+    }
+    const std::string eval_note = note.str();
+    note.str(std::string());
+
+    // --- Playback ---
+    bool play_ok = office != nullptr && trains != nullptr;
+    if (play_ok) {
+        ScriptPlayerState ps;
+        LevelScript s;
+        s.init(office, ScriptHost{});
+        const int op = find_op(*office, "escape_off", "SeqAct_Interp_0");
+        const float length = op >= 0 ? office->matinees[static_cast<size_t>(office->nodes[static_cast<size_t>(op)].matinee)].length : 0.0f;
+        const float dt = 0.01f;
+        const auto until_idle = [&](int limit) {
+            int ticks = 0;
+            while (ticks < limit && s.op_active(op)) {
+                s.update(dt, ps);
+                ++ticks;
+            }
+            return ticks;
+        };
+        play_ok = op >= 0 && std::abs(length - 0.15f) < 1.0e-4f;
+        if (play_ok) {
+            // Play to the end: the tick that reaches it fires nothing yet; Completed comes the tick after.
+            s.activate_input(op, 0);
+            int ticks = 0;
+            do {
+                s.update(dt, ps);
+                ++ticks;
+            } while (s.interp_playing(op) && ticks < 100);
+            const bool at_end = std::abs(s.interp_position(op) - length) < 1.0e-5f && s.op_active(op) && s.interp_fired(op, 0) == 0;
+            s.update(dt, ps);
+            const bool completed = !s.op_active(op) && s.interp_fired(op, 0) == 1 && s.interp_fired(op, 1) == 0;
+            // Play again, no rewind: it ends at once where it is and Completed fires again.
+            s.activate_input(op, 0);
+            s.update(dt, ps);
+            until_idle(10);
+            const bool again = s.interp_fired(op, 0) == 2 && std::abs(s.interp_position(op) - length) < 1.0e-5f;
+            // Reverse: back to the start, output 1; and Reverse again at the start: output 1 once more.
+            s.activate_input(op, 1);
+            s.update(dt, ps);
+            const bool backwards = s.interp_reversed(op) && s.interp_position(op) < length;
+            until_idle(100);
+            const bool reversed = backwards && s.interp_position(op) == 0.0f && s.interp_fired(op, 1) == 1 && s.interp_fired(op, 0) == 2;
+            s.activate_input(op, 1);
+            s.update(dt, ps);
+            until_idle(10);
+            const bool reversed_again = s.interp_position(op) == 0.0f && s.interp_fired(op, 1) == 2;
+            // Stop part way: neither output; the Position stays.
+            s.activate_input(op, 0);
+            for (int i = 0; i < 5; ++i) s.update(dt, ps);
+            const float part = s.interp_position(op);
+            s.activate_input(op, 2);
+            s.update(dt, ps);
+            until_idle(10);
+            const bool stopped = part > 0.03f && part < 0.07f && s.interp_position(op) == part && s.interp_fired(op, 0) == 2 && s.interp_fired(op, 1) == 2;
+            // Stop on an idle Matinee: the op ends a tick later with no output.
+            s.activate_input(op, 2);
+            s.update(dt, ps);
+            const bool idle_active = s.op_active(op);
+            until_idle(10);
+            const bool idle_stop = idle_active && s.interp_fired(op, 0) == 2 && s.interp_fired(op, 1) == 2 && s.interp_position(op) == part;
+            // Pause twice: it stands, then goes on to its end.
+            s.activate_input(op, 0);
+            s.update(dt, ps);
+            s.update(dt, ps);
+            s.activate_input(op, 3);
+            s.update(dt, ps);
+            const float held = s.interp_position(op);
+            for (int i = 0; i < 5; ++i) s.update(dt, ps);
+            const bool paused = s.op_active(op) && s.interp_playing(op) && s.interp_position(op) == held && held > part && held < length;
+            s.activate_input(op, 3);
+            s.update(dt, ps);
+            until_idle(100);
+            const bool resumed = std::abs(s.interp_position(op) - length) < 1.0e-5f && s.interp_fired(op, 0) == 3;
+            play_ok = at_end && completed && again && reversed && reversed_again && stopped && idle_stop && paused && resumed;
+            note << "end reached after " << ticks << " ticks of 0.01 s, Completed the tick after " << (completed ? "yes" : "NO") << ", again without a rewind "
+                 << (again ? "yes" : "NO") << ", reversed to 0 " << (reversed ? "yes" : "NO") << ", reversed at 0 " << (reversed_again ? "yes" : "NO")
+                 << ", stopped at " << part << " with no output " << (stopped ? "yes" : "NO") << ", stop when idle silent " << (idle_stop ? "yes" : "NO")
+                 << ", paused at " << held << " " << (paused ? "yes" : "NO") << ", resumed " << (resumed ? "yes" : "NO");
+        }
+        // A loop: the Training Area's turning sign (bLooping, PlayRate 0.05, 1 s long) goes round and never ends.
+        const std::shared_ptr<ScriptGraph> sign = lone_graph("Maps/SP00/Tutorial_Art.me1");
+        const int loop = sign ? find_op(*sign, "tutorial_art", "SeqAct_Interp_2") : -1;
+        bool loop_ok = loop >= 0;
+        if (loop_ok) {
+            LevelScript l;
+            l.init(sign, ScriptHost{});
+            l.activate_input(loop, 0);
+            bool always = true;
+            float wrapped_from = 0.0f;
+            int wraps = 0;
+            for (int i = 0; i < 1500; ++i) {  // 50 s: two and a half times round
+                const float before = l.interp_position(loop);
+                l.update(1.0f / 30.0f, ps);
+                always = always && l.op_active(loop) && l.interp_playing(loop) && l.interp_position(loop) <= 1.0f;
+                if (l.interp_position(loop) < before) {
+                    wrapped_from = before;
+                    ++wraps;
+                }
+            }
+            loop_ok = always && wraps == 2 && wrapped_from > 0.99f && l.interp_fired(loop, 0) == 0 && l.interp_fired(loop, 1) == 0;
+            note << "; a loop went round " << wraps << " times in 50 s (last from " << wrapped_from << ") and is still playing " << (always ? "yes" : "NO");
+        }
+        // The trains' Kismet: a forced start (ForceStartPosition 3; its rate comes from the ride's own
+        // variable), and the first train's loop, which its own Completed plays again: 18 s at twice
+        // the rate, rewound to 0 each time (bRewindOnPlay).
+        LevelScript t;
+        t.init(trains, ScriptHost{});
+        const int forced = find_op(*trains, "subway_train_spt", "SeqAct_Interp_0");
+        const int rewind = find_op(*trains, "subway_train_spt", "SeqAct_Interp_10");
+        bool train_ok = forced >= 0 && rewind >= 0;
+        if (train_ok) {
+            t.activate_input(forced, 0);
+            t.activate_input(rewind, 0);
+            t.update(1.0f / 60.0f, ps);
+            const float forced_at = t.interp_position(forced);
+            const float rate = t.interp_position(rewind) * 60.0f;  // PlayRate 2
+            for (int i = 0; i < 600; ++i) t.update(1.0f / 60.0f, ps);  // 10 s: it ended at 9 s
+            const bool rewound = t.interp_fired(rewind, 0) == 1 && t.interp_playing(rewind) && t.interp_position(rewind) > 0.5f && t.interp_position(rewind) < 3.0f;
+            train_ok = forced_at >= 3.0f && forced_at < 3.1f && std::abs(rate - 2.0f) < 1.0e-3f && rewound;
+            note << "; forced start at " << forced_at << ", rate " << rate << ", played again by its own Completed and rewound (at " << t.interp_position(rewind) << " a second later) "
+                 << (rewound ? "yes" : "NO");
+        }
+        play_ok = play_ok && loop_ok && train_ok;
+    }
+    std::string play_note = note.str();
+    note.str(std::string());
+
+    // What a level needs to run its script against its movers and a pawn.
+    struct Level {
+        LevelScene scene;
+        LevelScript script;
+        std::vector<std::string> log;
+        bool loaded = false;
+    };
+    const auto begin = [&](Level& level, const char* map) {
+        level.loaded = load_level_scene(game_root, map, level.scene) && level.scene.script && level.scene.script->valid() && level.scene.collision;
+        if (!level.loaded) return;
+        level.scene.enemies.clear();
+        level.scene.helicopters.clear();
+        ScriptHost host;
+        bind_scene_effects(host, level.scene);
+        const bool debug = std::getenv("ME_SCRIPT_DEBUG") != nullptr;
+        std::vector<std::string>* log = &level.log;
+        host.log = [log, debug](const std::string& line) {
+            log->push_back(line);
+            if (debug) std::cout << "    " << line << std::endl;
+        };
+        level.script.init(level.scene.script, host);  // every package's sequence runs; no level-loaded events
+    };
+    const auto actor_named = [&](const LevelScene& scene, const std::string& package, const std::string& name) {
+        for (size_t i = 0; i < scene.actors.size(); ++i) {
+            if (scene.actors[i].unique_name == name && lower_of(scene.actors[i].source_package) == package) return static_cast<int>(i);
+        }
+        return -1;
+    };
+    const float dt = 1.0f / 60.0f;
+
+    // --- Door ---
+    bool door_ok = false;
+    {
+        auto level = std::make_unique<Level>();
+        begin(*level, "Maps/SP01/Escape_p.me1");
+        LevelScene& scene = level->scene;
+        LevelScript& script = level->script;
+        const int ai = level->loaded ? actor_named(scene, "escape_off", "InterpActor_13") : -1;
+        const int mi = ai >= 0 ? scene.actors[static_cast<size_t>(ai)].mover : -1;
+        if (mi < 0) {
+            note << "the office door is not one of the script's movers" << (ai >= 0 && scene.actors[static_cast<size_t>(ai)].barge_door >= 0 ? " (still a door of the port's own)" : "");
+        } else {
+            const LevelActor& door = scene.actors[static_cast<size_t>(ai)];
+            const ScriptMover& mover = scene.movers[static_cast<size_t>(mi)];
+            ScriptPlayerState ps;
+            ps.position = Vec3(0.0f, 0.0f, -100000.0f);
+            const auto tick = [&](int frames, ParkourController* pawn = nullptr) {
+                for (int i = 0; i < frames; ++i) {
+                    if (pawn) pawn->step(InputFrame{}, dt, scene);
+                    script.update(dt, ps);
+                    update_script_movers(scene, dt, pawn);
+                }
+            };
+            const Vec3 hinge = door.location;
+            const Vec3 centre = (door.world_bounds.min_pt + door.world_bounds.max_pt) * 0.5f;
+            const Vec3 size = door.world_bounds.max_pt - door.world_bounds.min_pt;
+            const Vec3 n = size.x <= size.y ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);  // the way through the doorway
+            const auto on_line = [&]() { return find_impact_surface(scene, centre + n * 80.0f, centre - n * 80.0f).actor == ai; };
+            // A walk at the doorway from 150 uu out on either side: how far past its middle she gets (negative: not past).
+            const auto walk_through = [&](float side) {
+                const ImpactSurface floor = find_impact_surface(scene, centre + n * (side * 150.0f), centre + n * (side * 150.0f) - Vec3(0.0f, 0.0f, 400.0f));
+                if (!floor.hit) return -1.0e9f;
+                ParkourController walker(move_cfg);
+                walker.reset(floor.location + Vec3(0.0f, 0.0f, 4.0f), std::atan2(-n.y * side, -n.x * side) * RAD2DEG);
+                float past = -1.0e9f;
+                for (int f = 0; f < 150; ++f) {
+                    InputFrame in{};
+                    in.forward = 1.0f;
+                    walker.step(in, dt, scene);
+                    past = std::max(past, -(walker.get_position() - centre).dot(n * side));
+                }
+                return past;
+            };
+            const bool shut_line = on_line();
+            const float shut_walk = std::max(walk_through(1.0f), walk_through(-1.0f));
+            script.fire_remote_event("Open_Pope_Door");
+            tick(18);  // 0.3 s: the Matinee is 0.15 s long
+            const float opened = yaw_of(mover.delta);
+            const float hinge_off = (mover.delta.transform_point(hinge) - hinge).length();
+            const bool open_line = on_line();
+            const float open_walk = std::max(walk_through(1.0f), walk_through(-1.0f));
+            script.fire_remote_event("Close_Pope_Door");
+            tick(18);
+            const bool shut_again = !mover.moved && on_line();
+            // Open once more (its events have had their one firing: by the op's own inputs now), and shut
+            // with her standing where the leaf swings: 40 degrees short of shut, at the leaf's middle.
+            // She is pushed along by it; it stops for her only if she cannot get out.
+            const int door_op = find_op(*scene.script, "escape_off", "SeqAct_Interp_0");
+            script.activate_input(door_op, 0);
+            tick(18);
+            const float sign = opened < 0.0f ? -1.0f : 1.0f;
+            const float at = sign * 40.0f * DEG2RAD;
+            const Vec3 arm = centre - hinge;
+            const Vec3 spot(hinge.x + std::cos(at) * arm.x - std::sin(at) * arm.y, hinge.y + std::sin(at) * arm.x + std::cos(at) * arm.y, centre.z);
+            const ImpactSurface under = find_impact_surface(scene, spot, spot - Vec3(0.0f, 0.0f, 400.0f));
+            ParkourController stander(move_cfg);
+            stander.reset((under.hit ? under.location : spot) + Vec3(0.0f, 0.0f, 4.0f), 0.0f);
+            tick(20, &stander);
+            const Vec3 stood = stander.get_position();
+            const float open_before = yaw_of(mover.delta);
+            script.activate_input(door_op, 1);
+            if (std::getenv("ME_MOVER_DEBUG")) {
+                std::cout << "    door hinge (" << hinge.x << ", " << hinge.y << ", " << hinge.z << ") middle (" << centre.x << ", " << centre.y << ", " << centre.z
+                          << ") spot (" << spot.x << ", " << spot.y << ", " << spot.z << ") floor " << (under.hit ? under.location.z : -1.0f) << " stood ("
+                          << stood.x << ", " << stood.y << ", " << stood.z << ") grounded " << stander.is_grounded() << std::endl;
+                for (int f = 0; f < 12; ++f) {
+                    tick(1, &stander);
+                    const Vec3 p = stander.get_position();
+                    std::cout << "    tick " << f << ": door " << yaw_of(mover.delta) << " deg, she (" << p.x << ", " << p.y << ", " << p.z << ")" << std::endl;
+                }
+            }
+            tick(40, &stander);
+            const float pushed = (stander.get_position() - stood).length_xy();
+            const float left_open = yaw_of(mover.delta);
+            // Either it shut and she was moved out of its swing, or it stands part open against her.
+            const bool in_way_ok = turn_between(open_before, opened) < 0.02f && std::isfinite(pushed) &&
+                                   ((!mover.moved && pushed > 5.0f) || (mover.moved && mover.stop_on_encroach));
+            door_ok = shut_line && shut_walk < 0.0f && turn_between(opened, -129.37f) < 0.02f && hinge_off < 0.05f && !open_line && open_walk > 40.0f &&
+                      shut_again && in_way_ok;
+            note << "shut: on the line " << (shut_line ? "yes" : "NO") << ", a walk gets " << shut_walk << " past; open: turned " << opened
+                 << " deg about its hinge (off by " << hinge_off << "), on the line " << (open_line ? "YES" : "no") << ", a walk gets " << open_walk
+                 << " past; shut again " << (shut_again ? "yes" : "NO") << "; shut on her: pushed " << pushed << " uu, the door left at " << left_open
+                 << " deg (bStopOnEncroach " << (mover.stop_on_encroach ? "on" : "off") << ")";
+        }
+        // A Matinee whose PlayRate comes from a linked SeqVar_RandomFloat plays at a rate between its Min and Max.
+        if (level->loaded) {
+            const ScriptGraph& g = *scene.script;
+            bool found = false, in_range = false;
+            float rate = 0.0f, lo = 0.0f, hi = 0.0f;
+            for (size_t i = 0; i < g.nodes.size() && !found; ++i) {
+                const ScriptGraph::Node& node = g.nodes[i];
+                if (node.cls != "SeqAct_Interp" || node.matinee < 0 || node.b2 || node.b6 || g.matinees[static_cast<size_t>(node.matinee)].length < 1.0f) continue;
+                for (const ScriptGraph::VarLink& link : node.vars) {
+                    if (lower_of(link.desc) != "playrate" || link.vars.empty() || link.vars.front() < 0) continue;
+                    const ScriptGraph::Node& var = g.nodes[static_cast<size_t>(link.vars.front())];
+                    if (var.cls != "SeqVar_RandomFloat" || var.f2 <= var.f) continue;
+                    ScriptPlayerState ps;
+                    script.activate_input(static_cast<int>(i), 0);
+                    script.update(dt, ps);
+                    rate = script.interp_position(static_cast<int>(i)) / dt;
+                    lo = var.f;
+                    hi = var.f2;
+                    in_range = rate >= lo - 1.0e-3f && rate <= hi + 1.0e-3f;
+                    found = true;
+                }
+            }
+            play_ok = play_ok && found && in_range;
+            std::ostringstream linked;
+            linked << std::fixed << std::setprecision(3) << "; a linked PlayRate drew " << rate << " from " << lo << ".." << hi << (found && in_range ? "" : " (FAILED)");
+            play_note += linked.str();
+        }
+    }
+    const std::string door_note = note.str();
+    note.str(std::string());
+
+    // --- Ride ---
+    bool ride_ok = false, rise_ok = false;
+    // She is set on a mover's top and left to settle; then the script and the movers run with her.
+    const auto stand_on = [&](LevelScene& scene, int actor, ParkourController& pawn, const Vec3* over = nullptr) {
+        const ScriptMover& mover = scene.movers[static_cast<size_t>(scene.actors[static_cast<size_t>(actor)].mover)];
+        const Vec3 middle = over ? *over : mover.delta.transform_point((scene.actors[static_cast<size_t>(actor)].world_bounds.min_pt + scene.actors[static_cast<size_t>(actor)].world_bounds.max_pt) * 0.5f);
+        // Her feet at that point, and down onto whatever of it is under her there.
+        pawn.reset(middle, 0.0f);
+        for (int f = 0; f < 150 && (f < 30 || !pawn.is_grounded()); ++f) {
+            pawn.step(InputFrame{}, dt, scene);
+            update_script_movers(scene, dt, &pawn);
+        }
+        return pawn.base_actor() == actor;
+    };
+    {
+        // Heat's window-cleaner gondola: 1352 uu along its own X in 10 s at PlayRate 2.5.
+        auto level = std::make_unique<Level>();
+        begin(*level, "Maps/SP03/Cranes_p.me1");
+        LevelScene& scene = level->scene;
+        const int ai = level->loaded ? actor_named(scene, "cranes_puzz_spt", "InterpActor_2") : -1;
+        const int op = level->loaded ? find_op(*scene.script, "cranes_puzz_spt", "SeqAct_Interp_0") : -1;
+        if (ai < 0 || op < 0 || scene.actors[static_cast<size_t>(ai)].mover < 0) {
+            note << "the gondola is not one of the script's movers";
+        } else {
+            const ScriptMover& mover = scene.movers[static_cast<size_t>(scene.actors[static_cast<size_t>(ai)].mover)];
+            ParkourController rider(move_cfg);
+            const bool on_it = stand_on(scene, ai, rider);
+            const Vec3 her_start = rider.get_position(), its_start = origin(mover.actor_tm);
+            ScriptPlayerState ps;
+            ps.position = Vec3(0.0f, 0.0f, -100000.0f);
+            level->script.activate_input(op, 0);
+            bool rode = on_it;
+            if (std::getenv("ME_MOVER_DEBUG")) {
+                const LevelActor& a = scene.actors[static_cast<size_t>(ai)];
+                std::cout << "    gondola " << a.mesh_name << " at (" << its_start.x << ", " << its_start.y << ", " << its_start.z << ") yaw " << a.rotation.to_degrees().y << " box ("
+                          << a.world_bounds.min_pt.x << ", " << a.world_bounds.min_pt.y << ", " << a.world_bounds.min_pt.z << ") .. (" << a.world_bounds.max_pt.x << ", "
+                          << a.world_bounds.max_pt.y << ", " << a.world_bounds.max_pt.z << "), she at (" << her_start.x << ", " << her_start.y << ", " << her_start.z << ")" << std::endl;
+                for (const LevelActor& o : scene.actors) {
+                    if (o.unique_name != "StaticMeshActor_5" && o.unique_name != "StaticMeshActor_116") continue;
+                    if ((o.location - a.location).length() > 3000.0f) continue;
+                    std::cout << "      " << o.source_package << ":" << o.unique_name << " " << o.mesh_name << " box (" << o.world_bounds.min_pt.x << ", " << o.world_bounds.min_pt.y << ", "
+                              << o.world_bounds.min_pt.z << ") .. (" << o.world_bounds.max_pt.x << ", " << o.world_bounds.max_pt.y << ", " << o.world_bounds.max_pt.z << ") base '" << o.base_name << "'" << std::endl;
+                }
+            }
+            for (int f = 0; f < 300; ++f) {
+                rider.step(InputFrame{}, dt, scene);
+                level->script.update(dt, ps);
+                const int base = rider.base_actor();
+                update_script_movers(scene, dt, &rider);
+                if (std::getenv("ME_MOVER_DEBUG") && (base != ai || f < 3)) {
+                    const Vec3 p = rider.get_position(), o = origin(mover.actor_tm);
+                    std::cout << "    frame " << f << ": base " << base << " (" << (base >= 0 ? scene.actors[static_cast<size_t>(base)].unique_name : std::string("none")) << "), she (" << p.x - her_start.x << ", " << p.y - her_start.y << ", " << p.z - her_start.z
+                              << ") it (" << o.x - its_start.x << ", " << o.y - its_start.y << ", " << o.z - its_start.z << ") " << move_state_name(rider.get_move_state()) << std::endl;
+                }
+                rode = rode && base == ai;
+            }
+            const float its_way = (origin(mover.actor_tm) - its_start).length(), her_way = (rider.get_position() - her_start).length();
+            const float apart = ((rider.get_position() - her_start) - (origin(mover.actor_tm) - its_start)).length();
+            ride_ok = on_it && rode && std::abs(its_way - 1352.0f) < 1.0f && apart < 2.0f;
+            // And back by the Reverse input, without her.
+            level->script.activate_input(op, 1);
+            for (int f = 0; f < 300; ++f) {
+                level->script.update(dt, ps);
+                update_script_movers(scene, dt);
+            }
+            const float back = (origin(mover.actor_tm) - its_start).length();
+            ride_ok = ride_ok && back < 0.05f;
+            note << "the gondola went " << its_way << " uu and she " << her_way << " with it (" << apart << " apart, standing on it " << (rode ? "throughout" : "NOT throughout")
+                 << "); reversed it is " << back << " from its start";
+        }
+    }
+    {
+        // Jacknife's girder: Rising_Girder_Event gives the hidden twin its collision and plays its Matinee
+        // from ForceStartPosition 3.1 of 5 at a tenth of the rate; she stands on it and is raised.
+        auto level = std::make_unique<Level>();
+        begin(*level, "Maps/SP02/Stormdrain_p.me1");
+        LevelScene& scene = level->scene;
+        const int ai = level->loaded ? actor_named(scene, "stormdrain_stde_spt", "InterpActor_10") : -1;
+        if (ai < 0 || scene.actors[static_cast<size_t>(ai)].mover < 0) {
+            note << "; the girder is not one of the script's movers";
+        } else {
+            const ScriptMover& mover = scene.movers[static_cast<size_t>(scene.actors[static_cast<size_t>(ai)].mover)];
+            ScriptPlayerState ps;
+            ps.position = Vec3(0.0f, 0.0f, -100000.0f);
+            const float placed_z = origin(mover.actor_tm).z;
+            level->script.fire_remote_event("Rising_Girder_Event");
+            for (int f = 0; f < 3; ++f) {
+                level->script.update(dt, ps);
+                update_script_movers(scene, dt);
+            }
+            const float jumped = origin(mover.actor_tm).z - placed_z;
+            ParkourController rider(move_cfg);
+            // (Put as a restart at the chapter's `construction` checkpoint puts her: her centre at its place.)
+            const Vec3 over(2592.46f, -8019.43f, -2344.0f - kPawnCollisionHeight);
+            const bool on_it = stand_on(scene, ai, rider, &over);
+            const float her_z = rider.get_position().z, its_z = origin(mover.actor_tm).z;
+            if (std::getenv("ME_MOVER_DEBUG")) {
+                const Vec3 p = rider.get_position(), o = origin(mover.actor_tm);
+                std::cout << "    girder at (" << o.x << ", " << o.y << ", " << o.z << "), collidable " << scene.actors[static_cast<size_t>(ai)].is_collidable << ", collision "
+                          << (mover.collision ? mover.collision->triangle_count() : 0) << " triangles, she at (" << p.x << ", " << p.y << ", " << p.z << ") on it " << on_it
+                          << " base " << rider.base_actor() << std::endl;
+            }
+            bool rode = on_it;
+            for (int f = 0; f < 300; ++f) {
+                rider.step(InputFrame{}, dt, scene);
+                level->script.update(dt, ps);
+                update_script_movers(scene, dt, &rider);
+                rode = rode && rider.base_actor() == ai;
+            }
+            const float its_rise = origin(mover.actor_tm).z - its_z, her_rise = rider.get_position().z - her_z;
+            rise_ok = on_it && rode && scene.actors[static_cast<size_t>(ai)].is_collidable && jumped > 4000.0f && its_rise > 100.0f && std::abs(her_rise - its_rise) < 2.0f;
+            note << "; the girder starts " << jumped << " up (ForceStartPosition), then rises " << its_rise << " in 5 s and she " << her_rise << " on it"
+                 << (rode ? "" : " (NOT standing on it throughout)");
+        }
+    }
+    const std::string ride_note = note.str();
+
+    const bool pass = eval_ok && play_ok && door_ok && ride_ok && rise_ok;
+    std::cout << "  -> Stage 29 Result: " << (pass ? "PASS" : "FAIL") << " (Eval=" << (eval_ok ? "OK" : "FAIL") << " [" << eval_note << "], Playback="
+              << (play_ok ? "OK" : "FAIL") << " [" << play_note << "], Door=" << (door_ok ? "OK" : "FAIL") << " [" << door_note << "], Ride="
+              << (ride_ok && rise_ok ? "OK" : "FAIL") << " [" << ride_note << "])" << std::endl;
+    return pass;
+}
+
+// --verify-movers: stage 29, then what the Matinees move in every chapter (ME_MOVER_DEBUG=1 names
+// each blocking one that nothing moves).
+static int run_verify_movers(const std::string& game_root) {
+    using namespace me;
+    MovementConfig move_cfg;
+    load_movement_config_from_ini(get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+    std::cout << "[Oracle Stage 29] Testing the Level Script's Matinees on the Actors They Move..." << std::endl;
+    const bool pass = oracle_matinee_movers(game_root, move_cfg);
+    static const char* const kMaps[] = {"Maps/SP00/Tutorial_p.me1", "Maps/SP01/Edge_p.me1",   "Maps/SP01/Escape_p.me1", "Maps/SP02/Stormdrain_p.me1",
+                                        "Maps/SP03/Cranes_p.me1",   "Maps/SP04/Subway_p.me1", "Maps/SP05/Mall_p.me1",   "Maps/SP06/Factory_p.me1",
+                                        "Maps/SP07/Boat_p.me1",     "Maps/SP08/Convoy_p.me1", "Maps/SP09/Scraper_p.me1"};
+    ScriptMoverCensus all;
+    size_t movers = 0, colliding = 0;
+    for (const char* map : kMaps) {
+        LevelScene scene;
+        if (!load_level_scene(game_root, map, scene)) {
+            std::cout << "[Movers] " << map << ": not loaded" << std::endl;
+            continue;
+        }
+        const ScriptMoverCensus c = script_mover_census(scene);
+        size_t with_collision = 0;
+        for (const ScriptMover& m : scene.movers) with_collision += m.collision ? 1 : 0;
+        std::cout << "[Movers] " << map << (scene.script ? "" : " (no script is run)") << ": " << c.matinees << " Matinees with a movement track on a placed actor: " << c.moved
+                  << " move the script's movers, " << c.machines << " only what the port's own machines move, " << c.other << " only actors that are not moved; "
+                  << c.blocking << " have something that blocks: " << c.blocking_moved << " moved, " << c.blocking_machines << " the machines'; " << scene.movers.size()
+                  << " movers, " << with_collision << " with collision";
+        if (!c.other_classes.empty()) {
+            std::cout << "; not moved:";
+            for (const auto& [cls, count] : c.other_classes) std::cout << " " << cls << " " << count;
+        }
+        std::cout << std::endl;
+        if (std::getenv("ME_MOVER_DEBUG")) {
+            for (const std::string& name : c.blocking_unmoved) std::cout << "[Movers]   blocking, not moved: " << name << std::endl;
+            for (const auto& [package, count] : c.by_package) std::cout << "[Movers]   package " << package << " " << count << std::endl;
+            for (const std::string& name : c.counted) std::cout << "[Movers]   op " << name << std::endl;
+            if (scene.script) {
+                std::cout << "[Movers]   script packages:";
+                for (const std::string& p : scene.script->packages) std::cout << " " << p;
+                std::cout << std::endl;
+            }
+        }
+        all.matinees += c.matinees;
+        all.moved += c.moved;
+        all.machines += c.machines;
+        all.other += c.other;
+        all.blocking += c.blocking;
+        all.blocking_moved += c.blocking_moved;
+        all.blocking_machines += c.blocking_machines;
+        movers += scene.movers.size();
+        colliding += with_collision;
+    }
+    std::cout << "[Movers] all chapters: " << all.matinees << " Matinees with a movement track on a placed actor in the packages the port loads: " << all.moved
+              << " move the script's movers, " << all.machines << " only what the port's own machines move, " << all.other << " only actors that are not moved; "
+              << all.blocking << " have something that blocks: " << all.blocking_moved << " moved, " << all.blocking_machines << " the machines', "
+              << all.blocking - all.blocking_moved - all.blocking_machines << " not moved; " << movers << " movers, " << colliding << " with collision" << std::endl;
+    return pass ? 0 : 1;
 }
 
 static int run_oracle_verification(const std::string& game_root, const std::string& script_json) {
@@ -5371,9 +6036,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << "[Oracle Stage 27] Testing the Bots' Fire at Her, their Armour, the Helicopter's Box and a Bullet's Stumble..." << std::endl;
     const bool s27_pass = oracle_bot_fire(renderer, sim_scene, move_cfg);
 
+    // Stage 29: the level script's Matinees on the actors they move (oracle_matinee_movers above).
+    std::cout << "[Oracle Stage 29] Testing the Level Script's Matinees on the Actors They Move..." << std::endl;
+    const bool s29_pass = oracle_matinee_movers(game_root, move_cfg);
+
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass, s26_pass, s27_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass, s26_pass, s27_pass, s29_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -5592,7 +6261,59 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         shot_heli = true;
         std::cout << "[Shots] a helicopter " << heli_distance << " ahead, its Location " << heli_height << " over the eye, turned " << heli_turn << std::endl;
     }
+    // The level's script and the actors its Matinees move, for pictures of them (game/script_movers.hpp):
+    //   ME_SHOT_SCRIPT=<checkpoint>   the level begins play at that checkpoint ("1": its default one) with every
+    //                                 sublevel's sequence running, so the Matinees its level-loaded events start play;
+    //   ME_SHOT_EVENT="Name[@seconds],.."                       remote events fired at those times of the run;
+    //   ME_SHOT_MATINEE="package:SeqAct_Interp_N[:reverse][@seconds],.."  ops given their Play (or Reverse) input then.
+    // With any of them the script runs each frame and the movers follow; with ME_SHOT_MOVERS they are listed too.
+    LevelScript shot_script;
+    struct ShotCue {
+        float time = 0.0f;
+        std::string name;   // a remote event, or "package:op"
+        int input = -1;     // -1 a remote event, else the op's input
+    };
+    std::vector<ShotCue> shot_cues;
+    const char* shot_checkpoint = std::getenv("ME_SHOT_SCRIPT");
+    {
+        const auto parse = [&](const char* spec, bool matinee) {
+            if (!spec) return;
+            std::stringstream list(spec);
+            for (std::string item; std::getline(list, item, ',');) {
+                ShotCue cue;
+                const size_t at = item.find('@');
+                if (at != std::string::npos) cue.time = static_cast<float>(std::atof(item.c_str() + at + 1));
+                cue.name = item.substr(0, at);
+                if (matinee) {
+                    cue.input = 0;
+                    const size_t rev = cue.name.rfind(":reverse");
+                    if (rev != std::string::npos && rev + 8 == cue.name.size()) {
+                        cue.input = 1;
+                        cue.name = cue.name.substr(0, rev);
+                    }
+                }
+                if (!cue.name.empty()) shot_cues.push_back(cue);
+            }
+        };
+        parse(std::getenv("ME_SHOT_EVENT"), false);
+        parse(std::getenv("ME_SHOT_MATINEE"), true);
+    }
+    const bool shot_scripted = (shot_checkpoint || !shot_cues.empty()) && scene.script && scene.script->valid();
+    if (shot_scripted) {
+        ScriptHost host;
+        bind_scene_effects(host, scene);
+        if (std::getenv("ME_SCRIPT_DEBUG")) host.log = [](const std::string& line) { std::cout << "[Shots] " << line << std::endl; };
+        shot_script.init(scene.script, host);
+        if (shot_checkpoint) shot_script.begin_play(std::string(shot_checkpoint) == "1" ? std::string() : std::string(shot_checkpoint));
+        std::cout << "[Shots] the level's script runs: " << scene.movers.size() << " actors its Matinees move, " << shot_cues.size() << " cue(s)" << std::endl;
+    }
     if (movers) {
+        for (size_t k = 0; k < scene.movers.size(); ++k) {
+            const ScriptMover& m = scene.movers[k];
+            const LevelActor& a = scene.actors[static_cast<size_t>(m.actor_index)];
+            std::cout << "[Shots] mover " << k << " " << a.source_package << ":" << a.unique_name << " (" << a.mesh_name << ") at (" << a.location.x << ", "
+                      << a.location.y << ", " << a.location.z << ")" << (m.collision ? ", collides" : "") << (m.base >= 0 ? ", attached" : "") << std::endl;
+        }
         for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
             const BargeDoorInstance& door = scene.barge_doors[d];
             std::cout << "[Shots] door " << d << " " << door.name << ": hinge (" << door.hinge_pos.x << ", " << door.hinge_pos.y << ", "
@@ -5729,6 +6450,36 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             audio->update(dt, ear, ear_rot.forward(), ear_rot.up(), 0.0f, false);
         }
         update_impact_effects(scene, dt, tel.position);
+        if (shot_scripted) {
+            for (size_t k = 0; k < shot_cues.size();) {
+                const ShotCue& cue = shot_cues[k];
+                if (now + dt < cue.time) {
+                    ++k;
+                    continue;
+                }
+                if (cue.input < 0) {
+                    shot_script.fire_remote_event(cue.name);
+                } else {
+                    const size_t colon = cue.name.find(':');
+                    const std::string package = cue.name.substr(0, colon), op = colon == std::string::npos ? std::string() : cue.name.substr(colon + 1);
+                    int node = -1;
+                    for (size_t i = 0; i < scene.script->nodes.size() && node < 0; ++i) {
+                        const ScriptGraph::Node& n = scene.script->nodes[i];
+                        if (n.cls == "SeqAct_Interp" && n.name == op && scene.script->packages[static_cast<size_t>(n.package)] == lower(package)) node = static_cast<int>(i);
+                    }
+                    if (node >= 0) shot_script.activate_input(node, cue.input);
+                    else std::cout << "[Shots] no such Matinee: " << cue.name << std::endl;
+                }
+                std::cout << "[Shots] at " << now + dt << " s: " << (cue.input < 0 ? "remote event " : cue.input == 1 ? "Reverse on " : "Play on ") << cue.name << std::endl;
+                shot_cues.erase(shot_cues.begin() + static_cast<std::ptrdiff_t>(k));
+            }
+            ScriptPlayerState ps;
+            ps.position = standing ? stand_at : tel.position;
+            ps.eye = ps.position + Vec3(0.0f, 0.0f, tel.eye_height);
+            deliver_actor_damage(shot_script, scene);
+            shot_script.update(dt, ps);
+            update_script_movers(scene, dt);
+        }
         now += dt;
         (void)cutscene.take_intro_sounds();
         for (const IntroFadeEvent& ev : cutscene.take_intro_fades()) fade.apply(ev);
@@ -6232,6 +6983,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             ps.position = controller.get_telemetry().position;
             ps.eye = ps.position + Vec3(0.0f, 0.0f, controller.get_telemetry().eye_height);
             script.update(0.0f, ps);
+            update_script_movers(active_scene, 0.0f, &controller);
             if (script.playing_cutscene() < 0 && active_scene.level_intro.valid && at_default) {
                 std::cout << "[Script] the chapter's start did not reach its intro Matinee; playing it directly" << std::endl;
                 cutscene_player.play_in_engine_intro(active_scene, controller.get_telemetry(), 4.5f);
@@ -7418,6 +8170,9 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                 }
                 deliver_actor_damage(script, active_scene);  // the bullets' and the barges', for its damage events
                 script.update(dt, ps);
+                // The actors its Matinees move go where their Positions now have them, she with the
+                // one she stands on, and out of the way of one that comes at her.
+                update_script_movers(active_scene, dt, &controller);
                 if (t.supers_time_left > 0.0f) t.supers_time_left -= dt;
                 if (t.sign_time_left > 0.0f) t.sign_time_left -= dt;
             } else {
@@ -7772,6 +8527,7 @@ int main(int argc, char* argv[]) {
     bool verify_bodies = false;  // the enemies' bodies stage of the oracle, alone
     bool verify_botfire = false; // the bots' fire, armour, helicopter and stumble stage of the oracle, alone
     bool verify_respawn = false; // a restart at every checkpoint of every chapter
+    bool verify_movers = false;  // the Matinee movers' stage of the oracle, and a count over every chapter
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
     std::string cue_dump;      // --dump-sound-cues <file>
@@ -7821,6 +8577,8 @@ int main(int argc, char* argv[]) {
             verify_botfire = true;
         } else if (arg == "--verify-respawn") {
             verify_respawn = true;
+        } else if (arg == "--verify-movers") {
+            verify_movers = true;
         } else if (arg == "--verify-all") {
             verify_all = true;
         } else if (arg == "--headless-oracle") {
@@ -7863,6 +8621,7 @@ int main(int argc, char* argv[]) {
                       << "  --verify-bodies          Run only its stage of bullets against the enemies' posed bodies\n"
                       << "  --verify-botfire         Run only its stage of the bots' fire at her, their armour, the helicopter, a bullet's stumble\n"
                       << "  --verify-respawn         Restart at every checkpoint of every chapter and see where she ends up\n"
+                      << "  --verify-movers          Run only its stage of the script's Matinees moving actors, then count them by chapter\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
@@ -7911,6 +8670,7 @@ int main(int argc, char* argv[]) {
         return measure_intro_handover(renderer, game_root, handover_map, true).valid ? 0 : 1;
     }
     if (verify_respawn) return run_verify_respawn(game_root);
+    if (verify_movers) return run_verify_movers(game_root);
     if (verify_bodies) {
         me::Renderer renderer;
         renderer.set_game_root(game_root);

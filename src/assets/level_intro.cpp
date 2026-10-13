@@ -49,11 +49,15 @@ struct KeyedVector {
     };
     std::vector<Key> keys;
 
+    // (As the executable's evaluation, 0x00e40ae0: at a key's own time the curve is on that key, so a
+    // held segment ends there and the last key is reached at its time. game/matinee_move.hpp has the
+    // same rule for the tracks that move the level's actors.)
     [[nodiscard]] Vec3 at(float t) const {
         if (keys.empty()) return Vec3(0.0f, 0.0f, 0.0f);
         if (t <= keys.front().time) return keys.front().value;
+        if (t >= keys.back().time) return keys.back().value;
         for (size_t i = 1; i < keys.size(); ++i) {
-            if (t > keys[i].time) continue;
+            if (t >= keys[i].time) continue;
             const Key& a = keys[i - 1];
             const Key& b = keys[i];
             const float span = b.time - a.time;

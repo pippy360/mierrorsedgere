@@ -1978,6 +1978,60 @@ void ParkourController::camera_face_rotation(float dt) {
 // -----------------------------------------------------------------------------
 // Swept Collision & Tracing Subsystem (real UE3 level collision)
 // -----------------------------------------------------------------------------
+namespace {
+
+// The actors the level script's Matinees move (LevelScene::movers). A mover's triangles are kept
+// where the level placed the actor, so a query against it is taken there by the inverse of the
+// mover's `delta` and what it meets is brought back by `delta`. A box stays a box under a turn
+// about the vertical (the doors' rule: a standing cylinder's box turned with it); under any other
+// turn the box that holds the turned one is asked for, so a mover that tilts is met a little
+// early and never late.
+bool mover_in_reach(const ScriptMover& m, const Vec3& lo, const Vec3& hi) {
+    if (!m.collision || m.blocking_suspended) return false;
+    const AABB& b = m.world_box;
+    return b.min_pt.x <= hi.x && b.max_pt.x >= lo.x && b.min_pt.y <= hi.y && b.max_pt.y >= lo.y && b.min_pt.z <= hi.z && b.max_pt.z >= lo.z;
+}
+
+bool mover_in_reach(const ScriptMover& m, const Vec3& centre, const Vec3& delta, const Vec3& extent) {
+    const Vec3 end = centre + delta;
+    return mover_in_reach(m, Vec3(std::min(centre.x, end.x), std::min(centre.y, end.y), std::min(centre.z, end.z)) - extent,
+                          Vec3(std::max(centre.x, end.x), std::max(centre.y, end.y), std::max(centre.z, end.z)) + extent);
+}
+
+Vec3 mover_extent(const ScriptMover& m, const Vec3& e) {
+    if (!m.moved || m.pure_yaw) return e;
+    const float* r = m.delta_inv.m;
+    return Vec3(std::abs(r[0]) * e.x + std::abs(r[4]) * e.y + std::abs(r[8]) * e.z, std::abs(r[1]) * e.x + std::abs(r[5]) * e.y + std::abs(r[9]) * e.z,
+                std::abs(r[2]) * e.x + std::abs(r[6]) * e.y + std::abs(r[10]) * e.z);
+}
+
+CollisionHit mover_sweep(const ScriptMover& m, const Vec3& centre, const Vec3& delta, const Vec3& extent, uint8_t channels) {
+    if (!m.moved) return m.collision->sweep_box(centre, delta, extent, channels);
+    CollisionHit h = m.collision->sweep_box(m.delta_inv.transform_point(centre), m.delta_inv.transform_vector(delta), mover_extent(m, extent), channels);
+    if (h.hit) {
+        h.location = m.delta.transform_point(h.location);
+        h.normal = m.delta.transform_vector(h.normal);
+    }
+    return h;
+}
+
+CollisionHit mover_line(const ScriptMover& m, const Vec3& start, const Vec3& end, uint8_t channels) {
+    if (!m.moved) return m.collision->line_check(start, end, channels);
+    CollisionHit h = m.collision->line_check(m.delta_inv.transform_point(start), m.delta_inv.transform_point(end), channels);
+    if (h.hit) {
+        h.location = m.delta.transform_point(h.location);
+        h.normal = m.delta.transform_vector(h.normal);
+    }
+    return h;
+}
+
+bool mover_overlap(const ScriptMover& m, const Vec3& centre, const Vec3& extent, uint8_t channels) {
+    if (!m.moved) return m.collision->overlap_box(centre, extent, channels);
+    return m.collision->overlap_box(m.delta_inv.transform_point(centre), mover_extent(m, extent), channels);
+}
+
+}  // namespace
+
 // The pawn box is swept against LevelScene::collision (StaticMesh BodySetup hulls / kDOP triangles,
 // BlockingVolume brushes, BSP) and against every moving elevator part, whose collision is stored at
 // the part's initial pose and is therefore queried shifted by -offset.
@@ -2041,6 +2095,10 @@ ParkourController::TraceHit ParkourController::sweep_capsule(const Capsule& caps
             }
         }
     }
+    for (const ScriptMover& m : scene.movers) {
+        if (!mover_in_reach(m, centre, delta, extent)) continue;
+        consider(mover_sweep(m, centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
+    }
     return best;
 }
 
@@ -2096,6 +2154,10 @@ ParkourController::TraceHit ParkourController::trace_ray(const Vec3& start, cons
             }
         }
     }
+    for (const ScriptMover& m : scene.movers) {
+        if (!mover_in_reach(m, start, end - start, Vec3(0.0f, 0.0f, 0.0f))) continue;
+        consider(mover_line(m, start, end, channels), Vec3(0.0f, 0.0f, 0.0f));
+    }
     return best;
 }
 
@@ -2145,6 +2207,9 @@ bool ParkourController::box_free(const Vec3& centre, const Vec3& extent, const L
             }
         }
     }
+    for (const ScriptMover& m : scene.movers) {
+        if (mover_in_reach(m, centre - extent, centre + extent) && mover_overlap(m, centre, extent, COLL_BlockNonZeroExtent)) return false;
+    }
     return true;
 }
 
@@ -2176,7 +2241,107 @@ ParkourController::TraceHit ParkourController::sweep_box(const Vec3& centre, con
             consider(part.collision->sweep_box(centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
         }
     }
+    for (const ScriptMover& m : scene.movers) {
+        if (!mover_in_reach(m, centre, delta, extent)) continue;
+        consider(mover_sweep(m, centre, delta, extent, COLL_BlockNonZeroExtent), Vec3(0.0f, 0.0f, 0.0f));
+    }
     return best;
+}
+
+// A mover she stands on moved: her Location (the capsule's centre) is carried by the same step.
+// (Whether the game also turns a based pawn's view with a base that turns was not read; it is not
+// turned here.)
+void ParkourController::carried_by_mover(const LevelScene& scene, const Mat4& step) {
+    const Vec3 up(0.0f, 0.0f, kPawnCollisionHeight);
+    const Vec3 to = step.transform_point(m_telemetry.position + up) - up;
+    const Vec3 move = to - m_telemetry.position;
+    // Swept through the level, not the movers (the one under her has gone on already), from a step
+    // over her feet up, so that the floor she passes over is not met: a mover does not carry her
+    // into a ceiling or a wall. Where she starts in the level already, she is carried as she was.
+    const float length = move.length();
+    if (scene.collision && length > 1.0e-4f) {
+        const Vec3 extent(kPawnRadius, kPawnRadius, 0.5f * (kPawnHeight - kMaxStepHeight));
+        const Vec3 centre = m_telemetry.position + Vec3(0.0f, 0.0f, kMaxStepHeight + extent.z);
+        const CollisionHit h = scene.collision->sweep_box(centre, move, extent, COLL_BlockNonZeroExtent);
+        if (h.hit && !h.start_penetrating) {
+            m_telemetry.position += move * std::max(0.0f, h.time - 0.1f / length);
+            return;
+        }
+    }
+    m_telemetry.position = to;
+}
+
+bool ParkourController::encroached_by_mover(LevelScene& scene, size_t mover, const Mat4& step) {
+    ScriptMover& m = scene.movers[mover];
+    if (!m.collision) return false;
+    const EMovement st = m_telemetry.move_state;
+    const bool low = st == EMovement::MOVE_Crouch || st == EMovement::MOVE_Slide || st == EMovement::MOVE_MeleeSlide ||
+                     st == EMovement::MOVE_SkillRoll || st == EMovement::MOVE_Coil;
+    const float height = low ? kCrouchHeight : kPawnHeight;
+    // Shrunk a unit, so that resting against the mover is not being in it.
+    const Vec3 extent(kPawnRadius - 1.0f, kPawnRadius - 1.0f, 0.5f * height - 1.0f);
+    const auto centre = [&]() { return m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * height); };
+    const auto in_it = [&]() {
+        const Vec3 c = centre();
+        const AABB& b = m.world_box;
+        if (b.min_pt.x > c.x + extent.x || b.max_pt.x < c.x - extent.x || b.min_pt.y > c.y + extent.y || b.max_pt.y < c.y - extent.y ||
+            b.min_pt.z > c.z + extent.z || b.max_pt.z < c.z - extent.z) {
+            return false;
+        }
+        return mover_overlap(m, c, extent, COLL_BlockNonZeroExtent);
+    };
+    if (!in_it()) return false;
+
+    // 1. bPushedByEncroachers (Actor's default, which the pawn keeps): MoveDir is the mover's own
+    //    move, plus, when it turned, 1.5 times the way her Location is carried by the turn.
+    // (Turned: any off-diagonal of the step's rotation over 1e-5, under the sine of one rotation unit,
+    // 9.6e-5, and well over the rounding of a move that only goes along.)
+    const bool turned = std::max({std::abs(step.m[1]), std::abs(step.m[2]), std::abs(step.m[4]), std::abs(step.m[6]), std::abs(step.m[8]),
+                                  std::abs(step.m[9])}) > 1.0e-5f;
+    const Vec3 location = m_telemetry.position + Vec3(0.0f, 0.0f, kPawnCollisionHeight);
+    const Vec3 origin_now(m.actor_tm.m[12], m.actor_tm.m[13], m.actor_tm.m[14]);
+    Vec3 move_dir = origin_now - step.rigid_inverse().transform_point(origin_now);  // TestLocation - StartLocation
+    if (turned) move_dir += (step.transform_point(location) - location) * 1.5f;
+    m.blocking_suspended = true;  // the mover's bBlockActors is cleared while she is moved (moveSmooth)
+    move_and_slide(move_dir, height, 0.0f, scene);
+    bool still = in_it();
+    if (still) {
+        // A pawn still in it is tried once more: away from the mover's surface on the line between
+        // the two, and a tenth of that up, by her cylinder's radius.
+        const CollisionHit toward = mover_line(m, centre(), origin_now, COLL_BlockNonZeroExtent);
+        Vec3 away = toward.hit ? toward.normal : (centre() - origin_now).normalized();
+        if (away.length_sq() < 1.0e-6f) away = Vec3(0.0f, 0.0f, 1.0f);
+        move_and_slide((away + Vec3(0.0f, 0.0f, 0.1f)) * kPawnRadius, height, 0.0f, scene);
+        still = in_it();
+    }
+    m.blocking_suspended = false;
+    if (!still) {
+        // Out of its way: moved back the way she was pushed until she rests against the mover.
+        move_swept(move_dir * -1.0f, height, 0.0f, scene);
+        return false;
+    }
+
+    // 2. InterpActor.EncroachingOn. Only a mover that moves towards her (or one that only turns: its
+    //    Velocity is zero and the test passes for anyone) says anything.
+    const Vec3 to_her = (location - origin_now).normalized();
+    const Vec3 heading = m.velocity.normalized();
+    if (heading.dot(to_her) < 0.0f) return false;
+    if (!m_telemetry.grounded && m.velocity.z > 0.0f) {
+        // A falling pawn and a rising mover: her extent is traced down through the mover's mesh from
+        // her height above her to her height below; set on top of it when her Location is under the
+        // mover's, and the mover goes on either way (bLandingPawn).
+        const Vec3 half(kPawnRadius, kPawnRadius, kPawnCollisionHeight);
+        const Vec3 from = location + Vec3(0.0f, 0.0f, kPawnCollisionHeight);
+        const CollisionHit top = mover_sweep(m, from, Vec3(0.0f, 0.0f, -2.0f * kPawnCollisionHeight), half, COLL_BlockNonZeroExtent);
+        if (top.hit) {
+            // SetLocation(HitLocation + Height): her centre a half height over where the traced box
+            // met the top, so her feet where that box's middle was.
+            if (location.z < origin_now.z) m_telemetry.position = top.location;
+            return false;
+        }
+    }
+    // (The SeqEvent_Mover events it tells here are not run.)
+    return m.stop_on_encroach;
 }
 
 

@@ -85,6 +85,29 @@ std::vector<ScriptActor::Plane> hull_to_planes(const std::vector<Vec3>& tris) {
     return planes;
 }
 
+// A movement track's PosTrack or EulerTrack: the points of an FInterpCurveVector.
+std::vector<MoveCurveKey> read_move_curve(const UPropertyList& props, const char* name) {
+    std::vector<MoveCurveKey> keys;
+    const UProperty* curve = find_prop(props, name);
+    const UProperty* points = curve ? find_prop(curve->fields, "Points") : nullptr;
+    if (!points) return keys;
+    const auto vec = [](const UPropertyList& el, const char* field) {
+        const UProperty* p = find_prop(el, field);
+        return p ? Vec3(p->v[0], p->v[1], p->v[2]) : Vec3(0.0f, 0.0f, 0.0f);
+    };
+    for (const auto& el : points->elements) {
+        MoveCurveKey key;
+        key.time = prop_float(el, "InVal", 0.0f);
+        key.value = vec(el, "OutVal");
+        key.arrive = vec(el, "ArriveTangent");
+        key.leave = vec(el, "LeaveTangent");
+        const std::string mode = to_lower(prop_name(el, "InterpMode"));  // absent: CIM_Linear, the enum's first
+        key.mode = mode == "cim_constant" ? 2 : (mode.rfind("cim_curve", 0) == 0 ? 1 : 0);
+        keys.push_back(key);
+    }
+    return keys;
+}
+
 }  // namespace
 
 // --- the graph ------------------------------------------------------------------------------
@@ -361,6 +384,10 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
         } else if (c.rfind("SeqVar_", 0) == 0) {
             n.label = prop_name(props, "VarName");
             if (c == "SeqVar_Float") n.f = prop_float(props, "FloatValue", 0.0f);
+            if (c == "SeqVar_RandomFloat") {
+                n.f = prop_float(props, "Min", 0.0f);
+                n.f2 = prop_float(props, "Max", 1.0f);  // Engine.SeqVar_RandomFloat: Max 1
+            }
             if (c == "SeqVar_Int") n.i = prop_int(props, "IntValue", 0);
             if (c == "SeqVar_Bool") n.b = prop_int(props, "bValue", 0) != 0 || prop_bool(props, "bValue", false);
             if (c == "SeqVar_String") n.text = prop_string(props, "StrValue");
@@ -404,6 +431,9 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
             n.b2 = prop_bool(props, "bRewindOnPlay", false);
             n.b3 = prop_bool(props, "bRewindIfAlreadyPlaying", false);
             n.b4 = prop_bool(props, "bIsSkippable", false);
+            n.b5 = prop_bool(props, "bNoResetOnRewind", false);
+            n.b6 = prop_bool(props, "bForceStartPos", false);
+            n.f2 = prop_float(props, "ForceStartPosition", 0.0f);
         } else if (c == "SeqAct_TdCheckpoint") {
             n.b = prop_bool(props, "teleportPawnToCheckpoint", false);
             n.b2 = prop_bool(props, "skipSaveToDisk", false);
@@ -547,6 +577,19 @@ bool ScriptGraph::load(const std::vector<std::shared_ptr<UPKPackage>>& level_pac
                             if (const UProperty* keys = find_prop(tp, "EventTrack")) {
                                 for (const auto& k : keys->elements) m.events.emplace_back(prop_float(k, "Time", 0.0f), prop_name(k, "EventName"));
                             }
+                        } else if (cls == "InterpTrackMove") {
+                            // The group's first movement track is the one that moves its actor
+                            // (FindInterpMoveTrack, 0x00e51960; bOnePerGroup).
+                            const bool known = std::any_of(m.moves.begin(), m.moves.end(), [&](const ScriptMatinee::Move& mv) { return mv.group == group_name; });
+                            if (known) continue;
+                            ScriptMatinee::Move move;
+                            move.group = group_name;
+                            move.track.pos = read_move_curve(tp, "PosTrack");
+                            move.track.euler = read_move_curve(tp, "EulerTrack");
+                            // EInterpTrackMoveFrame { IMF_World, IMF_RelativeToInitial }: a track that saves none is the world's.
+                            move.track.relative = to_lower(prop_name(tp, "MoveFrame")) == "imf_relativetoinitial";
+                            move.track.quat = prop_bool(tp, "bUseQuatInterpolation", false);
+                            m.moves.push_back(std::move(move));
                         } else if (cls == "InterpTrackToggle") {
                             if (const UProperty* keys = find_prop(tp, "ToggleTrack")) {
                                 for (const auto& k : keys->elements) {
@@ -637,6 +680,10 @@ void LevelScript::reset_state() {
         s.open = n.b;
         s.enabled = n.enabled;
         s.auto_close_left = n.i;
+        if (n.cls == "SeqAct_Interp") {
+            s.play_rate = n.f;
+            s.force_start = n.f2;
+        }
         if (n.cls == "Sequence") {
             sequence_slot_[static_cast<int>(i)] = static_cast<int>(active_.size());
             active_.emplace_back();
@@ -893,6 +940,26 @@ bool LevelScript::read_bool(int node, const char* desc, bool fallback) const {
     return v >= 0 ? state_[static_cast<size_t>(v)].b : fallback;
 }
 
+// A float variable as an op reads it. A SeqVar_RandomFloat is drawn anew between its Min and Max
+// each time it is asked (stock UE3's USeqVar_RandomFloat::GetFloatRef; not read in this executable).
+float LevelScript::var_float(int var) {
+    const ScriptGraph::Node& v = graph_->nodes[static_cast<size_t>(var)];
+    State& s = state_[static_cast<size_t>(var)];
+    if (v.cls == "SeqVar_RandomFloat") {
+        random_ ^= random_ << 13;
+        random_ ^= random_ >> 17;
+        random_ ^= random_ << 5;
+        s.f = v.f + (v.f2 - v.f) * (static_cast<float>(random_ & 0xFFFFFFu) / 16777216.0f);
+    }
+    return s.f;
+}
+
+void LevelScript::activate_input(int node, int input) {
+    if (!graph_ || node < 0 || static_cast<size_t>(node) >= state_.size()) return;
+    queue(node, true);
+    state_[static_cast<size_t>(node)].impulses |= 1u << (input & 31);
+}
+
 bool LevelScript::var_is_player(int var) const {
     if (var < 0) return false;
     const std::string& c = graph_->nodes[static_cast<size_t>(var)].cls;
@@ -1085,47 +1152,80 @@ void LevelScript::run_sequence(int slot, float dt) {
     }
 }
 
-// USeqAct_Interp::Play
+// USeqAct_Interp::UpdateInterp, as far as the op goes: the Position is set, held to the Matinee's
+// length. (A movement track's own update does nothing there: its actor reads the Position when it
+// next moves, game/script_movers.hpp.)
+void LevelScript::interp_set_position(int node, float position) {
+    const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
+    State& s = state_[static_cast<size_t>(node)];
+    const float length = n.matinee >= 0 ? graph_->matinees[static_cast<size_t>(n.matinee)].length : 0.0f;
+    s.position = std::clamp(position, 0.0f, std::max(0.0f, length));
+    if (host_.interp_position) host_.interp_position(node, s.position);
+}
+
+// USeqAct_Interp::Play (0x00e51d70). A Matinee with bForceStartPos jumps to ForceStartPosition when
+// it is not playing yet; one with bRewindOnPlay to its start (when not playing, or playing with
+// bRewindIfAlreadyPlaying), its movement tracks first taking where their actors stand as the new
+// start if bNoResetOnRewind. Without either it goes on from where its Position is: one that ran to
+// its end ends again at once.
 void LevelScript::interp_play(int node) {
     const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     State& s = state_[static_cast<size_t>(node)];
-    if (n.b2 && (!s.playing || n.b3)) s.position = 0.0f;
+    if (n.b6 && !s.playing) {
+        interp_set_position(node, s.force_start);
+    } else if (n.b2 && (!s.playing || n.b3)) {
+        if (n.b5 && host_.interp_reset_initial) host_.interp_reset_initial(node);
+        interp_set_position(node, 0.0f);
+    }
     const bool was_playing = s.playing;
+    s.reversed = false;
+    s.paused = false;
     s.playing = true;
-    s.aborted = false;
     if (n.matinee < 0) return;
     const ScriptMatinee& m = graph_->matinees[static_cast<size_t>(n.matinee)];
     if (m.player_cutscene >= 0 && !was_playing) {
         playing_cutscene_ = m.player_cutscene;
         playing_cutscene_node_ = node;
         log("[Script] " + n.name + " plays the player's cutscene '" + m.name + "' (" + std::to_string(m.length) + " s at " +
-            std::to_string(n.f) + "x)");
-        if (host_.play_cutscene) host_.play_cutscene(m.player_cutscene, n.f);
+            std::to_string(s.play_rate) + "x)");
+        if (host_.play_cutscene) host_.play_cutscene(m.player_cutscene, s.play_rate);
     }
 }
 
-void LevelScript::interp_stop(int node, bool aborted) {
+// The Matinee is no longer playing: the player's cutscene it was is over for the script.
+void LevelScript::interp_stopped_playing(int node) {
     State& s = state_[static_cast<size_t>(node)];
-    if (!s.playing) return;
     s.playing = false;
-    s.aborted = aborted;
     if (playing_cutscene_node_ == node) {
         playing_cutscene_ = -1;
         playing_cutscene_node_ = -1;
-        if (host_.stop_cutscene) host_.stop_cutscene();
     }
 }
 
-void LevelScript::fire_matinee_keys(int node, float previous, float position) {
+// The Stop input: bIsPlaying and bPaused are cleared, the Position kept.
+void LevelScript::interp_stop(int node) {
+    State& s = state_[static_cast<size_t>(node)];
+    s.paused = false;
+    if (!s.playing) return;
+    const bool cutscene = playing_cutscene_node_ == node;
+    interp_stopped_playing(node);
+    if (cutscene && host_.stop_cutscene) host_.stop_cutscene();
+}
+
+// The keys between two Positions: (from, to] going forwards, [to, from) going backwards. (That the
+// game's event tracks fire going backwards is stock UE3's bFireEventsWhenBackwards default; the
+// track's own update was not read in this executable.)
+void LevelScript::fire_matinee_keys(int node, float from, float to) {
     const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     const ScriptMatinee& m = graph_->matinees[static_cast<size_t>(n.matinee)];
+    const auto passed = [&](float when) { return to >= from ? (when > from && when <= to) : (when >= to && when < from); };
     for (const auto& [when, name] : m.events) {
-        if (when > previous && when <= position) fire_output(node, name.c_str());
+        if (passed(when)) fire_output(node, name.c_str());
     }
     // The toggle tracks switch the emitters and lens flares of their groups.
     if (host_.toggle_effect) {
         for (const ScriptMatinee::Toggle& toggle : m.toggles) {
-            if (!(toggle.time > previous && toggle.time <= position)) continue;
+            if (!passed(toggle.time)) continue;
             for (int v : linked_vars(node, toggle.group.c_str())) {
                 const int actor = graph_->nodes[static_cast<size_t>(v)].actor;
                 if (actor >= 0) host_.toggle_effect(graph_->actors[static_cast<size_t>(actor)], toggle.action);
@@ -1135,57 +1235,66 @@ void LevelScript::fire_matinee_keys(int node, float previous, float position) {
     // A player cutscene's sound track plays from the player; another Matinee's would play from
     // its actors, positioned, which is not done here (an ambient loop would otherwise be heard
     // everywhere at full volume).
-    if (m.player_cutscene < 0) return;
+    // (UInterpTrackSound plays going forwards only.)
+    if (m.player_cutscene < 0 || to < from) return;
     for (const ScriptSound& snd : m.sounds) {
-        if (snd.time > previous && snd.time <= position && host_.play_sound) host_.play_sound(snd.cue, snd.bank, snd.voice, 1.0f, nullptr);
+        if (passed(snd.time) && host_.play_sound) host_.play_sound(snd.cue, snd.bank, snd.voice, 1.0f, nullptr);
     }
 }
 
-// USeqAct_Interp::StepInterp: the position advances by dt * PlayRate; the event keys passed fire
-// their outputs; at the end a looping Matinee starts over and any other stops.
+// USeqAct_Interp::StepInterp (0x00e51dd0): the Position moves by dt * PlayRate, forwards or
+// backwards; the event keys passed fire their outputs; past the end (or the start, backwards) a
+// looping Matinee goes round and any other stops there. A paused one stands.
 void LevelScript::interp_step(int node, float dt) {
     const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     State& s = state_[static_cast<size_t>(node)];
-    if (!s.playing || n.matinee < 0) return;
+    if (!s.playing || s.paused || n.matinee < 0) return;
     const float length = graph_->matinees[static_cast<size_t>(n.matinee)].length;
     if (length <= kSmall) {
         // An empty Matinee (a few are cooked that way) is over the moment it starts.
         fire_matinee_keys(node, -1.0f, 0.0f);
-        s.position = length;
-        s.playing = false;
-        if (playing_cutscene_node_ == node) {
-            playing_cutscene_ = -1;
-            playing_cutscene_node_ = -1;
-        }
+        interp_set_position(node, length);
+        interp_stopped_playing(node);
         return;
     }
-    float next = s.position + dt * std::max(0.01f, n.f);
-    bool stop = false;
-    if (next > length) {
-        if (n.b) {
-            fire_matinee_keys(node, s.position, length);
-            s.position = 0.0f;
-            next = std::fmod(next, length);
-        } else {
-            next = length;
-            stop = true;
+    float next = s.position;
+    if (!s.reversed) {
+        next += dt * s.play_rate;
+        if (next > length) {
+            if (n.b) {
+                // UpdateInterp(InterpLength), the transforms reset for a bNoResetOnRewind Matinee, then the jump to 0.
+                fire_matinee_keys(node, s.position, length);
+                interp_set_position(node, length);
+                if (n.b5 && host_.interp_reset_initial) host_.interp_reset_initial(node);
+                s.position = 0.0f;
+                while (next > length) next -= length;
+            } else {
+                interp_stopped_playing(node);
+                next = length;
+            }
+        }
+    } else {
+        next -= dt * s.play_rate;
+        if (next < 0.0f) {
+            if (n.b) {
+                fire_matinee_keys(node, s.position, 0.0f);
+                s.position = length;
+                while (next < 0.0f) next += length;
+            } else {
+                interp_stopped_playing(node);
+                next = 0.0f;
+            }
         }
     }
     fire_matinee_keys(node, s.position, next);
-    s.position = next;
-    if (stop) {
-        s.playing = false;
-        if (playing_cutscene_node_ == node) {
-            playing_cutscene_ = -1;
-            playing_cutscene_node_ = -1;
-        }
-    }
+    interp_set_position(node, next);
 }
 
 // SkipCutscene (TdPlayerController, native): a skippable Matinee is set to its end
-// (USeqAct_Interp::SetPosition(InterpLength, bJump)): the event keys in between do not fire, and
-// the op, no longer playing, fires Completed (the Edge intro's "Land closes the gate that leads
-// to the teleport" pattern only works this way; Aborted is the Stop input's).
+// (USeqAct_Interp::SetPosition(InterpLength, bJump), 0x00e4f960): the event keys in between do not
+// fire, the actors its tracks move are put there at once, and the op, no longer playing, fires
+// Completed (the Edge intro's "Land closes the gate that leads to the teleport" pattern only works
+// this way).
 void LevelScript::skip_cutscene() {
     if (playing_cutscene_node_ < 0 || skip_disabled_) return;
     const int node = playing_cutscene_node_;
@@ -1194,22 +1303,28 @@ void LevelScript::skip_cutscene() {
     log("[Script] cutscene skipped: " + n.name);
     playing_cutscene_ = -1;
     playing_cutscene_node_ = -1;
+    // The actors are put at the end first, then she is handed over among them (SetPosition moves
+    // them before the cutscene's end gives the player back).
+    if (n.matinee >= 0) {
+        s.position = graph_->matinees[static_cast<size_t>(n.matinee)].length;
+        if (host_.interp_jump) host_.interp_jump(node, s.position);
+    }
     if (host_.stop_cutscene) host_.stop_cutscene();
-    if (n.matinee >= 0) s.position = graph_->matinees[static_cast<size_t>(n.matinee)].length;
     s.playing = false;
-    s.aborted = false;
+    s.paused = false;
 }
 
 void LevelScript::cutscene_finished() {
     // The op reaches its length on its own in the same frame; nothing to do unless the host's
     // playback ran ahead of the op (a long first frame).
     if (playing_cutscene_node_ < 0) return;
-    State& s = state_[static_cast<size_t>(playing_cutscene_node_)];
-    const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(playing_cutscene_node_)];
+    const int node = playing_cutscene_node_;
+    State& s = state_[static_cast<size_t>(node)];
+    const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     if (n.matinee >= 0 && s.playing) {
         const float length = graph_->matinees[static_cast<size_t>(n.matinee)].length;
-        fire_matinee_keys(playing_cutscene_node_, s.position, length);
-        s.position = length;
+        fire_matinee_keys(node, s.position, length);
+        interp_set_position(node, length);
         s.playing = false;
     }
     playing_cutscene_ = -1;
@@ -1233,13 +1348,57 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
 
     // --- latent ops ---
     if (c == "SeqAct_Interp") {
-        if (newly && (s.impulses & 0x13u)) s.initialised = true;
+        // The inputs: 1 Play, 2 Reverse, 4 Stop, 8 Pause, 16 Change Dir.
+        // A player's cutscene played backwards is not one the port can show: the cutscene is
+        // stopped and she is handed over, as a Stop does, and the Matinee goes on for the script.
+        const auto leave_cutscene = [&]() {
+            if (playing_cutscene_node_ != node) return;
+            playing_cutscene_ = -1;
+            playing_cutscene_node_ = -1;
+            if (host_.stop_cutscene) host_.stop_cutscene();
+        };
+        const auto reverse = [&]() {
+            s.reversed = true;
+            s.playing = true;
+            s.paused = false;
+            leave_cutscene();
+        };
+        const auto change_direction = [&]() {  // USeqAct_Interp::ChangeDirection (0x00e39cb0)
+            s.reversed = !s.reversed;
+            s.paused = false;
+            s.playing = true;
+            if (s.reversed) leave_cutscene();
+        };
+        if (newly) {
+            // A variable linked to PlayRate or ForceStartPosition gives the property its value as the op
+            // activates (stock UE3's PublishLinkedVariableValues; 304 of the Matinees that move an
+            // actor have their rate from one, most of them a SeqVar_RandomFloat).
+            if (const int rate = linked_var(node, "PlayRate"); rate >= 0) s.play_rate = var_float(rate);
+            if (const int start = linked_var(node, "ForceStartPosition"); start >= 0) s.force_start = var_float(start);
+            // USeqAct_Interp::Activated (0x00e52070): Play, Reverse or Change Dir on a Matinee that is
+            // not playing builds its instances (InitInterp: each movement track's InitialTM, from the
+            // Position it has now), starts it, and puts it on its actors' LatentActions. Stop or
+            // Pause alone builds nothing: the op then ends a tick later with no output.
+            if (!s.playing && (s.impulses & 0x13u) && n.matinee >= 0) {
+                s.initialised = true;
+                if (host_.interp_init) host_.interp_init(node, s.position);
+                if (s.impulses & 1u) interp_play(node);
+                else if (s.impulses & 2u) reverse();
+                else change_direction();
+                if (host_.interp_started) host_.interp_started(node);
+            }
+        }
+        // USeqAct_Interp::UpdateOp (0x00e522e0): one input a tick, in this order; with none, an op
+        // that is not playing has finished. The tick the end is reached still returns false, so
+        // Completed fires the tick after.
         if (s.impulses & 1u) interp_play(node);
-        else if (s.impulses & 4u) interp_stop(node, true);  // Stop
-        else if (s.impulses & 8u) s.playing = false;        // Pause
-        else if (s.impulses & 2u) interp_stop(node, false); // Reverse: not played backwards here
+        else if (s.impulses & 2u) reverse();
+        else if (s.impulses & 4u) interp_stop(node);
+        else if (s.impulses & 8u) s.paused = s.playing ? !s.paused : s.paused;  // USeqAct_Interp::Pause (0x00e39c90): a toggle
+        else if (s.impulses & 16u) change_direction();
+        else if (!s.playing) return true;
         interp_step(node, dt);
-        return !s.playing;
+        return false;
     }
     if (c == "SeqAct_Delay") {
         if (s.impulses & 2u) {
@@ -1253,7 +1412,8 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
         if (s.impulses & 1u) {
             if (!s.delay_running) {
                 s.delay_running = true;
-                s.remaining = read_float(node, "Duration", n.f);
+                const int duration = linked_var(node, "Duration");
+                s.remaining = duration >= 0 ? var_float(duration) : n.f;
                 s.started_tick = tick_;
             }
         }
@@ -1666,21 +1826,26 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
     return true;
 }
 
-// USeqAct_Interp::DeActivated: "Completed" if it stopped at the end, "Aborted" if it was stopped
-// part way. An op that never initialised has no data and fires nothing.
+// USeqAct_Interp::DeActivated (0x00e44f80): output 1 (named "Aborted": the end of a reverse play)
+// when the Position is at the start, output 0 ("Completed") when it is at the end, neither for a
+// Matinee stopped part way. An op that never built its instances (a Stop or Pause on an idle
+// Matinee) has no data and fires nothing. The op leaves its actors' LatentActions; they stay where
+// the last update left them.
 void LevelScript::deactivated(int node) {
     const ScriptGraph::Node& n = graph_->nodes[static_cast<size_t>(node)];
     if (n.cls != "SeqAct_Interp") return;
     State& s = state_[static_cast<size_t>(node)];
     if (!s.initialised || n.matinee < 0) return;
     const float length = graph_->matinees[static_cast<size_t>(n.matinee)].length;
-    if (s.aborted) {
+    if (s.position < kSmall) {
         if (n.outputs.size() > 1) s.out |= 2u;
+        ++s.fired[1];
     } else if (s.position > length - kSmall) {
         if (!n.outputs.empty()) s.out |= 1u;
+        ++s.fired[0];
     }
+    if (host_.interp_finished) host_.interp_finished(node);
     s.initialised = false;
-    s.aborted = false;
 }
 
 std::string LevelScript::playing() const {

@@ -2007,6 +2007,12 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             set_matrix(uniforms.model, active_scene.barge_doors[static_cast<size_t>(mb.barge_door)].model_matrix);
             return true;
         }
+        // An actor the script's Matinees move: from where the level placed it to where it is now.
+        if (mb.mover >= 0 && static_cast<size_t>(mb.mover) < active_scene.movers.size() &&
+            active_scene.movers[static_cast<size_t>(mb.mover)].moved) {
+            set_matrix(uniforms.model, active_scene.movers[static_cast<size_t>(mb.mover)].delta);
+            return true;
+        }
         set_matrix(uniforms.model, identity);
         return false;
     };
@@ -2040,7 +2046,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 const auto& mesh = active_scene.meshes[i];
                 if (mesh.vertices.empty() || !impl->cached_mesh_buffers[i]) continue;
                 if (mesh_hidden(mesh)) continue;
-                if (!dynamic_casters && (mesh.elevator >= 0 || mesh.barge_door >= 0)) continue;
+                if (!dynamic_casters && scene_mesh_moves(active_scene, mesh)) continue;
                 if (mesh.is_decal) continue;
                 bool moved = apply_scene_mesh_model(i);
                 if (moved || sh_prev_moved) push_uniforms();

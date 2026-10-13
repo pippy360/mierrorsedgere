@@ -21,6 +21,7 @@
 
 #include "../math/types.hpp"
 #include "../physics/collision_world.hpp"
+#include "../physics/scene_lines.hpp"
 #include "post_process.hpp"
 
 #include <algorithm>
@@ -100,7 +101,7 @@ inline Vec3 light_env_quantize(const Vec3& c) {
 // UpdateStaticEnvironment: the level's lights at `origin`, for an owner of bounds radius `radius`.
 // `collision` (may be null) answers the one line check a light gets.
 inline SH9RGB gather_light_environment(const Vec3& origin, float radius, const LightEnvSettings& s,
-                                       const std::vector<LevelLight>& lights, const CollisionWorld* collision) {
+                                       const std::vector<LevelLight>& lights, const SceneLines* collision) {
     SH9RGB e{};
     float b[9];
     for (const LevelLight& l : lights) {
@@ -207,7 +208,7 @@ inline SH9RGB gather_dynamic_lights(const Vec3& origin, float radius, uint32_t c
 // (bCastCompositeShadow: the sun and the sky by class, lamps where the level says), with no bounce.
 // The component's ambient shadow term is added when the light is made (it can turn with the owner).
 inline SH9RGB gather_shadow_environment(const Vec3& origin, float radius, const LightEnvSettings& s,
-                                        const std::vector<LevelLight>& lights, const CollisionWorld* collision) {
+                                        const std::vector<LevelLight>& lights, const SceneLines* collision) {
     SH9RGB e{};
     float b[9];
     for (const LevelLight& l : lights) {
@@ -427,7 +428,7 @@ public:
     // `now` in seconds. A clock that ran back, or the first call, sets the environment at once.
     // `direct`: light to add to the environment's own before it is split (gather_dynamic_lights).
     void update(const Vec3& origin, float radius, const LightEnvSettings& s, const std::vector<LevelLight>& lights,
-                const CollisionWorld* collision, float now, const SH9RGB* direct = nullptr) {
+                const SceneLines* collision, float now, const SH9RGB* direct = nullptr) {
         const float dt = now - last_time_;
         if (!valid_ || !(dt >= 0.0f) || dt > 2.0f) {
             current_ = target_ = gather_light_environment(origin, radius, s, lights, collision);
@@ -478,7 +479,7 @@ private:
 
 // ME_LIGHT_ENV_DEBUG=1: what an environment at `origin` gathers, light by light, twice a second.
 inline void debug_light_environment(const char* who, const Vec3& origin, float radius, const LightEnvSettings& s,
-                                    const std::vector<LevelLight>& lights, const CollisionWorld* collision,
+                                    const std::vector<LevelLight>& lights, const SceneLines* collision,
                                     const std::vector<LevelActor>& actors, const LightEnvLighting& result, float now) {
     static const bool on = std::getenv("ME_LIGHT_ENV_DEBUG") != nullptr;
     static float last = -1.0e9f;
@@ -549,6 +550,8 @@ public:
             }
         } else if (mb.barge_door >= 0 && static_cast<size_t>(mb.barge_door) < scene.barge_doors.size()) {
             origin = scene.barge_doors[static_cast<size_t>(mb.barge_door)].model_matrix.transform_point(origin);
+        } else if (mb.mover >= 0 && static_cast<size_t>(mb.mover) < scene.movers.size()) {
+            origin = scene.movers[static_cast<size_t>(mb.mover)].delta.transform_point(origin);
         }
     }
 
@@ -560,7 +563,8 @@ public:
         if (mb.lighting.mode == DynamicLighting::Mode::Environment) {
             LightEnvironment& env = meshes_[i];
             const SH9RGB direct = gather_dynamic_lights(placed, radius, mb.lighting.channels, scene.lights);
-            env.update(origin, radius, mb.lighting, scene.lights, scene.collision.get(), now, &direct);
+            const SceneLines lines{&scene};
+            env.update(origin, radius, mb.lighting, scene.lights, &lines, now, &direct);
             return env.lighting();
         }
         if (mb.lighting.mode == DynamicLighting::Mode::Direct) {
@@ -575,7 +579,8 @@ public:
         const EnemyBot& bot = scene.enemies[ei];
         const Vec3 origin = bot.position + Vec3(0.0f, 0.0f, 90.0f);
         const SH9RGB direct = gather_dynamic_lights(origin, 110.0f, pawn_light_environment().channels, scene.lights);
-        enemies_[ei].update(origin, 110.0f, pawn_light_environment(), scene.lights, scene.collision.get(), now, &direct);
+        const SceneLines lines{&scene};
+        enemies_[ei].update(origin, 110.0f, pawn_light_environment(), scene.lights, &lines, now, &direct);
         return enemies_[ei].lighting();
     }
 
@@ -584,8 +589,9 @@ public:
     const LightEnvLighting& first_person(const LevelScene& scene, const Vec3& pawn_position, float now) {
         const Vec3 origin = pawn_position + Vec3(0.0f, 0.0f, 100.0f);
         const SH9RGB direct = gather_dynamic_lights(origin, 100.0f, arms_light_environment().channels, scene.lights);
-        player_.update(origin, 100.0f, arms_light_environment(), scene.lights, scene.collision.get(), now, &direct);
-        debug_light_environment("first person", origin, 100.0f, arms_light_environment(), scene.lights, scene.collision.get(),
+        const SceneLines lines{&scene};
+        player_.update(origin, 100.0f, arms_light_environment(), scene.lights, &lines, now, &direct);
+        debug_light_environment("first person", origin, 100.0f, arms_light_environment(), scene.lights, &lines,
                                 scene.actors, player_.lighting(), now);
         return player_.lighting();
     }
@@ -597,7 +603,8 @@ public:
         LightEnvSettings s = pawn_light_environment();
         const float yaw = yaw_deg * 3.14159265f / 180.0f;
         s.ambient_shadow_dir = Vec3(-std::cos(yaw), -std::sin(yaw), 10.0f);
-        player_body_.update(pawn_position + Vec3(0.0f, 0.0f, 90.0f), 110.0f, s, scene.lights, scene.collision.get(), now);
+        const SceneLines lines{&scene};
+        player_body_.update(pawn_position + Vec3(0.0f, 0.0f, 90.0f), 110.0f, s, scene.lights, &lines, now);
         return player_body_.shadow();
     }
     const ShadowLight& enemy_shadow(const LevelScene& scene, size_t ei, float now) {
@@ -610,7 +617,8 @@ public:
         mesh_bounds(scene, i, center, radius, &placed);
         LightEnvironment& env = meshes_[i];
         const SH9RGB direct = gather_dynamic_lights(placed, radius, scene.meshes[i].lighting.channels, scene.lights);
-        env.update(center, radius, scene.meshes[i].lighting, scene.lights, scene.collision.get(), now, &direct);
+        const SceneLines lines{&scene};
+        env.update(center, radius, scene.meshes[i].lighting, scene.lights, &lines, now, &direct);
         return env.shadow();
     }
 

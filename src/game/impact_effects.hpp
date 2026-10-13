@@ -75,24 +75,31 @@ inline void direction_axes(const Vec3& direction, Vec3& x, Vec3& y, Vec3& z) {
     z = Vec3(-x.z * cy, -x.z * sy, flat);
 }
 
-// Where a part of a lift or a door is now, against where the level has it (the place its
-// collision triangles are in): a lift's part is moved by its offset, a door turned about its hinge.
+// Where a part of a lift, a door or an actor the script's Matinees move is now, against where the
+// level has it (the place its collision triangles are in): a lift's part is moved by its offset, a
+// door turned about its hinge, a script mover taken by its `delta`.
 struct MoverPose {
-    uint8_t kind = 0;  // 0 the level itself, 1 a lift's part, 2 a door
+    uint8_t kind = 0;  // 0 the level itself, 1 a lift's part, 2 a door, 3 a script mover
     int32_t mover = -1;
     int32_t part = -1;
     Vec3 offset{0.0f, 0.0f, 0.0f};
     Vec3 hinge{0.0f, 0.0f, 0.0f};
     float angle = 0.0f;
+    Mat4 delta = Mat4::identity();      // kind 3
+    Mat4 delta_inv = Mat4::identity();
 
     [[nodiscard]] Vec3 turned(const Vec3& d, float by) const {
         const float c = std::cos(by), sn = std::sin(by);
         return Vec3(c * d.x - sn * d.y, sn * d.x + c * d.y, d.z);
     }
-    [[nodiscard]] Vec3 dir_to_world(const Vec3& d) const { return kind == 2 ? turned(d, angle) : d; }
-    [[nodiscard]] Vec3 dir_to_rest(const Vec3& d) const { return kind == 2 ? turned(d, -angle) : d; }
-    [[nodiscard]] Vec3 to_world(const Vec3& p) const { return kind == 1 ? p + offset : kind == 2 ? hinge + turned(p - hinge, angle) : p; }
-    [[nodiscard]] Vec3 to_rest(const Vec3& p) const { return kind == 1 ? p - offset : kind == 2 ? hinge + turned(p - hinge, -angle) : p; }
+    [[nodiscard]] Vec3 dir_to_world(const Vec3& d) const { return kind == 2 ? turned(d, angle) : kind == 3 ? delta.transform_vector(d) : d; }
+    [[nodiscard]] Vec3 dir_to_rest(const Vec3& d) const { return kind == 2 ? turned(d, -angle) : kind == 3 ? delta_inv.transform_vector(d) : d; }
+    [[nodiscard]] Vec3 to_world(const Vec3& p) const {
+        return kind == 1 ? p + offset : kind == 2 ? hinge + turned(p - hinge, angle) : kind == 3 ? delta.transform_point(p) : p;
+    }
+    [[nodiscard]] Vec3 to_rest(const Vec3& p) const {
+        return kind == 1 ? p - offset : kind == 2 ? hinge + turned(p - hinge, -angle) : kind == 3 ? delta_inv.transform_point(p) : p;
+    }
 };
 
 // The pose of a mover this frame, and its collision triangles. False when there is no such mover.
@@ -104,6 +111,14 @@ inline bool mover_pose(const LevelScene& scene, uint8_t kind, int32_t mover, int
     if (kind == 0) {
         if (triangles) *triangles = scene.collision.get();
         return scene.collision != nullptr;
+    }
+    if (kind == 3) {
+        if (mover < 0 || static_cast<size_t>(mover) >= scene.movers.size()) return false;
+        const ScriptMover& m = scene.movers[static_cast<size_t>(mover)];
+        out.delta = m.delta;
+        out.delta_inv = m.delta_inv;
+        if (triangles) *triangles = m.collision.get();
+        return true;
     }
     if (mover < 0 || part < 0) return false;
     if (kind == 1) {
@@ -140,7 +155,8 @@ struct ImpactSurface {
     const CollisionWorld* triangles = nullptr;  // in the pose's rest place
 };
 
-inline ImpactSurface find_impact_surface(const LevelScene& scene, const Vec3& from, const Vec3& to) {
+inline ImpactSurface find_impact_surface(const LevelScene& scene, const Vec3& from, const Vec3& to, uint8_t channels = COLL_ShadowCast,
+                                         bool movers_only = false) {
     ImpactSurface best;
     Vec3 dir = to - from;
     const float whole = dir.length();
@@ -155,7 +171,7 @@ inline ImpactSurface find_impact_surface(const LevelScene& scene, const Vec3& fr
         const Vec3 along = pose.dir_to_rest(dir);
         CollisionHit h;
         for (int tries = 0; tries < 4; ++tries) {
-            h = world->line_check(a, b, COLL_ShadowCast);
+            h = world->line_check(a, b, channels);
             if (!h.hit || h.actor < 0 || static_cast<size_t>(h.actor) >= scene.actors.size() ||
                 !scene.actors[static_cast<size_t>(h.actor)].is_hidden) {
                 break;
@@ -176,6 +192,16 @@ inline ImpactSurface find_impact_surface(const LevelScene& scene, const Vec3& fr
         best.pose = pose;
         best.triangles = world;
     };
+    // What the script's Matinees move, where each is now (the line's box against the mover's first).
+    const Vec3 lo(std::min(from.x, to.x), std::min(from.y, to.y), std::min(from.z, to.z));
+    const Vec3 hi(std::max(from.x, to.x), std::max(from.y, to.y), std::max(from.z, to.z));
+    for (size_t k = 0; k < scene.movers.size(); ++k) {
+        const ScriptMover& m = scene.movers[k];
+        const AABB& b = m.world_box;
+        if (!m.collision || b.min_pt.x > hi.x || b.max_pt.x < lo.x || b.min_pt.y > hi.y || b.max_pt.y < lo.y || b.min_pt.z > hi.z || b.max_pt.z < lo.z) continue;
+        consider(3, static_cast<int32_t>(k), 0);
+    }
+    if (movers_only) return best;
     consider(0, -1, -1);
     for (size_t e = 0; e < scene.elevators.size(); ++e) {
         for (size_t k = 0; k < scene.elevators[e].parts.size(); ++k) consider(1, static_cast<int32_t>(e), static_cast<int32_t>(k));
@@ -454,9 +480,13 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         };
         // Actor.TakeDamage: the level actor it struck, for the script's damage events.
         const CollisionHit struck = first_shown(COLL_BlockZeroExtent | COLL_ShadowCast);
-        if (struck.hit && struck.actor >= 0 && static_cast<size_t>(struck.actor) < scene.actors.size() &&
-            scene.actors[static_cast<size_t>(struck.actor)].script_damage) {
-            scene.actor_damage.push_back(ActorDamage{struck.actor, tracer.damage, tracer.from_player, 0});
+        // (What the script's Matinees move has its triangles apart: one of those, where it is now, when it is nearer.)
+        const ImpactSurface on_mover = find_impact_surface(scene, stretch_from, stretch_to, COLL_BlockZeroExtent | COLL_ShadowCast, true);
+        const bool mover_first = on_mover.hit && (!struck.hit || (on_mover.location - stretch_from).dot(ray) < (struck.location - stretch_from).dot(ray));
+        const int32_t struck_actor = mover_first ? on_mover.actor : struck.hit ? struck.actor : -1;
+        if (struck_actor >= 0 && static_cast<size_t>(struck_actor) < scene.actors.size() &&
+            scene.actors[static_cast<size_t>(struck_actor)].script_damage) {
+            scene.actor_damage.push_back(ActorDamage{struck_actor, tracer.damage, tracer.from_player, 0});
         }
         if (physical.empty()) continue;
         // The surface the bullet stopped at: a mesh's own triangles there (its hull has no
@@ -515,9 +545,9 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         }
         const bool made = spawn_decal(scene, *decal, hit, hit.location, n, decal->width * scaling, decal->height * scaling * stretching, rotation);
         if (debug) {
-            static const char* const kOn[3] = {"", " (a lift's part)", " (a door)"};
+            static const char* const kOn[4] = {"", " (a lift's part)", " (a door)", " (a mover of the script's)"};
             std::cout << "[Impact] at (" << hit.location.x << ", " << hit.location.y << ", " << hit.location.z << ") actor " << hit.actor
-                      << kOn[std::min<int>(hit.pose.kind, 2)] << " element " << hit.element << " on "
+                      << kOn[std::min<int>(hit.pose.kind, 3)] << " element " << hit.element << " on "
                       << (valid(surface) ? physical[static_cast<size_t>(surface)].path : std::string("no physical material"))
                       << ": effect " << (effect >= 0 ? scene.particle_templates[static_cast<size_t>(effect)].path : std::string("none"))
                       << ", sound " << heard << ", angle " << impact_angle << ", decal material "
