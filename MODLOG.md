@@ -2929,6 +2929,18 @@ reader's verdicts (`verify.md` overrides `notes.md`), is in the main checkout's 
   `kRestartsOnMovers` loses `construction` and `Train_Ride_End`; `--intro-shots` takes `ME_SHOT_SCRIPT`,
   `ME_SHOT_EVENT` and `ME_SHOT_MATINEE` (`docs/RENDERING_RE.md`'s table).
 
+- **After the review** (an independent reader of the branch): the movers' triangles are no longer in
+  `LevelScene::collision`, so the line checks outside the controller (a lens flare's coverage, a light
+  environment's shadowing, the loader's floor snap for a bot) went through them; they now ask
+  `SceneLines` (`src/physics/scene_lines.hpp`: the level, then each mover where it is). A skipped cutscene
+  puts its actors at the end before it hands her over; a `Reverse` or a `Change Dir` backwards on the
+  player's own cutscene stops that cutscene as a `Stop` does; a cutscene's sound keys play going forwards only
+  (`UInterpTrackSound`); a pawn carried by a mover is swept through the level, so a mover cannot carry her into
+  a ceiling; whether a mover turned is read off the step's rotation, not off float rounding; the restart
+  harness puts back what the scripts switched in the collision it shares with the oracle's scene, and a spot
+  on a mover passes only with a drop under 200 and a drift under 50. `TODO.md`: the random-float delay item
+  is done; the far shadow cascade and movers, and the Vulkan link on MSYS2, are new.
+
 ### 46.4 Checked (Windows, Direct3D 11, headless)
 - **Oracle stage 29** (`--verify-movers`): Eval: the office door from yaw 270 to 140.630, its place moved
   0.002; New Eden's lift hull off by 0.000 at 0 s and 1279.999 up at 10 s; Ropeburn's first train at its end
@@ -2955,7 +2967,7 @@ reader's verdicts (`verify.md` overrides `notes.md`), is in the main checkout's 
   Flight's office door (`S_SP01_Door_01`) shut at 0.5 s and swung open about its hinge at 6 s, lit as before,
   the lettering decal at its foot turned with it (kept in the main checkout's ignored
   `build/re/open2/movers/shots/`).
-- **`--verify-all`:** ALL SYSTEMS PASS: stages 1 to 27 and 29 (after the rebase onto `main` at `c6eb457`).
+- **`--verify-all`:** ALL SYSTEMS PASS: stages 1 to 27 and 29 (after the rebase onto `main` at `c6eb457`, and again after the review's fixes, with the same numbers).
 - **Builds:** `mirrorsedge_windows` and `mirrorsedge_opengl` here; `vulkan_renderer.cpp` compiles here with the
   MSYS2 Vulkan headers (the Vulkan executable does not link on this machine: MSYS2's `libshaderc_combined.a`
   wants SPIRV-Tools after it, a build-setup matter of `main`); the macOS build on CI (run 38426355440, `macos-15`: compiles and links, nothing run).

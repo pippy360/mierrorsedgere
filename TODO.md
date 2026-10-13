@@ -28,7 +28,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 - **Splash hint texture rendering (`SeqAct_TdTriggerSplashHint`):** Render the hint image `TdUIResources_InGame_Hints.splashNN` inside the paused hint card (`src/renderer/overlay_ui.inl`).
 - **On-screen text font & layout parity:** Measure exact retail pixel coordinates, font metrics, and fade timings for `[TdSupersMessage]`, `[TdTutorialMessages]`, `TdLookAt.int` subtitles, and skip prompts (`src/renderer/overlay_ui.inl`, `src/renderer/hud_font.hpp`).
 - **Prologue (`Edge_p`) 3D opening title credits & chapter title overlay:** Animate and render the `InterpActor` 3D credit lettering driven by the opening Matinee in `Edge_p`, as well as chapter title / time-of-day HUD cards.
-- **`SeqAct_Delay` with a `SeqVar_RandomFloat` duration lasts one frame:** `level_script.cpp` reads a value only from `SeqVar_Float`, so 343 of the 1,087 delays in script-run packages are zero. Loops built on them restart every frame (`Trains.Tracks_Sparks` in the Subway, the door-cutting hits), Merc's idle reminders (2 to 4 minutes apart in retail) and passing trains come back to back. `SeqAct_DelaySwitch` also fires only Link 1.
+- **`SeqAct_DelaySwitch` fires only Link 1.** (A `SeqAct_Delay` whose duration is a `SeqVar_RandomFloat` now draws it between its `Min` and `Max`: `MODLOG.md` §46.)
 - **Restarts that still go wrong:** A level begun without a script (`LevelScene::player_spawn_pos`) still takes the checkpoint's place plus 35 for her feet and drops her 131. A start spot whose middle is under its floor (The Shard's `Scraper_Start`) is set on the first surface found and pushed up from there; whether she has room where she is put is not asked. The Training Area restarts her at the last stage's start she walked onto, where retail restarts the movement challenge at its `TdTutorialStart` nearest the last gate.
 - **World Matinees, what is left** (`docs/GAMEPLAY_SCRIPTING_RE.md` section 9, `MODLOG.md` §46): a world Matinee's float, vector, colour, visibility and anim-control tracks do nothing; `SeqEvent_Mover` (what a mover tells when she stands on it or it meets her) is not run; a skeletal mesh actor a movement track names is not moved (`--verify-movers` counts 227 `SkeletalMeshActor` and 9 `SkeletalMeshActorMAT` bindings in the chapters); a based pawn's view does not turn with a base that turns (not read). The lifts keep the port's own machine and `settle_lifts_for_restart` rather than the script's Matinees.
 - **Matinee event and sound keys at Time 0 never fire:** the key test runs from the Matinee's previous position, which starts at 0 (`level_script.cpp`, event and sound key loops). 410 of 1,678 event keys sit at Time 0 (245 linked; 103 sound actions on 72 Matinees): the Prologue intro loses its music track and Faith's monologue, elevators their door-open sound.
@@ -55,6 +55,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 ---
 
 ## Rendering, Lighting & Post-Processing
+- **A mover in the far shadow cascade:** the cached far cascade leaves out every actor the script's Matinees have moved or are moving (`scene_mesh_moves`), so a door that opened and stays open, or a girder raised and left there, casts no far shadow; after a restart the movers are back where the level placed them but stay out of the cached cascade until it is drawn again.
 *(Refs: `docs/RENDERING_RE.md` §16, `MODLOG.md` §9.4, §14, §23, §24, §29, §31, §32, §36 & §39, `src/renderer/*`, `src/assets/level_*`; research notes in the main checkout's ignored `build/re/notes/`, and for a bullet in a person `build/re/impacts/research/bodies/`, `bodies/` below)*
 
 - **Particle emitters left out:** the PhysX type-data emitters (`ParticleModuleTypeDataMeshPhysX`: 4 in Heat's opening area), and any emitter with an attractor or a collision module (`ME_PARTICLE_DEBUG=1` lists them). Sprites are not sorted against other translucent surfaces, and the emitter tick's order is stock UE3's, not read from the executable (`docs/RENDERING_RE.md` §13).
@@ -121,6 +122,7 @@ This file tracks open bugs, missing mechanics, and known retail parity gaps acro
 ---
 
 ## Menus, Time Trials & Platform Backends
+- **The Vulkan executable does not link with MSYS2 on Windows:** `mirrorsedge_vulkan.exe` fails with undefined `spvtools::` symbols from `libshaderc_combined.a`, which MSYS2 builds without SPIRV-Tools inside (they are `libSPIRV-Tools-opt.a` and `libSPIRV-Tools.a`, to be linked after it). Building it also wants the `mingw-w64-ucrt-x86_64-vulkan-headers` package. Configure with `-DME_VULKAN=OFF` there until the CMake link line names them.
 *(Refs: `docs/MAIN_MENU_SYSTEM_RE.md`, `docs/SUB_MENUS_RE.md`, `docs/WINDOWS_PORT.md`, `docs/LINUX_PORT.md`)*
 
 - **Time Trial (`TT_*`) & Speed Run mode:** Implement race start/finish triggers (`SeqEvt_TTRace*`), checkpoint split timers, star rating targets from `TdTimeTrial` data, and ghost recording/playback.

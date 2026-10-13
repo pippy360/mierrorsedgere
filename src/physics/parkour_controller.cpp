@@ -2251,9 +2251,24 @@ ParkourController::TraceHit ParkourController::sweep_box(const Vec3& centre, con
 // A mover she stands on moved: her Location (the capsule's centre) is carried by the same step.
 // (Whether the game also turns a based pawn's view with a base that turns was not read; it is not
 // turned here.)
-void ParkourController::carried_by_mover(const Mat4& step) {
+void ParkourController::carried_by_mover(const LevelScene& scene, const Mat4& step) {
     const Vec3 up(0.0f, 0.0f, kPawnCollisionHeight);
-    m_telemetry.position = step.transform_point(m_telemetry.position + up) - up;
+    const Vec3 to = step.transform_point(m_telemetry.position + up) - up;
+    const Vec3 move = to - m_telemetry.position;
+    // Swept through the level, not the movers (the one under her has gone on already), from a step
+    // over her feet up, so that the floor she passes over is not met: a mover does not carry her
+    // into a ceiling or a wall. Where she starts in the level already, she is carried as she was.
+    const float length = move.length();
+    if (scene.collision && length > 1.0e-4f) {
+        const Vec3 extent(kPawnRadius, kPawnRadius, 0.5f * (kPawnHeight - kMaxStepHeight));
+        const Vec3 centre = m_telemetry.position + Vec3(0.0f, 0.0f, kMaxStepHeight + extent.z);
+        const CollisionHit h = scene.collision->sweep_box(centre, move, extent, COLL_BlockNonZeroExtent);
+        if (h.hit && !h.start_penetrating) {
+            m_telemetry.position += move * std::max(0.0f, h.time - 0.1f / length);
+            return;
+        }
+    }
+    m_telemetry.position = to;
 }
 
 bool ParkourController::encroached_by_mover(LevelScene& scene, size_t mover, const Mat4& step) {
@@ -2279,7 +2294,10 @@ bool ParkourController::encroached_by_mover(LevelScene& scene, size_t mover, con
 
     // 1. bPushedByEncroachers (Actor's default, which the pawn keeps): MoveDir is the mover's own
     //    move, plus, when it turned, 1.5 times the way her Location is carried by the turn.
-    const bool turned = std::abs(step.m[0] - 1.0f) > 1.0e-7f || std::abs(step.m[5] - 1.0f) > 1.0e-7f || std::abs(step.m[10] - 1.0f) > 1.0e-7f;
+    // (Turned: any off-diagonal of the step's rotation over 1e-5, under the sine of one rotation unit,
+    // 9.6e-5, and well over the rounding of a move that only goes along.)
+    const bool turned = std::max({std::abs(step.m[1]), std::abs(step.m[2]), std::abs(step.m[4]), std::abs(step.m[6]), std::abs(step.m[8]),
+                                  std::abs(step.m[9])}) > 1.0e-5f;
     const Vec3 location = m_telemetry.position + Vec3(0.0f, 0.0f, kPawnCollisionHeight);
     const Vec3 origin_now(m.actor_tm.m[12], m.actor_tm.m[13], m.actor_tm.m[14]);
     Vec3 move_dir = origin_now - step.rigid_inverse().transform_point(origin_now);  // TestLocation - StartLocation

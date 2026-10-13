@@ -152,8 +152,9 @@ public:
     // The actor she stands on (Pawn.Base), -1 for none: a mover that is her base carries her.
     [[nodiscard]] int32_t base_actor() const { return m_telemetry.grounded ? m_base_actor : -1; }
     // The mover she stands on has moved by `step` (a rigid transform of its own points): she goes
-    // with it, as UWorld::MoveActor moves what is based on the actor it moves.
-    void carried_by_mover(const Mat4& step);
+    // with it, as UWorld::MoveActor moves what is based on the actor it moves: swept through the
+    // level, which stops her where it is in the way.
+    void carried_by_mover(const LevelScene& scene, const Mat4& step);
     // UWorld::CheckEncroachment (0x00c12f50) for her, the mover `mover` of `scene` standing at its new
     // place already, `step` what took it there. In its way she is first pushed out of it (the mover's
     // own move, and half as much again of what a turn does to her place, slid along the level with

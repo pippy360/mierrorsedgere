@@ -106,7 +106,7 @@ inline bool move_script_mover(LevelScene& scene, size_t index, const Mat4& targe
     set_script_mover_transform(scene, m, target, carried);
     if (!pawn || !m.collision || !actor.is_collidable) return true;
     if (pawn->base_actor() == m.actor_index) {
-        pawn->carried_by_mover(step);
+        pawn->carried_by_mover(scene, step);
         return true;
     }
     if (pawn->encroached_by_mover(scene, index, step)) {

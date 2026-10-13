@@ -545,9 +545,9 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         }
         const bool made = spawn_decal(scene, *decal, hit, hit.location, n, decal->width * scaling, decal->height * scaling * stretching, rotation);
         if (debug) {
-            static const char* const kOn[3] = {"", " (a lift's part)", " (a door)"};
+            static const char* const kOn[4] = {"", " (a lift's part)", " (a door)", " (a mover of the script's)"};
             std::cout << "[Impact] at (" << hit.location.x << ", " << hit.location.y << ", " << hit.location.z << ") actor " << hit.actor
-                      << kOn[std::min<int>(hit.pose.kind, 2)] << " element " << hit.element << " on "
+                      << kOn[std::min<int>(hit.pose.kind, 3)] << " element " << hit.element << " on "
                       << (valid(surface) ? physical[static_cast<size_t>(surface)].path : std::string("no physical material"))
                       << ": effect " << (effect >= 0 ? scene.particle_templates[static_cast<size_t>(effect)].path : std::string("none"))
                       << ", sound " << heard << ", angle " << impact_angle << ", decal material "

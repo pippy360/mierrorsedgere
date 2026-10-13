@@ -1235,7 +1235,8 @@ void LevelScript::fire_matinee_keys(int node, float from, float to) {
     // A player cutscene's sound track plays from the player; another Matinee's would play from
     // its actors, positioned, which is not done here (an ambient loop would otherwise be heard
     // everywhere at full volume).
-    if (m.player_cutscene < 0) return;
+    // (UInterpTrackSound plays going forwards only.)
+    if (m.player_cutscene < 0 || to < from) return;
     for (const ScriptSound& snd : m.sounds) {
         if (passed(snd.time) && host_.play_sound) host_.play_sound(snd.cue, snd.bank, snd.voice, 1.0f, nullptr);
     }
@@ -1302,11 +1303,13 @@ void LevelScript::skip_cutscene() {
     log("[Script] cutscene skipped: " + n.name);
     playing_cutscene_ = -1;
     playing_cutscene_node_ = -1;
-    if (host_.stop_cutscene) host_.stop_cutscene();
+    // The actors are put at the end first, then she is handed over among them (SetPosition moves
+    // them before the cutscene's end gives the player back).
     if (n.matinee >= 0) {
         s.position = graph_->matinees[static_cast<size_t>(n.matinee)].length;
         if (host_.interp_jump) host_.interp_jump(node, s.position);
     }
+    if (host_.stop_cutscene) host_.stop_cutscene();
     s.playing = false;
     s.paused = false;
 }
@@ -1346,15 +1349,25 @@ bool LevelScript::step_op(int node, float dt, bool newly) {
     // --- latent ops ---
     if (c == "SeqAct_Interp") {
         // The inputs: 1 Play, 2 Reverse, 4 Stop, 8 Pause, 16 Change Dir.
+        // A player's cutscene played backwards is not one the port can show: the cutscene is
+        // stopped and she is handed over, as a Stop does, and the Matinee goes on for the script.
+        const auto leave_cutscene = [&]() {
+            if (playing_cutscene_node_ != node) return;
+            playing_cutscene_ = -1;
+            playing_cutscene_node_ = -1;
+            if (host_.stop_cutscene) host_.stop_cutscene();
+        };
         const auto reverse = [&]() {
             s.reversed = true;
             s.playing = true;
             s.paused = false;
+            leave_cutscene();
         };
         const auto change_direction = [&]() {  // USeqAct_Interp::ChangeDirection (0x00e39cb0)
             s.reversed = !s.reversed;
             s.paused = false;
             s.playing = true;
+            if (s.reversed) leave_cutscene();
         };
         if (newly) {
             // A variable linked to PlayRate or ForceStartPosition gives the property its value as the op

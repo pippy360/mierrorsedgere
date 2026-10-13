@@ -15,6 +15,7 @@
 #include "../game/matinee_move.hpp"
 #include "../physics/bot_fire.hpp"
 #include "../physics/collision_world.hpp"
+#include "../physics/scene_lines.hpp"
 #include "../platform/platform.hpp"
 #include <fstream>
 #include <cstring>
@@ -6310,8 +6311,10 @@ bool load_level_scene(const std::string& game_root, const std::string& map_rel_p
             }
         }
         if (out_scene.collision) {
+            // (On the level or on what the script's Matinees move, where it stands as the level begins.)
+            const SceneLines lines{&out_scene};
             for (auto& bot : out_scene.enemies) {
-                CollisionHit floor_hit = out_scene.collision->line_check(
+                CollisionHit floor_hit = lines.line_check(
                     bot.position + Vec3(0.0f, 0.0f, 80.0f), bot.position - Vec3(0.0f, 0.0f, 180.0f));
                 if (floor_hit.hit) {
                     bot.position.z = floor_hit.location.z;

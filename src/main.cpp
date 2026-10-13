@@ -3499,8 +3499,9 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
             ok = !died && drift < 8.0f;
             out.in_cab += ok ? 1 : 0;
         } else if (on_mover && (!placed || std::abs(drop) >= 1.0f || drift >= 8.0f)) {
-            // On one of the script's movers that the checkpoint's events put under her, or that carries her.
-            ok = !died;
+            // On one of the script's movers that the checkpoint's events put under her, or that carries her:
+            // not far down onto one, nor carried far from the spot.
+            ok = !died && drop < 200.0f && drift < 50.0f;
             out.on_mover += ok ? 1 : 0;
         } else if (placed) {
             ok = !died && t.grounded && std::abs(drop) < 1.0f && drift < 8.0f;
@@ -3551,6 +3552,8 @@ static RespawnCheck check_checkpoint_respawns(const me::LevelScene& scene, const
                       << (known ? std::string("  (known: ") + known + ")" : ok ? std::string() : std::string("  <-- FAIL")) << std::endl;
         }
     }
+    // The copy shares its collision worlds with `scene`: what the scripts switched there is put back.
+    if (scripted) restore_script_actors(world);
     return out;
 }
 
