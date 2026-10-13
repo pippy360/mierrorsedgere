@@ -2387,3 +2387,241 @@ platform glue, and a read-only memory profile (its findings are in `TODO.md`, "M
 - **Emscripten Build (`emcmake cmake -B build-wasm -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build-wasm -j`)**: Compiled and linked cleanly with 0 errors and 0 warnings (`mirrorsedge_wasm.wasm` + `mirrorsedge_wasm.js` + `mirrorsedge_wasm.html`).
 - **Real Chrome WebGL 2 Pixel Readback (`?chapter=0&max_frames=150&exit_screenshot=/wasm_shot.png&mute=1`)**: Mounted 7.2 GB `/Users/tomnom/mirrorsedge` manifest in `< 20 ms`, compiled all 271 UE3 material shaders + 99 lightmaps, rendered 150 frames in WebGL 2 (`ANGLE Metal`), and exported a crisp 1280x720 PNG via `glReadPixels` matching native Metal/Vulkan/OpenGL pixel-for-pixel.
 - **Desktop Native Regression Check (`/Users/tomnom/git/mierrorsedgere/.worktrees/wasm-port/build/mirrorsedge_macos --verify-all`)**: **ALL 25 ORACLE STAGES PASS (`EXIT_CODE=0`)**.
+
+---
+
+## 44. A paused game's sounds, the emitters' voices, the low pass with distance (agent/audio-pause-layers-lowpass, 2026-10-11)
+
+Three open items of `TODO.md`: the low pass with distance, the pause menu and the hint card, and the level
+emitters, which section 38 left as one layer of a cue on the four nearest. The research is two readings of
+the executable, the scripts, the ini and the cooked `*_Aud` sublevels (scratch in the main checkout's ignored
+`build/re/open2/audio2/`: `notes.md`, and `verify.md`, a second reader's, which overrides it in five places:
+the seamless rule, a wave without a source, a ranked-out emitter, the mix groups, the music's level after a
+pause). `docs/AUDIO_SYSTEM_RE.md` sections 3.2 and 3.3 have the rules.
+
+### 44.1 What the game does (MirrorsEdge.exe, Engine.u, TdGame.u, the ini, the cooked `*_Aud` files)
+- **The low pass.** `FALSoundSource::Update` (0x010D71B0) holds the wave's high-frequency gain between 0.01
+  and 1, and `FALAudioEffectsManager::UpdateEffect` (0x010DBCB0) writes it, at every update of the source, as
+  `AL_LOWPASS_GAINHF` of the source's own EFX low-pass filter (its `AL_LOWPASS_GAIN` 1.0) and sets the filter
+  as the source's `AL_DIRECT_FILTER` and on its reverb send. The gain is a product of four (0x00B6F570,
+  0x00B77ADD): the nodes' ramp from `LPFMinRadius` to `LPFMaxRadius` (0x00B7DEDA), the sound group's
+  `LowPass` with the sound mode's adjuster, the component's adjust level (occlusion), its
+  `LowPassMultiplier`. The filters are there only if the device's effects came up (0x010DBE50): the
+  `ALC_EXT_EFX` extension and every entry point of it, an effect slot, a send, a filter for each of the 32
+  sources. The game ships Creative's `wrap_oal.dll` 2.2.0.5 behind the OpenAL router and opens the device
+  `Generic Hardware`. Whether that grants all of it on a retail machine was not determined (it needs a run
+  of the game or of that library), so **it is not known whether retail's players hear the low pass.**
+- **A pause.** The engine's tick gives the device `bGameTicking = !World->IsPaused()` (0x007C7E47). On the
+  first update of a game that is not ticking `UAudioDevice::HandlePause` (0x00B652B0) calls `alSourcePause`
+  on every source whose component is not of a sound group with `bIsUISound` (`HudSFX`, `DialogueHUD`,
+  `HudMusic`, `InGameMusic`, `TimeTrialMusic`), and on the first update of one that ticks again it plays
+  them all, each from where it stopped. Meanwhile every cue is parsed with a `DeltaTime` of 0 unless it is a
+  UI sound (0x00B70316), `StartSources` neither starts nor updates a wave that is not one (0x00B6EFE4), and a
+  `SoundNodeDelay` counts `WorldInfo.TimeSeconds` (0x00B7F2A0), which stands still. `TdPlayerController.SetPause`
+  calls `SetAudioGroupVolume('InGameMusic', 0.25)` when it has paused the game and `('InGameMusic', 1.0)`
+  when it has let it go; `UAudioDevice::SetGroupVolume` (0x00B6DD00) puts the number in the place of the
+  group's own `Volume`, so the ini's 1.2 is gone with the first call, and `ClientRestart` makes that call,
+  `SetPause(false)`, at every spawn: in play the group is at 1.0, and a pause is a quarter of it. No script of
+  `TdGame.u` sets the sound mode 4, "Pause". The main menu is a map of its own, not a paused game
+  (`TdHUD.PauseGame` returns at once there).
+- **One wave, one voice.** `USoundNodeWave::ParseNodes` (0x00B77880) keeps a wave instance for each wave
+  under each parent node, filled with what the nodes above it on its own branch have left in the component;
+  a `USoundNodeMixer` (0x00B767A0) parses every input from the state it was reached with. A wave whose volume
+  comes to 0.0001 or less is not handed to the device (0x00B77B78), and a cue whose sound group has a
+  `MaxUpdateDistance` (`IndoorAmbientProps` 2000, `OutdoorAmbientProps` 3000) is not parsed at all past it
+  (0x00B6FBB5). The device sorts what it was handed by `PlayPriority`, the volume the graph gave the wave
+  with the distance in it and 1.0 more for a group with `bAlwaysPlay`, and its sources, 32 by the ini's
+  `MaxChannels` (0x010D9760), go to the highest (0x00B70200). A source whose wave is no longer among them is
+  stopped; a wave among them with no source gets one and plays from its start; one that has a source is only
+  updated (0x00B6B340, 0x00B6EFB0). A level emitter's component has `bShouldRemainActiveIfDropped`
+  (`Default__AmbientSound`'s `AudioComponent0`), so a wave of it that is left out is not finished: it is in
+  the running again at every update. A wave without a source does not move on.
+- **Loops and rounds.** `USoundNodeLooping` (0x00B7E130) asks for seamless looping and is what the waves
+  below it report their end to. `USoundNodeMixer`, `USoundNodeRandom` (0x00B7EFB1) and `USoundNodeDelay`
+  (0x00B7F296) clear the flag, so a wave loops in its source only when the last of those four kinds of node
+  above it is a looping node. Any other plays once, and when every wave of the round has ended (0x00B7FE50)
+  every node below the looping node is drawn again and the next parse plays the next round. A node above
+  the looping node is never drawn again: a delay up there is waited out once.
+- **Mix groups.** `UTdSoundNodeMixGroup::ParseNodes` (0x012292A0) multiplies the volume and the pitch of what
+  is below it by those of the mix groups it names: `AmbientPropSounds`, 0.9, on the `A_Prop_*` cues that name
+  it (three store no mix group and keep Default's 1.0). It is
+  part of the volume a wave is ranked by.
+- **The cues.** The 1,650 emitters of the `*_Aud` sublevels play 94 cues. The 767 layered props are a mix
+  group over a mixer of two branches, each an attenuation node, a modulator, a random node and a looping
+  node straight over each wave: two voices that each loop one wave without a gap. The 291 vehicle packs are
+  a looping node over a delay of 7 to 15 s, a modulator and a random node; the 63 `WindHard` a mixer of a
+  looping bed and three layers of gusts, each a looping node over a random node; `DullHammering` and
+  `Horns&Boats` have their delay above the looping node; `BirdsChirp`'s random node has an empty input
+  (`docs/AUDIO_SYSTEM_RE.md` section 3.3 has the table). Every looping node of them loops for ever.
+
+### 44.2 What was wrong
+- **The low pass** was read and kept (section 37) and nothing applied it.
+- **A pause paused nothing.** Under the port's overlay menu (`set_menu_active`) the menu's theme took the
+  place of the level's music (`set_menu_music` bound the first stem to `A_M_Menu`), the level's music began
+  again from its start afterwards, and the emitters were stopped; voice lines, one-shots, her breath and the
+  run wind played on. Under the pause menu and under a hint card everything played on at its full level,
+  the music and the emitters too, and under the card the footstep timer. Nothing called `alSourcePause`.
+- **Emitters.** Four sources, dealt at every update to the four nearest emitters that were heard, so only
+  four emitters ever sounded and a change of rank started a wave over and cut a delay's wait. One wave an
+  emitter, of the layer that carries farthest: a vent was its hum alone at every distance. Rounds only for a
+  cue whose first wave had a delay: a loop over a random node repeated one wave (79 emitters), a delay above
+  the looping node was drawn every round (16). No mix group, no `MaxUpdateDistance`, and the emitters of the
+  level before were not stopped when the next one was loaded.
+
+### 44.3 Changes
+- `src/audio/attenuation.hpp`: `low_pass_gain`, the ramp; `DrawnAttenuation` carries the node's flag and its
+  two LPF radii as drawn; `VoiceAttenuation::high_frequency_gain` is the product over the nodes above a wave;
+  the source's 0.01 and 1.
+- `src/audio/sound_groups.hpp` (new): the ini's sound groups as far as the port uses them (`Volume`,
+  `MaxUpdateDistance`, `bAlwaysPlay`, `bIsUISound`), its mix groups (`Volume`, `Pitch`) and the three volumes
+  of `InGameMusic`.
+- `src/audio/audio_engine.*`, the low pass: `alGenFilters`, `alDeleteFilters`, `alFilteri` and `alFilterf`
+  are asked of the library at run time (`alcIsExtensionPresent("ALC_EXT_EFX")`, `alGetProcAddress`) and never
+  linked, with the six EFX numbers written out; one low-pass filter for each of the 32 pool sources and the
+  32 emitter sources, and none at all unless every one was made and a first one could be set on a source and
+  taken off again. `set_source_low_pass` is `UpdateEffect`: gain 1, the wave's high-frequency gain, the
+  filter set on the source again, at the start of a sound at a place and at every update; a 2D sound on a
+  pool source has no filter. The value is worked out with and without the extension
+  (`PositionalVoice::high_frequency_gain`). Only the nodes' factor of the four exists in the port.
+- The same files, the pause: `set_game_paused` pauses every pool source that is playing and is not a UI
+  sound, the emitters' sources, the run wind and the voice line, and plays them on at its end; while it lasts
+  `update` runs no delay of a sound that is not a UI one, starts no sound at a place, advances no voice line,
+  wind, breath or emitter and follows no gain; `play_sound` and `play_vo` keep what is asked for meanwhile and
+  start it with the first update after it, unless the cue's sound group is a UI one (the menus' `A_HUD` cues
+  are `HudSFX`). The music's stems keep their mix and play at the `InGameMusic` group's volume: 1.2 until the
+  first call, then 0.25 paused and 1.0 in play (the stems' own fixed level stands for the 1.0, so in play the
+  music is as loud as it was). `set_menu_music` is the front end only, and stops the level's sounds
+  (`stop_level_sounds`). The sound mode 4 is left as the ini's preset, which nothing selects.
+- The same files, the emitters: `EmitterState` is a payload for every node of the emitter's cue and a record
+  for every wave its parses have reached; `parse_emitter_node` is the graph's parse (wave, mixer, looping,
+  delay, random, modulator, attenuation and ambient, mix group), `emitter_wave_finished` the looping node's
+  count and its drawing again of what is below it, `update_ambient_emitters` the device's update: the waves
+  whose source has ended, every emitter's parse (not past its group's `MaxUpdateDistance`), the waves above
+  0.0001 sorted by the graph's volume with the distance in it, the sources to the highest, a source kept by
+  the wave that has it, a new one from the wave's start. They share up to 32 sources of their own: at each
+  update as many as the port's other sounds are leaving of 32 (`count_other_voices`: the pool's one-shots, a
+  voice line, the run wind, the music as one). `load_level_audio` stops and forgets the emitters of the
+  level before. `collect_cue_voices` (the one-shots) applies a mix group node too.
+- `src/math/types.hpp`, `src/assets/upk_loader.cpp`: `SoundCueNode` has the kinds `Looping`
+  (`bLoopIndefinitely`, `LoopCount`) and `MixGroup` (the names, the two flags).
+- `src/main.cpp`: `game_is_paused` (the pause menu, the port's overlay menu when it was opened from play, a
+  hint card) is given to the engine by `update_audio` at every frame; `set_menu_active` says whether the
+  overlay stands for the front end; the per-frame `set_menu_music` is the front end's alone. The gunshot and
+  the footstep timer are for a step of the simulation that ran. Oracle stage 23 has the low pass (worked
+  values, the engine's reading for an impact, a two-node chain, a `TdSoundNodeAttenuation`, the emitters) and
+  every layer of the factory's emitters on its own curve; stage 26 is new (below); `--verify-sound` runs
+  both. `--emitter-walk` is the count over the eleven maps. `--audio-device-check` opens the audio device
+  with no window and the master volume at nothing and reads OpenAL's own states.
+- Documents: `docs/AUDIO_SYSTEM_RE.md` sections 1.1, 2.2, 2.3, 3.1, 3.2, the new 3.3 and 7;
+  `docs/RENDERING_RE.md`'s table of switches; `TODO.md`.
+
+### 44.4 Checked (Windows; with no audio device unless said)
+Nothing here was listened to, and nothing can be on this machine by an agent: every result is a number read
+back from the engine, or a source's state asked of OpenAL.
+
+- **The low pass** (stage 23): eleven worked values of the ramp, worst difference 0.00004 (1500 / 5000: 1 at
+  1500, 0.8857 at 1900, 0.5 at 3250, 0 at 5000 and beyond); a node with the flag off leaves 1, two nodes
+  multiply (0.25), a node with `bAttenuate` off still filters. In the engine a concrete impact heard from
+  480, 1900, 2500 and 1000 uu reads 1.0000, 0.8857, 0.7143 and 1.0000 (its volume gone at 2500); a pistol's
+  `Fire3P` 0.6838 at 4000 uu and the floor, 0.0100, at 13000; a slap-back's `TdSoundNodeAttenuation` the
+  floor; `WindHard` at 1000 uu 0.8016 (its radii 10 / 5000); 274 emitter voices of the training area on
+  their curve and their low pass, worst difference 0.0000.
+- **Layers** (stages 23 and 26): the factory's emitters heard from 150 and 1900 uu above each in turn, 2,643
+  voices, 0 at volume 0, 2,508 held against their own node's curve, worst 0.0000 (it was the farthest layer's
+  curve, section 38); an `A_Prop_AirVent_Indoor` from 100 uu is two looping voices at 0.4091 (the hiss,
+  Logarithmic 2 / 1500) and 1.0000 (the hum, 150 / 3000), ranked at 0.0955 and 0.4209, inside what its mix
+  group's 0.9 and its modulators allow; from 1900 uu one, at 0.1525 with high frequencies 0.8857; from 2100
+  uu none (its group's `MaxUpdateDistance`).
+- **A pause** (stage 26): beside a wind in the training area, with an impact playing and a slap-back echo
+  still held back by its distance, ten voices; under `set_game_paused` for 600 updates of a tenth of a
+  second, the listener walking 1200 uu off: ten voices, 0 changed (name, wave, age, gain, distance), the
+  impact's age 0.1000 s before and after the minute and 0.1400 s one update of 0.04 s later, the echo not
+  come in the pause nor 0.04 s after it and come at 0.06 s, its delay of 0.151 s having run 0.1 s before the
+  pause and not at all in it. Of an impact, a footstep and the
+  menu's click asked for in the pause one started, the click (`HudSFX`); the other two with the first update
+  after it. `InGameMusic` 1.2000 before any call, 0.2500 paused, 1.0000 after; 1.0 after a first
+  `set_game_paused(false)` with no pause before. Behind the front end 0 voices and nothing paused; 9 from
+  their start when it is left.
+- **Sources** (stage 26, The Boat): from 150 uu above each of its 151 emitters, 32 sources, up to 81 waves
+  asking at a place and more than 32 at 132 places; the waves with a source are as many as there are
+  sources, or all that ask, at every place, and at none is one ranked under a wave that has none. With
+  three impacts playing the emitters have 29, and 29 waves hold one. Walking off from the busiest place in
+  twenty steps of 150 uu, 615 times a voice kept its
+  source across a step, 0 of them started over, while 300 places in the ranking changed and 25 voices came
+  in new, each from its start. Of the factory's voices 1 was sounding before The Boat was loaded and 0 after.
+- **Rounds** (stage 26): `VehiclePack_02` in 150 s plays 9 rounds, one pass each and none looping, 7
+  different passes, the waits between them 7.25 to 14.20 s (its delay is 7 to 15); after 40 s with the
+  listener out of range its next pass starts 0.05 s after the listener is back, the delay having run out
+  and the pass, with no source out there, not having moved on. `WindHard`: one looping bed and 10 different
+  gusts in 60 s. `DullHammering`: its first sound 2.2 s after the level starts (the delay above its looping
+  node, 0 to 3 s), then 11 rounds with no wait between them.
+- **Seeds:** those numbers are one draw of `std::rand`. With a switch put in for the purpose and taken out
+  again, `--verify-sound` under 24 seeds passes both stages every time: the vehicle pack's waits 7.05 to
+  14.95 s over 8 to 11 rounds, 78 to 82 waves asking on The Boat, 611 to 621 voices kept and 0 started over,
+  `DullHammering`'s first sound after 0.15 to 3.05 s. Inside `--verify-all`, where the stages before it have
+  drawn from the same generator, stage 26 reads 11 rounds, 7.10 to 12.45 s, 616 kept, 0 started over.
+- **Every level, before and after** (`--emitter-walk`: 100, 150, 1000 and 2000 uu above each emitter of the
+  eleven maps in turn, a quarter of a second at each of the 6,600 places):
+
+  | map | emitters | voices heard, before | after | places with none, before | after | waves asking, after |
+  |---|---|---|---|---|---|---|
+  | Training Area | 38 | 218 | 1,233 | 61 | 7 | 1,233 |
+  | Prologue | 106 | 650 | 6,425 | 207 | 0 | 6,434 |
+  | Flight | 136 | 772 | 10,408 | 298 | 13 | 10,698 |
+  | Jacknife | 155 | 2,123 | 15,816 | 42 | 10 | 19,957 |
+  | Heat | 213 | 2,111 | 18,558 | 261 | 0 | 22,687 |
+  | Ropeburn | 188 | 2,265 | 10,531 | 92 | 4 | 10,546 |
+  | New Eden | 117 | 1,006 | 5,321 | 177 | 9 | 5,321 |
+  | Pirandello Kruger | 153 | 1,915 | 9,644 | 107 | 0 | 10,150 |
+  | The Boat | 151 | 2,122 | 19,182 | 0 | 0 | 30,637 |
+  | Kate | 149 | 1,521 | 12,562 | 199 | 10 | 13,569 |
+  | The Shard | 244 | 3,253 | 12,079 | 3 | 18 | 12,805 |
+  | all | 1,650 | 17,956 | 121,759 | 1,447 | 71 | 144,037 |
+
+  Before, at most 4 at a place; after, at most 32, with 84 waves asking at the busiest place (The Boat),
+  more asking than there are sources at 1,443 places, and 0 voices with a source ranked under a wave
+  without one. No voice is at a distance gain of 0, before or after; 2,358 are at 0.002 or less (91
+  before): a wave above retail's 0.0001 gets a source when one is free. One emitter had stopped for good by
+  the end of the walk, a `BirdsChirp` in New Eden, its random node having drawn its empty input. The walk
+  gives the same numbers when run again. The Shard's 18 places with none (3 before) were not looked at
+  singly; a prop that is not parsed past its `MaxUpdateDistance`, where its far layer alone used to sound,
+  is a rule that can do it. A random node draws only among its empty inputs and those that reach a wave
+  the port has loaded (all of them when none does): retail has every wave, and an emitter that drew an
+  unloaded one would stop for good, its round unable to end. The walk's numbers are the same with it.
+- **On the audio device, silent** (`--audio-device-check`, OpenAL Soft): the device gives the 32 emitter
+  sources and a low-pass filter for every source that plays sounds at a place, and takes a filter on a
+  source; ten sounds at a place, the dullest filter at 0.6888 (a `WindHard` 1563 uu off: `1 - 1553 / 4990`).
+  OpenAL's own states: in play 9 emitter sources and 1 pool source playing, 4 stems; half a second into a
+  pause 0 and 0 playing, 9 and 1 paused, the 4 stems playing, the run wind paused; a click and a footstep
+  asked for there, 1 pool source playing and 1 paused; in play again 9 and 3 playing, none paused; no OpenAL
+  error at any of the four. The master volume was 0 throughout: this says the calls are taken, not how it
+  sounds.
+- **Through the game's own path** (`--intro-shots`, `ME_AUDIO_DEBUG=1`, the Prologue): from
+  `ME_SHOT_STAND="-6596,-4636,6736"` the two `A_Prop_AirVent_Indoor` 330 and 647 uu off are four looping
+  voices, the hums on Logarithmic 150 / 3000 at 0.7366 and 0.5123 and the hisses on Logarithmic 2 / 1500 at
+  0.2286 and 0.1271, and a fan 2607 uu off at 0.0513. From section 38's stand, `"-8784,-5296,7400"`, the two
+  vents 2168 and 2396 uu off that played their hum there at 0.1084 and 0.0750 are silent, past their
+  group's 2000; a `Wind` 1297 uu off plays two gusts at 0.3533.
+- **The loader:** `--dump-sound-cues` over the 2,406 packages (19,363 cues, 19,316 attenuation nodes) is
+  byte for byte what `main` writes.
+- **Warnings:** `g++ -std=c++20 -Wall -Wextra -Wpedantic -Wno-unused-parameter -fsyntax-only` on
+  `audio_engine.cpp`, with and without `-DME_NO_OPENAL`: nothing beyond the three pragma lines.
+- **`--verify-all`:** ALL SYSTEMS PASS, 26 stages, 0 failed, on the last build; its 17 screenshots are byte
+  for byte the tracked ones. The Direct3D 11 and the OpenGL executables both build and link.
+- **Not compiled:** macOS and clang. There is no clang on this machine, and the branch was not pushed, so
+  the `macos-15` check was not run. The EFX entry points are fetched by name and nothing of `AL/efx.h` is
+  included, so Apple's framework needs none of it; that is by reading.
+
+### 44.5 Not done
+Nothing was listened to, and the game's loop was not run: that the pause menu, the overlay and the hint card
+reach `set_game_paused` is by reading. Whether retail's own OpenAL grants the filters is not known. Of the
+low pass's four factors only the nodes' is in, and the port has no reverb send to filter. The one-shots,
+the voice line, the wind and the music are not ranked with the emitters' waves as retail ranks everything
+for one pool of 32; a one-shot out of range keeps its source. An emitter's level is still its component's
+`VolumeMultiplier` times 0.55, without its cue's, its sound group's and its wave's volumes, which are not in
+the 0.0001 either. A random node repeats inputs where retail's goes through all of them first; that it, a
+modulator and `USoundNodeAmbient` behave on a new round as stock Unreal Engine 3's do was not read, nor
+that an empty input of a random node stops the component. The mix groups' run-time values, the
+`SoundNodeOscillator` and `TdSoundNodeVelocity` nodes, the emitters outside the `*_Aud` sublevels, a tutorial
+message's `bPauseGame`, a cutscene's music under a pause and the pause of a level load are open. In
+`TODO.md`.

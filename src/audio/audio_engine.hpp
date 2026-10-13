@@ -2,6 +2,7 @@
 
 #include "../math/types.hpp"
 #include "attenuation.hpp"
+#include "sound_groups.hpp"
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -119,9 +120,23 @@ public:
     // Dynamic 4-track Solar Fields stem volume control (0.0 to 1.0)
     void set_music_stems(float ambient_vol, float tension_vol, float chase_vol, float reaction_vol);
 
-    // Switch between Main Menu theme (A_M_Menu.upk) and active chapter Solar Fields stems
+    // The front end: the Main Menu theme (A_M_Menu.upk) in place of the chapter's Solar Fields
+    // stems, and the level's own sounds stopped. Retail's front end is a map of its own, so nothing
+    // of a level sounds behind it; it is not a paused game (TdHUD.PauseGame returns at once there).
     void set_menu_music(bool active);
     [[nodiscard]] const std::string& get_active_music_bank() const { return active_music_bank_; }
+
+    // The game paused (the pause menu, a hint card: WorldInfo.Pauser set), as retail's audio device
+    // takes it. Every source that is not playing a sound of a UI sound group (HudSFX, DialogueHUD,
+    // HudMusic, InGameMusic, TimeTrialMusic) is paused where it is and played on from there when the
+    // pause ends (UAudioDevice::HandlePause, 0x00B652B0); while it lasts no such sound is started or
+    // updated and none of their clocks runs (UAudioDevice::StartSources, 0x00B6EFE4): what is asked
+    // for meanwhile starts with the first update after it. The level's music plays on, at the volume
+    // TdPlayerController.SetPause gives its group: 0.25 paused, 1.0 when it is let go.
+    void set_game_paused(bool paused);
+    [[nodiscard]] bool is_game_paused() const { return game_paused_; }
+    // The Volume of the sound group InGameMusic now: the ini's 1.2 until the first set_game_paused.
+    [[nodiscard]] float ingame_music_volume() const { return ingame_music_volume_; }
 
     // Stop all playing sound sources
     void stop_all();
@@ -141,8 +156,8 @@ public:
     [[nodiscard]] float cue_max_audible_distance(const std::string& group_and_name) const;
 
     // What the sounds at a place are doing now: one entry per wave playing from the pool, and one
-    // per level emitter that has a source. It is the same with and without an audio device, so the
-    // oracle can hold the gains against the curves; ME_AUDIO_DEBUG=1 prints them as they change.
+    // per wave of a level emitter that has a source. It is the same with and without an audio device,
+    // so the oracle can hold the gains against the curves; ME_AUDIO_DEBUG=1 prints them as they change.
     struct PositionalVoice {
         std::string name;            // the cue (or wave) asked for
         std::string clip;            // the wave playing
@@ -150,11 +165,49 @@ public:
         float distance = 0.0f;       // from the listener of the last update (uu)
         float distance_gain = 1.0f;  // the product of its attenuation nodes' factors
         float gain = 0.0f;           // what the source is set to
+        // What the source's low-pass filter is set to (AL_LOWPASS_GAINHF): the product of its
+        // attenuation nodes' low passes, held between 0.01 and 1. Worked out with and without EFX.
+        float high_frequency_gain = 1.0f;
         bool spatialized = false;    // placed in the world; false: source-relative, at the listener
         size_t attenuation_nodes = 0;
         bool emitter = false;        // a level AmbientSound
+        int emitter_index = -1;      // which one (get_ambient_emitters)
+        int emitter_wave = -1;       // and which of the waves its cue's graph has reached
+        float priority = 0.0f;       // an emitter's wave: what it is ranked by for a source
+        bool looping = false;        // an emitter's wave: it loops inside its source (false: once a round)
+        bool sourced = true;         // it has a source (false only in emitter_candidates)
+        float age = 0.0f;            // seconds it has been playing on its source
+        bool paused = false;         // paused with the game
     };
     [[nodiscard]] std::vector<PositionalVoice> positional_voices() const;
+    // Every wave of a level emitter that asked for a source in the last update (its volume above
+    // retail's threshold of 0.0001), with and without one: the oracle holds the dealing against the rule.
+    [[nodiscard]] std::vector<PositionalVoice> emitter_candidates() const;
+    // How many level emitters have stopped for good (nothing left in their cue to play).
+    [[nodiscard]] size_t stopped_emitter_count() const;
+    // How many sources the level emitters' waves had between them in the last update: what the
+    // port's other sounds left of retail's 32 (or of what the device gave).
+    [[nodiscard]] size_t emitter_source_budget() const { return emitter_budget_; }
+    // True when the low pass with distance reaches the device (it has the EFX extension).
+    [[nodiscard]] bool has_low_pass_filters() const { return efx_; }
+
+    // The master volume, as the listener's gain. At 0 the device is silent while everything plays.
+    void set_master_volume(float volume);
+    // What the audio device is doing now, in OpenAL's own words, for --audio-device-check.
+    struct DeviceReport {
+        bool device = false;          // sounds reach an OpenAL device
+        std::string name;             // the device OpenAL opened
+        bool low_pass = false;        // it has EFX and gave every source its low-pass filter
+        size_t emitter_sources = 0;   // how many of the emitters' sources it gave
+        size_t emitters_playing = 0;  // the emitters' sources that are AL_PLAYING
+        size_t emitters_paused = 0;   // and AL_PAUSED
+        size_t pool_playing = 0;      // the pool's
+        size_t pool_paused = 0;
+        size_t music_playing = 0;     // the music stems'
+        bool wind_paused = false;     // the run wind's source is AL_PAUSED
+        bool error = false;           // OpenAL has had an error since the last report
+    };
+    [[nodiscard]] DeviceReport device_report() const;
 
     // A log of every sound asked to play (the cue or wave name it resolved from), for --trace.
     // It records the request, so it is the same with and without an audio device. A sound at a
@@ -198,7 +251,6 @@ private:
     // The pool slot a new sound gets: the first that is not playing, else the next in turn, whose
     // sound is cut. What the slot was playing is forgotten.
     size_t acquire_slot();
-    uint32_t acquire_source();
     uint32_t get_or_create_buffer(const SoundClip& clip, bool force_mono_for_3d = false);
     void invalidate_cached_buffer(const std::string& key);
     void clear_chapter_music_clips();
@@ -238,6 +290,14 @@ private:
         Vec3 position{0.0f, 0.0f, 0.0f};
         VoiceAttenuation attenuation;  // positional: what `voice.attenuations` came to for this play
         std::string name;              // the cue asked for
+        bool ui = false;               // of a UI sound group: its delay runs on while the game is paused
+    };
+    // A 2D sound or a voice line asked for while the game was paused: it starts when the pause ends.
+    struct DeferredSound {
+        std::string name;
+        float volume = 1.0f;
+        float pitch = 1.0f;
+        bool voice = false;
     };
     // A sound asked for at a place, waiting for the update that knows where the listener is.
     struct PositionalRequest {
@@ -246,9 +306,11 @@ private:
         float volume = 1.0f;
         float pitch = 1.0f;
     };
-    // What a pool source is playing, when it is a sound at a place: update() gives it the gain its
-    // distance from the listener asks for, every time, as retail's node graph does.
+    // What a pool source is playing. When it is a sound at a place, update() gives it the gain and
+    // the low pass its distance from the listener asks for, every time, as retail's node graph does.
     struct SourceVoice {
+        bool ui = false;               // a sound of a UI sound group: the game's pause leaves it alone
+        bool paused = false;           // paused with the game (FALSoundSource::Pause, 0x010D67D0)
         bool positional = false;
         Vec3 position{0.0f, 0.0f, 0.0f};
         float volume = 1.0f;           // before the distance: the cue's, its nodes' and the bus's
@@ -257,12 +319,15 @@ private:
         float logged_gain = -1.0f;     // ME_AUDIO_DEBUG: the gain last printed
         PositionalVoice info;
     };
-    // A MinRadius and a MaxRadius drawn for one play (and a TdSoundNodeAttenuation's SpeedOfSound).
+    // The radii of one attenuation node drawn for one play (and a TdSoundNodeAttenuation's SpeedOfSound).
     struct DrawnRadii {
         float min_radius = 0.0f;
         float max_radius = 0.0f;
+        float lpf_min_radius = 0.0f;
+        float lpf_max_radius = 0.0f;
         float speed_of_sound = 0.0f;
     };
+    [[nodiscard]] DrawnRadii draw_radii(const SoundAttenuation& a) const;
     // One play's draw for every attenuation node of the cue, in the order of SoundCueDef::attenuations.
     [[nodiscard]] std::vector<DrawnRadii> draw_cue_radii(const SoundCueDef& cue) const;
     // What the attenuation nodes `path` (root first) do to a wave played at `world_pos` with those
@@ -280,17 +345,23 @@ private:
     void start_positional(const PositionalRequest& request);
     void update_voice_gains(float dt);
     void update_ambient_emitters(float dt);
-    // A level AmbientSound whose cue waits between sounds (a SoundNodeDelay under its
-    // SoundNodeLooping, e.g. the vehicle packs: 7 to 15 s, then one of 38 passes, brakes and
-    // horns): the next sound it will play and how long until then. False for a cue that just loops.
-    bool next_ambient_voice(size_t slot, const AmbientEmitterInfo& em);
     // `path` is the walk's own list of the attenuation nodes above `node`; pass it empty.
     void collect_cue_voices(const SoundCueDef& cue, int node, float delay, float volume, float pitch,
                             std::vector<CueVoice>& out, std::vector<int>& path) const;
     bool play_layered_cue(const std::string& name, const Vec3* world_pos, float volume, float pitch);
-    // Starts a wave on a pool source: in 2D, or at `world_pos` with `attenuation`.
+    // Starts a wave on a pool source: in 2D, or at `world_pos` with `attenuation`. `ui`: a sound of
+    // a UI sound group, which a paused game does not pause.
     void start_voice(const SoundClip& clip, const Vec3* world_pos, float volume, float pitch,
-                     const VoiceAttenuation* attenuation = nullptr, const std::string& name = std::string());
+                     const VoiceAttenuation* attenuation = nullptr, const std::string& name = std::string(), bool ui = false);
+    // True for a cue whose sound group has bIsUISound (false for a wave with no cue, or no such cue).
+    [[nodiscard]] bool is_ui_sound(const std::string& name) const;
+    // What a level's sounds are when the front end takes over: stopped, not paused.
+    void stop_level_sounds();
+    // The low pass of a source: `high_frequency_gain` on its filter and the filter on the source
+    // (FALAudioEffectsManager::UpdateEffect, 0x010DBCB0). Nothing without EFX.
+    void set_source_low_pass(uint32_t src, uint32_t filter, float high_frequency_gain);
+    // No filter on a source that plays a sound with no place.
+    void clear_source_low_pass(uint32_t src);
 
     bool decode_ogg_to_pcm(const uint8_t* ogg_data, size_t ogg_size,
                            std::vector<int16_t>& out_pcm, int& out_rate, int& out_channels);
@@ -340,38 +411,113 @@ private:
     std::string active_vo_clip_;
     std::string active_vo_subtitle_;
 
-    // 4 Dedicated looping 3D sources for level *_Aud.me1 AmbientSound emitters
-    static constexpr size_t kAmbientPoolSize = 4;
-    uint32_t ambient_sources_[kAmbientPoolSize] = {0};
-    int32_t active_ambient_indices_[kAmbientPoolSize] = {-1, -1, -1, -1};
-    // What each of those sources is doing: looping its cue's wave, waiting out the cue's delay,
-    // or playing the one sound that followed it.
-    enum class AmbientMode : uint8_t { Loop, Waiting, Playing, Silent };
-    AmbientMode ambient_mode_[kAmbientPoolSize] = {};
-    CueVoice ambient_voice_[kAmbientPoolSize];
-    VoiceAttenuation ambient_attenuation_[kAmbientPoolSize];  // of the wave each is playing
-    bool ambient_sounding_[kAmbientPoolSize] = {};            // a wave was started on it
-    float ambient_remaining_[kAmbientPoolSize] = {};          // without a device: the seconds a one-shot would still play
-    float ambient_logged_gain_[kAmbientPoolSize] = {};        // ME_AUDIO_DEBUG: the gain last printed
-    PositionalVoice ambient_info_[kAmbientPoolSize];
-    // An emitter's cue is one play that starts with the level and lasts as long as it does: the
-    // radii of its attenuation nodes are drawn once, the first time the emitter is looked at, and
-    // not again when it comes back into the pool. Retail plays every layer of the cue. An emitter
-    // here has one source, which plays one wave, so of a cue that mixes layers under different
-    // attenuation nodes (767 of the 1,650 emitters of the *_Aud files; in 701 the layers' MaxRadius
-    // differ: a vent's hiss to 1500 uu with its hum to 3000) it plays the layer that carries
-    // farthest, the one heard wherever retail's emitter is. `waves` are that layer's and
-    // `attenuation` the nodes above it with the radii drawn: the emitter is in the running for a
-    // source while they leave it any volume at all.
-    struct EmitterPlay {
-        bool drawn = false;
-        bool has_cue = false;
-        std::vector<DrawnRadii> radii;
-        std::vector<std::string> waves;                       // sound_clips_ keys; none: whatever its name resolves to
-        VoiceAttenuation attenuation;
+    // The level's AmbientSound emitters (the actors of the *_Aud.me1 sublevels).
+    //
+    // Retail starts each one's cue when its level comes in and parses the cue's graph on every audio
+    // update, as it does every playing sound's (UAudioComponent::UpdateWaveInstances, 0x00B6F570).
+    // Each wave the parse reaches is a wave instance of its own, with the volume, pitch, low pass
+    // and place that the nodes above it on its own branch have left (USoundNodeWave::ParseNodes,
+    // 0x00B77880; a mixer parses every input from the state it was reached with, 0x00B767A0): a
+    // vent's hiss and its hum are two voices, each on its own curve. The device then gives its
+    // sources to the instances of the highest PlayPriority (UAudioDevice::Update, 0x00B70440).
+    // The port keeps the same per emitter: a payload for every node of its cue, a record for every
+    // wave its parses have reached, and one pool of sources for the waves of all the emitters.
+    //
+    // Retail has MaxChannels sources for everything that sounds, 32 in the ini (UALAudioDevice::Init,
+    // 0x010D9760), and ranks every wave for them. The port's other sounds (the one-shots of the pool,
+    // a voice line, the run wind, the music) are not ranked: they have sources of their own, and what
+    // they are using of the 32 at an update is what the emitters' waves do not get (count_other_voices).
+    static constexpr size_t kMaxChannels = 32;
+    static constexpr size_t kEmitterSourceBudget = kMaxChannels;
+    uint32_t emitter_sources_[kEmitterSourceBudget] = {0};
+    uint32_t emitter_filters_[kEmitterSourceBudget] = {0};       // their low-pass filters (EFX)
+    size_t emitter_source_count_ = kEmitterSourceBudget;         // how many of them the device gave
+    size_t emitter_budget_ = kEmitterSourceBudget;               // how many the last update had to deal
+    [[nodiscard]] size_t count_other_voices() const;
+    struct EmitterSourceUse {
+        int32_t emitter = -1;
+        int32_t wave = -1;
     };
-    std::vector<EmitterPlay> ambient_plays_;                  // by ambient_emitters_ index
-    const EmitterPlay& emitter_play(size_t emitter);
+    EmitterSourceUse emitter_source_use_[kEmitterSourceBudget];  // the wave each one is playing
+
+    // A node's payload for the emitter's play (UAudioComponent::SoundNodeData).
+    struct EmitterNode {
+        bool requires_init = true;   // RequiresInit: the next parse draws its values again
+        float value = 0.0f;          // Delay: the wait drawn (s); Modulator, Ambient: the volume drawn; Looping: UsedLoopCount
+        float pitch = 1.0f;          // Modulator, Ambient: the pitch drawn
+        double start = 0.0;          // Delay: the game time its wait began at
+        int pick = -1;               // Random: the input chosen; Looping: FinishedCount
+        int wave = -1;               // Wave: its record in EmitterState::waves
+    };
+    // A wave one of the emitter's parses has reached (FWaveInstance).
+    struct EmitterWave {
+        int node = -1;               // its wave node in the cue (-1: the one wave of an emitter with no cue)
+        std::string clip;            // sound_clips_ key
+        int hook = -1;               // the SoundNodeLooping that is told when it ends (CurrentNotifyBufferFinishedHook)
+        bool seamless = false;       // LoopingMode 1: it loops inside its source
+        bool finished = false;       // bIsFinished: it has played to its end and no loop has put it back
+        bool parsed = false;         // the last parse reached it
+        bool wants_source = false;   // and its volume was above the threshold
+        bool active = false;         // and it ranked among the waves the sources go to
+        float graph_volume = 1.0f;   // CurrentVolume before the distance: mixer inputs, modulators, mix groups
+        float pitch = 1.0f;          // CurrentPitch
+        std::vector<int> path;       // the attenuation nodes above it (SoundCueDef::attenuations), root first
+        VoiceAttenuation attenuation;
+        uint32_t radii_stamp = 0;    // EmitterState::radii_stamp when `attenuation` was made
+        int source = -1;             // the emitter source it holds
+        float remaining = 0.0f;      // without a device: the seconds its pass would still play
+        float offset = 0.0f;         // with one, a looping wave: where its source was at the last update (s)
+        float logged_gain = -1.0f;   // ME_AUDIO_DEBUG: the gain last printed
+        PositionalVoice info;        // the last update's numbers
+    };
+    struct EmitterState {
+        bool started = false;        // its cue has been looked up
+        bool has_cue = false;
+        // The component has stopped: a parse found nothing in the graph playing or waiting
+        // (UAudioComponent::UpdateWaveInstances, 0x00B6FCF1). Nothing starts a level's emitter again.
+        bool dead = false;
+        size_t node_count = 0;       // of the cue it was started with
+        std::vector<DrawnRadii> radii;       // by SoundCueDef::attenuations index
+        std::vector<uint8_t> radii_drawn;    // the node's own RequiresInit
+        uint32_t radii_stamp = 0;            // counts the draws
+        std::vector<EmitterNode> nodes;      // by SoundCueDef::nodes index
+        std::vector<EmitterWave> waves;
+    };
+    std::vector<EmitterState> emitter_states_;                   // by ambient_emitters_ index
+    // What the nodes above have left for the ones below (FAudioComponentSavedState).
+    struct EmitterParse {
+        float volume = 1.0f;         // CurrentVolume
+        float pitch = 1.0f;          // CurrentPitch
+        bool seamless = false;       // CurrentUseSeamlessLooping
+        int hook = -1;               // CurrentNotifyBufferFinishedHook
+    };
+    void parse_emitter_node(EmitterState& st, const SoundCueDef& cue, int node, EmitterParse state, std::vector<int>& path,
+                            bool& finished);
+    // Whether a node of a cue has, at or below it, a wave the port has loaded.
+    bool reaches_loaded_wave(const SoundCueDef& cue, int node, int depth = 0) const;
+    // A wave's source has played to its end (FWaveInstance::NotifyFinished, 0x00B64640).
+    void emitter_wave_finished(EmitterState& st, const SoundCueDef* cue, int wave);
+    void stop_emitter_source(size_t source);
+    // Every emitter silent and as it is before its first parse.
+    void reset_emitters();
+    // The game's clock, WorldInfo.TimeSeconds: what a SoundNodeDelay counts on (0x00B7F2A0). It
+    // stands still while the game is paused and behind the front end.
+    double game_time_ = 0.0;
+
+    // Pause (set_game_paused).
+    bool game_paused_ = false;
+    float ingame_music_volume_ = kInGameMusicIniVolume;          // the sound group InGameMusic's Volume
+    // The Volume of the sound group of the music that is playing: a level's is InGameMusic's (the
+    // stems' fixed level stands for its 1.0); the menu's theme is HudMusic's, which no pause touches.
+    [[nodiscard]] float music_group_volume() const { return is_menu_music_ ? 1.0f : ingame_music_volume_; }
+    bool wind_paused_ = false;
+    bool vo_paused_ = false;
+    bool vo_ui_ = false;                                         // the line playing is of a UI sound group (DialogueHUD)
+    std::vector<DeferredSound> deferred_sounds_;                 // asked for while paused
+
+    // The low pass with distance (EFX): one low-pass filter for every pool source.
+    bool efx_ = false;
+    uint32_t source_filters_[kSourcePoolSize] = {0};
 
     // Stamina-coupled Faith breathing cadence state (A_Character_Female_01.upk)
     float breath_timer_ = 0.0f;

@@ -2437,8 +2437,8 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
 
         auto nprops = parse_exp_props(obj_idx);
 
-        // The node itself: USoundNodeMixer / Random / Delay / Modulator / Attenuation / Ambient
-        // (the rest pass through).
+        // The node itself: USoundNodeMixer / Random / Delay / Modulator / Attenuation / Ambient /
+        // Looping and DICE's TdSoundNodeMixGroup (the rest pass through).
         const int node_index = static_cast<int>(cue.nodes.size());
         int32_t ambient_wave = 0;
         {
@@ -2539,6 +2539,25 @@ void UPKPackage::extract_sound_cues_and_ambients(std::vector<SoundCueDef>& out_c
                 node.min_pitch = plo;
                 node.max_pitch = phi;
                 ambient_wave = prop_object(uprops, "Wave");
+            } else if (ncls == "SoundNodeLooping") {
+                // Default__SoundNodeLooping: bLoopIndefinitely set, LoopCount 1000000 .. 1000000.
+                node.kind = SoundCueNode::Kind::Looping;
+                node.loop_indefinitely = prop_bool(uprops, "bLoopIndefinitely", true);
+                const auto [lo, hi] = distribution_range(uprops, "LoopCount", 1000000.0f, 1000000.0f);
+                node.min_value = lo;
+                node.max_value = hi;
+            } else if (ncls == "TdSoundNodeMixGroup") {
+                // Default__TdSoundNodeMixGroup (TdGame.u): MixGroups [Default], the three
+                // bModulate flags set. A node stores the names of its own (an array of names).
+                node.kind = SoundCueNode::Kind::MixGroup;
+                if (const UProperty* groups = find_prop(uprops, "MixGroups")) {
+                    node.mix_groups = groups->names;
+                } else {
+                    node.mix_groups.push_back("Default");
+                }
+                node.modulate_volume = prop_bool(uprops, "bModulateVolume", true);
+                node.modulate_pitch = prop_bool(uprops, "bModulatePitch", true);
+                node.min_value = node.max_value = 1.0f;
             }
             cue.nodes.push_back(std::move(node));
         }

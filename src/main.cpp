@@ -68,6 +68,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <set>
@@ -603,8 +604,10 @@ static bool oracle_script_effects(const std::string& game_root, me::Renderer* re
 // engine, without a device, playing cues at measured distances from the listener: what each wave
 // would be set to must be its attenuation nodes' curve, follow the listener, be the product of two
 // nodes on one branch, leave a wave with no node above it alone, and not start at all where retail
-// refuses to; and of a level's emitters none may hold a source it is not heard on.
-// --verify-sound runs it alone; ME_AUDIO_DEBUG=1 prints every gain as it is set.
+// refuses to; the high frequencies its source's low-pass filter would be given must be the same
+// nodes' low pass; and of a level's emitters none may hold a source it is not heard on, and every
+// layer of one's cue must be a voice on its own node's curve.
+// --verify-sound runs it, and stage 26 after it; ME_AUDIO_DEBUG=1 prints every gain as it is set.
 // -----------------------------------------------------------------------------
 static bool oracle_sound_attenuation(const std::string& game_root) {
     using namespace me;
@@ -656,6 +659,62 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
     std::cout << "  [curve] " << std::size(kWorked) << " worked values: " << (curve_ok ? "OK" : "FAIL") << ", worst difference "
               << curve_worst << std::endl;
 
+    // 1b. The same function's low pass (0x00B7DEDA), for a node with bAttenuateWithLowPassFilter:
+    // all of the high frequencies at or inside LPFMinRadius, none at or beyond LPFMaxRadius, a
+    // straight line between, whatever the node's model.
+    struct WorkedLowPass {
+        float distance, lpf_min, lpf_max, want;
+    };
+    static const WorkedLowPass kLowPass[] = {
+        {1000.0f, 1500.0f, 5000.0f, 1.0f},     // the class's radii: untouched inside 1500
+        {1500.0f, 1500.0f, 5000.0f, 1.0f},
+        {1900.0f, 1500.0f, 5000.0f, 0.8857f},
+        {3250.0f, 1500.0f, 5000.0f, 0.5f},     // half way
+        {4999.0f, 1500.0f, 5000.0f, 0.0003f},
+        {5000.0f, 1500.0f, 5000.0f, 0.0f},     // at LPFMaxRadius and beyond: none
+        {9000.0f, 1500.0f, 5000.0f, 0.0f},
+        {2000.0f, 1500.0f, 2500.0f, 0.5f},     // Default__SoundNodeAmbient's radii
+        {4000.0f, 300.0f, 12000.0f, 0.6838f},  // a pistol's Fire3P, see 5 below
+        {299.0f, 300.0f, 300.0f, 1.0f},        // equal radii: all of them inside, none outside
+        {300.0f, 300.0f, 300.0f, 0.0f},
+    };
+    bool lowpass_ok = true;
+    float lowpass_worst = 0.0f;
+    for (const WorkedLowPass& w : kLowPass) {
+        const float got = low_pass_gain(w.distance, w.lpf_min, w.lpf_max);
+        lowpass_worst = std::max(lowpass_worst, std::abs(got - w.want));
+        if (!near(got, w.want, 1.0e-4f)) {
+            lowpass_ok = false;
+            std::cout << "  [low pass] " << w.lpf_min << "/" << w.lpf_max << " at " << w.distance << ": " << got << ", wanted " << w.want << std::endl;
+        }
+    }
+    {
+        // The nodes above one wave: a node with the flag off leaves the high frequencies alone, two
+        // nodes with it multiply, and a node that does not attenuate still filters.
+        DrawnAttenuation plain;  // Linear 400 / 5000, no low pass
+        DrawnAttenuation first = plain, second = plain, filter_only = plain;
+        first.low_pass = true;
+        first.lpf_min_radius = 1500.0f;
+        first.lpf_max_radius = 5000.0f;
+        second.low_pass = true;
+        second.lpf_min_radius = 1000.0f;
+        second.lpf_max_radius = 5500.0f;
+        filter_only.attenuate = false;
+        filter_only.low_pass = true;
+        filter_only.lpf_min_radius = 1500.0f;
+        filter_only.lpf_max_radius = 5000.0f;
+        VoiceAttenuation none, one, two, unattenuated;
+        none.nodes = {plain};
+        one.nodes = {first};
+        two.nodes = {first, second};
+        unattenuated.nodes = {filter_only};
+        lowpass_ok = lowpass_ok && near(none.high_frequency_gain(3250.0f), 1.0f) && near(one.high_frequency_gain(3250.0f), 0.5f) &&
+                     near(two.high_frequency_gain(3250.0f), 0.25f) && near(two.high_frequency_gain(5200.0f), 0.0f) &&
+                     near(unattenuated.gain(3250.0f), 1.0f) && near(unattenuated.high_frequency_gain(3250.0f), 0.5f);
+    }
+    std::cout << "  [low pass] " << std::size(kLowPass) << " worked values: " << (lowpass_ok ? "OK" : "FAIL") << ", worst difference "
+              << lowpass_worst << std::endl;
+
     // 2. The engine, with no device: the stock banks and the training area's audio sublevel.
     AudioEngine audio;
     audio.init(true);
@@ -700,19 +759,24 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
                         found[0].attenuation_nodes == 1;
         }
     }
-    // The gain follows the listener while the sound plays, down to nothing and back.
+    // The gain follows the listener while the sound plays, down to nothing and back, and so does
+    // what its source's low-pass filter would be given (the cue's node has the class's 1500 / 5000).
     bool follow_ok = true;
     float follow_gain[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
+    float follow_hf[4] = {-1.0f, -1.0f, -1.0f, -1.0f};
     {
         audio.stop_all();
         const Vec3 at = home + Vec3(0.0f, 480.0f, 0.0f);
         audio.play_sound_3d(kConcrete, at);
         const float distances[4] = {480.0f, 1900.0f, 2500.0f, 1000.0f};
         const float wanted[4] = {0.7638f, 0.0503f, 0.0f, 0.5025f};
+        const float wanted_hf[4] = {1.0f, 0.8857f, 0.7143f, 1.0f};
         for (int i = 0; i < 4; ++i) {
             tick(at - Vec3(0.0f, distances[i], 0.0f));
             follow_gain[i] = one_gain(kConcrete);
-            follow_ok = follow_ok && near(follow_gain[i], wanted[i], 1.0e-4f);
+            const auto found = voices_of(kConcrete);
+            if (found.size() == 1) follow_hf[i] = found[0].high_frequency_gain;
+            follow_ok = follow_ok && near(follow_gain[i], wanted[i], 1.0e-4f) && near(follow_hf[i], wanted_hf[i], 1.0e-4f);
         }
     }
     // A sound played on the player (2D) is not one of these: nothing gives it a distance.
@@ -748,17 +812,33 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
 
     // 5. Two attenuation nodes on one branch multiply. A pistol's Fire3P is a mixer of two layers
     // under a LogReverse 1 / 18000 node, one of them under a second node, LogReverse 10 / 8000.
+    // Their low passes are 300 / 12000 and 10000 / 20000: at 4000 uu the first takes the high
+    // frequencies of both layers to 0.6838 and the second leaves them. At 13000 uu the first layer is
+    // still at 0.8693 of its volume and past its LPFMaxRadius: the source's floor, 0.01, dull and
+    // not silent.
     bool chain_ok = false;
-    float chain_one = -1.0f, chain_two = -1.0f;
+    float chain_one = -1.0f, chain_two = -1.0f, chain_hf = -1.0f, chain_far = -1.0f, chain_far_hf = -1.0f;
     {
         audio.stop_all();
         audio.play_sound_3d("Fire.Fire3P", home + Vec3(0.0f, 0.0f, 4000.0f));
         tick(home);
+        bool hf_same = true;
         for (const AudioEngine::PositionalVoice& v : voices_of("Fire.Fire3P")) {
             if (v.attenuation_nodes == 1) chain_one = v.distance_gain;
             if (v.attenuation_nodes == 2) chain_two = v.distance_gain;
+            hf_same = hf_same && (chain_hf < 0.0f || near(chain_hf, v.high_frequency_gain, 1.0e-5f));
+            chain_hf = v.high_frequency_gain;
         }
-        chain_ok = near(chain_one, 0.9744f, 2.0e-4f) && near(chain_two, 0.9744f * 0.8963f, 2.0e-4f);
+        audio.stop_all();
+        audio.play_sound_3d("Fire.Fire3P", home + Vec3(0.0f, 0.0f, 13000.0f));
+        tick(home);
+        for (const AudioEngine::PositionalVoice& v : voices_of("Fire.Fire3P")) {
+            if (v.attenuation_nodes != 1) continue;
+            chain_far = v.distance_gain;
+            chain_far_hf = v.high_frequency_gain;
+        }
+        chain_ok = near(chain_one, 0.9744f, 2.0e-4f) && near(chain_two, 0.9744f * 0.8963f, 2.0e-4f) && hf_same &&
+                   near(chain_hf, 0.6838f, 1.0e-4f) && near(chain_far, 0.8693f, 2.0e-4f) && near(chain_far_hf, 0.01f, 1.0e-6f);
     }
 
     // 6. A wave with no attenuation node above it plays as it is, at the listener, beside its
@@ -808,9 +888,11 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
     // At 5000 uu the click comes 0.151 s late at 0.5505 squared, the tail 0.094 s after it at that
     // times 0.7042 squared.
     const char* const kSlap = "Slap_Back.Slap_Back";
+    // Both nodes have the low pass on, and a TdSoundNodeAttenuation's parent takes the first
+    // distance and the delay for its LPF radii: the echo has the floor's high frequencies, 0.01.
     bool td_ok = false;
     size_t td_early = 99;
-    float td_click = -1.0f, td_tail = -1.0f, td_moved = -1.0f;
+    float td_click = -1.0f, td_tail = -1.0f, td_moved = -1.0f, td_hf = -1.0f;
     if (audio.find_cue(kSlap)) {
         audio.stop_all();
         const Vec3 at = home + Vec3(5000.0f, 0.0f, 0.0f);
@@ -829,10 +911,11 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
         tick(home + Vec3(2500.0f, 0.0f, 0.0f));  // half way there: the first factors stay, the second ones follow
         for (const AudioEngine::PositionalVoice& v : voices_of(kSlap)) {
             if (v.attenuation_nodes == 2) td_moved = v.distance_gain;
+            td_hf = std::max(td_hf, v.high_frequency_gain);
         }
         const float outer = 1.0f - 4900.0f / 10900.0f, inner = 1.0f - 4200.0f / 14200.0f;
         td_ok = td_early == 0 && near(td_click, outer * outer) && near(td_tail, outer * outer * inner * inner) &&
-                near(td_moved, outer * (1.0f - 2400.0f / 10900.0f) * inner * (1.0f - 1700.0f / 14200.0f));
+                near(td_moved, outer * (1.0f - 2400.0f / 10900.0f) * inner * (1.0f - 1700.0f / 14200.0f)) && near(td_hf, 0.01f, 1.0e-6f);
     }
 
     // 9. The level's emitters, heard from a thousand units above each in turn: whichever of them
@@ -840,7 +923,7 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
     // so a ranged MaxRadius gives a gain between the two ends), and none is past its reach.
     bool emitter_ok = true;
     int emitters_heard = 0, emitters_checked = 0;
-    float emitter_worst = 0.0f, emitter_sample_distance = 0.0f, emitter_sample_gain = -1.0f;
+    float emitter_worst = 0.0f, emitter_sample_distance = 0.0f, emitter_sample_gain = -1.0f, emitter_sample_hf = -1.0f;
     std::string emitter_sample;
     {
         audio.stop_all();
@@ -860,13 +943,19 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
                 const float hi = attenuation_gain(a.model, v.distance, std::min(a.min_radius[0], a.min_radius[1]),
                                                   std::max(a.max_radius[0], a.max_radius[1]), a.db_at_max);
                 ++emitters_checked;
-                const float off = std::max(0.0f, std::max(lo - v.distance_gain, v.distance_gain - hi));
+                float off = std::max(0.0f, std::max(lo - v.distance_gain, v.distance_gain - hi));
+                // And its low pass, where the node has one with single radii (WindHard: 10 / 5000).
+                if (a.lowpass && a.lpf_min_radius[0] == a.lpf_min_radius[1] && a.lpf_max_radius[0] == a.lpf_max_radius[1]) {
+                    const float hf = std::clamp(low_pass_gain(v.distance, a.lpf_min_radius[0], a.lpf_max_radius[0]), 0.01f, 1.0f);
+                    off = std::max(off, std::abs(hf - v.high_frequency_gain));
+                }
                 emitter_worst = std::max(emitter_worst, off);
                 emitter_ok = emitter_ok && off < 1.0e-4f && v.distance < std::max(a.max_radius[0], a.max_radius[1]);
                 if (emitter_sample.empty() && lo == hi && v.distance > 900.0f && v.distance_gain > 0.0f && v.distance_gain < 1.0f) {
                     emitter_sample = v.name;
                     emitter_sample_distance = v.distance;
                     emitter_sample_gain = v.distance_gain;
+                    emitter_sample_hf = v.high_frequency_gain;
                 }
             }
         }
@@ -876,21 +965,20 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
         for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) emitter_ok = emitter_ok && !v.emitter;
     }
 
-    // 10. An emitter has one source, which plays one wave. Of a cue that mixes layers with different
-    // radii (114 of the factory's 153 emitters: an air vent's hiss, Logarithmic 2 / 1500, with its
-    // hum, Logarithmic 150 / 3000) it plays the layer that carries farthest, and it is given one of
-    // the four sources only while it would be heard. From 150 and from 2000 uu above each of the
-    // factory's emitters in turn: no source is at volume 0, and every such cue is on the curve of its
-    // farthest layer (the cues whose radii are all single values are held against it).
+    // 10. Every layer of an emitter's cue is a voice of its own, on the curve of the node above it
+    // (114 of the factory's 153 emitters have a cue that mixes two layers with different radii: an
+    // air vent's hiss, Logarithmic 2 / 1500, with its hum, Logarithmic 150 / 3000). From 150 and from
+    // 1900 uu above each of the factory's emitters in turn: no source is at volume 0, every voice of
+    // a cue whose radii are all single values is on the curve of one of its cue's nodes, and of the
+    // vent straight below both layers ask for a source from 150 uu and the hum alone from 1900.
     bool layered_ok = true;
-    int layered_heard = 0, layered_silent = 0, layered_checked = 0;
-    float layered_worst = 0.0f, layered_sample_gain = -1.0f;
-    std::string layered_sample;
+    int layered_heard = 0, layered_silent = 0, layered_checked = 0, vents = 0, vents_right = 0;
+    float layered_worst = 0.0f, vent_near[2] = {-1.0f, -1.0f}, vent_far = -1.0f;
     {
         audio.stop_all();
         audio.load_level_audio(game_root, "Maps/SP06/Factory_p.me1");
         const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
-        for (const float height : {150.0f, 2000.0f}) {
+        for (const float height : {150.0f, 1900.0f}) {
             for (size_t e = 0; e < emitters.size(); ++e) {
                 tick(emitters[e].location + Vec3(0.0f, 0.0f, height));
                 for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
@@ -900,49 +988,711 @@ static bool oracle_sound_attenuation(const std::string& game_root) {
                     const SoundCueDef* cue = audio.find_cue(v.name);
                     if (!cue || cue->attenuations.size() < 2 || v.attenuation_nodes != 1) continue;
                     bool single_values = true;
-                    float farthest = 0.0f;
                     for (const SoundAttenuation& a : cue->attenuations) {
                         single_values = single_values && a.attenuate && a.min_radius[0] == a.min_radius[1] && a.max_radius[0] == a.max_radius[1];
-                        farthest = std::max(farthest, a.max_radius[0]);
                     }
                     if (!single_values) continue;
                     float off = 1.0f;
                     for (const SoundAttenuation& a : cue->attenuations) {
-                        if (a.max_radius[0] != farthest) continue;
                         off = std::min(off, std::abs(v.distance_gain - attenuation_gain(a.model, v.distance, a.min_radius[0], a.max_radius[0], a.db_at_max)));
                     }
                     ++layered_checked;
                     layered_worst = std::max(layered_worst, off);
-                    // (The emitter straight below, between its two layers' reach.)
-                    if (layered_sample.empty() && height == 2000.0f && near(v.distance, height, 0.01f)) {
-                        layered_sample = v.name;
-                        layered_sample_gain = v.distance_gain;
+                }
+                if (emitters[e].cue_name != "A_Prop_AirVent_Indoor") continue;
+                // The vent straight below: its hiss and its hum, each by its own curve.
+                std::vector<float> gains;
+                for (const AudioEngine::PositionalVoice& v : audio.emitter_candidates()) {
+                    if (v.emitter_index == static_cast<int>(e)) gains.push_back(v.distance_gain);
+                }
+                std::sort(gains.begin(), gains.end());
+                ++vents;
+                const float hiss = attenuation_gain(1, height, 2.0f, 1500.0f, -60.0f), hum = attenuation_gain(1, height, 150.0f, 3000.0f, -60.0f);
+                if (height == 150.0f) {
+                    if (gains.size() == 2 && near(gains[0], hiss, 1.0e-4f) && near(gains[1], hum, 1.0e-4f)) ++vents_right;
+                    if (gains.size() == 2 && vent_near[0] < 0.0f) {
+                        vent_near[0] = gains[0];
+                        vent_near[1] = gains[1];
                     }
+                } else {
+                    if (gains.size() == 1 && near(gains[0], hum, 1.0e-4f)) ++vents_right;
+                    if (gains.size() == 1 && vent_far < 0.0f) vent_far = gains[0];
                 }
             }
         }
-        layered_ok = layered_silent == 0 && layered_checked >= 20 && layered_worst < 1.0e-4f;
+        layered_ok = layered_silent == 0 && layered_checked >= 20 && layered_worst < 1.0e-4f && vents >= 2 && vents_right == vents;
     }
 
-    const bool pass = curve_ok && impact_ok && follow_ok && flat_ok && gate_ok && chain_ok && bare_ok && radio_ok && td_ok && emitter_ok &&
-                      layered_ok;
+    const bool pass = curve_ok && lowpass_ok && impact_ok && follow_ok && flat_ok && gate_ok && chain_ok && bare_ok && radio_ok && td_ok &&
+                      emitter_ok && layered_ok;
     std::cout << std::fixed << std::setprecision(4) << "  -> Stage 23 Result: " << (pass ? "PASS" : "FAIL") << " (Curve=" << (curve_ok ? "OK" : "FAIL")
-              << ", Impact=" << (impact_ok ? "OK" : "FAIL") << " [concrete at 480 / 1000 / 2100 uu: " << impact_gain[0] << " / " << impact_gain[1]
-              << " / " << impact_gain[2] << "], Follow=" << (follow_ok ? "OK" : "FAIL") << " [listener at 480 / 1900 / 2500 / 1000 uu: "
-              << follow_gain[0] << " / " << follow_gain[1] << " / " << follow_gain[2] << " / " << follow_gain[3] << "], 2D="
-              << (flat_ok ? "OK" : "FAIL") << ", Gate=" << (gate_ok ? "OK" : "FAIL") << " [0.72 s cue at 2100 uu: " << gate_far
+              << ", LowPass=" << (lowpass_ok ? "OK" : "FAIL") << ", Impact=" << (impact_ok ? "OK" : "FAIL") << " [concrete at 480 / 1000 / 2100 uu: "
+              << impact_gain[0] << " / " << impact_gain[1] << " / " << impact_gain[2] << "], Follow=" << (follow_ok ? "OK" : "FAIL")
+              << " [listener at 480 / 1900 / 2500 / 1000 uu: " << follow_gain[0] << " / " << follow_gain[1] << " / " << follow_gain[2] << " / "
+              << follow_gain[3] << ", high frequencies " << follow_hf[0] << " / " << follow_hf[1] << " / " << follow_hf[2] << " / " << follow_hf[3]
+              << "], 2D=" << (flat_ok ? "OK" : "FAIL") << ", Gate=" << (gate_ok ? "OK" : "FAIL") << " [0.72 s cue at 2100 uu: " << gate_far
               << " started, at 1900: " << gate_near << "], Chain=" << (chain_ok ? "OK" : "FAIL") << " [Fire3P at 4000 uu: one node "
-              << chain_one << ", two " << chain_two << "], BareLayer=" << (bare_ok ? "OK" : "FAIL") << " [at 400 uu: " << bare_layer
+              << chain_one << ", two " << chain_two << ", high frequencies " << chain_hf << "; at 13000 uu: " << chain_far << " with high frequencies "
+              << chain_far_hf << "], BareLayer=" << (bare_ok ? "OK" : "FAIL") << " [at 400 uu: " << bare_layer
               << " beside " << placed_layer << "], Radio=" << (radio_ok ? "OK" : "FAIL") << " [not spatialised, at 2700 uu: " << radio_gain
               << "], TdAttenuation=" << (td_ok ? "OK" : "FAIL") << " [at 5000 uu: " << td_early << " waves before 0.15 s, then the click at "
-              << td_click << " and the tail at " << td_tail << ", " << td_moved << " heard from 2500 uu], Emitters=" << (emitter_ok ? "OK" : "FAIL") << " [" << emitters_heard << " heard, "
-              << emitters_checked << " held against their curve, worst " << emitter_worst << "; " << emitter_sample << " at "
+              << td_click << " and the tail at " << td_tail << ", " << td_moved << " heard from 2500 uu, high frequencies " << td_hf
+              << "], Emitters=" << (emitter_ok ? "OK" : "FAIL") << " [" << emitters_heard << " heard, "
+              << emitters_checked << " held against their curve and low pass, worst " << emitter_worst << "; " << emitter_sample << " at "
               << std::setprecision(1) << emitter_sample_distance << std::setprecision(4) << " uu: " << emitter_sample_gain
-              << "], LayeredEmitters=" << (layered_ok ? "OK" : "FAIL") << " [the factory: " << layered_heard << " heard, " << layered_silent
-              << " at volume 0, " << layered_checked << " held against their farthest layer's curve, worst " << layered_worst << "; "
-              << layered_sample << " at 2000 uu: " << layered_sample_gain << "])"
+              << ", high frequencies " << emitter_sample_hf << "], LayeredEmitters=" << (layered_ok ? "OK" : "FAIL") << " [the factory: "
+              << layered_heard << " heard, " << layered_silent << " at volume 0, " << layered_checked
+              << " held against their cue's curves, worst " << layered_worst << "; " << vents_right << " of " << vents
+              << " looks at an A_Prop_AirVent_Indoor right, from 150 uu its layers at " << vent_near[0] << " and " << vent_near[1]
+              << ", from 1900 uu one at " << vent_far << "])" << std::defaultfloat << std::setprecision(6) << std::endl;
+    return pass;
+}
+
+// -----------------------------------------------------------------------------
+// Oracle stage 26: a paused game, and the level emitters as retail's audio device has them
+// (docs/AUDIO_SYSTEM_RE.md section 3.3). The audio engine with no device, as in stage 23:
+//   Pause      under set_game_paused the sounds at a place and the emitters' voices stay as they
+//              are for as long as it lasts (none starts, none ends, none moves on, none follows the
+//              listener), a delay does not run, a sound asked for meanwhile waits and starts with
+//              the first update after it, a sound of a UI sound group plays through, and the level's
+//              music group is at 0.25, then 1.0 (the ini's 1.2 before the first call)
+//   FrontEnd   behind the front end nothing of the level sounds and nothing is paused
+//   Layers     an indoor air vent is two voices that loop, each on its own node's curve and ranked
+//              by its volume in the graph (its mix group's 0.9 in it); nothing of it is parsed past
+//              its sound group's MaxUpdateDistance
+//   Budget     where more waves ask for a source than there are, the ones with one are the
+//              loudest, and a sound from the pool takes one from them
+//   NoRestart  a voice that keeps its source while the listener moves and the ranks change plays on
+//   Rounds     a vehicle pack plays one pass a round, 7 to 15 s after the one before has ended,
+//              and not the same one every time; an unheard round waits for its listener; a cue
+//              with its delay above its looping node waits once; a wind's bed loops while its gusts
+//              are drawn again every round
+// --verify-sound runs it after stage 23; ME_AUDIO_DEBUG=1 prints every gain as it is set.
+// -----------------------------------------------------------------------------
+static bool oracle_sound_pause_and_emitters(const std::string& game_root) {
+    using namespace me;
+    const auto near = [](float a, float b, float tolerance = 1.0e-3f) { return std::abs(a - b) <= tolerance; };
+    const Vec3 ahead(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    const Vec3 home(400000.0f, 400000.0f, 0.0f);  // far from every level
+    using Voices = std::vector<AudioEngine::PositionalVoice>;
+    const auto emitter_voices = [](const Voices& all, int emitter = -1) {
+        Voices found;
+        for (const AudioEngine::PositionalVoice& v : all) {
+            if (v.emitter && (emitter < 0 || v.emitter_index == emitter)) found.push_back(v);
+        }
+        return found;
+    };
+    const auto first_emitter_of = [](const AudioEngine& audio, const std::string& cue) {
+        const std::vector<AmbientEmitterInfo>& emitters = audio.get_ambient_emitters();
+        for (size_t e = 0; e < emitters.size(); ++e) {
+            if (emitters[e].cue_name == cue) return static_cast<int>(e);
+        }
+        return -1;
+    };
+
+    AudioEngine audio;
+    audio.init(true);
+    const float music_at_start = audio.ingame_music_volume();
+    audio.load_stock_audio(game_root);
+    audio.load_level_audio(game_root, "Maps/SP00/Tutorial_p.me1");
+    audio.load_cue_bank(game_root, "A_WP_SLAPBACK");
+    const auto tick = [&](const Vec3& listener, float dt = 0.0f) { audio.update(dt, listener, ahead, up, 0.0f, false); };
+
+    // 1. Pause. Beside one of the training area's winds, with a bullet impact playing 300 uu off
+    // (1.35 s long) and a slap-back echo 5000 uu off still held back by its distance (0.151 s).
+    const char* const kConcrete = "Concrete.9mm_Concrete_Impact";
+    const char* const kFabric = "Fabric.9mm_Fabric_Impact";
+    const char* const kSlap = "Slap_Back.Slap_Back";
+    const char* const kFootstep = "Concrete._03_Female_FootStepRun";
+    const char* const kClick = "A_Pos";
+    bool pause_ok = false;
+    size_t paused_voices = 0, changed = 0, started_in_pause = 0, started_after = 0;
+    float music_paused = -1.0f, music_after = -1.0f, age_before = -1.0f, age_in_pause = -1.0f, age_after = -1.0f;
+    bool click_played = false, others_waited = false, others_started = false, delay_held = false, impact_ended = false;
+    const int wind = first_emitter_of(audio, "WindHard");
+    if (wind >= 0 && audio.find_cue(kSlap) && audio.has_sound(kFootstep) && audio.has_sound(kClick)) {
+        const Vec3 ear = audio.get_ambient_emitters()[static_cast<size_t>(wind)].location + Vec3(0.0f, 0.0f, 150.0f);
+        for (int i = 0; i < 5; ++i) tick(ear, 0.1f);
+        audio.play_sound_3d(kConcrete, ear + Vec3(300.0f, 0.0f, 0.0f));
+        audio.play_sound_3d(kSlap, ear + Vec3(5000.0f, 0.0f, 0.0f));
+        tick(ear);
+        tick(ear, 0.1f);
+        const Voices before = audio.positional_voices();
+        for (const AudioEngine::PositionalVoice& v : before) {
+            if (v.name == kConcrete) age_before = v.age;
+        }
+        audio.set_play_log(true);
+        (void)audio.take_play_log();
+        audio.set_game_paused(true);
+        music_paused = audio.ingame_music_volume();
+        audio.play_sound_3d(kFabric, ear + Vec3(200.0f, 0.0f, 0.0f));  // at a place
+        audio.play_sound(kFootstep);                                  // on the player
+        audio.play_sound(kClick);                                     // the menu's click: HudSFX, a UI sound group
+        // A minute of updates, the listener walking off the while: the vehicle packs would have
+        // sounded, the impact ended, the echo come, and every gain fallen.
+        for (int i = 0; i < 600; ++i) tick(ear + Vec3(0.0f, 2.0f * static_cast<float>(i), 0.0f), 0.1f);
+        const Voices during = audio.positional_voices();
+        paused_voices = during.size();
+        changed = before.size() == during.size() ? 0 : 1;
+        for (size_t i = 0; i < before.size() && i < during.size(); ++i) {
+            const AudioEngine::PositionalVoice& a = before[i];
+            const AudioEngine::PositionalVoice& b = during[i];
+            if (a.name != b.name || a.clip != b.clip || a.age != b.age || a.gain != b.gain || a.distance != b.distance || !b.paused) ++changed;
+            if (b.name == kConcrete) age_in_pause = b.age;
+        }
+        delay_held = true;
+        for (const AudioEngine::PositionalVoice& v : during) delay_held = delay_held && v.name != kSlap;
+        const std::vector<AudioEngine::PlayEvent> log_in_pause = audio.take_play_log();
+        started_in_pause = log_in_pause.size();
+        others_waited = true;
+        for (const AudioEngine::PlayEvent& e : log_in_pause) {
+            click_played = click_played || e.name == kClick;
+            others_waited = others_waited && e.name == kClick;
+        }
+        audio.set_game_paused(false);
+        music_after = audio.ingame_music_volume();
+        tick(ear, 0.04f);
+        const std::vector<AudioEngine::PlayEvent> log_after = audio.take_play_log();
+        started_after = log_after.size();
+        bool step_started = false, fabric_started = false;
+        for (const AudioEngine::PlayEvent& e : log_after) {
+            step_started = step_started || e.name == kFootstep;
+            fabric_started = fabric_started || e.name == kFabric;
+        }
+        bool fabric_sounds = false, echo_early = false, echo_came = false;
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+            if (v.name == kConcrete) age_after = v.age;
+            fabric_sounds = fabric_sounds || v.name == kFabric;
+            echo_early = echo_early || v.name == kSlap;  // 0.14 of its 0.151 s
+        }
+        others_started = step_started && fabric_started && fabric_sounds;
+        tick(ear, 0.02f);
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) echo_came = echo_came || v.name == kSlap;
+        delay_held = delay_held && !echo_early && echo_came;
+        // And the impact plays out the 1.2 s it had left, no more.
+        tick(ear, 1.0f);
+        bool still = false, gone = true;
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) still = still || v.name == kConcrete;
+        tick(ear, 0.3f);
+        tick(ear, 0.0f);
+        for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) gone = gone && v.name != kConcrete;
+        impact_ended = still && gone;
+        audio.set_play_log(false);
+        // A spawn's SetPause(false), with no pause before it, on an engine of its own.
+        AudioEngine fresh;
+        fresh.init(true);
+        const float fresh_start = fresh.ingame_music_volume();
+        fresh.set_game_paused(false);
+        pause_ok = near(music_at_start, 1.2f, 1.0e-6f) && near(fresh_start, 1.2f, 1.0e-6f) && near(fresh.ingame_music_volume(), 1.0f, 1.0e-6f) &&
+                   near(music_paused, 0.25f, 1.0e-6f) && near(music_after, 1.0f, 1.0e-6f) && before.size() >= 3 && changed == 0 &&
+                   near(age_before, 0.1f, 1.0e-4f) && age_in_pause == age_before && near(age_after, age_before + 0.04f, 1.0e-4f) &&
+                   click_played && others_waited && others_started && delay_held && impact_ended;
+    }
+
+    // 2. The front end is not a pause: nothing of the level sounds behind it, and nothing waits.
+    bool frontend_ok = false;
+    size_t behind_menu = 99, back_in_play = 0;
+    if (wind >= 0) {
+        const Vec3 ear = audio.get_ambient_emitters()[static_cast<size_t>(wind)].location + Vec3(0.0f, 0.0f, 150.0f);
+        audio.play_sound_3d(kConcrete, ear + Vec3(300.0f, 0.0f, 0.0f));
+        tick(ear, 0.1f);
+        const size_t in_play = audio.positional_voices().size();
+        audio.set_menu_music(true);
+        tick(ear, 0.1f);
+        behind_menu = audio.positional_voices().size();
+        const bool paused = audio.is_game_paused();
+        audio.set_menu_music(false);
+        tick(ear, 0.1f);
+        const Voices back = audio.positional_voices();
+        back_in_play = back.size();
+        bool from_their_start = !back.empty();
+        for (const AudioEngine::PositionalVoice& v : back) from_their_start = from_their_start && v.emitter && v.age == 0.0f;
+        frontend_ok = in_play >= 3 && behind_menu == 0 && !paused && from_their_start;
+    }
+
+    // 3. Rounds, still in the training area. A vehicle pack (VehiclePack_02) is a looping node over a delay of 7 to 15 s, a
+    // modulator and a random node over 38 passes: a random node and a delay between the looping
+    // node and the wave, so the wave does not loop in its source; it plays once, and when it has
+    // ended the round is over and the next draws its delay, its modulation and its pass again.
+    bool rounds_ok = false;
+    int pack_rounds = 0, pack_clips = 0, pack_looped = 0;
+    float pack_gap_min = 1.0e9f, pack_gap_max = 0.0f, pack_wait_after_return = -1.0f;
+    bool pack_lengths_ok = true;
+    audio.stop_all();
+    const int pack = first_emitter_of(audio, "VehiclePack_02");
+    constexpr float kStep = 0.05f;
+    if (pack >= 0) {
+        const Vec3 ear = audio.get_ambient_emitters()[static_cast<size_t>(pack)].location + Vec3(0.0f, 0.0f, 500.0f);
+        std::vector<std::string> clips;
+        float now = 0.0f, started_at = -1.0f, ended_at = -1.0f, length = 0.0f;
+        bool sounding = false;
+        std::string clip;
+        const auto listen = [&](const Vec3& from) {
+            tick(from, kStep);
+            now += kStep;
+            const Voices heard = emitter_voices(audio.positional_voices(), pack);
+            if (!heard.empty() && !sounding) {
+                if (ended_at >= 0.0f) {
+                    pack_gap_min = std::min(pack_gap_min, now - ended_at);
+                    pack_gap_max = std::max(pack_gap_max, now - ended_at);
+                }
+                started_at = now;
+                clip = heard[0].clip;
+                if (std::find(clips.begin(), clips.end(), clip) == clips.end()) clips.push_back(clip);
+                if (heard[0].looping) ++pack_looped;
+                const SoundClip* wave = audio.get_clip(clip);
+                length = wave ? wave->duration : 0.0f;
+            } else if (heard.empty() && sounding) {
+                ended_at = now;
+                ++pack_rounds;
+                // (Its pitch is the modulator's draw, held by the source between 0.4 and 2.)
+                const float played = now - started_at;
+                pack_lengths_ok = pack_lengths_ok && played >= length / 2.0f - 2.0f * kStep && played <= length / 0.4f + 2.0f * kStep;
+            }
+            sounding = !heard.empty();
+        };
+        while (now < 150.0f || sounding) listen(ear);
+        // An unheard round: the listener leaves for 40 s once the pass has ended. The delay runs
+        // out meanwhile, and the pass, which has no source out there, has not moved on: it starts
+        // when the listener is back, not 7 s or more later.
+        const int rounds_heard = pack_rounds;
+        const float gap_min = pack_gap_min, gap_max = pack_gap_max;
+        for (int i = 0; i < 800; ++i) listen(home);
+        const bool silent_away = !sounding && pack_rounds == rounds_heard;
+        const float back_at = now;
+        while (!sounding && now < back_at + 20.0f) listen(ear);
+        pack_wait_after_return = now - back_at;
+        pack_gap_min = gap_min;
+        pack_gap_max = gap_max;
+        pack_clips = static_cast<int>(clips.size());
+        rounds_ok = pack_rounds >= 5 && pack_looped == 0 && pack_clips >= 2 && pack_lengths_ok && pack_gap_min >= 7.0f - kStep &&
+                    pack_gap_max <= 15.0f + 2.0f * kStep && silent_away && pack_wait_after_return <= 2.0f * kStep;
+    }
+    // A wind (WindHard): under one attenuation node a mixer of a bed, a looping node straight over
+    // its wave, which loops in its source, and three layers of gusts, each a looping node over a
+    // random node: one gust a round, drawn again when it has ended.
+    bool wind_ok = false;
+    int wind_beds = 0;
+    size_t wind_gust_clips = 0;
+    const int gusty = first_emitter_of(audio, "WindHard");
+    if (gusty >= 0) {
+        const Vec3 ear = audio.get_ambient_emitters()[static_cast<size_t>(gusty)].location + Vec3(0.0f, 0.0f, 100.0f);
+        std::vector<std::string> beds, gusts;
+        for (int i = 0; i < 1200; ++i) {
+            tick(ear, kStep);
+            for (const AudioEngine::PositionalVoice& v : emitter_voices(audio.positional_voices(), gusty)) {
+                std::vector<std::string>& list = v.looping ? beds : gusts;
+                if (std::find(list.begin(), list.end(), v.clip) == list.end()) list.push_back(v.clip);
+            }
+        }
+        wind_beds = static_cast<int>(beds.size());
+        wind_gust_clips = gusts.size();
+        wind_ok = wind_beds == 1 && wind_gust_clips >= 4;
+    }
+    // 4. An indoor air vent (A_Prop_AirVent_Indoor, sound group IndoorAmbientProps): a mix group
+    // node (AmbientPropSounds, 0.9) over a mixer of two layers, each an attenuation node, a
+    // modulator, a random node and a looping node over each of its waves. The hiss is Logarithmic
+    // 2 / 1500 and the hum Logarithmic 150 / 3000, both with the class's low pass, 1500 / 5000.
+    bool layers_ok = false;
+    size_t vent_near = 0, vent_far = 99, vent_past = 99;
+    float vent_gain[2] = {-1.0f, -1.0f}, vent_rank[2] = {-1.0f, -1.0f}, vent_far_gain = -1.0f, vent_far_hf = -1.0f, vent_mix = -1.0f;
+    audio.stop_all();
+    audio.load_level_audio(game_root, "Maps/SP06/Factory_p.me1");
+    const int vent = first_emitter_of(audio, "A_Prop_AirVent_Indoor");
+    if (const SoundCueDef* cue = audio.find_cue("A_Prop_AirVent_Indoor"); cue && vent >= 0 && !cue->nodes.empty()) {
+        // What the graph can leave a wave's volume at before the distance: the mix group's factor,
+        // the mixer's inputs, the modulators' ranges.
+        float lowest = 1.0e9f, highest = 0.0f;
+        const auto bounds = [&](const auto& self, int node, float lo, float hi) -> void {
+            if (node < 0 || static_cast<size_t>(node) >= cue->nodes.size()) return;
+            const SoundCueNode& n = cue->nodes[static_cast<size_t>(node)];
+            if (n.kind == SoundCueNode::Kind::Wave) {
+                lowest = std::min(lowest, lo);
+                highest = std::max(highest, hi);
+                return;
+            }
+            for (size_t i = 0; i < n.children.size(); ++i) {
+                float a = lo, b = hi;
+                if (n.kind == SoundCueNode::Kind::MixGroup) {
+                    a *= n.min_value;
+                    b *= n.min_value;
+                } else if (n.kind == SoundCueNode::Kind::Mixer) {
+                    const float input = i < n.weights.size() ? n.weights[i] : 1.0f;
+                    a *= input;
+                    b *= input;
+                } else if (n.kind == SoundCueNode::Kind::Modulator) {
+                    a *= std::min(n.min_value, n.max_value);
+                    b *= std::max(n.min_value, n.max_value);
+                }
+                self(self, n.children[i], a, b);
+            }
+        };
+        bounds(bounds, 0, 1.0f, 1.0f);
+        vent_mix = cue->nodes[0].kind == SoundCueNode::Kind::MixGroup ? cue->nodes[0].min_value : -1.0f;
+        const Vec3 at = audio.get_ambient_emitters()[static_cast<size_t>(vent)].location;
+        tick(at + Vec3(0.0f, 0.0f, 100.0f), 0.1f);
+        Voices heard = emitter_voices(audio.emitter_candidates(), vent);
+        std::sort(heard.begin(), heard.end(), [](const auto& a, const auto& b) { return a.distance_gain < b.distance_gain; });
+        vent_near = heard.size();
+        bool near_ok = heard.size() == 2;
+        for (size_t i = 0; i < heard.size() && i < 2; ++i) {
+            vent_gain[i] = heard[i].distance_gain;
+            vent_rank[i] = heard[i].priority;
+            near_ok = near_ok && heard[i].looping && heard[i].sourced && heard[i].attenuation_nodes == 1 && heard[i].spatialized &&
+                      near(heard[i].high_frequency_gain, 1.0f, 1.0e-6f) && heard[i].priority >= lowest * heard[i].distance_gain - 1.0e-5f &&
+                      heard[i].priority <= highest * heard[i].distance_gain + 1.0e-5f;
+        }
+        near_ok = near_ok && near(vent_gain[0], attenuation_gain(1, 100.0f, 2.0f, 1500.0f, -60.0f), 1.0e-4f) && near(vent_gain[1], 1.0f, 1.0e-6f);
+        tick(at + Vec3(0.0f, 0.0f, 1900.0f), 0.1f);
+        heard = emitter_voices(audio.emitter_candidates(), vent);
+        vent_far = heard.size();
+        if (heard.size() == 1) {
+            vent_far_gain = heard[0].distance_gain;
+            vent_far_hf = heard[0].high_frequency_gain;
+        }
+        tick(at + Vec3(0.0f, 0.0f, 2100.0f), 0.1f);
+        vent_past = emitter_voices(audio.emitter_candidates(), vent).size();
+        layers_ok = near_ok && vent_far == 1 && near(vent_far_gain, attenuation_gain(1, 1900.0f, 150.0f, 3000.0f, -60.0f), 1.0e-4f) &&
+                    near(vent_far_hf, low_pass_gain(1900.0f, 1500.0f, 5000.0f), 1.0e-4f) && vent_past == 0 && near(vent_mix, 0.9f, 1.0e-6f) &&
+                    highest < 1.0e8f && lowest > 0.0f;
+    }
+
+    // 5. More waves than sources. On The Boat about 80 waves ask for one at the busiest place. Above each of its
+    // emitters in turn: the waves that have a source are as many as there are sources, and none of
+    // them ranks under one that has none. With three bullet impacts playing beside the listener
+    // there are three sources fewer for the emitters.
+    bool budget_ok = false;
+    size_t budget = 0, most_asking = 0, places_over = 0, misranked = 0, wrong_count = 0, budget_with_impacts = 0, sourced_with_impacts = 0;
+    Vec3 busiest = home;
+    audio.stop_all();
+    const size_t before_load = emitter_voices(audio.positional_voices()).size();
+    audio.load_level_audio(game_root, "Maps/SP07/Boat_p.me1");
+    // (The level before's emitters go with it: none of the factory's is left sounding.)
+    const size_t after_load = emitter_voices(audio.positional_voices()).size();
+    {
+        const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
+        for (const AmbientEmitterInfo& em : emitters) {
+            const Vec3 ear = em.location + Vec3(0.0f, 0.0f, 150.0f);
+            tick(ear, 0.1f);
+            const Voices asking = audio.emitter_candidates();
+            size_t sourced = 0;
+            float lowest_with = 1.0e9f, highest_without = -1.0f;
+            for (const AudioEngine::PositionalVoice& v : asking) {
+                if (v.sourced) {
+                    ++sourced;
+                    lowest_with = std::min(lowest_with, v.priority);
+                } else {
+                    highest_without = std::max(highest_without, v.priority);
+                }
+            }
+            budget = audio.emitter_source_budget();
+            if (sourced != std::min(asking.size(), budget)) ++wrong_count;
+            if (asking.size() > budget) ++places_over;
+            if (lowest_with < highest_without) ++misranked;
+            if (asking.size() > most_asking) {
+                most_asking = asking.size();
+                busiest = ear;
+            }
+        }
+        tick(busiest, 0.1f);
+        for (int i = 0; i < 3; ++i) audio.play_sound_3d("Concrete.9mm_Concrete_Impact", busiest + Vec3(100.0f * static_cast<float>(i + 1), 0.0f, 0.0f));
+        tick(busiest, 0.0f);  // starts them; the emitters were dealt before
+        tick(busiest, 0.1f);
+        budget_with_impacts = audio.emitter_source_budget();
+        for (const AudioEngine::PositionalVoice& v : audio.emitter_candidates()) sourced_with_impacts += v.sourced ? 1 : 0;
+        budget_ok = budget == 32 && most_asking > budget && places_over > 0 && misranked == 0 && wrong_count == 0 && budget_with_impacts == 29 &&
+                    sourced_with_impacts == 29 && before_load > 0 && after_load == 0;
+        audio.stop_all();
+    }
+
+    // 6. No restart for a voice that keeps its source. From that busiest place the listener moves
+    // off in steps of 150 uu, a tenth of a second each: the ranks of the waves change and some lose
+    // their source to others, but every wave that has one before and after a step has played on.
+    bool restart_ok = false;
+    size_t kept = 0, restarted = 0, rank_changes = 0, newcomers = 0;
+    {
+        tick(busiest, 0.1f);
+        tick(busiest, 0.1f);
+        const auto key = [](const AudioEngine::PositionalVoice& v) { return v.emitter_index * 1000 + v.emitter_wave; };
+        for (int step = 1; step <= 20; ++step) {
+            Voices before = audio.positional_voices();
+            tick(busiest + Vec3(150.0f * static_cast<float>(step), 0.0f, 0.0f), 0.1f);
+            Voices after = audio.positional_voices();
+            std::vector<int> order_before, order_after;
+            const auto by_rank = [](const auto& a, const auto& b) { return a.priority > b.priority; };
+            std::stable_sort(before.begin(), before.end(), by_rank);
+            std::stable_sort(after.begin(), after.end(), by_rank);
+            for (const AudioEngine::PositionalVoice& b : after) {
+                bool had = false;
+                for (const AudioEngine::PositionalVoice& a : before) {
+                    if (key(a) != key(b)) continue;
+                    had = true;
+                    ++kept;
+                    // (A wave that plays once a round may have ended and begun its next round.)
+                    const bool played_on = near(b.age, a.age + 0.1f, 1.0e-4f);
+                    if (!played_on && !(!b.looping && b.age == 0.0f)) ++restarted;
+                    order_after.push_back(key(b));
+                }
+                if (!had) {
+                    ++newcomers;
+                    if (b.age != 0.0f) ++restarted;  // one that gets a source starts from its beginning
+                }
+            }
+            for (const AudioEngine::PositionalVoice& a : before) {
+                for (const AudioEngine::PositionalVoice& b : after) {
+                    if (key(a) == key(b)) order_before.push_back(key(a));
+                }
+            }
+            for (size_t i = 0; i < order_before.size() && i < order_after.size(); ++i) rank_changes += order_before[i] != order_after[i] ? 1 : 0;
+        }
+        restart_ok = kept >= 100 && restarted == 0 && rank_changes > 0 && newcomers > 0;
+    }
+
+    // 7. A cue with its delay above its looping node (DullHammering, in The Shard's ducts: a delay, then
+    // a looping node over a modulator and a random node over six hammerings) waits once, when the
+    // level starts it, and then plays one hammering after another.
+    bool once_ok = false;
+    int hammer_rounds = 0;
+    float hammer_first = -1.0f, hammer_gap_max = 0.0f, hammer_delay[2] = {0.0f, 0.0f};
+    audio.stop_all();
+    audio.load_level_audio(game_root, "Maps/SP09/Scraper_p.me1");
+    const int hammer = first_emitter_of(audio, "DullHammering");
+    if (const SoundCueDef* cue = audio.find_cue("DullHammering"); cue && hammer >= 0) {
+        // The delay above the looping node, as the cue has it.
+        bool above_loop = false;
+        const auto find_delay = [&](const auto& self, int node) -> void {
+            if (node < 0 || static_cast<size_t>(node) >= cue->nodes.size()) return;
+            const SoundCueNode& n = cue->nodes[static_cast<size_t>(node)];
+            if (n.kind == SoundCueNode::Kind::Looping) return;
+            if (n.kind == SoundCueNode::Kind::Delay) {
+                above_loop = true;
+                hammer_delay[0] = std::min(n.min_value, n.max_value);
+                hammer_delay[1] = std::max(n.min_value, n.max_value);
+            }
+            for (int child : n.children) self(self, child);
+        };
+        find_delay(find_delay, 0);
+        const Vec3 ear = audio.get_ambient_emitters()[static_cast<size_t>(hammer)].location + Vec3(0.0f, 0.0f, 150.0f);
+        float now = 0.0f, silent_since = -1.0f, last_age = -1.0f;
+        while (now < hammer_delay[1] + 40.0f) {
+            tick(ear, kStep);
+            now += kStep;
+            const Voices heard = emitter_voices(audio.positional_voices(), hammer);
+            if (heard.empty()) {
+                if (hammer_first >= 0.0f && silent_since < 0.0f) silent_since = now;
+                last_age = -1.0f;
+                continue;
+            }
+            if (hammer_first < 0.0f) hammer_first = now;
+            if (silent_since >= 0.0f) hammer_gap_max = std::max(hammer_gap_max, now - silent_since);
+            silent_since = -1.0f;
+            // One hammering ends and the next begins in the same update: its age starts over.
+            if (heard[0].age < last_age || last_age < 0.0f) ++hammer_rounds;
+            last_age = heard[0].age;
+        }
+        once_ok = above_loop && hammer_first >= hammer_delay[0] - kStep && hammer_first <= hammer_delay[1] + 2.0f * kStep && hammer_rounds >= 3 &&
+                  hammer_gap_max <= 2.0f * kStep;
+    }
+    rounds_ok = rounds_ok && wind_ok && once_ok;
+
+    const bool pass = pause_ok && frontend_ok && layers_ok && budget_ok && restart_ok && rounds_ok;
+    std::cout << std::fixed << std::setprecision(4) << "  -> Stage 26 Result: " << (pass ? "PASS" : "FAIL") << " (Pause=" << (pause_ok ? "OK" : "FAIL")
+              << " [" << paused_voices << " voices held for 60 s, " << changed << " changed; an impact's age " << age_before << " s before, "
+              << age_in_pause << " in it, " << age_after << " 0.04 s after; " << started_in_pause << " sound started in it (the menu's click: "
+              << (click_played ? "yes" : "no") << "), " << started_after << " after; the echo's delay held: " << (delay_held ? "yes" : "no")
+              << "; InGameMusic " << music_at_start << " at first, " << music_paused << " paused, " << music_after << " after], FrontEnd="
+              << (frontend_ok ? "OK" : "FAIL") << " [" << behind_menu << " voices behind it, " << back_in_play << " back in play], Layers="
+              << (layers_ok ? "OK" : "FAIL") << " [A_Prop_AirVent_Indoor from 100 uu: " << vent_near << " voices, distance gains " << vent_gain[0]
+              << " and " << vent_gain[1] << ", ranked at " << vent_rank[0] << " and " << vent_rank[1] << " (mix group " << vent_mix
+              << "); from 1900 uu: " << vent_far << " at " << vent_far_gain << ", high frequencies " << vent_far_hf << "; from 2100 uu: "
+              << vent_past << "], Budget=" << (budget_ok ? "OK" : "FAIL") << " [The Boat: " << budget << " sources, up to " << most_asking
+              << " waves asking, " << places_over << " places with more asking than sources, " << misranked << " misranked, " << wrong_count
+              << " miscounted; with three impacts playing " << sourced_with_impacts << " of " << budget_with_impacts << "; "
+              << before_load << " voices of the level before, " << after_load << " once this one was loaded], NoRestart="
+              << (restart_ok ? "OK" : "FAIL") << " [" << kept << " voices kept their source over 20 steps, " << restarted << " restarted, "
+              << rank_changes << " places in the ranking changed, " << newcomers << " new voices], Rounds=" << (rounds_ok ? "OK" : "FAIL")
+              << " [VehiclePack_02: " << pack_rounds << " rounds, waits " << pack_gap_min << " to "
+              << pack_gap_max << " s, " << pack_clips << " different passes, " << pack_looped << " looped, " << pack_wait_after_return
+              << " s to start after 40 s unheard; WindHard: " << wind_beds << " looping bed, " << wind_gust_clips
+              << " different gusts in 60 s; DullHammering: first after " << hammer_first << " s (its delay " << hammer_delay[0] << " to "
+              << hammer_delay[1] << "), " << hammer_rounds << " rounds, longest wait between them " << hammer_gap_max << " s])"
               << std::defaultfloat << std::setprecision(6) << std::endl;
     return pass;
+}
+
+// -----------------------------------------------------------------------------
+// --audio-device-check: the audio engine on a real audio device, with no window and its master
+// volume at nothing, so that everything plays and nothing is heard. It says what the device gives
+// (the emitters' sources, the EFX low-pass filters) and asks OpenAL itself what a paused game does
+// to its sources: the emitters', a bullet impact's and the run wind's paused, the music's playing
+// on, the menu's click starting under the pause, all of them playing again after it.
+// -----------------------------------------------------------------------------
+static int run_audio_device_check(const std::string& game_root) {
+    using namespace me;
+    AudioEngine audio;
+    audio.init(false);
+    if (!audio.device_report().device) {
+        std::cout << "[AudioDevice] no audio device (or a build without OpenAL): nothing checked" << std::endl;
+        return 1;
+    }
+    audio.set_master_volume(0.0f);
+    audio.load_stock_audio(game_root);
+    audio.load_level_audio(game_root, "Maps/SP00/Tutorial_p.me1");
+    Vec3 ear(0.0f, 0.0f, 0.0f);
+    for (const AmbientEmitterInfo& em : audio.get_ambient_emitters()) {
+        if (em.cue_name != "WindHard") continue;
+        ear = em.location + Vec3(0.0f, 0.0f, 150.0f);
+        break;
+    }
+    const Vec3 ahead(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    // Frames of a sixtieth of a second, in real time: the device plays what it is given.
+    const auto run = [&](int frames) {
+        for (int i = 0; i < frames; ++i) {
+            audio.update(1.0f / 60.0f, ear, ahead, up, 0.0f, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    };
+    const auto say = [](const char* when, const AudioEngine::DeviceReport& r) {
+        std::cout << "[AudioDevice] " << when << ": emitter sources " << r.emitters_playing << " playing, " << r.emitters_paused << " paused; pool "
+                  << r.pool_playing << " playing, " << r.pool_paused << " paused; music stems " << r.music_playing << " playing; run wind "
+                  << (r.wind_paused ? "paused" : "not paused") << "; OpenAL error: " << (r.error ? "yes" : "no") << std::endl;
+    };
+    audio.set_game_paused(false);
+    run(30);
+    audio.play_sound_3d("Concrete.9mm_Concrete_Impact", ear + Vec3(300.0f, 0.0f, 0.0f));  // 1.35 s
+    run(6);
+    const AudioEngine::DeviceReport play = audio.device_report();
+    std::cout << "[AudioDevice] device '" << play.name << "': " << play.emitter_sources << " emitter sources, low-pass filters (EFX): "
+              << (play.low_pass ? "yes" : "no") << std::endl;
+    float lowest_hf = 1.0f;
+    for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) lowest_hf = std::min(lowest_hf, v.high_frequency_gain);
+    std::cout << "[AudioDevice] " << audio.positional_voices().size() << " sounds at a place, the dullest with its filter's high frequencies at "
+              << lowest_hf << std::endl;
+    say("in play", play);
+    audio.set_game_paused(true);
+    run(30);
+    const AudioEngine::DeviceReport paused = audio.device_report();
+    say("paused for half a second", paused);
+    audio.play_sound("A_Pos");                          // the menu's click, a UI sound
+    audio.play_sound("Concrete._03_Female_FootStepRun");  // and a footstep, which waits
+    run(2);
+    const AudioEngine::DeviceReport click = audio.device_report();
+    say("a click and a footstep asked for", click);
+    audio.set_game_paused(false);
+    run(3);
+    const AudioEngine::DeviceReport after = audio.device_report();
+    say("in play again", after);
+    const bool pass = play.emitters_playing > 0 && play.emitters_paused == 0 && play.pool_playing >= 1 && play.music_playing >= 1 && !play.error &&
+                      paused.emitters_playing == 0 && paused.emitters_paused > 0 && paused.pool_playing == 0 && paused.pool_paused >= 1 &&
+                      paused.music_playing == play.music_playing && paused.wind_paused && !paused.error && click.pool_playing >= 1 &&
+                      click.pool_paused == paused.pool_paused && !click.error && after.emitters_playing > 0 && after.emitters_paused == 0 &&
+                      after.pool_paused == 0 && after.pool_playing >= 2 && !after.wind_paused && !after.error;
+    std::cout << "[AudioDevice] " << (pass ? "PASS" : "FAIL") << std::endl;
+    audio.shutdown();
+    return pass ? 0 : 1;
+}
+
+// -----------------------------------------------------------------------------
+// --emitter-walk: the level emitters of the eleven maps, heard with no audio device from 100, 150,
+// 1000 and 2000 uu above each of them in turn, a quarter of a second at every place: how many
+// emitter voices sound there, how many of those are at a distance gain of nothing or next to it,
+// how many emitters they belong to, and how many waves asked for a source (the ones with one and
+// the ones ranked out). The walk of MODLOG.md sections 38 and 41.
+// -----------------------------------------------------------------------------
+static int run_emitter_walk(const std::string& game_root) {
+    using namespace me;
+    static const char* const kMaps[] = {
+        "Maps/SP00/Tutorial_p.me1",   "Maps/SP01/Edge_p.me1",    "Maps/SP01/Escape_p.me1", "Maps/SP02/Stormdrain_p.me1",
+        "Maps/SP03/Cranes_p.me1",     "Maps/SP04/Subway_p.me1",  "Maps/SP05/Mall_p.me1",   "Maps/SP06/Factory_p.me1",
+        "Maps/SP07/Boat_p.me1",       "Maps/SP08/Convoy_p.me1",  "Maps/SP09/Scraper_p.me1"};
+    constexpr size_t kMost = 40;  // the histogram's last column: that many voices or more
+    struct Count {
+        size_t emitters = 0, places = 0, voices = 0, silent = 0, quiet = 0, heard_emitters = 0, most = 0;
+        size_t by_voices[kMost + 1] = {};
+        size_t asked = 0, most_asked = 0, over_budget = 0, misranked = 0, stopped = 0;
+        size_t by_asked[7] = {};  // 0, 1-4, 5-8, 9-16, 17-24, 25-32, more
+    };
+    AudioEngine audio;
+    audio.init(true);
+    audio.load_stock_audio(game_root);
+    const Vec3 ahead(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    Count total;
+    const auto print = [](const char* name, const Count& c) {
+        std::cout << "[Walk] " << name << ": " << c.emitters << " emitters, " << c.places << " places, " << c.voices << " emitter voices sound ("
+                  << c.silent << " at distance gain 0, " << c.quiet << " at 0.002 or less), of " << c.heard_emitters
+                  << " emitters; most at one place " << c.most << "; places by voices";
+        for (size_t n = 0; n <= kMost; ++n) {
+            if (c.by_voices[n]) std::cout << " " << n << (n == kMost ? "+" : "") << ":" << c.by_voices[n];
+        }
+        static const char* const kAsked[] = {"0", "1-4", "5-8", "9-16", "17-24", "25-32", "33+"};
+        std::cout << "; " << c.asked << " waves asked for a source, most at one place " << c.most_asked << ", places by waves asking";
+        for (size_t n = 0; n < std::size(kAsked); ++n) {
+            if (c.by_asked[n]) std::cout << " " << kAsked[n] << ":" << c.by_asked[n];
+        }
+        std::cout << "; " << c.over_budget << " places with more asking than there are sources, " << c.misranked
+                  << " waves with a source ranked under one without; " << c.stopped << " emitters stopped for good" << std::endl;
+    };
+    for (const char* map : kMaps) {
+        audio.stop_all();
+        audio.load_level_audio(game_root, map);
+        const std::vector<AmbientEmitterInfo> emitters = audio.get_ambient_emitters();
+        Count c;
+        c.emitters = emitters.size();
+        for (const float height : {100.0f, 150.0f, 1000.0f, 2000.0f}) {
+            for (const AmbientEmitterInfo& em : emitters) {
+                audio.update(0.25f, em.location + Vec3(0.0f, 0.0f, height), ahead, up, 0.0f, false);
+                size_t voices = 0;
+                std::vector<Vec3> from;
+                for (const AudioEngine::PositionalVoice& v : audio.positional_voices()) {
+                    if (!v.emitter) continue;
+                    ++voices;
+                    if (v.distance_gain <= 0.0f) ++c.silent;
+                    if (v.distance_gain <= 0.002f) ++c.quiet;
+                    bool known = false;
+                    for (const Vec3& p : from) known = known || (p - v.position).length() < 0.01f;
+                    if (!known) from.push_back(v.position);
+                }
+                ++c.places;
+                c.voices += voices;
+                c.heard_emitters += from.size();
+                c.most = std::max(c.most, voices);
+                ++c.by_voices[std::min(voices, kMost)];
+                // The waves that asked for a source, and whether the ones that got one outrank the rest.
+                const std::vector<AudioEngine::PositionalVoice> asking = audio.emitter_candidates();
+                float lowest_with = 1.0e9f, highest_without = -1.0f;
+                for (const AudioEngine::PositionalVoice& v : asking) {
+                    if (v.sourced) lowest_with = std::min(lowest_with, v.priority);
+                    else highest_without = std::max(highest_without, v.priority);
+                }
+                for (const AudioEngine::PositionalVoice& v : asking) {
+                    if (v.sourced && v.priority < highest_without) ++c.misranked;
+                }
+                c.asked += asking.size();
+                c.most_asked = std::max(c.most_asked, asking.size());
+                if (asking.size() > voices) ++c.over_budget;
+                ++c.by_asked[asking.empty() ? 0 : asking.size() <= 4 ? 1 : asking.size() <= 8 ? 2 : asking.size() <= 16 ? 3
+                                             : asking.size() <= 24 ? 4 : asking.size() <= 32 ? 5 : 6];
+            }
+        }
+        c.stopped = audio.stopped_emitter_count();
+        print(map, c);
+        total.emitters += c.emitters;
+        total.places += c.places;
+        total.voices += c.voices;
+        total.silent += c.silent;
+        total.quiet += c.quiet;
+        total.heard_emitters += c.heard_emitters;
+        total.most = std::max(total.most, c.most);
+        for (size_t n = 0; n <= kMost; ++n) total.by_voices[n] += c.by_voices[n];
+        total.asked += c.asked;
+        total.most_asked = std::max(total.most_asked, c.most_asked);
+        total.over_budget += c.over_budget;
+        total.misranked += c.misranked;
+        total.stopped += c.stopped;
+        for (size_t n = 0; n < std::size(c.by_asked); ++n) total.by_asked[n] += c.by_asked[n];
+    }
+    print("all eleven maps", total);
+    return 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -3612,9 +4362,13 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
                   << " uu from After_Intro's])" << std::endl;
     }
 
+    // Stage 26: a paused game and the level emitters (oracle_sound_pause_and_emitters above).
+    std::cout << "[Oracle Stage 26] Testing the Paused Game's Sounds and the Level Emitters (layers, sources, rounds)..." << std::endl;
+    const bool s26_pass = oracle_sound_pause_and_emitters(game_root);
+
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass, s26_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -4565,9 +5319,17 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         return 1;
     }
 
-    auto set_menu_active = [&](bool open) {
+    // The port's own overlay menu stands for two of retail's things. Opened from play (Tab, or
+    // Escape when no front end is loaded) it is a paused game: the level's sounds are paused under
+    // it and its music turned down (AudioEngine::set_game_paused). Opened as the front end, where the
+    // game starts in a menu or The Shard ends and no front end is loaded, it is not a pause: it has
+    // the menu's theme and nothing of the level, as retail's front end, a map of its own, has.
+    bool overlay_is_front_end = false;
+    auto set_menu_active = [&](bool open, bool as_front_end = false) {
         renderer.set_menu_open(open);
-        audio.set_menu_music(open);
+        overlay_is_front_end = open && as_front_end;
+        audio.set_menu_music(overlay_is_front_end);
+        audio.set_game_paused(open && !as_front_end);
         SDL_SetRelativeMouseMode(open ? SDL_FALSE : SDL_TRUE);
         SDL_ShowCursor(open ? SDL_ENABLE : SDL_DISABLE);
         if (!open && level_play_pending && !cutscene_player.is_playing()) {
@@ -4581,7 +5343,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         uy = (static_cast<float>(my) / static_cast<float>(std::max(1, win_h))) * 720.0f;
     };
 
-    set_menu_active(start_in_main_menu);
+    set_menu_active(start_in_main_menu, /*as_front_end=*/true);
     ensure_dir("screenshots");
 
     // The front end: "Press Any Key", then the main menu, as retail has them
@@ -4673,10 +5435,21 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         trace_file << std::defaultfloat << std::setprecision(6);
     };
 
+    // Whether the game is paused as retail's is while WorldInfo.Pauser is set: under the pause menu
+    // (TdUIScene_Pause.PostInitialize calls SetPause(true)), under the port's overlay menu when it
+    // was opened from play, and under a hint card (TdUIScene_SplashHint, the scene that says "game
+    // paused"). The front end is not a paused game: TdHUD.PauseGame returns at once in the main menu.
+    auto game_is_paused = [&]() {
+        return (frontend && !frontend_active && frontend->is_pause_open()) || (renderer.is_menu_open() && !overlay_is_front_end) ||
+               splash_hint_open;
+    };
+
     // The audio engine's frame. The listener is the pawn's location plus her eye height, facing as
     // the view does, in play and behind a menu alike: the update starts the sounds the frame asked
-    // for at a place and sets the ones already playing by their distance from it.
+    // for at a place and sets the ones already playing by their distance from it. It is told first
+    // whether the game is paused, which pauses every sound of the level but its music.
     auto update_audio = [&](float dt, float player_speed, bool reaction_active) {
+        audio.set_game_paused(game_is_paused());
         const PlayerTelemetry& t = controller.get_telemetry();
         const Rotator ear_rot = Rotator::from_degrees(t.pitch_deg, t.yaw_deg, t.camera_roll_deg);
         audio.update(dt, t.position + Vec3(0.0f, 0.0f, t.eye_height), ear_rot.forward(), ear_rot.up(), player_speed, reaction_active);
@@ -5418,7 +6191,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
 
         // Advance simulation or active cutscene step (paused while Main Menu is open or a hint card is up)
         Vec3 pre_vel = controller.get_velocity();
-        if (!renderer.is_menu_open() && !splash_hint_open) {
+        const bool sim_running = !renderer.is_menu_open() && !splash_hint_open;
+        if (sim_running) {
             if (cutscene_player.get_mode() != ECutsceneMode::BinkVideo && pending_level_loaded_audio) {
                 pending_level_loaded_audio = false;
                 audio.play_level_loaded_cues();
@@ -5643,7 +6417,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
                             SDL_SetRelativeMouseMode(SDL_FALSE);
                             SDL_ShowCursor(SDL_ENABLE);
                         } else {
-                            set_menu_active(true);
+                            set_menu_active(true, /*as_front_end=*/true);
                         }
                     } else {
                         const std::string map_file = find_map_file(tr.level);
@@ -5788,7 +6562,8 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             prev_checkpoint = tel.active_checkpoint;
         }
 
-        if (tel.weapon.fired_this_tick && !cutscene_player.is_playing()) {
+        // (Only for a step that ran: the flag stays up for as long as the simulation is not stepping.)
+        if (sim_running && tel.weapon.fired_this_tick && !cutscene_player.is_playing()) {
             audio.play_effect(EAudioEffect::Gunshot);
         }
 
@@ -5797,7 +6572,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         // barge the locomotion only steps while the move's animation slot is mostly blended out.
         const bool locomotion_feet = tel.move_state == EMovement::MOVE_Walking ||
                                      (tel.move_state == EMovement::MOVE_Barge && tel.barge_anim_weight < 0.5f);
-        if (!renderer.is_menu_open() && !cutscene_player.is_playing() && tel.grounded && locomotion_feet &&
+        if (sim_running && !cutscene_player.is_playing() && tel.grounded && locomotion_feet &&
             tel.speed_2d > 40.0f) {
             footstep_timer += dt;
             float stride_time = std::clamp(150.0f / tel.speed_2d, 0.22f, 0.45f);
@@ -5828,7 +6603,7 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         }
 
         // Update 3D listener and dynamic audio stems
-        audio.set_menu_music(renderer.is_menu_open());
+        audio.set_menu_music(renderer.is_menu_open() && overlay_is_front_end);
         // A cutscene's motion is not the player's running: no speed-driven wind or breathing for it.
         update_audio(dt, (cutscene_player.is_playing() || into_cutscene_pending) ? 0.0f : tel.speed_2d,
                      tel.reaction_active && !cutscene_player.is_playing());
@@ -5921,12 +6696,14 @@ int main(int argc, char* argv[]) {
     std::string game_root = me::default_game_root();
     bool verify_all = false;
     bool verify_script = false;  // the level script's stage of the oracle, alone
-    bool verify_sound = false;   // and the sound attenuation stage
+    bool verify_sound = false;   // and the two sound stages
     bool verify_bodies = false;  // the enemies' bodies stage of the oracle, alone
     bool verify_respawn = false; // a restart at every checkpoint of every chapter
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
     std::string cue_dump;      // --dump-sound-cues <file>
+    bool emitter_walk = false; // --emitter-walk
+    bool audio_device_check = false;  // --audio-device-check
     std::string script_json = "";
     int initial_chapter = 0;
     std::string custom_level = "";
@@ -5957,6 +6734,10 @@ int main(int argc, char* argv[]) {
             return 0;
         } else if (arg == "--dump-sound-cues") {
             if (i + 1 < argc) cue_dump = argv[++i];
+        } else if (arg == "--emitter-walk") {
+            emitter_walk = true;
+        } else if (arg == "--audio-device-check") {
+            audio_device_check = true;
         } else if (arg == "--verify-script") {
             verify_script = true;
         } else if (arg == "--verify-sound") {
@@ -6003,13 +6784,15 @@ int main(int argc, char* argv[]) {
                       << "  --main-menu              Boot into the 3D City of Glass Main Menu (default)\n"
                       << "  --verify-all             Run deterministic headless oracle verification suite\n"
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
-                      << "  --verify-sound           Run only its sound attenuation stage (gain with distance, per cue)\n"
+                      << "  --verify-sound           Run only its sound stages (gain and low pass with distance, pause, emitters)\n"
                       << "  --verify-bodies          Run only its stage of bullets against the enemies' posed bodies\n"
                       << "  --verify-respawn         Restart at every checkpoint of every chapter and see where she ends up\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
                       << "  --dump-shaders <dir>     Write the Metal shader sources, to check them with a compiler\n"
                       << "  --dump-sound-cues <file> Write every sound cue's attenuation nodes as the loader reads them, headless\n"
+                      << "  --emitter-walk           Count the emitter voices heard above every level emitter of the eleven maps, headless\n"
+                      << "  --audio-device-check     Open the audio device with no window and no sound and see what a pause does to its sources\n"
                       << "  --headless-oracle <file> Run script-based headless oracle\n"
                       << "  --test-replay <trace>    Replay physics trace headless\n"
                       << "  --chapter <0..9>         Start at specified campaign chapter\n"
@@ -6036,9 +6819,14 @@ int main(int argc, char* argv[]) {
     if (!cue_dump.empty()) {
         return run_dump_sound_cues(game_root, cue_dump);
     }
+    if (emitter_walk) return run_emitter_walk(game_root);
+    if (audio_device_check) return run_audio_device_check(game_root);
     if (verify_sound) {
         std::cout << "[Oracle Stage 23] Testing Sound Attenuation with Distance (the cues' own curves, per wave)..." << std::endl;
-        return oracle_sound_attenuation(game_root) ? 0 : 1;
+        const bool attenuation_ok = oracle_sound_attenuation(game_root);
+        std::cout << "[Oracle Stage 26] Testing the Paused Game's Sounds and the Level Emitters (layers, sources, rounds)..." << std::endl;
+        const bool emitters_ok = oracle_sound_pause_and_emitters(game_root);
+        return attenuation_ok && emitters_ok ? 0 : 1;
     }
     if (!handover_map.empty()) {
         me::Renderer renderer;

@@ -60,6 +60,22 @@ inline float attenuation_gain(uint8_t model, float distance, float min_radius, f
     }
 }
 
+// The same function's low pass (0x00B7DEDA), for a node with bAttenuateWithLowPassFilter: what it
+// multiplies into CurrentHighFrequencyGain. All of the high frequencies at or inside LPFMinRadius,
+// none at or beyond LPFMaxRadius, a straight line between, whatever the node's DistanceModel and
+// whether or not it has bAttenuate. The radii are the ones drawn for this play.
+inline float low_pass_gain(float distance, float lpf_min_radius, float lpf_max_radius) {
+    if (distance >= lpf_max_radius) return 0.0f;
+    if (distance > lpf_min_radius) return 1.0f - (distance - lpf_min_radius) / (lpf_max_radius - lpf_min_radius);
+    return 1.0f;
+}
+
+// The audio device hands that gain to OpenAL as the high-frequency gain of a low-pass filter on the
+// source, AL_LOWPASS_GAINHF, between these two (FALSoundSource::Update, 0x010D724F): beyond
+// LPFMaxRadius a sound that is still inside its MaxRadius is dull, never without high frequencies.
+inline constexpr float kMinHighFrequencyGain = 0.01f;
+inline constexpr float kMaxHighFrequencyGain = 1.0f;
+
 // A radius drawn for one play from the pair its cooked table holds. The pair is not always the
 // lower value first (three of the game's tables are 5000 then 800, 5000 then 3000, 1500 then 400).
 inline float draw_radius(const float pair[2], float random01) {
@@ -79,6 +95,13 @@ struct DrawnAttenuation {
     // parse found, whatever its DistanceModel, and then calls its parent's, which applies the model
     // to the distance now: this is the first factor, fixed for the play (1 for any other node).
     float first_distance_gain = 1.0f;
+    // bAttenuateWithLowPassFilter and the LPF radii drawn with the others. (A TdSoundNodeAttenuation
+    // that attenuates or delays keeps its first distance and its delay where its parent looks for
+    // these two, so its parent's low pass runs from the one to the other: no high frequencies at any
+    // distance past the delay's number of seconds, which is every distance.)
+    bool low_pass = false;
+    float lpf_min_radius = 1500.0f;
+    float lpf_max_radius = 5000.0f;
 };
 
 // Everything the attenuation nodes above one wave do to it. A cue can have several such nodes: on
@@ -96,6 +119,17 @@ struct VoiceAttenuation {
         for (const DrawnAttenuation& n : nodes) {
             if (!n.attenuate) continue;
             g *= n.first_distance_gain * attenuation_gain(n.model, distance, n.min_radius, n.max_radius, n.db_at_max);
+        }
+        return g;
+    }
+
+    // CurrentHighFrequencyGain as the nodes leave it: the product of their low passes, 1 for a wave
+    // none of them filters. Not yet held between kMinHighFrequencyGain and kMaxHighFrequencyGain:
+    // that is the source's doing.
+    [[nodiscard]] float high_frequency_gain(float distance) const {
+        float g = 1.0f;
+        for (const DrawnAttenuation& n : nodes) {
+            if (n.low_pass) g *= low_pass_gain(distance, n.lpf_min_radius, n.lpf_max_radius);
         }
         return g;
     }
