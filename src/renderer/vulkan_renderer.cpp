@@ -2535,7 +2535,6 @@ void VulkanRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                 hiz = std::fmax(hiz, p.z);
                 has_nan |= (p.x != p.x) | (p.y != p.y) | (p.z != p.z);
             }
-            if (has_nan) lox = NAN;
             if (mesh.shield && impl->shield_index_count > 0) {
                 // ...and his shield's box.
                 lox = std::fmin(lox, mesh.shield_lo.x);
@@ -2547,6 +2546,7 @@ void VulkanRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                 draw.shield = true;
                 draw.shield_model = mesh.shield_model;
             }
+            if (has_nan) lox = NAN;  // (after the shield's box: fmin would take a NaN out again)
             const Vec3 lo(lox, loy, loz);
             const Vec3 hi(hix, hiy, hiz);
             const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);

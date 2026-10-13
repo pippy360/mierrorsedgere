@@ -3152,6 +3152,13 @@ The item of `TODO.md` "The riot shield", by the proposal of the main checkout's 
   `main.cpp`) compile; the Metal renderer's change was written from the Direct3D and OpenGL ones and not
   compiled here.
 
+- **After the review** (an independent reader of the branch): merging the shield's box into a bot's bounds
+  took away the NaN that keeps a bot with a broken vertex from being culled (`fmin` drops a NaN); the NaN is
+  now set after the merge, in all four renderers. Not checked by the oracle, though the code does it: a bot's
+  bullet stopping on another bot's shield (`pawn_hit` 3), the riot set played in place beyond the reach bound
+  of 360, the renderers' own list of drawn indices (stage 24 counts the sections itself), and a line that meets
+  the shield's back face (both pulls from behind meet his body first).
+
 ### 48.5 Not done
 - **The window** is not drawn (translucent, unlit, opacity 0.1, distortion on a bot's attachment); it stops
   bullets.
