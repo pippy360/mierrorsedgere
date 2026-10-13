@@ -36,6 +36,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 #include "math/types.hpp"
 #include "assets/upk_loader.hpp"
+#include "anim/anim_system.hpp"
 #include "assets/ini_config.hpp"
 #include "audio/audio_engine.hpp"
 #include "cutscene/cutscene_player.hpp"
@@ -1817,7 +1818,7 @@ static int run_dump_sound_cues(const std::string& game_root, const std::string& 
 //           a pull poses, a shotgun's pellets after the one that kills, a dead bot, the cylinder
 //           when nothing poses them, the tutorial's bot
 // -----------------------------------------------------------------------------
-static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, const me::MovementConfig& move_cfg) {
+static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, const me::MovementConfig& move_cfg, const std::string& game_root) {
     using namespace me;
     constexpr float kDt = 1.0f / 60.0f;
     const std::vector<EnemyBot> enemies_before = scene.enemies;
@@ -1937,8 +1938,14 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     std::string archetype_note, reach_note, state_note[std::size(kPlayed)];
     float reach = 0.0f, state_reach[std::size(kPlayed)] = {}, sequence_reach[std::size(kPlayed)][std::size(kDeaths)] = {};
     int poses = 0;
+    // The riot shield in those poses: how many carry it (the riot cop's, every one), and how far
+    // the corners of its box get from where he stands.
+    int shield_poses = 0, shield_poses_elsewhere = 0;
+    float shield_reach = 0.0f;
+    std::string shield_reach_note;
     for (const char* archetype : kArchetypes) {
         size_t shapes = 0;
+        int archetype_poses = 0, archetype_shields = 0;
         for (size_t state = 0; state < std::size(kPlayed); ++state) {
             const Played& played = kPlayed[state];
             for (size_t q = 0; q < played.sequence_count; ++q) {
@@ -1956,10 +1963,27 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
                     EnemyBodySet s;
                     if (!renderer.pose_enemy_bodies(bot, static_cast<float>(k / 2) * 0.0437f, false, s)) continue;
                     ++poses;
+                    ++archetype_poses;
                     shapes = s.shapes.size();
                     float far = 0.0f;
                     for (const BodyShape& b : s.shapes) {
                         far = std::max(far, (b.centre - bot.position).length() + (b.kind == EBodyShape::Box ? b.half.length() : b.half.x + b.half.z));
+                    }
+                    if (s.shield.valid && s.shield.mesh) {
+                        ++archetype_shields;
+                        (bot.has_shield ? shield_poses : shield_poses_elsewhere) += 1;
+                        const Vec3& lo = s.shield.mesh->lo;
+                        const Vec3& hi = s.shield.mesh->hi;
+                        for (int c = 0; c < 8; ++c) {
+                            const Vec3 corner = s.shield.origin + s.shield.axis[0] * ((c & 1) ? hi.x : lo.x) + s.shield.axis[1] * ((c & 2) ? hi.y : lo.y) +
+                                                s.shield.axis[2] * ((c & 4) ? hi.z : lo.z);
+                            const float out = (corner - bot.position).length();
+                            far = std::max(far, out);
+                            if (out > shield_reach) {
+                                shield_reach = out;
+                                shield_reach_note = std::string(played.name) + (played.sequences[q][0] ? std::string(" with ") + played.sequences[q] : std::string());
+                            }
+                        }
                     }
                     sequence_reach[state][q] = std::max(sequence_reach[state][q], far);
                     if (far > state_reach[state]) {
@@ -1973,10 +1997,13 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
                 }
             }
         }
-        archetype_note += std::string(archetype_note.empty() ? "" : ", ") + archetype + " " + std::to_string(shapes);
+        archetype_note += std::string(archetype_note.empty() ? "" : ", ") + archetype + " " + std::to_string(shapes) +
+                          (archetype_shields > 0 ? " + a shield in " + std::to_string(archetype_shields) + " of " + std::to_string(archetype_poses) : std::string());
         asset_ok = asset_ok && shapes == std::size(kStored);
+        // The riot cop's template carries it in every pose, no other's in any.
+        asset_ok = asset_ok && archetype_shields == (std::string(archetype) == "RiotCop" ? archetype_poses : 0);
     }
-    asset_ok = asset_ok && reach < kEnemyBodyReach;
+    asset_ok = asset_ok && reach < kEnemyBodyReach && shield_poses > 0 && shield_poses_elsewhere == 0 && shield_reach < kEnemyBodyReach;
     double pose_us = 0.0;
     {
         const auto t0 = std::chrono::steady_clock::now();
@@ -1991,7 +2018,8 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         std::cout << " " << kPlayed[k].name << " " << state_reach[k];
         if (!state_note[k].empty()) std::cout << " (" << state_note[k] << ")";
     }
-    std::cout << std::endl;
+    std::cout << "; the riot shield in " << shield_poses << " poses (" << shield_poses_elsewhere << " of other templates), the corners of its box at most "
+              << shield_reach << " uu from where he stands (" << shield_reach_note << ")" << std::endl;
     if (std::getenv("ME_BODIES_DEBUG")) {
         // The reach by sequence, in the states that take one from the controller.
         for (size_t k = 0; k < std::size(kPlayed); ++k) {
@@ -2209,9 +2237,13 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         BulletTracer tracer;   // the last one of the pull
         ParkourController::EnemyShotHit expected;  // what the same line meets, asked just before
         bool expected_met = false;
+        Vec3 eye, dir;            // the line aimed along
+        float shield_at = -1.0f;  // where it crosses the first bot's shield, not drawn back (-1: it does not)
+        EnemyShield shield;       // the first bot's shield as it stood at the pull
     };
-    // One pull at the aim `which` on the first of `bots`, which are the enemies for it.
-    const auto pull = [&](const std::vector<EnemyBot>& bots, int which, bool scatter) {
+    // One pull at the point `target` gives of the first of `bots` as he stands at the pull, the bots
+    // being the enemies for it.
+    const auto pull_to = [&](const std::vector<EnemyBot>& bots, const std::function<Vec3(const EnemyBodySet&)>& target, bool scatter) {
         // The weapon's interval (a pump-action's is the longest), and the trigger let go.
         for (int i = 0; i < 16 || (i < 240 && controller.get_telemetry().weapon.cooldown > 0.0f); ++i) controller.step(idle, kDt, scene);
         scene.enemies = bots;
@@ -2222,10 +2254,15 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         const Vec3 eye = controller.get_position() + Vec3(0.0f, 0.0f, controller.get_telemetry().eye_height);
         EnemyBodySet at_pull;
         renderer.pose_enemy_bodies(scene.enemies[0], controller.get_telemetry().sim_time, controller.get_telemetry().reaction_active, at_pull);
-        const Vec3 dir = (aim_at(at_pull, which) - eye).normalized();
+        const Vec3 dir = (target(at_pull) - eye).normalized();
         std::vector<EnemyBodySet> now;
         controller.pose_enemies_for_shot(scene, eye, dir, 4000.0f, 0.0f, now);
         p.expected_met = controller.trace_enemies(scene, now, eye, dir, 4000.0f, p.expected);
+        p.eye = eye;
+        p.dir = dir;
+        Vec3 shield_normal;
+        if (!now.empty() && !trace_enemy_shield(now[0].shield, eye, dir, 4000.0f, p.shield_at, shield_normal)) p.shield_at = -1.0f;
+        if (!now.empty()) p.shield = now[0].shield;
         posed_calls = calls;
         controller.set_rotation(std::atan2(dir.y, dir.x) * RAD2DEG, std::asin(std::clamp(dir.z, -1.0f, 1.0f)) * RAD2DEG, 0.0f);
         const float health = scene.enemies[0].health;
@@ -2255,11 +2292,17 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         }
         return p;
     };
+    const auto pull = [&](const std::vector<EnemyBot>& bots, int which, bool scatter) {
+        return pull_to(bots, [&](const EnemyBodySet& s) { return aim_at(s, which); }, scatter);
+    };
     const auto say = [&](const std::string& what, bool ok, const Pull& p, const std::string& more) {
         std::cout << "  [Pulls] " << (ok ? "OK" : "FAIL") << ": " << what << ": " << (p.fired ? "" : "NOT FIRED, ") << "damage " << p.damage << ", ";
         if (p.expected_met) {
-            std::cout << "the line meets " << (p.expected.posed ? "body " + std::to_string(p.expected.body) + " " + p.expected.bone : std::string("his cylinder"))
-                      << (p.expected.head ? " (head)" : " (body)") << " at (" << p.expected.location.x << ", " << p.expected.location.y << ", "
+            std::cout << "the line meets "
+                      << (p.expected.shield ? "his riot shield (" + p.expected.bone + ")"
+                          : p.expected.posed ? "body " + std::to_string(p.expected.body) + " " + p.expected.bone + (p.expected.head ? " (head)" : " (body)")
+                                             : std::string("his cylinder") + (p.expected.head ? " (head)" : " (body)"))
+                      << " at (" << p.expected.location.x << ", " << p.expected.location.y << ", "
                       << p.expected.location.z << "), ";
         } else {
             std::cout << "the line meets nobody, ";
@@ -2377,9 +2420,291 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && !p.expected.head && p.damage == colt && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
     controller.set_enemy_body_poser(poser);
 
+    // --- Shield ----------------------------------------------------------------------------------
+    // The riot cop's shield (TdInv_Shield's RiotShield component, anim/anim_system.hpp,
+    // physics/body_shapes.hpp; research in the main checkout's build/re/open2/shield/notes.md): the
+    // asset as read, where it stands on him, and the controller's pulls at it and round it.
+    bool shield_ok = true;
+    const auto shield_say = [&](const std::string& what, bool ok, const std::string& detail) {
+        std::cout << "  [Shield] " << (ok ? "OK" : "FAIL") << ": " << what << ": " << detail << std::endl;
+        shield_ok = shield_ok && ok;
+    };
+    const auto num = [](float v, int digits) {
+        std::ostringstream text;
+        text << std::fixed << std::setprecision(digits) << v;
+        return text.str();
+    };
+    const auto v3 = [&](const Vec3& v) { return "(" + num(v.x, 2) + ", " + num(v.y, 2) + ", " + num(v.z, 2) + ")"; };
+    // A point given in Shield_Root's space, where the shield stands.
+    const auto shield_point = [](const EnemyShield& sh, float x, float y, float z) {
+        return sh.origin + sh.axis[0] * x + sh.axis[1] * y + sh.axis[2] * z;
+    };
+    // ...and back: a point of the world in Shield_Root's space.
+    const auto in_shield = [](const EnemyShield& sh, const Vec3& p) {
+        const Vec3 r = p - sh.origin;
+        return Vec3(r.dot(sh.axis[0]), r.dot(sh.axis[1]), r.dot(sh.axis[2]));
+    };
+    // A point of the world in a bot's own frame: x ahead of him, y to his right, z up from his feet.
+    const auto in_bot = [](const EnemyBot& bot, const Vec3& p) {
+        const Vec3 r = p - bot.position;
+        const float c = std::cos(bot.yaw_deg * DEG2RAD), sn = std::sin(bot.yaw_deg * DEG2RAD);
+        return Vec3(r.x * c + r.y * sn, -r.x * sn + r.y * c, r.z);
+    };
+    // The middle of its width (raw x 15.78), down its height (raw y, 0 at the hand) the middle of the
+    // composite plate (44.9) and of the window (-29.1), on its face (raw z 4.5).
+    const auto plate_of = [&](const EnemyShield& sh) { return shield_point(sh, 15.78f, 44.9f, 4.5f); };
+    const auto at_plate = [&](const EnemyBodySet& set_now) { return plate_of(set_now.shield); };
+    const auto at_window = [&](const EnemyBodySet& set_now) { return shield_point(set_now.shield, 15.78f, -29.1f, 4.5f); };
+    // The middle of one body's shape of the given kind.
+    const auto body_centre = [](const EnemyBodySet& set_now, uint8_t body, EBodyShape kind) {
+        for (const BodyShape& b : set_now.shapes) {
+            if (b.body == body && b.kind == kind) return b.centre;
+        }
+        return set_now.bound_centre;
+    };
+    {
+        // The asset: SK_WP_RiotShield and AS_AI_RiotCop_OneHanded read here on their own, and what a
+        // riot cop the renderer poses carries.
+        const std::string cooked = game_root + "/TdGame/CookedPC/";
+        SkeletalMeshAsset shield_mesh;
+        UPKPackage pkg_shield(cooked + "Weapons/WP_RiotShield.upk");
+        if (pkg_shield.is_valid()) {
+            for (const auto& exp : pkg_shield.get_exports()) {
+                if (pkg_shield.get_export_class(exp) == "SkeletalMesh" && exp.object_name == "SK_WP_RiotShield") {
+                    AnimSystem::parse_skeletal_mesh(pkg_shield, exp, shield_mesh);
+                    break;
+                }
+            }
+        }
+        static const struct {
+            const char* material;
+            int triangles;
+        } kSections[] = {{"M_RiotShield", 754}, {"M_RiotShield_Glass", 166}, {"M_RiotShield_Composite", 166}};
+        bool sections_ok = shield_mesh.sections.size() == std::size(kSections);
+        std::string sections_note;
+        int drawn = 0;
+        for (size_t k = 0; k < shield_mesh.sections.size(); ++k) {
+            const SkelMeshSection& sec = shield_mesh.sections[k];
+            sections_note += (k ? ", " : "") + sec.material_name + " " + std::to_string(sec.num_triangles);
+            sections_ok = sections_ok && k < std::size(kSections) && sec.material_name == kSections[k].material && sec.num_triangles == kSections[k].triangles;
+            if (sec.material_name.find("Glass") == std::string::npos) drawn += sec.num_triangles;
+        }
+        AnimSetAsset riot_set;
+        UPKPackage pkg_riot(cooked + "Animations/AS_AI_RiotCop_OneHanded.upk");
+        if (pkg_riot.is_valid()) AnimSystem::parse_anim_set_package(pkg_riot, riot_set);
+        bool set_ok = riot_set.sequences.size() == 29;
+        for (const char* name : {"Stand", "standfire", "walkfwd", "MeleeStart", "MeleeEnd", "SnatchBack"}) set_ok = set_ok && riot_set.find_sequence(name) != nullptr;
+        // What a bullet is tested against, as the posed riot cop carries it.
+        EnemyBot riot_bot = make_bot("AITemplate_RiotCop", "SteyrTMP");
+        EnemyBodySet rs;
+        const bool riot_posed = renderer.pose_enemy_bodies(riot_bot, 0.0f, false, rs) && rs.valid && rs.shield.valid && rs.shield.mesh != nullptr;
+        const EnemyShieldMesh* cm = riot_posed ? rs.shield.mesh : nullptr;
+        const Vec3 want_lo(-21.10f, -48.58f, -5.57f), want_hi(52.66f, 79.38f, 8.32f);
+        const float box_off = cm ? std::max({std::abs(cm->lo.x - want_lo.x), std::abs(cm->lo.y - want_lo.y), std::abs(cm->lo.z - want_lo.z),
+                                             std::abs(cm->hi.x - want_hi.x), std::abs(cm->hi.y - want_hi.y), std::abs(cm->hi.z - want_hi.z)})
+                                 : 1.0e9f;
+        const bool collision_ok = cm && cm->vertices.size() == 1174 && cm->indices.size() == 3 * 1086 && box_off < 0.01f;
+        // No other skeleton has a socket for it, even under a bot made to carry one; a riot cop made
+        // to carry none has none.
+        std::string carried_by;
+        for (const char* archetype : kArchetypes) {
+            EnemyBot b = make_bot(archetype, "Colt1911");
+            b.has_shield = true;
+            EnemyBodySet bs;
+            if (renderer.pose_enemy_bodies(b, 0.0f, false, bs) && bs.shield.valid) carried_by += std::string(carried_by.empty() ? "" : ", ") + archetype;
+        }
+        riot_bot.has_shield = false;
+        EnemyBodySet none;
+        const bool bare = renderer.pose_enemy_bodies(riot_bot, 0.0f, false, none) && !none.shield.valid;
+        const bool ok = shield_mesh.bones.size() == 8 && shield_mesh.vertices.size() == 1174 && shield_mesh.indices.size() == 3258 && sections_ok && drawn == 920 &&
+                        set_ok && collision_ok && carried_by == "RiotCop" && bare;
+        shield_say("the asset", ok,
+                   "SK_WP_RiotShield " + std::to_string(shield_mesh.bones.size()) + " bones, " + std::to_string(shield_mesh.vertices.size()) + " vertices, " +
+                       std::to_string(shield_mesh.indices.size() / 3) + " triangles (" + sections_note + "; drawn " + std::to_string(drawn) +
+                       ", all but the window); met by a bullet on a posed riot cop: " + (cm ? std::to_string(cm->vertices.size()) : std::string("no")) + " vertices, " +
+                       (cm ? std::to_string(cm->indices.size() / 3) : std::string("no")) + " triangles in " + (cm ? v3(cm->lo) + " .. " + v3(cm->hi) : std::string("-")) +
+                       " (the package's within " + num(box_off, 3) + "); AS_AI_RiotCop_OneHanded " + std::to_string(riot_set.sequences.size()) +
+                       " sequences with Stand, standfire, walkfwd, MeleeStart, MeleeEnd, SnatchBack: " + (set_ok ? "yes" : "NO") +
+                       "; made to carry one, the shield hangs on: " + (carried_by.empty() ? std::string("none") : carried_by) + "; a riot cop with none: " +
+                       (bare ? "none" : "ONE"));
+    }
+    {
+        // Where it stands on him: Stand at its first key (the disarm's state plays the sequence it is
+        // named from its start; the idle state blends standfire in), against the research's pose of
+        // the same rule (s7_pose.py: box (34.8, -37.1, 1.0) .. (48.7, 36.7, 129.0) in his own frame,
+        // the plate's normal straight ahead), and the idle as the controller has him.
+        const auto shield_box_in_bot = [&](const EnemyBot& bot, const EnemyBodySet& bs, Vec3& lo, Vec3& hi) {
+            for (int c = 0; c < 8; ++c) {
+                const EnemyShieldMesh& m = *bs.shield.mesh;
+                const Vec3 p = in_bot(bot, shield_point(bs.shield, (c & 1) ? m.hi.x : m.lo.x, (c & 2) ? m.hi.y : m.lo.y, (c & 4) ? m.hi.z : m.lo.z));
+                lo = c == 0 ? p : Vec3(std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z));
+                hi = c == 0 ? p : Vec3(std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z));
+            }
+        };
+        EnemyBot standing = make_bot("AITemplate_RiotCop", "SteyrTMP");
+        standing.anim_state = EEnemyAnimState::BeingDisarmed;
+        standing.stunned = true;
+        standing.active_anim_seq = "Stand";
+        standing.anim_timer = 0.0f;
+        EnemyBodySet bs;
+        const bool posed_stand = renderer.pose_enemy_bodies(standing, 0.0f, false, bs) && bs.shield.valid && bs.shield.mesh;
+        Vec3 lo, hi;
+        float off = 1.0e9f, normal_deg = 180.0f, down_deg = 180.0f;
+        if (posed_stand) {
+            shield_box_in_bot(standing, bs, lo, hi);
+            const Vec3 want_lo(34.8f, -37.1f, 1.0f), want_hi(48.7f, 36.7f, 129.0f);
+            off = std::max({std::abs(lo.x - want_lo.x), std::abs(lo.y - want_lo.y), std::abs(lo.z - want_lo.z), std::abs(hi.x - want_hi.x),
+                            std::abs(hi.y - want_hi.y), std::abs(hi.z - want_hi.z)});
+            const Vec3 normal = in_bot(standing, standing.position + bs.shield.axis[2]);
+            const Vec3 down = in_bot(standing, standing.position + bs.shield.axis[1]);
+            normal_deg = std::acos(std::clamp(normal.x, -1.0f, 1.0f)) * RAD2DEG;
+            down_deg = std::acos(std::clamp(-down.z, -1.0f, 1.0f)) * RAD2DEG;
+        }
+        // The idle (standfire blended with Stand), at the stage's first moment.
+        EnemyBot idling = make_bot("AITemplate_RiotCop", "SteyrTMP");
+        idling.anim_state = EEnemyAnimState::Idle;
+        EnemyBodySet is;
+        Vec3 ilo, ihi;
+        const bool posed_idle = renderer.pose_enemy_bodies(idling, 0.0f, false, is) && is.shield.valid && is.shield.mesh;
+        if (posed_idle) shield_box_in_bot(idling, is, ilo, ihi);
+        const bool ok = posed_stand && posed_idle && off < 0.2f && normal_deg < 1.0f && down_deg < 1.0f;
+        shield_say("its pose", ok,
+                   "Stand at its first key, the shield's box in his frame " + v3(lo) + " .. " + v3(hi) + " (within " + num(off, 3) +
+                       " of the research's), the plate's normal " + num(normal_deg, 3) + " degrees off straight ahead, its height " + num(down_deg, 3) +
+                       " off upright; idling " + v3(ilo) + " .. " + v3(ihi));
+    }
+    {
+        // The controller's pulls: she on the terrace, the riot cop facing her with his TMP.
+        controller.equip_weapon("Colt1911");
+        const std::vector<EnemyBot> riot = {make_bot("AITemplate_RiotCop", "SteyrTMP")};
+        // What a pull left of him, against a pull that passes over him.
+        struct Left {
+            float health;
+            EEnemyAnimState state;
+            std::string sequence;
+            bool stunned, alive;
+            uint8_t stumble;
+        };
+        const auto left = [&]() {
+            const EnemyBot& b = scene.enemies[0];
+            return Left{b.health, b.anim_state, b.active_anim_seq, b.stunned, b.alive, b.combat.stumble};
+        };
+        const auto same = [](const Left& a, const Left& b) {
+            return a.health == b.health && a.state == b.state && a.sequence == b.sequence && a.stunned == b.stunned && a.alive == b.alive && a.stumble == b.stumble;
+        };
+        const auto left_note = [&](const Left& a) {
+            return "health " + num(a.health, 0) + ", state " + std::to_string(static_cast<int>(a.state)) + ", sequence '" + a.sequence + "', " +
+                   (a.stunned ? "stunned" : "not stunned") + ", stumble " + std::to_string(a.stumble);
+        };
+        // The tracer of a shield's hit ends where the line crosses the triangle, 4 uu short of it.
+        const auto drawn_back = [](const Pull& q) {
+            return q.shield_at >= 0.0f ? (q.tracer.end_pos - (q.eye + q.dir * (q.shield_at - kShieldPullBack))).length() : 1.0e9f;
+        };
+        const auto shield_pull = [&](const Pull& q) {
+            return "the line meets " +
+                   std::string(q.expected.shield ? "his riot shield (" + q.expected.bone + ")" : q.expected_met ? "body " + q.expected.bone : std::string("nothing")) +
+                   " " + num(q.expected.distance, 2) + " uu off, the shield's triangle " + (q.shield_at >= 0.0f ? num(q.shield_at, 2) + " uu off" : std::string("not on it")) +
+                   "; damage " + num(q.damage, 0) + ", tracer pawn_hit " + std::to_string(q.tracer.pawn_hit) + " ends " +
+                   num((q.tracer.end_pos - q.eye).length(), 2) + " uu off";
+        };
+        Pull over = pull_to(riot, [&](const EnemyBodySet& bs) { return bs.bound_centre + up * 400.0f; }, false);
+        const Left untouched = left();
+        Pull q = pull_to(riot, at_plate, false);
+        const Left plate_left = left();
+        const float marker = controller.get_telemetry().hit_marker_timer;
+        const Vec3 aimed = in_bot(riot[0], plate_of(q.shield));
+        shield_say("a Colt at the plate's middle", q.fired && over.fired && q.expected.shield && q.expected.bone == "Shield_Root" && q.damage == 0.0f &&
+                                                       same(plate_left, untouched) && q.tracer.pawn_hit == 4 && drawn_back(q) < 0.05f && as_asked(q) && marker <= 0.0f,
+                   shield_pull(q) + " (" + num(drawn_back(q), 3) + " from 4 uu short of the triangle), aimed at " + v3(aimed) +
+                       " in his frame; he is left with " + left_note(plate_left) + " (a pull over his head leaves " + left_note(untouched) + "); hit marker " +
+                       num(marker, 2));
+        controller.equip_weapon("M95");
+        q = pull_to(riot, at_plate, false);
+        shield_say("an M95 at the plate's middle", q.fired && q.expected.shield && q.damage == 0.0f && q.alive && q.tracer.pawn_hit == 4 && drawn_back(q) < 0.05f,
+                   shield_pull(q) + " (a sniper's bullet on a body takes 99999)");
+        controller.equip_weapon("Colt1911");
+        q = pull_to(riot, at_window, false);
+        const Vec3 on_window = in_shield(q.shield, q.eye + q.dir * std::max(q.shield_at, 0.0f));
+        shield_say("a Colt at the window's middle", q.fired && q.expected.shield && q.damage == 0.0f && q.tracer.pawn_hit == 4 && drawn_back(q) < 0.05f &&
+                                                        on_window.y < -9.58f && on_window.y > -48.58f,
+                   shield_pull(q) + "; the triangle met is at " + v3(on_window) + " in the shield's space (the window: y -48.58 .. -9.58)");
+        // His gun hand (the RightHand body, PM_Character_Head), a few units outside the shield's
+        // edge: he stands so that she looks at it square to the shield.
+        std::vector<EnemyBot> hand_on = riot;
+        {
+            EnemyBodySet bs;
+            renderer.pose_enemy_bodies(hand_on[0], controller.get_telemetry().sim_time, false, bs);
+            const Vec3 hand = body_centre(bs, 9, EBodyShape::Capsule);
+            const float aside = (hand - controller.get_position()).dot(right);
+            hand_on[0].position = hand_on[0].home_position = hand_on[0].position - right * aside;
+        }
+        q = pull_to(hand_on, [&](const EnemyBodySet& bs) { return body_centre(bs, 9, EBodyShape::Capsule); }, false);
+        shield_say("a Colt at his gun hand", q.fired && q.expected_met && q.expected.posed && !q.expected.shield && q.expected.bone == "RightHand" && q.damage > 0.0f &&
+                                                 q.damage == colt_takes(hand_on[0], q.expected) && q.tracer.pawn_hit == 1 && as_asked(q),
+                   shield_pull(q) + " (his armour 0.6 on the body, the hand's material the head's)");
+        // From behind: his back, and a line at the plate's middle that has to go through him first.
+        std::vector<EnemyBot> away = riot;
+        away[0].yaw_deg = 90.0f;
+        q = pull_to(away, [&](const EnemyBodySet& bs) { return aim_at(bs, kAimBelly); }, false);
+        shield_say("from behind, at his back", q.fired && q.expected_met && q.expected.posed && !q.expected.shield && q.damage > 0.0f &&
+                                                   q.damage == colt_takes(away[0], q.expected) && q.tracer.pawn_hit == 1 && as_asked(q),
+                   shield_pull(q));
+        q = pull_to(away, at_plate, false);
+        shield_say("from behind, through him at the plate", q.fired && q.expected_met && q.expected.posed && !q.expected.shield && q.damage > 0.0f &&
+                                                                q.shield_at > q.expected.distance && q.tracer.pawn_hit == 1 && as_asked(q),
+                   shield_pull(q));
+        // Shot dead: he keeps it (TdBotPawn.Died and PlayDying leave the inventory be), and it is met
+        // as he is drawn, showing nothing.
+        std::vector<EnemyBot> last_breath = hand_on;
+        last_breath[0].health = 1.0f;
+        q = pull_to(last_breath, [&](const EnemyBodySet& bs) { return body_centre(bs, 9, EBodyShape::Capsule); }, false);
+        EnemyBodySet shot_dead;
+        renderer.pose_enemy_bodies(scene.enemies[0], controller.get_telemetry().sim_time, false, shot_dead);
+        const bool kept = !scene.enemies[0].alive && scene.enemies[0].has_shield && shot_dead.shield.valid;
+        EnemyBot dead_riot = make_bot("AITemplate_RiotCop", "None");
+        dead_riot.alive = false;
+        dead_riot.health = 0.0f;
+        dead_riot.stunned = true;
+        dead_riot.anim_state = EEnemyAnimState::KnockedOut;
+        dead_riot.active_anim_seq = "HitMeleeRight";
+        dead_riot.anim_timer = 2.0f;
+        q = pull_to({dead_riot}, at_plate, false);
+        shield_say("a riot cop shot dead", kept && q.fired && q.expected.shield && q.damage == 0.0f && q.tracer.pawn_hit == 3 && drawn_back(q) < 0.05f,
+                   std::string("killed at the hand he ") + (kept ? "keeps his shield" : "LOSES his shield") + "; a dead one's (drawn at the end of HitMeleeRight): " +
+                       shield_pull(q));
+        // A disarm (from behind, the only way TdAI_Riot.QueryDisarmState allows) takes it, as it ends.
+        scene.dropped_weapons.clear();
+        for (int i = 0; i < 16; ++i) controller.step(idle, kDt, scene);
+        EnemyBot victim = make_bot("AITemplate_RiotCop", "SteyrTMP");
+        victim.position = victim.home_position = Vec3(controller.get_position().x, controller.get_position().y + 150.0f, bot_at.z);
+        victim.yaw_deg = 90.0f;
+        scene.enemies = {victim};
+        InputFrame grab{};
+        grab.disarm = true;
+        controller.step(grab, kDt, scene);
+        const bool snatching = controller.get_move_state() == EMovement::MOVE_Snatch;
+        const bool from_back = controller.get_telemetry().snatch_from_back;
+        const float length = controller.get_telemetry().combat_anim_duration;
+        bool held_midway = false;
+        int steps = 0;
+        for (; steps < 600 && controller.get_move_state() == EMovement::MOVE_Snatch; ++steps) {
+            controller.step(idle, kDt, scene);
+            if (steps == 30) held_midway = scene.enemies[0].has_shield;
+        }
+        EnemyBodySet disarmed;
+        const bool posed_after = renderer.pose_enemy_bodies(scene.enemies[0], controller.get_telemetry().sim_time, false, disarmed);
+        shield_say("a disarm", snatching && from_back && held_midway && controller.get_move_state() != EMovement::MOVE_Snatch && !scene.enemies[0].has_shield &&
+                                   posed_after && disarmed.valid && !disarmed.shield.valid,
+                   std::string(snatching ? "her move begins" : "NO MOVE") + (from_back ? " from behind" : "") + ", " + num(length, 3) + " s long; half a second in he " +
+                       (held_midway ? "still has" : "has LOST") + " his shield; it ends after " + std::to_string(steps + 1) + " steps and he " +
+                       (scene.enemies[0].has_shield ? "STILL HAS it" : "has none") + "; posed, his bodies " + (disarmed.valid ? "are there" : "are NOT there") +
+                       " and the shield " + (disarmed.shield.valid ? "IS" : "is not"));
+    }
+    pass = pass && shield_ok;
+
     std::cout << std::defaultfloat << std::setprecision(6);
     std::cout << "  -> Stage 24 Result: " << (pass ? "PASS" : "FAIL") << " (Asset=" << (asset_ok ? "OK" : "FAIL") << ", Lines=" << (lines_ok ? "OK" : "FAIL")
-              << ", Rays=" << (rays_ok ? "OK" : "FAIL") << ", a pose " << pose_us << " us)" << std::endl;
+              << ", Rays=" << (rays_ok ? "OK" : "FAIL") << ", Shield=" << (shield_ok ? "OK" : "FAIL") << ", a pose " << pose_us << " us)" << std::endl;
     scene.enemies = enemies_before;
     scene.active_tracers = tracers_before;
     scene.dropped_weapons = dropped_before;
@@ -5984,7 +6309,7 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     const bool s23_pass = oracle_sound_attenuation(game_root);
     // Stage 24: the player's bullets against an enemy's posed bodies (oracle_enemy_bodies above).
     std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
-    const bool s24_pass = oracle_enemy_bodies(renderer, sim_scene, move_cfg);
+    const bool s24_pass = oracle_enemy_bodies(renderer, sim_scene, move_cfg, game_root);
     // Stage 25: where a restart at a checkpoint puts her (check_checkpoint_respawns above), in the
     // two levels loaded here; --verify-respawn does every chapter.
     std::cout << "[Oracle Stage 25] Testing Restarts at the Checkpoints (TdSPStoryGame.RestartPlayer)..." << std::endl;
@@ -8692,7 +9017,7 @@ int main(int argc, char* argv[]) {
         me::LevelScene scene;
         if (!me::load_level_scene(game_root, "Maps/SP00/Tutorial_p.me1", scene)) return 1;
         std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
-        return oracle_enemy_bodies(renderer, scene, move_cfg) ? 0 : 1;
+        return oracle_enemy_bodies(renderer, scene, move_cfg, game_root) ? 0 : 1;
     }
     if (verify_botfire) {
         me::Renderer renderer;

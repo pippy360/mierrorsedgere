@@ -442,7 +442,8 @@ private:
                              const SkeletalMeshAsset*& out_mesh, std::vector<Vec3>& out_comp_pos,
                              std::vector<Quat4>& out_comp_quat) const;
     // Where the riot shield hangs on a bot so posed: Shield_Root's place and axes in the bot's own
-    // frame. False when he has none (EnemyBot::has_shield), or his skeleton has no LeftWeapon.
+    // frame. False when he has none (EnemyBot::has_shield), or his mesh is not SK_TKY_Cop_Riot (the one
+    // character mesh with a ShieldSocket), or it has no LeftWeapon.
     bool enemy_shield_frame(const EnemyBot& bot, const SkeletalMeshAsset& body_mesh, const std::vector<Vec3>& comp_pos,
                             const std::vector<Quat4>& comp_quat, Vec3& out_origin, Vec3 out_axis[3]) const;
     // The bots' physics asset (init_from_game_root): its bodies, and for each archetype the bone of

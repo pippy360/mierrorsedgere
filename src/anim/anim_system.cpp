@@ -3036,6 +3036,7 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
     // his animation, so the riot set is played in place: its root keeps the reference pose's
     // translation. (The patrol cop's sets keep theirs, as before.)
     const int32_t riot_root = [&] {
+        if (!riot) return -1;
         const auto it = body_mesh.bone_name_to_index.find("root");
         return it != body_mesh.bone_name_to_index.end() ? it->second : -1;
     }();
@@ -3064,11 +3065,13 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
 // (in Shield_Root's space, its raw space) stands at LeftWeapon's place plus LeftWeapon's rotation of
 // it in the cop's raw mesh space: the rule a weapon is held by on the other hand. (The attach chain,
 // child RotOrigin x socket x bone x parent, is stock UE3's, INFERRED; with the riot cop's own
-// sequences it stands the shield upright on the floor and square to his front.) A skeleton with no
-// LeftWeapon has no socket for it, and the shield is neither drawn nor met.
+// sequences it stands the shield upright on the floor and square to his front.) Another mesh has no
+// socket for it (AttachComponentToSocket finds none), and the shield is neither drawn nor met.
 bool AnimSystem::enemy_shield_frame(const EnemyBot& bot, const SkeletalMeshAsset& body_mesh, const std::vector<Vec3>& comp_pos,
                                     const std::vector<Quat4>& comp_quat, Vec3& out_origin, Vec3 out_axis[3]) const {
     if (!bot.has_shield || riot_shield_collision_.indices.empty()) return false;
+    // The socket is SK_TKY_Cop_Riot's alone (the port reads no sockets: the mesh stands for it).
+    if (&body_mesh != &enemy_models_[EnemyArch_Riot].mesh) return false;
     const auto it = body_mesh.bone_name_to_index.find("leftweapon");
     if (it == body_mesh.bone_name_to_index.end() || it->second < 0) return false;
     const size_t b = static_cast<size_t>(it->second);
