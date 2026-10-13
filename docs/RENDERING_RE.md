@@ -565,11 +565,18 @@ with the particles' batches under the decals' bias, in the order made. What it h
 a lift or a door where that is now (`find_impact_surface`). A hole in a mover is clipped and kept in the place
 the level has the mover in, and its triangles are carried to where the mover is each frame they are drawn, a
 lift's part by its offset and a door about its hinge (`dynamic_decal_vertices`). Not as the game: on BSP a
-hole lies on all the BSP in its box, not on the one node; a bullet hole does not fade, it goes; a computed
-decal is clipped onto the static meshes and BSP of every loaded package, where the game asks the colliding
-components of the decal's own level only (a model of both rules over the data leaves 167 of the 199 the
-port's rule puts on static meshes with nothing to lie on in the game; no retail picture was held against it,
-so they stay). The door
+hole lies on all the BSP in its box, not on the one node; a bullet hole does not fade, it goes. A computed
+decal is clipped onto the BSP and the colliding static meshes (`CollideActors` on the actor and on its
+component: what the collision hash holds) of its own level only, as the game asks (the owner test above; each
+`BspRenderBin` carries its package). In the chapters 177 of the 236 the port computed went: the 134 that lie
+only on another package's meshes, the 10 only on another package's BSP, and the 33 only on meshes that do
+not collide. Retail pictures agree for each kind: The Boat's `Boat_Cont` `DecalActor_10` (on the yard's ground
+of another package) is in none of five intro frames; the Factory's bay labels `MD_A1_01` and `MD_A2_01` (on a
+garage door that does not collide) are not on the door from either side, and the Scraper lobby's
+`MD_RoomText_01` and `MD_Logo` of `Scraper_Lobby` (on the BSP of `Scraper_Deck-Lobby_Slc`) are not drawn a
+second time over their stored twins (the main checkout's ignored `build/re/open2/decalcheck/notes.md`,
+"Retail captures"). No retail picture yet shows one of the 59 left (on its own level's colliding meshes or
+BSP) drawn: that retail draws no computed decal at all fits the frames as well. The door
 with the stripes opens by its Matinee and its decals go with it ([`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md)
 section 9). Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
@@ -904,8 +911,9 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
 - **Bullets:** there is no riot shield; a bot's shot at the player is a line through a stand-in for her
   bodies, in their reference pose, and whether it shows is judged by distance alone (section 13).
-- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load lie on more than the
-  game's do; a bullet hole on BSP is not kept to one node (section 12).
+- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load may lie on meshes that
+  do not collide, which the game's query probably leaves out; a bullet hole on BSP is not kept to one node
+  (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
 - **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.

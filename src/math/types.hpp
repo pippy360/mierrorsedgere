@@ -833,6 +833,7 @@ struct LevelActor {
     // BlockActors && BlockNonZeroExtent (pawn movement) / BlockZeroExtent (traces).
     bool is_collidable = true;   // blocks non-zero-extent (player / AI movement) checks
     bool blocks_traces = true;   // blocks zero-extent line checks
+    bool collide_actors = true;  // bCollideActors && CollisionComponent.CollideActors: in the collision hash at all
     bool is_hidden = false;      // bHidden / HiddenGame: collides but is never drawn
     bool collide_complex = false; // Actor.bCollideComplex: ignore simple collision, collide per poly
     bool is_blocking_volume = false;
