@@ -76,10 +76,17 @@ inline float source_high_frequency_gain(float nodes_gain) {
     return std::clamp(nodes_gain, kMinHighFrequencyGain, kMaxHighFrequencyGain);
 }
 
-// A SoundNodeRandom's pick among its inputs, by weight.
-int pick_random_child(const SoundCueNode& n) {
+// A SoundNodeRandom's pick among its inputs, by weight; with `allowed`, among those it lets through
+// (when it lets none through, among all).
+template <typename Allowed>
+int pick_random_child(const SoundCueNode& n, Allowed allowed) {
     if (n.children.empty()) return -1;
-    const auto weight = [&n](size_t i) { return (i < n.weights.size()) ? std::max(n.weights[i], 0.0f) : 1.0f; };
+    bool any = false;
+    for (size_t i = 0; i < n.children.size(); ++i) any = any || allowed(i);
+    const auto weight = [&](size_t i) {
+        if (any && !allowed(i)) return 0.0f;
+        return (i < n.weights.size()) ? std::max(n.weights[i], 0.0f) : 1.0f;
+    };
     float total = 0.0f;
     for (size_t i = 0; i < n.children.size(); ++i) total += weight(i);
     float pick = rand_normalized() * total;
@@ -87,7 +94,14 @@ int pick_random_child(const SoundCueNode& n) {
         if (pick < weight(i)) return static_cast<int>(i);
         pick -= weight(i);
     }
+    for (size_t i = n.children.size(); i-- > 0;) {
+        if (weight(i) > 0.0f) return static_cast<int>(i);
+    }
     return static_cast<int>(n.children.size()) - 1;
+}
+
+int pick_random_child(const SoundCueNode& n) {
+    return pick_random_child(n, [](size_t) { return true; });
 }
 
 // Memory read callbacks for libvorbisfile
@@ -1131,6 +1145,19 @@ void AudioEngine::reset_emitters() {
 // audio update (USoundNode::ParseNodes, vtable slot 74). `state` is what the nodes above have left
 // in the component; `finished` is the component's bFinished, which the parse starts at true and a
 // wave that is playing, or a delay that is waiting, clears.
+bool AudioEngine::reaches_loaded_wave(const SoundCueDef& cue, int node, int depth) const {
+    if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || depth > 64) return false;
+    const SoundCueNode& n = cue.nodes[static_cast<size_t>(node)];
+    if (n.kind == SoundCueNode::Kind::Wave) {
+        const auto clip = sound_clips_.find(n.wave);
+        return clip != sound_clips_.end() && !clip->second.pcm_data.empty();
+    }
+    for (int child : n.children) {
+        if (reaches_loaded_wave(cue, child, depth + 1)) return true;
+    }
+    return false;
+}
+
 void AudioEngine::parse_emitter_node(EmitterState& st, const SoundCueDef& cue, int node, EmitterParse state, std::vector<int>& path,
                                      bool& finished) {
     if (node < 0 || static_cast<size_t>(node) >= cue.nodes.size() || static_cast<size_t>(node) >= st.nodes.size()) return;
@@ -1218,9 +1245,14 @@ void AudioEngine::parse_emitter_node(EmitterState& st, const SoundCueDef& cue, i
             // (0x00B7EFB1) and parses one input, here the one drawn by weight at its first parse.
             // (That it keeps the input until a loop above it has it draw again is stock Unreal
             // Engine 3's node: the function was not read beyond the store above.)
+            // The draw is among the inputs that are empty (retail's silence) or reach a wave the
+            // port has loaded: retail has every wave, so it never draws one that leaves the round
+            // without an end.
             state.seamless = false;
             if (payload.requires_init) {
-                payload.pick = pick_random_child(n);
+                payload.pick = pick_random_child(n, [&](size_t i) {
+                    return n.children[i] < 0 || reaches_loaded_wave(cue, n.children[i]);
+                });
                 payload.requires_init = false;
             }
             if (payload.pick >= 0 && static_cast<size_t>(payload.pick) < n.children.size()) {

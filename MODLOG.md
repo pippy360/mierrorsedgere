@@ -2585,7 +2585,9 @@ back from the engine, or a source's state asked of OpenAL.
   the end of the walk, a `BirdsChirp` in New Eden, its random node having drawn its empty input. The walk
   gives the same numbers when run again. The Shard's 18 places with none (3 before) were not looked at
   singly; a prop that is not parsed past its `MaxUpdateDistance`, where its far layer alone used to sound,
-  is a rule that can do it.
+  is a rule that can do it. A random node draws only among its empty inputs and those that reach a wave
+  the port has loaded (all of them when none does): retail has every wave, and an emitter that drew an
+  unloaded one would stop for good, its round unable to end. The walk's numbers are the same with it.
 - **On the audio device, silent** (`--audio-device-check`, OpenAL Soft): the device gives the 32 emitter
   sources and a low-pass filter for every source that plays sounds at a place, and takes a filter on a
   source; ten sounds at a place, the dullest filter at 0.6888 (a `WindHard` 1563 uu off: `1 - 1553 / 4990`).

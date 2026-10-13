@@ -493,6 +493,8 @@ private:
     };
     void parse_emitter_node(EmitterState& st, const SoundCueDef& cue, int node, EmitterParse state, std::vector<int>& path,
                             bool& finished);
+    // Whether a node of a cue has, at or below it, a wave the port has loaded.
+    bool reaches_loaded_wave(const SoundCueDef& cue, int node, int depth = 0) const;
     // A wave's source has played to its end (FWaveInstance::NotifyFinished, 0x00B64640).
     void emitter_wave_finished(EmitterState& st, const SoundCueDef* cue, int wave);
     void stop_emitter_source(size_t source);
