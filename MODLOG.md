@@ -2865,3 +2865,104 @@ a Colt, and the riot cops a Steyr TMP's; pursuit cops no longer shoot.
   (fire interval, range, spread: still the port's numbers): each is in `TODO.md`.
 - Who a bot takes for his enemy and when he stands to fire are still the controller's own rules, and a
   helicopter's riders still stand as bots where their factories spawn them (they no longer fire).
+
+---
+
+## 46. World Matinees move their actors (agent/matinee-movers, 2026-10-11 to 2026-10-13)
+
+`TODO.md`'s "World Matinees move nothing": a `SeqAct_Interp`'s movement track was played only for the lifts
+and the barge doors; every other `InterpActor` stayed where the level placed it. What the game does, with
+the executable's addresses, is `docs/GAMEPLAY_SCRIPTING_RE.md` section 9; the research, with a second
+reader's verdicts (`verify.md` overrides `notes.md`), is in the main checkout's ignored
+`build/re/open2/movers/`.
+
+### 46.1 What the game does (in short; section 9 has it all)
+- A movement track does nothing when its Matinee is updated. The actor moves itself while it is
+  `PHYS_Interpolating` (an `InterpActor`'s default): `AActor::physInterpolating` (0x00ef9870) finds the first
+  `SeqAct_Interp` in its `LatentActions` with a group for it and goes, by `UWorld::MoveActor`, to where that
+  group's first movement track has it at the Matinee's `Position`. The move is placed, not swept; for an
+  actor that collides `CheckEncroachment` asks about the pawn in the way (pushed first, then
+  `InterpActor.EncroachingOn`, which stops a mover with `bStopOnEncroach` that comes at her).
+- Where the track puts it: `Base * Initial * Rel(t)` for `IMF_RelativeToInitial`, `Base * Rel(t)` for
+  `IMF_World`, `Initial` taken from where the actor stands when the Matinee is initialised
+  (`CalcInitialTransform`, 0x00e51ad0) with the key transform of that moment divided out.
+- Playback by `USeqAct_Interp`'s `Play` (forced start, rewind), `StepInterp`, `SetPosition` (a skip: no
+  event keys, `Completed`) and `DeActivated` (`Completed` at the end, `Aborted` at the start, nothing part
+  way). An actor no Matinee is on stays where the last one left it until the level is loaded again.
+
+### 46.2 What was wrong
+- Nothing a script's Matinee names moved but the lifts' parts and the barge doors: Flight's office door,
+  the trains, the gondolas, the girders and the construction lift stood where they were placed. Two restarts stood on one of them: Jacknife's `construction` (a girder the checkpoint's events raise
+  into place: she fell 1413 and died) and Ropeburn's `Train_Ride_End` (the train, hidden where it is
+  placed: she landed on the track 518 below). Both were on `kRestartsOnMovers`.
+- The restart harness ran no script, so a checkpoint's own events (the ones that raise the girder) never
+  ran there.
+
+### 46.3 Changes
+- **`src/game/matinee_move.hpp`** (new): the track evaluation (`FInterpCurveVector` as 0x00e40ae0,
+  `MakeFromEuler`, the quaternion path, `CalcInitialTransform`, `GetLocationAtTime`) in the port's
+  column-vector matrices.
+- **`src/game/level_script.*`**: the move tracks are read with their Matinee (`MoveFrame`, keys, tangents,
+  modes, `bUseQuatInterpolation`); `Play`, `Reverse`, `Stop`, `Pause`, `Change Dir`, looping, rewind
+  (`bRewindOnPlay`, `bRewindIfAlreadyPlaying`, `bNoResetOnRewind`), `bForceStartPos` and the outputs by the
+  rules above; `PlayRate` and `ForceStartPosition` from a linked variable (a `SeqVar_RandomFloat` drawn each
+  time, for `SeqAct_Delay` too); the host's `interp_*` callbacks.
+- **`src/game/script_movers.hpp`** (new): `update_script_movers`, every mover's physics tick once a frame
+  after the script's update, bases before what they carry; `bind_scene_movers`; `reset_script_movers` for a
+  level loaded again.
+- **`src/assets/upk_loader.*`**: `assign_script_movers` (`LevelScene::movers`, the placed `InterpActor`s a
+  script's track is bound to and what is attached to them, one mover for an actor cooked into two packages;
+  `LevelScene::matinee_moves`); `build_script_mover_geometry` (each mover's triangles in a collision world of
+  its own, where the level placed it, and a `MeshBuffer` of its own); `release_script_doors` (a door only
+  Matinees move becomes the script's; a door she barges, one a player's cutscene swings and one no Matinee
+  touches stay the port's). A relative lift track now goes on from its first key. `script_mover_census`.
+- **`src/physics/parkour_controller.*`**: every query visits the movers (through the inverse of the mover's
+  `delta`); `carried_by_mover` (she goes with what she stands on); `encroached_by_mover` (pushed, then
+  `EncroachingOn`).
+- **Renderers** (Direct3D 11, OpenGL, Metal, and Vulkan after the rebase): a mover's mesh is drawn with its
+  `delta`, and moving geometry is kept out of the cached far shadow cascade (`scene_mesh_moves`).
+  `light_environment.hpp`, `impact_effects.hpp` (`MoverPose` kind 3: decals and bullet holes ride with it),
+  `script_effects.hpp`.
+- **`src/main.cpp`**: the game loop runs the movers after the script; oracle stage 29
+  (`oracle_matinee_movers`) and `--verify-movers` (stage 29, then the census by chapter; `ME_MOVER_DEBUG=1`);
+  `--verify-respawn` runs the level's script as a restart runs it (`load_last_checkpoint`'s order), and
+  `kRestartsOnMovers` loses `construction` and `Train_Ride_End`; `--intro-shots` takes `ME_SHOT_SCRIPT`,
+  `ME_SHOT_EVENT` and `ME_SHOT_MATINEE` (`docs/RENDERING_RE.md`'s table).
+
+### 46.4 Checked (Windows, Direct3D 11, headless)
+- **Oracle stage 29** (`--verify-movers`): Eval: the office door from yaw 270 to 140.630, its place moved
+  0.002; New Eden's lift hull off by 0.000 at 0 s and 1279.999 up at 10 s; Ropeburn's first train at its end
+  y -34095.973; the construction lift back to 0.003 of its start, 1648.001 away at its furthest; a turn from 0
+  to 270 at 135 half way by its angles, -45 by quaternion. Playback: the end after 16 ticks of 0.01 s,
+  `Completed` the tick after, again with no rewind, reversed to 0, `Stop` at 0.050 with no output, a `Stop` on
+  an idle Matinee silent, paused at 0.070 and resumed, a loop round twice in 50 s and still playing, a forced
+  start at 3.000 with rate 2.000 rewound by its own `Completed`, a linked `PlayRate` of 1.048 drawn from
+  1..2. Door: shut it is on the line and a walk gets 35.7 short; open (-129.37 degrees about its hinge, 0.002
+  off) a walk gets 841.9 past; shut on her it pushes her 81.4 and stays at 0 degrees. Ride: Heat's gondola
+  1352.003 uu and she 1352.003 with it, on it throughout, back at its start reversed; Jacknife's girder 4886.6
+  up from its `ForceStartPosition`, then 880.3 in 5 s with her on it.
+- **The census** (`--verify-movers`, every chapter): 1,191 Matinees with a movement track on a placed actor
+  in the packages the port loads; 835 move the script's movers, 193 only what the port's lifts and doors
+  move, 163 only actors that are not moved (above all skeletal mesh actors: 227 `SkeletalMeshActor` and 9 `SkeletalMeshActorMAT` bindings); 463 have something
+  that blocks: 278 moved, 185 the lifts' and doors', none left unmoved. 1,204 movers, 389 with collision.
+- **Restarts** (`--verify-respawn`, the level's script run): 202 places: 190 stand where they are put, 7 in a
+  lift's cab, 1 on something the script moves (Jacknife's `construction`: on the girder,
+  `Stormdrain_StdE_Spt:InterpActor_10`, raised 496 under her, 18.5 from the spot), 3 fall and live (Ropeburn's
+  `Train_Ride_End` now lands 85 down on the train's roof, where she landed 518 down on the track), 1 known
+  (The Shard's `Scraper_Start`), 0 failed; largest drift 0.039.
+- **Pictures:** `--intro-shots Maps/SP01/Escape_p.me1 "0.50,6.00"` with
+  `ME_SHOT_STAND="4480,7600,12672"`, `ME_SHOT_LOOK="0,180"`, `ME_SHOT_MATINEE="escape_off:SeqAct_Interp_0@1"`:
+  Flight's office door (`S_SP01_Door_01`) shut at 0.5 s and swung open about its hinge at 6 s, lit as before,
+  the lettering decal at its foot turned with it (kept in the main checkout's ignored
+  `build/re/open2/movers/shots/`).
+- **`--verify-all`:** ALL SYSTEMS PASS: stages 1 to 27 and 29 (after the rebase onto `main` at `c6eb457`).
+- **Builds:** `mirrorsedge_windows` and `mirrorsedge_opengl` here; `vulkan_renderer.cpp` compiles here with the
+  MSYS2 Vulkan headers (the Vulkan executable does not link on this machine: MSYS2's `libshaderc_combined.a`
+  wants SPIRV-Tools after it, a build-setup matter of `main`); the macOS build on CI (run 38426355440, `macos-15`: compiles and links, nothing run).
+
+### 46.5 Not done
+- The event and sound keys at Time 0 still do not fire (`TODO.md`); a world Matinee's sound track is not
+  played; its float, vector, colour, visibility and anim-control tracks do nothing; `SeqEvent_Mover` is not
+  run; skeletal mesh actors a track names are not moved; a based pawn's view does not turn with its base.
+- The lifts keep the port's machine and `settle_lifts_for_restart`; in retail the script's Matinees move
+  them too.

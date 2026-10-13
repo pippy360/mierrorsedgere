@@ -569,9 +569,9 @@ hole lies on all the BSP in its box, not on the one node; a bullet hole does not
 decal is clipped onto the static meshes and BSP of every loaded package, where the game asks the colliding
 components of the decal's own level only (a model of both rules over the data leaves 167 of the 199 the
 port's rule puts on static meshes with nothing to lie on in the game; no retail picture was held against it,
-so they stay); the door
-with the stripes does not open here, the port playing no Matinee's movement but the lifts' and the barge
-doors'. Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
+so they stay). The door
+with the stripes opens by its Matinee and its decals go with it ([`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md)
+section 9). Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
 ## 13. Particles
 
