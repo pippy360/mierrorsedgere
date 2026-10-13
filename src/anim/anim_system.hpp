@@ -263,6 +263,14 @@ public:
         size_t index_list = 0;    // enemy_swat_index_lists() entry to draw
         size_t index_count = 0;   // leading indices of that list to draw (0 = nothing to draw)
         uint32_t archetype_id = 0; // EnemyArchetypeId (0..EnemyArch_Count-1) for GPU texture binding
+        // The riot shield he carries (EnemyBot::has_shield), when his skeleton has the bone it hangs
+        // on: riot_shield_vertices() through riot_shield_draw_indices(), with the textures named
+        // kRiotShieldTextures in the weapon's slots, placed in the bot's own frame by shield_model
+        // (the renderers' model matrix is the bot's times it), and its box there (for the bounds).
+        bool shield = false;
+        Mat4 shield_model;
+        Vec3 shield_lo{0.0f, 0.0f, 0.0f};
+        Vec3 shield_hi{0.0f, 0.0f, 0.0f};
     };
     EnemySwatDraw evaluate_enemy_swat_indexed(const EnemyBot& bot, float sim_time, bool reaction_disarm,
                                               Vertex* out_vertices) const;
@@ -300,6 +308,22 @@ public:
 
     // Lookup a loaded weapon skeletal mesh by weapon name (Colt1911, Glock18, BerettaM93R, SteyrTMP, MP5K, G36C, FNSCARL, Remington870, Neostead, FNMinimi, M95)
     [[nodiscard]] const SkeletalMeshAsset* get_weapon_mesh(const std::string& weapon_name) const;
+
+    // The riot shield: TdInv_Shield's RiotShield component, WP_RiotShield.SK_WP_RiotShield (eight
+    // bones of a weapon's skeleton, every vertex rigid on Shield_Root, which stands at the mesh's
+    // origin unturned; three sections: M_RiotShield the frame and grips, M_RiotShield_Glass the
+    // window, M_RiotShield_Composite the lower plate), with T_RiotShield_D and T_RiotShield_S.
+    [[nodiscard]] const SkeletalMeshAsset& riot_shield_mesh() const { return riot_shield_mesh_; }
+    // What the renderers upload once: its vertices in Shield_Root's space, shaded as a weapon's
+    // (u2 2.0, the textures in the weapon's slots, found under this name among the weapons'), and
+    // the triangles of the frame and the plate. The window, an unlit translucent material of
+    // opacity 0.1 with distortion, is not drawn.
+    static constexpr const char* kRiotShieldTextures = "RiotShield";
+    [[nodiscard]] const std::vector<Vertex>& riot_shield_vertices() const { return riot_shield_vertices_; }
+    [[nodiscard]] const std::vector<uint32_t>& riot_shield_draw_indices() const { return riot_shield_draw_indices_; }
+    // What a bullet meets in it: every one of its triangles, the window's included (the per-poly
+    // tree stored in the package holds all 1086), in Shield_Root's space.
+    [[nodiscard]] const EnemyShieldMesh& riot_shield_collision() const { return riot_shield_collision_; }
 
     // Standalone binary parsers exposed for inspection and unit verification
     static bool parse_skeletal_mesh(const UPKPackage& pkg, const FObjectExport& exp, SkeletalMeshAsset& out_mesh);
@@ -354,6 +378,7 @@ public:
     [[nodiscard]] const AnimSetAsset& faith_colt_anims() const { return faith_colt_set_; }
     [[nodiscard]] const AnimSetAsset& swat_anims() const { return swat_set_; }
     [[nodiscard]] const AnimSetAsset& swat_2h_anims() const { return swat_2h_set_; }
+    [[nodiscard]] const AnimSetAsset& riot_anims() const { return riot_set_; }
     [[nodiscard]] const std::vector<AnimBlendConfig>& blend_configs() const { return blend_configs_; }
 
 private:
@@ -379,6 +404,10 @@ private:
     std::array<EnemyCharacterModel, EnemyArch_Count> enemy_models_{};
     SkeletalMeshAsset heli_mesh_;
     DXT1Texture heli_diffuse_tex_;
+    SkeletalMeshAsset riot_shield_mesh_;
+    std::vector<Vertex> riot_shield_vertices_;
+    std::vector<uint32_t> riot_shield_draw_indices_;
+    EnemyShieldMesh riot_shield_collision_;
     SkeletalMeshAsset colt1911_mesh_;
     std::unordered_map<std::string, SkeletalMeshAsset> weapon_meshes_;
 
@@ -400,6 +429,9 @@ private:
     AnimSetAsset swat_set_;
     AnimSetAsset swat_2h_set_;
     AnimSetAsset celeste_set_;
+    // AITemplate_RiotCop's AnimationSets[0] (the riot cop's only set): 29 sequences, every one with
+    // the shield arm up. Where it has no sequence of the name asked for, swat_set_'s is played.
+    AnimSetAsset riot_set_;
 
     std::vector<AnimBlendConfig> blend_configs_;
 
@@ -409,6 +441,11 @@ private:
     bool pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyArchetypeId& out_arch,
                              const SkeletalMeshAsset*& out_mesh, std::vector<Vec3>& out_comp_pos,
                              std::vector<Quat4>& out_comp_quat) const;
+    // Where the riot shield hangs on a bot so posed: Shield_Root's place and axes in the bot's own
+    // frame. False when he has none (EnemyBot::has_shield), or his mesh is not SK_TKY_Cop_Riot (the one
+    // character mesh with a ShieldSocket), or it has no LeftWeapon.
+    bool enemy_shield_frame(const EnemyBot& bot, const SkeletalMeshAsset& body_mesh, const std::vector<Vec3>& comp_pos,
+                            const std::vector<Quat4>& comp_quat, Vec3& out_origin, Vec3 out_axis[3]) const;
     // The bots' physics asset (init_from_game_root): its bodies, and for each archetype the bone of
     // its skeleton that carries each body (-1: that skeleton has no bone of the name, and the body
     // is left out, as USkeletalMeshComponent::MatchRefBone leaves it out).

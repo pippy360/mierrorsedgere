@@ -238,8 +238,14 @@ struct MetalRenderer::Impl {
         uint32_t archetype_id = 0;
         bool in_view = false;     // may cover pixels of the camera view (world pass)
         bool in_shadow = false;   // may cover texels of the near shadow cascade (shadow pass)
+        bool shield = false;      // his riot shield is drawn too, placed in his frame by shield_model
+        Mat4 shield_model;
     };
     std::vector<EnemyFrameDraw> frame_enemy_draws;
+    // The riot shield, one copy for every bot that carries one: AnimSystem::riot_shield_vertices()
+    // through riot_shield_draw_indices(), as a triangle list (the corners in order).
+    id<MTLBuffer> shield_vertex_buffer = nil;
+    NSUInteger shield_corner_count = 0;
     AnimSystem anim_system;
 
     // Triple-buffered CPU/GPU frame synchronization & reusable dynamic vertex buffers
@@ -1180,6 +1186,28 @@ struct MetalRenderer::Impl {
             wtex.mask     = upload_dxt1_texture(wmesh.tex_mask, true);
             weapon_gpu_textures[wname] = wtex;
         }
+
+        // The riot shield: its textures among the weapons' (the world shader's weapon slots), and
+        // the triangles drawn of it.
+        shield_vertex_buffer = nil;
+        shield_corner_count = 0;
+        const std::vector<Vertex>& shield_vertices = anim_system.riot_shield_vertices();
+        const std::vector<uint32_t>& shield_indices = anim_system.riot_shield_draw_indices();
+        if (!shield_vertices.empty() && !shield_indices.empty()) {
+            WeaponGPUTextures stex{};
+            stex.diffuse = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_diffuse, true);
+            stex.specular = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_specular, true);
+            weapon_gpu_textures[AnimSystem::kRiotShieldTextures] = stex;
+            std::vector<Vertex> corners;
+            corners.reserve(shield_indices.size());
+            for (const uint32_t i : shield_indices) {
+                if (i < shield_vertices.size()) corners.push_back(shield_vertices[i]);
+            }
+            shield_vertex_buffer = [device newBufferWithBytes:corners.data()
+                                                       length:corners.size() * sizeof(Vertex)
+                                                      options:MTLResourceStorageModeShared];
+            if (shield_vertex_buffer) shield_corner_count = static_cast<NSUInteger>(corners.size());
+        }
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
@@ -1581,7 +1609,18 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     hiz = std::fmax(hiz, p.z);
                     has_nan |= (p.x != p.x) | (p.y != p.y) | (p.z != p.z);
                 }
-                if (has_nan) lox = NAN;
+                if (mesh.shield && impl->shield_corner_count > 0) {
+                    // ...and his shield's box.
+                    lox = std::fmin(lox, mesh.shield_lo.x);
+                    loy = std::fmin(loy, mesh.shield_lo.y);
+                    loz = std::fmin(loz, mesh.shield_lo.z);
+                    hix = std::fmax(hix, mesh.shield_hi.x);
+                    hiy = std::fmax(hiy, mesh.shield_hi.y);
+                    hiz = std::fmax(hiz, mesh.shield_hi.z);
+                    draw.shield = true;
+                    draw.shield_model = mesh.shield_model;
+                }
+                if (has_nan) lox = NAN;  // (after the shield's box: fmin would take a NaN out again)
                 const Vec3 lo(lox, loy, loz);
                 const Vec3 hi(hix, hiy, hiz);
                 const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
@@ -1619,6 +1658,24 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
             [encoder drawPrimitives:MTLPrimitiveTypeTriangle
                         vertexStart:0
                         vertexCount:impl_->frame_enemy_draws[ei].corner_count];
+        };
+        // Draws enemy ei's riot shield if he carries one (after draw_enemy_mesh, with what that left
+        // bound): the shield's own buffer, under the bot's model matrix times the shield's place in his
+        // frame (TdInv_Shield.Activate: SetShadowParent and SetLightEnvironment to his mesh's, so it
+        // goes into his shadows and takes his light). `fragment`: the pass's fragment stage reads the
+        // uniforms too (the world pass). Leaves the bot's model matrix in the uniforms.
+        auto draw_enemy_shield = [&](id<MTLRenderCommandEncoder> encoder, size_t ei, bool fragment) {
+            const auto& draw = impl_->frame_enemy_draws[ei];
+            if (!draw.shield || !impl_->shield_vertex_buffer || impl_->shield_corner_count == 0) return;
+            const auto& bot = active_scene.enemies[ei];
+            const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+            const Mat4 shield_model = bot_model * draw.shield_model;
+            std::memcpy(&uniforms.model, shield_model.m, sizeof(float) * 16);
+            [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+            if (fragment) [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+            [encoder setVertexBuffer:impl_->shield_vertex_buffer offset:0 atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:impl_->shield_corner_count];
+            std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
         };
 
         // A buffer of one actor that the level's script has hidden (a broken pane, a pane's twin in waiting).
@@ -1723,6 +1780,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                         [shEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                         draw_enemy_mesh(shEnc, ei);
+                        draw_enemy_shield(shEnc, ei, false);
                     }
                     std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);
                 }
@@ -1790,6 +1848,7 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                         std::memcpy(&uniforms.model, bot_model.m, sizeof(float) * 16);
                         [cellEnc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
                         draw_enemy_mesh(cellEnc, s.index);
+                        draw_enemy_shield(cellEnc, s.index, false);
                     } else if (s.kind == ModShadow::Kind::Mesh) {
                         const auto& mesh = active_scene.meshes[s.index];
                         if (!impl_->cached_mesh_buffers[s.index]) continue;
@@ -1998,6 +2057,11 @@ void MetalRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
                 set_light_env(&impl_->light_envs.enemy(active_scene, ei, telemetry.sim_time), Vec3(0.0f, 0.0f, 0.0f));
                 draw_enemy_mesh(enc, ei);
+                if (impl_->frame_enemy_draws[ei].shield) {
+                    // His shield, in his light, with its own textures in the weapon's slots.
+                    bind_world_char_wep_textures(AnimSystem::kRiotShieldTextures, impl_->frame_enemy_draws[ei].archetype_id);
+                    draw_enemy_shield(enc, ei, true);
+                }
             }
             set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
             std::memcpy(&uniforms.model, identity.m, sizeof(float) * 16);

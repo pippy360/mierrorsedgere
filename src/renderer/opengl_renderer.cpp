@@ -539,10 +539,16 @@ struct OpenGLRenderer::Impl {
         uint32_t archetype_id = 0;
         bool in_view = false;    // may cover pixels of the camera view (world pass)
         bool in_shadow = false;  // may cover texels of the near shadow cascade (shadow pass)
+        bool shield = false;     // his riot shield is drawn too, placed in his frame by shield_model
+        Mat4 shield_model;
     };
     std::vector<EnemyFrameDraw> frame_enemy_draws;
     std::vector<Vertex*> enemy_mapped;  // this frame's write pointer into each enemy's vertex buffer (null = not posed)
     std::vector<GLuint> enemy_index_buffers;
+    // The riot shield, one copy for every bot that carries one (AnimSystem::riot_shield_vertices()).
+    // (Its vertex buffer is a GpuBuffer, declared with them below.)
+    GLuint shield_index_buffer = 0;
+    GLsizei shield_index_count = 0;
     static constexpr float kEnemyReach = 1024.0f;  // UU: a posed enemy's vertices are within this of its origin
     AnimSystem anim_system;
 
@@ -583,6 +589,7 @@ struct OpenGLRenderer::Impl {
     std::vector<GpuBuffer> dyn_vertex_buffers;
     size_t dyn_vertex_cursor = 0;
     std::vector<GpuBuffer> enemy_vertex_buffers;
+    GpuBuffer shield_vertex_buffer;  // the riot shield's (fixed contents)
 
     static size_t dynamic_buffer_capacity(size_t length) {
         return std::max<size_t>((length + 4095u) & ~size_t(4095u), 65536u);
@@ -2203,6 +2210,25 @@ struct OpenGLRenderer::Impl {
         for (const std::vector<uint32_t>& list : anim_system.enemy_swat_index_lists()) {
             enemy_index_buffers.push_back(list.empty() ? 0 : make_static_buffer(list.data(), list.size() * sizeof(uint32_t)));
         }
+
+        // The riot shield: its textures among the weapons' (the world shader's weapon slots), its
+        // vertices and the triangles drawn of it.
+        destroy_buffer(shield_vertex_buffer);
+        if (shield_index_buffer) glDeleteBuffers(1, &shield_index_buffer);
+        shield_index_buffer = 0;
+        shield_index_count = 0;
+        const std::vector<Vertex>& shield_vertices = anim_system.riot_shield_vertices();
+        const std::vector<uint32_t>& shield_indices = anim_system.riot_shield_draw_indices();
+        if (!shield_vertices.empty() && !shield_indices.empty()) {
+            WeaponGPUTextures stex{};
+            stex.diffuse = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_diffuse, true);
+            stex.specular = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_specular, true);
+            weapon_gpu_textures[AnimSystem::kRiotShieldTextures] = stex;
+            shield_vertex_buffer.vbo = make_static_buffer(shield_vertices.data(), shield_vertices.size() * sizeof(Vertex));
+            shield_vertex_buffer.capacity = shield_vertices.size() * sizeof(Vertex);
+            shield_index_buffer = make_static_buffer(shield_indices.data(), shield_indices.size() * sizeof(uint32_t));
+            if (shield_vertex_buffer.vbo && shield_index_buffer) shield_index_count = static_cast<GLsizei>(shield_indices.size());
+        }
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
@@ -2673,7 +2699,18 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                 hiz = std::fmax(hiz, p.z);
                 has_nan |= (p.x != p.x) | (p.y != p.y) | (p.z != p.z);
             }
-            if (has_nan) lox = NAN;
+            if (mesh.shield && impl->shield_index_count > 0) {
+                // ...and his shield's box.
+                lox = std::fmin(lox, mesh.shield_lo.x);
+                loy = std::fmin(loy, mesh.shield_lo.y);
+                loz = std::fmin(loz, mesh.shield_lo.z);
+                hix = std::fmax(hix, mesh.shield_hi.x);
+                hiy = std::fmax(hiy, mesh.shield_hi.y);
+                hiz = std::fmax(hiz, mesh.shield_hi.z);
+                draw.shield = true;
+                draw.shield_model = mesh.shield_model;
+            }
+            if (has_nan) lox = NAN;  // (after the shield's box: fmin would take a NaN out again)
             const Vec3 lo(lox, loy, loz);
             const Vec3 hi(hix, hiy, hiz);
             const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
@@ -2704,6 +2741,24 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
         impl->flush_bindings();
         glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(draw.index_count), GL_UNSIGNED_INT, nullptr);
         ++impl->prof_draws;
+    };
+    // Draws enemy ei's riot shield if he carries one (after draw_enemy_mesh, with what that left
+    // bound): the shield's own buffers, under the bot's model matrix times the shield's place in his
+    // frame (TdInv_Shield.Activate: SetShadowParent and SetLightEnvironment to his mesh's, so it
+    // goes into his shadows and takes his light). Leaves the bot's model matrix in the uniforms.
+    auto draw_enemy_shield = [&](size_t ei) {
+        const Impl::EnemyFrameDraw& draw = impl->frame_enemy_draws[ei];
+        if (!draw.shield || impl->shield_index_count == 0) return;
+        const EnemyBot& bot = active_scene.enemies[ei];
+        const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+        set_matrix(uniforms.model, bot_model * draw.shield_model);
+        push_uniforms();
+        set_scene_vertices(&impl->shield_vertex_buffer);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, impl->shield_index_buffer);
+        impl->flush_bindings();
+        glDrawElements(GL_TRIANGLES, impl->shield_index_count, GL_UNSIGNED_INT, nullptr);
+        ++impl->prof_draws;
+        set_matrix(uniforms.model, bot_model);
     };
 
     // A buffer of one actor that the level's script has hidden (a broken pane, a pane's twin in waiting).
@@ -2793,6 +2848,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
                     push_uniforms();
                     draw_enemy_mesh(ei);
+                    draw_enemy_shield(ei);
                 }
                 set_matrix(uniforms.model, identity);
             }
@@ -2861,6 +2917,7 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                     set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
                     push_uniforms();
                     draw_enemy_mesh(s.index);
+                    draw_enemy_shield(s.index);
                 } else if (s.kind == ModShadow::Kind::Mesh) {
                     const auto& mesh = active_scene.meshes[s.index];
                     if (!impl->cached_mesh_buffers[s.index].vbo) continue;
@@ -3075,6 +3132,11 @@ void OpenGLRenderer::render_frame(const LevelScene& scene, const PlayerTelemetry
                 push_uniforms();
                 set_light_env(&impl->light_envs.enemy(active_scene, ei, telemetry.sim_time), Vec3(0.0f, 0.0f, 0.0f));
                 draw_enemy_mesh(ei);
+                if (impl->frame_enemy_draws[ei].shield) {
+                    // His shield, in his light, with its own textures in the weapon's slots.
+                    bind_world_char_wep_textures(AnimSystem::kRiotShieldTextures, impl->frame_enemy_draws[ei].archetype_id);
+                    draw_enemy_shield(ei);
+                }
             }
             set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
             set_matrix(uniforms.model, identity);

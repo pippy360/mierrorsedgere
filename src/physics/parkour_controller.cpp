@@ -558,6 +558,7 @@ ParkourController::ParkourController(const MovementConfig& config)
 void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.tick = 0;
     m_telemetry.sim_time = 0.0f;
+    m_disarmed_bot = -1;
     m_ai_bursts.clear();  // TdAIManager's turns are stamped with the clock that starts over here
     m_telemetry.position = spawn_pos;
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
@@ -1345,6 +1346,13 @@ void ParkourController::step(const InputFrame& input, float dt, LevelScene& scen
         if (bot.disarm_weapon.empty()) continue;
         bot.disarm_weapon_time -= effective_dt;
         if (bot.disarm_weapon_time <= 0.0f || m_telemetry.move_state != EMovement::MOVE_Snatch) bot.disarm_weapon.clear();
+    }
+    // TdMove_Disarmed.OnCustomAnimEnd: the disarm has run its course, and the bot's inventory goes
+    // (DiscardInventory destroys each item, the TdInv_Shield among them, and with it the component
+    // on his mesh: stock Engine, INFERRED). Here it ends with her move.
+    if (m_disarmed_bot >= 0 && m_telemetry.move_state != EMovement::MOVE_Snatch) {
+        if (static_cast<size_t>(m_disarmed_bot) < scene.enemies.size()) scene.enemies[static_cast<size_t>(m_disarmed_bot)].has_shield = false;
+        m_disarmed_bot = -1;
     }
     m_telemetry.balance_lean = std::clamp(m_balance_lean + m_balance_sway, -1.0f, 1.0f);
     if (m_telemetry.move_state != EMovement::MOVE_Balance) {
@@ -5725,6 +5733,7 @@ bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector
             out.posed = true;
             out.body = h.body;
             out.bone.assign(h.bone);
+            out.shield = h.shield;
             continue;
         }
         // The cylinder is a living bot's alone, as it was before there were bodies.
@@ -5743,6 +5752,7 @@ bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector
                 out.posed = false;
                 out.body = 0;
                 out.bone.clear();
+                out.shield = false;
                 // Where it goes in: the near side of the cylinder, not its middle.
                 const float inside = kBotRadius * kBotRadius - dist_xy * dist_xy;
                 out.location = closest - dir * (inside > 0.0f ? std::sqrt(inside) : 0.0f);
@@ -5977,6 +5987,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             }
 
             std::string snatched_wep = bot.weapon_name;
+            m_disarmed_bot = static_cast<int32_t>(&bot - scene.enemies.data());
             bot.disarm_window = false;
             bot.stunned = true;
             bot.attack_timer = 0.0f;
@@ -6111,9 +6122,14 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                 tracer_end = on_helicopter.location;
             }
 
+            // A bullet that stops on a riot shield does nothing to the bot who carries it:
+            // TdBotPawn.TakeDamage returns at once when HitInfo.HitComponent's TemplateName is
+            // 'RiotShield', before any damage is worked out (a sniper's bullet as well), and
+            // TdInv_Shield.TakeDamage is empty. No stumble, no hit marker.
+            const bool on_shield = hit_bot != nullptr && shot.shield;
             // TdBotPawn.TakeDamage: nothing for a bot already dead (an earlier pellet of this pull
             // killed him, or he lay there before it); the bullet stops in him all the same.
-            if (hit_bot != nullptr && hit_bot->alive) {
+            if (hit_bot != nullptr && hit_bot->alive && !on_shield) {
                 any_hit = true;
                 const AimTemplate& bot_template = find_aim_template(hit_bot->archetype);
                 const BotWeapon* fired = find_bot_weapon(ws.name);
@@ -6205,10 +6221,13 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.end_pos = tracer_end;
             tr.timer = 0.09f;
             tr.max_time = 0.09f;
-            tr.hit_enemy = (hit_bot != nullptr);
+            tr.hit_enemy = (hit_bot != nullptr) && !on_shield;
             // TdBotPawn.PreventWeaponImpactEffect: a bot that is dying or dead (the shot that killed
             // him included: the damage comes first) shows nothing; TdBotPawn_Tutorial's never does.
             tr.pawn_hit = hit_bot ? ((hit_bot->alive && !is_tutorial_bot(*hit_bot)) ? 1 : 3) : 0;
+            // His shield names no physical material: the weapon's default effect and sound and no
+            // hole (pawn_hit 4, game/impact_effects.hpp), and nothing on one who is dying or dead.
+            if (on_shield) tr.pawn_hit = (hit_bot->alive && !is_tutorial_bot(*hit_bot)) ? 4 : 3;
             tr.pawn_normal = shot.normal;
             tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;
             if (on_helicopter.helicopter >= 0) {

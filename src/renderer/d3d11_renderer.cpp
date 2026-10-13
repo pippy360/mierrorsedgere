@@ -398,10 +398,16 @@ struct D3D11Renderer::Impl {
         uint32_t archetype_id = 0;
         bool in_view = false;    // may cover pixels of the camera view (world pass)
         bool in_shadow = false;  // may cover texels of the near shadow cascade (shadow pass)
+        bool shield = false;     // his riot shield is drawn too, placed in his frame by shield_model
+        Mat4 shield_model;
     };
     std::vector<EnemyFrameDraw> frame_enemy_draws;
     std::vector<Vertex*> enemy_mapped;  // this frame's write pointer into each enemy's vertex buffer (null = not posed)
     std::vector<ComPtr<ID3D11Buffer>> enemy_index_buffers;
+    // The riot shield, one copy for every bot that carries one (AnimSystem::riot_shield_vertices()).
+    ComPtr<ID3D11Buffer> shield_vertex_buffer;
+    ComPtr<ID3D11Buffer> shield_index_buffer;
+    UINT shield_index_count = 0;
     static constexpr float kEnemyReach = 1024.0f;  // UU: a posed enemy's vertices are within this of its origin
     AnimSystem anim_system;
 
@@ -1517,6 +1523,32 @@ struct D3D11Renderer::Impl {
             }
             enemy_index_buffers.push_back(buffer);
         }
+
+        // The riot shield: its textures among the weapons' (the world shader's weapon slots), its
+        // vertices and the triangles drawn of it.
+        shield_vertex_buffer.Reset();
+        shield_index_buffer.Reset();
+        shield_index_count = 0;
+        const std::vector<Vertex>& shield_vertices = anim_system.riot_shield_vertices();
+        const std::vector<uint32_t>& shield_indices = anim_system.riot_shield_draw_indices();
+        if (!shield_vertices.empty() && !shield_indices.empty()) {
+            WeaponGPUTextures stex{};
+            stex.diffuse = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_diffuse, true);
+            stex.specular = upload_dxt1_texture(anim_system.riot_shield_mesh().tex_specular, true);
+            weapon_gpu_textures[AnimSystem::kRiotShieldTextures] = stex;
+            D3D11_BUFFER_DESC d{};
+            d.ByteWidth = static_cast<UINT>(shield_vertices.size() * sizeof(Vertex));
+            d.Usage = D3D11_USAGE_IMMUTABLE;
+            d.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            D3D11_SUBRESOURCE_DATA init{};
+            init.pSysMem = shield_vertices.data();
+            device->CreateBuffer(&d, &init, &shield_vertex_buffer);
+            d.ByteWidth = static_cast<UINT>(shield_indices.size() * sizeof(uint32_t));
+            d.BindFlags = D3D11_BIND_INDEX_BUFFER;
+            init.pSysMem = shield_indices.data();
+            device->CreateBuffer(&d, &init, &shield_index_buffer);
+            if (shield_vertex_buffer && shield_index_buffer) shield_index_count = static_cast<UINT>(shield_indices.size());
+        }
     }
 
     void build_faith_viewmodel(const PlayerTelemetry& telemetry) {
@@ -1949,7 +1981,18 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 hiz = std::fmax(hiz, p.z);
                 has_nan |= (p.x != p.x) | (p.y != p.y) | (p.z != p.z);
             }
-            if (has_nan) lox = NAN;
+            if (mesh.shield && impl->shield_index_count > 0) {
+                // ...and his shield's box.
+                lox = std::fmin(lox, mesh.shield_lo.x);
+                loy = std::fmin(loy, mesh.shield_lo.y);
+                loz = std::fmin(loz, mesh.shield_lo.z);
+                hix = std::fmax(hix, mesh.shield_hi.x);
+                hiy = std::fmax(hiy, mesh.shield_hi.y);
+                hiz = std::fmax(hiz, mesh.shield_hi.z);
+                draw.shield = true;
+                draw.shield_model = mesh.shield_model;
+            }
+            if (has_nan) lox = NAN;  // (after the shield's box: fmin would take a NaN out again)
             const Vec3 lo(lox, loy, loz);
             const Vec3 hi(hix, hiy, hiz);
             const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
@@ -1979,6 +2022,23 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
         ctx->IASetIndexBuffer(impl->enemy_index_buffers[draw.index_list].Get(), DXGI_FORMAT_R32_UINT, 0);
         ctx->DrawIndexed(static_cast<UINT>(draw.index_count), 0, 0);
         ++impl->prof_draws;
+    };
+    // Draws enemy ei's riot shield if he carries one (after draw_enemy_mesh, with what that left
+    // bound): the shield's own buffers, under the bot's model matrix times the shield's place in his
+    // frame (TdInv_Shield.Activate: SetShadowParent and SetLightEnvironment to his mesh's, so it
+    // goes into his shadows and takes his light). Leaves the bot's model matrix in the uniforms.
+    auto draw_enemy_shield = [&](size_t ei) {
+        const Impl::EnemyFrameDraw& draw = impl->frame_enemy_draws[ei];
+        if (!draw.shield || impl->shield_index_count == 0) return;
+        const EnemyBot& bot = active_scene.enemies[ei];
+        const Mat4 bot_model = Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD);
+        set_matrix(uniforms.model, bot_model * draw.shield_model);
+        push_uniforms();
+        set_scene_vertices(impl->shield_vertex_buffer.Get());
+        ctx->IASetIndexBuffer(impl->shield_index_buffer.Get(), DXGI_FORMAT_R32_UINT, 0);
+        ctx->DrawIndexed(impl->shield_index_count, 0, 0);
+        ++impl->prof_draws;
+        set_matrix(uniforms.model, bot_model);
     };
 
     // A buffer of one actor that the level's script has hidden (a broken pane, a pane's twin in waiting).
@@ -2075,6 +2135,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
                     push_uniforms();
                     draw_enemy_mesh(ei);
+                    draw_enemy_shield(ei);
                 }
                 set_matrix(uniforms.model, identity);
             }
@@ -2136,6 +2197,7 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                     set_matrix(uniforms.model, Mat4::translation(bot.position) * Mat4::rotation_z(bot.yaw_deg * DEG2RAD));
                     push_uniforms();
                     draw_enemy_mesh(s.index);
+                    draw_enemy_shield(s.index);
                 } else if (s.kind == ModShadow::Kind::Mesh) {
                     const auto& mesh = active_scene.meshes[s.index];
                     if (!impl->cached_mesh_buffers[s.index]) continue;
@@ -2342,6 +2404,11 @@ void D3D11Renderer::render_frame(const LevelScene& scene, const PlayerTelemetry&
                 push_uniforms();
                 set_light_env(&impl->light_envs.enemy(active_scene, ei, telemetry.sim_time), Vec3(0.0f, 0.0f, 0.0f));
                 draw_enemy_mesh(ei);
+                if (impl->frame_enemy_draws[ei].shield) {
+                    // His shield, in his light, with its own textures in the weapon's slots.
+                    bind_world_char_wep_textures(AnimSystem::kRiotShieldTextures, impl->frame_enemy_draws[ei].archetype_id);
+                    draw_enemy_shield(ei);
+                }
             }
             set_light_env(nullptr, Vec3(0.0f, 0.0f, 0.0f));
             set_matrix(uniforms.model, identity);

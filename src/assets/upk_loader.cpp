@@ -5367,6 +5367,7 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                         EnemyBot bot{};
                         bot.archetype = bot_template;
                         bot.weapon_name = weapon;
+                        bot.has_shield = template_carries_shield(ai_template);
                         bot.position = sp;
                         bot.home_position = sp;
                         bot.yaw_deg = yaw_deg;

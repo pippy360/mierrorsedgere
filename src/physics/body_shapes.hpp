@@ -60,23 +60,52 @@ struct EnemyBody {
     ECharacterSurface surface = ECharacterSurface::Body;  // PhysMaterial (math/types.hpp)
 };
 
+// A mesh a bot carries whose own triangles a bullet is tested against: the riot shield
+// (TdInv_Shield's RiotShield component, WP_RiotShield.SK_WP_RiotShield). Its mesh names a
+// PerPolyCollisionBones (Shield_Root) and has no physics asset, so USkeletalMeshComponent::LineCheck
+// takes the per-triangle branch for a bullet's trace (TRACEFLAG_Bullet) and no other trace meets it.
+// The tree the package stores for that bone holds all 1086 triangles on all 1174 vertices. Here
+// they are, in the bone's space, with their box.
+struct EnemyShieldMesh {
+    std::vector<Vec3> vertices;
+    std::vector<uint32_t> indices;  // three to a triangle
+    Vec3 lo{0.0f, 0.0f, 0.0f}, hi{0.0f, 0.0f, 0.0f};
+};
+
+// The per-triangle hit is drawn back along the line (USkeletalMeshComponent::LineCheck,
+// MirrorsEdge.exe 0xd53a52..0xd53b91): Time - Min(4 / Dist, Max(0.1, 0.1 / Dist)), Dist the
+// line's whole length, which is 4 uu for any line over 40 long (every weapon's), and reports the
+// bone named there.
+inline constexpr float kShieldPullBack = 4.0f;
+inline constexpr std::string_view kShieldBone = "Shield_Root";
+
+// The shield as one bot carries it at one moment: its bone's frame in the world.
+struct EnemyShield {
+    bool valid = false;
+    Vec3 origin{0.0f, 0.0f, 0.0f};
+    Vec3 axis[3] = {Vec3(1.0f, 0.0f, 0.0f), Vec3(0.0f, 1.0f, 0.0f), Vec3(0.0f, 0.0f, 1.0f)};  // unit, square to each other
+    const EnemyShieldMesh* mesh = nullptr;  // the animation system's, shared by every bot
+};
+
 // One bot's bodies at one moment.
 struct EnemyBodySet {
     bool valid = false;  // false: he has none (no character assets): the caller keeps to his cylinder
-    Vec3 bound_centre{0.0f, 0.0f, 0.0f};  // a sphere round every shape
+    Vec3 bound_centre{0.0f, 0.0f, 0.0f};  // a sphere round every shape, and round the shield's box
     float bound_radius = 0.0f;
     std::vector<EnemyBody> bodies;  // the asset's, in its order
     std::vector<BodyShape> shapes;  // body by body, a body's boxes before its capsules
+    EnemyShield shield;             // the riot shield, when he carries one
 };
 
 struct EnemyBodyHit {
     float distance = 0.0f;         // from the line's start
     Vec3 location{0.0f, 0.0f, 0.0f};
     Vec3 normal{0.0f, 0.0f, 1.0f};  // out of the shape, where the line goes in
-    int32_t shape = -1;            // EnemyBodySet::shapes
+    int32_t shape = -1;            // EnemyBodySet::shapes (-1 on the shield)
     uint8_t body = 0;              // EnemyBodySet::bodies
     ECharacterSurface surface = ECharacterSurface::Body;
     std::string_view bone;         // the body's bone: the set's own string, good while the set is
+    bool shield = false;           // on the shield (bone Shield_Root), not on a body
 };
 
 // Whether a bullet can meet this bot at all. A pawn that has died is still what the weapon's trace
@@ -192,10 +221,72 @@ inline bool trace_body_shape(const BodyShape& s, const Vec3& from, const Vec3& d
     return true;
 }
 
+// The nearest of the shield's triangles the line from `from` along the unit vector `dir` crosses
+// within `max_dist`, from either side (that the kDOP test takes both faces is inferred: the stock
+// line check, not read in the executable): how far along the line, and the triangle's normal turned
+// to face back along it. Not drawn back.
+inline bool trace_enemy_shield(const EnemyShield& shield, const Vec3& from, const Vec3& dir, float max_dist, float& out_distance, Vec3& out_normal) {
+    if (!shield.valid || !shield.mesh || shield.mesh->indices.size() < 3 || max_dist < 0.0f) return false;
+    const EnemyShieldMesh& m = *shield.mesh;
+    // The line in the bone's frame, from the bone's place, so that the arithmetic is among numbers
+    // of the shield's own size.
+    const Vec3 rel = from - shield.origin;
+    const float os[3] = {rel.dot(shield.axis[0]), rel.dot(shield.axis[1]), rel.dot(shield.axis[2])};
+    const float ds[3] = {dir.dot(shield.axis[0]), dir.dot(shield.axis[1]), dir.dot(shield.axis[2])};
+    // Its box first (a little grown), as the tree's root node is.
+    constexpr float kGrow = 0.1f;
+    const float lo[3] = {m.lo.x - kGrow, m.lo.y - kGrow, m.lo.z - kGrow}, hi[3] = {m.hi.x + kGrow, m.hi.y + kGrow, m.hi.z + kGrow};
+    float enter = 0.0f, leave = max_dist;
+    for (int i = 0; i < 3; ++i) {
+        if (std::abs(ds[i]) < 1.0e-9f) {
+            if (os[i] < lo[i] || os[i] > hi[i]) return false;
+            continue;
+        }
+        float a = (lo[i] - os[i]) / ds[i], b = (hi[i] - os[i]) / ds[i];
+        if (a > b) std::swap(a, b);
+        enter = std::max(enter, a);
+        leave = std::min(leave, b);
+        if (enter > leave) return false;
+    }
+    const Vec3 o(os[0], os[1], os[2]), d(ds[0], ds[1], ds[2]);
+    float best = max_dist;
+    bool found = false;
+    Vec3 n(0.0f, 0.0f, 0.0f);
+    for (size_t k = 0; k + 2 < m.indices.size(); k += 3) {
+        const Vec3& v0 = m.vertices[m.indices[k]];
+        const Vec3 e1 = m.vertices[m.indices[k + 1]] - v0, e2 = m.vertices[m.indices[k + 2]] - v0;
+        const Vec3 p = d.cross(e2);
+        const float det = e1.dot(p);
+        if (std::abs(det) < 1.0e-12f) continue;  // the line runs in the triangle's plane
+        const float inv = 1.0f / det;
+        const Vec3 s = o - v0;
+        const float u = s.dot(p) * inv;
+        if (u < 0.0f || u > 1.0f) continue;
+        const Vec3 q = s.cross(e1);
+        const float v = d.dot(q) * inv;
+        if (v < 0.0f || u + v > 1.0f) continue;
+        const float t = e2.dot(q) * inv;
+        if (t < 0.0f || t > best || (found && t >= best)) continue;
+        best = t;
+        n = e1.cross(e2);
+        found = true;
+    }
+    if (!found) return false;
+    Vec3 normal = shield.axis[0] * n.x + shield.axis[1] * n.y + shield.axis[2] * n.z;
+    const float len = normal.length();
+    normal = len > 1.0e-12f ? normal * (1.0f / len) : dir * -1.0f;
+    if (normal.dot(dir) > 0.0f) normal = normal * -1.0f;
+    out_distance = best;
+    out_normal = normal;
+    return true;
+}
+
 // UPhysicsAsset::LineCheck: the nearest of a bot's shapes the line from `from` along the unit vector
-// `dir` goes into within `max_dist`.
+// `dir` goes into within `max_dist`; and his shield's per-triangle check beside it, as another
+// component of the same actor: the nearer of the two wins, the shield's hit drawn back first.
 inline bool trace_enemy_bodies(const EnemyBodySet& set, const Vec3& from, const Vec3& dir, float max_dist, EnemyBodyHit& out) {
-    if (!set.valid || !line_near_point(from, dir, max_dist, set.bound_centre, set.bound_radius)) return false;
+    const float reach = set.shield.valid ? max_dist + kShieldPullBack : max_dist;
+    if (!set.valid || !line_near_point(from, dir, reach, set.bound_centre, set.bound_radius)) return false;
     float best = max_dist;
     int32_t hit = -1;
     Vec3 normal(0.0f, 0.0f, 0.0f);
@@ -208,7 +299,25 @@ inline bool trace_enemy_bodies(const EnemyBodySet& set, const Vec3& from, const 
         hit = static_cast<int32_t>(i);
         normal = n;
     }
+    // A triangle up to 4 uu past the end still counts: drawn back, it is within it.
+    float on_shield = 0.0f;
+    Vec3 shield_normal;
+    if (trace_enemy_shield(set.shield, from, dir, best + kShieldPullBack, on_shield, shield_normal)) {
+        on_shield = std::max(on_shield - kShieldPullBack, 0.0f);
+        if (on_shield <= max_dist && (hit < 0 || on_shield < best)) {
+            out.distance = on_shield;
+            out.location = from + dir * on_shield;
+            out.normal = shield_normal;
+            out.shape = -1;
+            out.body = 0;
+            out.surface = ECharacterSurface::Body;
+            out.bone = kShieldBone;
+            out.shield = true;
+            return true;
+        }
+    }
     if (hit < 0) return false;
+    out.shield = false;
     const BodyShape& s = set.shapes[static_cast<size_t>(hit)];
     out.distance = best;
     out.location = from + dir * best;

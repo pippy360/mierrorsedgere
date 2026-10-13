@@ -1315,6 +1315,62 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
         weapon_meshes_[ws.key] = std::move(w_mesh);
     }
 
+    // The riot shield (TdInv_Shield's RiotShield component: WP_RiotShield.SK_WP_RiotShield).
+    riot_shield_mesh_ = SkeletalMeshAsset{};
+    riot_shield_vertices_.clear();
+    riot_shield_draw_indices_.clear();
+    riot_shield_collision_ = EnemyShieldMesh{};
+    {
+        UPKPackage pkg_shield(cooked + "Weapons/WP_RiotShield.upk");
+        if (pkg_shield.is_valid()) {
+            for (const auto& exp : pkg_shield.get_exports()) {
+                if (pkg_shield.get_export_class(exp) == "SkeletalMesh" && exp.object_name == "SK_WP_RiotShield") {
+                    parse_skeletal_mesh(pkg_shield, exp, riot_shield_mesh_);
+                    break;
+                }
+            }
+            parse_dxt1_texture(pkg_shield, "T_RiotShield_D", riot_shield_mesh_.tex_diffuse);
+            parse_dxt1_texture(pkg_shield, "T_RiotShield_S", riot_shield_mesh_.tex_specular);
+        }
+    }
+    if (riot_shield_mesh_.is_valid()) {
+        // Every vertex is rigid on Shield_Root, which is the identity at the mesh's origin: a
+        // vertex's place in the mesh is its place in the bone's space.
+        const SkeletalMeshAsset& shield = riot_shield_mesh_;
+        riot_shield_collision_.vertices.reserve(shield.vertices.size());
+        riot_shield_collision_.lo = riot_shield_collision_.hi = shield.vertices.front().bind_pos;
+        for (const SkinnedVertex& sv : shield.vertices) {
+            Vertex v{};
+            v.position = sv.bind_pos;
+            v.normal = sv.bind_norm;
+            v.tangent = Vec3(1.0f, 0.0f, 0.0f);
+            v.u = sv.u;
+            v.v = sv.v;
+            v.u2 = 2.0f;  // the world shader's weapon branch: wep_d_tex, wep_s_tex
+            v.v2 = 0.0f;
+            v.color = 0xFFFFFFFF;
+            riot_shield_vertices_.push_back(v);
+            riot_shield_collision_.vertices.push_back(sv.bind_pos);
+            riot_shield_collision_.lo = Vec3(std::min(riot_shield_collision_.lo.x, sv.bind_pos.x), std::min(riot_shield_collision_.lo.y, sv.bind_pos.y),
+                                             std::min(riot_shield_collision_.lo.z, sv.bind_pos.z));
+            riot_shield_collision_.hi = Vec3(std::max(riot_shield_collision_.hi.x, sv.bind_pos.x), std::max(riot_shield_collision_.hi.y, sv.bind_pos.y),
+                                             std::max(riot_shield_collision_.hi.z, sv.bind_pos.z));
+        }
+        const size_t vertex_count = shield.vertices.size();
+        for (const SkelMeshSection& sec : shield.sections) {
+            const size_t first = static_cast<size_t>(std::max(0, sec.base_index));
+            const size_t last = std::min(shield.indices.size(), first + static_cast<size_t>(sec.num_triangles) * 3);
+            const bool glass = to_lower_str(sec.material_name).find("glass") != std::string::npos;
+            for (size_t k = first; k + 3 <= last; k += 3) {
+                if (shield.indices[k] >= vertex_count || shield.indices[k + 1] >= vertex_count || shield.indices[k + 2] >= vertex_count) continue;
+                for (int c = 0; c < 3; ++c) {
+                    riot_shield_collision_.indices.push_back(shield.indices[k + c]);
+                    if (!glass) riot_shield_draw_indices_.push_back(shield.indices[k + c]);
+                }
+            }
+        }
+    }
+
     // 5. Load Animation Sets (Unarmed, 1H Common + Weapon Sets, 2H Common + Weapon Sets, AI 1H & 2H)
     UPKPackage pkg_as_unarmed(cooked + "Animations/AS_C1P_Unarmed.upk");
     if (pkg_as_unarmed.is_valid()) parse_anim_set_package(pkg_as_unarmed, faith_unarmed_set_);
@@ -1366,6 +1422,9 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
     UPKPackage pkg_as_celeste(cooked + "Animations/AS_AI_Celeste_Unarmed.upk");
     if (pkg_as_celeste.is_valid()) parse_anim_set_package(pkg_as_celeste, celeste_set_);
 
+    UPKPackage pkg_as_riot(cooked + "Animations/AS_AI_RiotCop_OneHanded.upk");
+    if (pkg_as_riot.is_valid()) parse_anim_set_package(pkg_as_riot, riot_set_);
+
     loaded_ = faith_upper_.is_valid() && faith_lower_.is_valid() &&
               swat_mesh_.is_valid() && !faith_unarmed_set_.sequences.empty() &&
               !swat_set_.sequences.empty();
@@ -1389,6 +1448,9 @@ bool AnimSystem::init_from_game_root(const std::string& game_root) {
                   << "  - Weapon-specific 1P AnimSets: " << faith_weapon_sets_.size() << " sets\n"
                   << "  - AS_AI_PatrolCop_OneHanded: " << swat_set_.sequences.size() << " sequences\n"
                   << "  - AS_AI_Assault_TwoHanded: " << swat_2h_set_.sequences.size() << " sequences\n"
+                  << "  - AS_AI_RiotCop_OneHanded: " << riot_set_.sequences.size() << " sequences\n"
+                  << "  - SK_WP_RiotShield: " << riot_shield_mesh_.vertices.size() << " verts, " << riot_shield_collision_.indices.size() / 3
+                  << " tris met by a bullet, " << riot_shield_draw_indices_.size() / 3 << " drawn\n"
                   << "  - DefaultAnimation.ini CustomAnimNodes: " << blend_configs_.size() << std::endl;
     }
     if (!enemy_bodies_.empty()) {
@@ -2867,6 +2929,11 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
     if ((arch_id == EnemyArch_Celeste || arch_id == EnemyArch_Kate) && !celeste_set_.sequences.empty() && !two_handed) {
         active_set = &celeste_set_;
     }
+    // The riot cop: his template's one set, whatever he holds (TdBotPawn.SetupTemplate fills
+    // Mesh.AnimSets from AITemplate_RiotCop.AnimationSets). He never runs (CanRun FALSE,
+    // TdAI_Riot.IsOkToRun), and his set has no SnatchFwd to blend into the wind-up.
+    const bool riot = arch_id == EnemyArch_Riot && !riot_set_.sequences.empty();
+    if (riot) active_set = &riot_set_;
     const AnimSequenceAsset* seq_a = nullptr;
     const AnimSequenceAsset* seq_b = nullptr;
     float blend_alpha = 0.0f;
@@ -2929,7 +2996,7 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
         }
     } else if (bot.anim_state == EEnemyAnimState::MeleeWindup || (reaction_disarm && bot.disarm_window)) {
         seq_a = find_ai_seq("MeleeStart");
-        seq_b = find_ai_seq("SnatchFwd");
+        seq_b = riot ? nullptr : find_ai_seq("SnatchFwd");
         if (!seq_a) seq_a = find_ai_seq("SnatchFwd");
         norm_time = (bot.anim_timer > 0.0f)
                         ? std::clamp(bot.anim_timer / std::max(0.20f, bot.anim_duration), 0.15f, 0.85f)
@@ -2939,10 +3006,10 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
         seq_a = find_ai_seq("MeleeEnd");
         if (!seq_a) seq_a = find_ai_seq("MeleeMiss");
         norm_time = std::clamp(bot.anim_timer / std::max(0.20f, bot.anim_duration), 0.0f, 0.95f);
-    } else if (bot.anim_state == EEnemyAnimState::Chase || bot.velocity.length_xy() > 140.0f) {
+    } else if (!riot && (bot.anim_state == EEnemyAnimState::Chase || bot.velocity.length_xy() > 140.0f)) {
         seq_a = find_ai_seq("runfwd");
         norm_time = std::fmod(sim_time * 1.5f, 1.0f);
-    } else if (bot.anim_state == EEnemyAnimState::Patrol || bot.velocity.length_xy() > 20.0f) {
+    } else if (bot.anim_state == EEnemyAnimState::Patrol || bot.anim_state == EEnemyAnimState::Chase || bot.velocity.length_xy() > 20.0f) {
         seq_a = find_ai_seq("walkfwd");
         norm_time = std::fmod(sim_time * 1.1f, 1.0f);
     } else {
@@ -2962,14 +3029,58 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
 
     thread_local std::vector<Vec3> local_pos, local_pos_b;
     thread_local std::vector<Quat4> local_quat, local_quat_b;
+    // The riot set's MeleeStart, MeleeEnd, SnatchBack and HitHeadBack move the root bone (MeleeEnd
+    // begins with the skeleton 162 uu ahead of it, SnatchBack holds it 125 ahead). Retail plays the
+    // melee pair with root motion (TdMove_Melee_Riot: UseRootMotion), which moves the pawn and leaves
+    // the root where the reference pose has it (stock UE3, INFERRED); the port's bot does not move by
+    // his animation, so the riot set is played in place: its root keeps the reference pose's
+    // translation. (The patrol cop's sets keep theirs, as before.)
+    const int32_t riot_root = [&] {
+        if (!riot) return -1;
+        const auto it = body_mesh.bone_name_to_index.find("root");
+        return it != body_mesh.bone_name_to_index.end() ? it->second : -1;
+    }();
+    const auto in_place = [&](const AnimSetAsset* owner, std::vector<Vec3>& pos) {
+        if (owner == &riot_set_ && riot_root >= 0 && static_cast<size_t>(riot_root) < pos.size()) {
+            pos[static_cast<size_t>(riot_root)] = body_mesh.bones[static_cast<size_t>(riot_root)].bind_pos;
+        }
+    };
     sample_sequence_pose(body_mesh, *owner_a, seq_a, norm_time, local_pos, local_quat);
+    in_place(owner_a, local_pos);
     if (seq_b && blend_alpha > 0.001f) {
         const AnimSetAsset* owner_b = (active_set->find_sequence(seq_b->name) == seq_b) ? active_set : &swat_set_;
         sample_sequence_pose(body_mesh, *owner_b, seq_b, norm_time, local_pos_b, local_quat_b);
+        in_place(owner_b, local_pos_b);
         blend_local_poses(local_pos, local_quat, local_pos_b, local_quat_b, blend_alpha, local_pos, local_quat);
     }
 
     compute_skeleton_fk(body_mesh.bones, local_pos, local_quat, out_comp_pos, out_comp_quat);
+    return true;
+}
+
+// TdInv_Shield.Activate: AttachComponentToSocket(its RiotShield component, 'ShieldSocket') on the
+// bot's mesh. Of the character meshes only CH_TKY_Cop_Riot.SK_TKY_Cop_Riot has that socket: bone
+// LeftWeapon, no RelativeLocation, RelativeRotation (Pitch 16384, Yaw 16384, Roll 0). That rotation
+// is the inverse of the shield mesh's RotOrigin (0, -16384, 16384), so a vertex of SK_WP_RiotShield
+// (in Shield_Root's space, its raw space) stands at LeftWeapon's place plus LeftWeapon's rotation of
+// it in the cop's raw mesh space: the rule a weapon is held by on the other hand. (The attach chain,
+// child RotOrigin x socket x bone x parent, is stock UE3's, INFERRED; with the riot cop's own
+// sequences it stands the shield upright on the floor and square to his front.) Another mesh has no
+// socket for it (AttachComponentToSocket finds none), and the shield is neither drawn nor met.
+bool AnimSystem::enemy_shield_frame(const EnemyBot& bot, const SkeletalMeshAsset& body_mesh, const std::vector<Vec3>& comp_pos,
+                                    const std::vector<Quat4>& comp_quat, Vec3& out_origin, Vec3 out_axis[3]) const {
+    if (!bot.has_shield || riot_shield_collision_.indices.empty()) return false;
+    // The socket is SK_TKY_Cop_Riot's alone (the port reads no sockets: the mesh stands for it).
+    if (&body_mesh != &enemy_models_[EnemyArch_Riot].mesh) return false;
+    const auto it = body_mesh.bone_name_to_index.find("leftweapon");
+    if (it == body_mesh.bone_name_to_index.end() || it->second < 0) return false;
+    const size_t b = static_cast<size_t>(it->second);
+    if (b >= comp_pos.size() || b >= comp_quat.size()) return false;
+    out_origin = enemy_mesh_to_bot(comp_pos[b]);
+    const Quat4 q = comp_quat[b].normalized();
+    out_axis[0] = enemy_mesh_to_bot(q.rotate(Vec3(1.0f, 0.0f, 0.0f))).normalized();
+    out_axis[1] = enemy_mesh_to_bot(q.rotate(Vec3(0.0f, 1.0f, 0.0f))).normalized();
+    out_axis[2] = enemy_mesh_to_bot(q.rotate(Vec3(0.0f, 0.0f, 1.0f))).normalized();
     return true;
 }
 
@@ -3034,6 +3145,29 @@ AnimSystem::EnemySwatDraw AnimSystem::evaluate_enemy_swat_indexed(const EnemyBot
     draw.vertex_count = body_vertices;
     draw.index_list = body_list_idx;
     draw.index_count = enemy_swat_index_lists_[body_list_idx].size();
+
+    // The riot shield on his left hand: a matrix for the renderers' one copy of it, and its box.
+    Vec3 shield_origin, shield_axis[3];
+    if (enemy_shield_frame(bot, body_mesh, comp_pos, comp_quat, shield_origin, shield_axis)) {
+        draw.shield = true;
+        Mat4 m;
+        for (int c = 0; c < 3; ++c) {
+            m.m[c * 4 + 0] = shield_axis[c].x;
+            m.m[c * 4 + 1] = shield_axis[c].y;
+            m.m[c * 4 + 2] = shield_axis[c].z;
+        }
+        m.m[12] = shield_origin.x;
+        m.m[13] = shield_origin.y;
+        m.m[14] = shield_origin.z;
+        draw.shield_model = m;
+        const Vec3& lo = riot_shield_collision_.lo;
+        const Vec3& hi = riot_shield_collision_.hi;
+        for (int k = 0; k < 8; ++k) {
+            const Vec3 p = m.transform_point(Vec3((k & 1) ? hi.x : lo.x, (k & 2) ? hi.y : lo.y, (k & 4) ? hi.z : lo.z));
+            draw.shield_lo = k == 0 ? p : Vec3(std::min(draw.shield_lo.x, p.x), std::min(draw.shield_lo.y, p.y), std::min(draw.shield_lo.z, p.z));
+            draw.shield_hi = k == 0 ? p : Vec3(std::max(draw.shield_hi.x, p.x), std::max(draw.shield_hi.y, p.y), std::max(draw.shield_hi.z, p.z));
+        }
+    }
 
     // Attach weapon to officer's RightWeapon bone in component space (1:1 scale + animated RightWeapon rotation)
     if (bot_wmesh && bot_wmesh->is_valid()) {
@@ -3154,6 +3288,7 @@ bool AnimSystem::pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool rea
     out.valid = false;
     out.shapes.clear();
     out.bodies.clear();
+    out.shield = EnemyShield{};
     out.bound_centre = bot.position;
     out.bound_radius = 0.0f;
     if (enemy_bodies_.empty()) return false;
@@ -3194,6 +3329,23 @@ bool AnimSystem::pose_enemy_bodies(const EnemyBot& bot, float sim_time, bool rea
     for (const BodyShape& s : out.shapes) {
         const float reach = s.kind == EBodyShape::Box ? s.half.length() : s.half.x + s.half.z;
         out.bound_radius = std::max(out.bound_radius, (s.centre - out.bound_centre).length() + reach);
+    }
+    // The riot shield, a component of his own beside the physics asset's bodies: its bone's frame in
+    // the world, and its box inside the sphere.
+    Vec3 shield_origin, shield_axis[3];
+    if (enemy_shield_frame(bot, *mesh, comp_pos, comp_quat, shield_origin, shield_axis)) {
+        EnemyShield& shield = out.shield;
+        shield.valid = true;
+        shield.origin = bot_model.transform_point(shield_origin);
+        for (int i = 0; i < 3; ++i) shield.axis[i] = bot_model.transform_vector(shield_axis[i]).normalized();
+        shield.mesh = &riot_shield_collision_;
+        const Vec3& lo = riot_shield_collision_.lo;
+        const Vec3& hi = riot_shield_collision_.hi;
+        for (int k = 0; k < 8; ++k) {
+            const Vec3 corner = shield.origin + shield.axis[0] * ((k & 1) ? hi.x : lo.x) + shield.axis[1] * ((k & 2) ? hi.y : lo.y) +
+                                shield.axis[2] * ((k & 4) ? hi.z : lo.z);
+            out.bound_radius = std::max(out.bound_radius, (corner - out.bound_centre).length() + 0.5f);
+        }
     }
     out.valid = true;
     return true;
@@ -3286,6 +3438,17 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, const Vec3& v
             for (const BodyShape& s : set.shapes) {
                 const bool head = s.body < set.bodies.size() && set.bodies[s.body].surface == ECharacterSurface::Head;
                 append_body_shape_wires(head ? out_rv_tris : out_world_tris, s, view_pos, kHalfWidth, head ? head_col : body_col);
+            }
+            // His shield: the box round the triangles a bullet is tested against, in yellow.
+            if (set.shield.valid && set.shield.mesh) {
+                const EnemyShieldMesh& m = *set.shield.mesh;
+                BodyShape box;
+                box.kind = EBodyShape::Box;
+                const Vec3 mid = (m.lo + m.hi) * 0.5f;
+                box.centre = set.shield.origin + set.shield.axis[0] * mid.x + set.shield.axis[1] * mid.y + set.shield.axis[2] * mid.z;
+                for (int i = 0; i < 3; ++i) box.axis[i] = set.shield.axis[i];
+                box.half = (m.hi - m.lo) * 0.5f;
+                append_body_shape_wires(out_world_tris, box, view_pos, kHalfWidth, pack_rgba8(1.0f, 0.85f, 0.10f));
             }
         }
         // ...and of each helicopter that is there, the one box a bullet meets (physics/bot_fire.hpp).
