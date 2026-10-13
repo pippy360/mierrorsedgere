@@ -3034,3 +3034,134 @@ the rule).
 ### 47.4 Not done
 - A decal's own `FLightMap1D` and depth bias, as before; whether the 59 computed decals left are drawn in retail
   (above).
+
+---
+
+## 48. The riot shield: who carries it, the riot cop's own sequences, the shield drawn and stopping bullets (agent/riot-shield, 2026-10-13)
+
+The item of `TODO.md` "The riot shield", by the proposal of the main checkout's ignored
+`build/re/open2/shield/notes.md` (steps 1 to 7; with `build/re/impacts/research/bodies/notes.md` F10 and
+`verify.md` C9, C24, C25 for the bullet's rules). The rules are written out in
+`docs/TDGAME_CLASSES_AND_MOVES_RE.md`, "Combat between the player and the bots", 5, and what the port does in
+`docs/RENDERING_RE.md` section 13. What is inferred, not read, is marked so there.
+
+### 48.1 What the game does
+- **Who carries it.** `AITemplate_RiotCop` alone of `DefaultAITemplates.ini` names a `ShieldClass`
+  (`TdGame.TdInv_Shield`); `TdBotPawn.SetupTemplate` makes it and `TdInv_Shield.Activate` attaches its
+  `RiotShield` component, `WP_RiotShield.SK_WP_RiotShield`, to the bot mesh's `ShieldSocket` (bone
+  `LeftWeapon`, no offset, rotation (16384, 16384, 0)), with the bot's mesh as its shadow parent and the bot's
+  light environment. Only `CH_TKY_Cop_Riot.SK_TKY_Cop_Riot` has that socket. The riot cop's weapon is the
+  Steyr TMP (on `main` since section 45), his one set of sequences `AS_AI_RiotCop_OneHanded` (29: no run, no
+  crouch, no death). Three factories in the shipped story make riot cops: one in the Subway, two in the Mall.
+- **The mesh.** Eight bones of a weapon's skeleton; 1174 vertices, every one rigid on `Shield_Root`, which
+  stands unturned at the origin; 1086 triangles in three sections: `M_RiotShield` (frame and grips, 754),
+  `M_RiotShield_Glass` (the window, 166: translucent, unlit, opacity 0.1, with distortion) and
+  `M_RiotShield_Composite` (the lower plate, 166); `T_RiotShield_D` and `T_RiotShield_S`, no normal map.
+- **Where it stands.** The socket's rotation undoes the shield mesh's `RotOrigin`, so the shield's raw space is
+  the bone's (the attach chain is stock Unreal Engine 3's: inferred). Posed by his own `Stand` the shield,
+  74 by 128, stands upright on the floor square to his front and he crouches behind it; from the front only
+  his gun hand shows, 3 uu outside its right edge, and his head is behind the window.
+- **His sequences carry root motion** (read here with `s7_pose.py`'s reader, the `root` track's forward
+  component): `MeleeStart` 0 to 146.7, `MeleeEnd` 162.2 to 0, `SnatchBack` 125 held, `HitHeadBack` 0 to 60;
+  `Stand`, `standfire`, `walkfwd` and `MarioMove` none. Retail plays the shield push with `UseRootMotion`.
+- **A bullet.** No physics asset and `PerPolyCollisionBones` (`Shield_Root`): only a bullet's trace meets
+  it, on its triangles, all 1086 of them in the package's per-poly tree, the window's included; the hit is
+  drawn back 4 uu along the line and names the bone `Shield_Root` (both faces count: inferred).
+  `TdBotPawn.TakeDamage` returns first for the `RiotShield` component: no damage, whatever the weapon, no
+  stumble. The weapon's `DefaultImpactMaterial` effect and sound, no hole.
+- **Losing it.** A disarm (only from behind) throws his inventory away as `TdMove_Disarmed` ends
+  (`DiscardInventory`; that the component goes with it is inferred); a bot shot dead keeps it.
+
+### 48.2 What was wrong
+- The port drew no shield and tested none: every bullet at a riot cop went into his body, through where the
+  shield is. He was posed with the patrol cop's sequences, upright; with those the shield's rule would have
+  hung it over his head (z 97 to 210 in his frame).
+
+### 48.3 Changes
+- **`src/math/types.hpp`:** `EnemyBot::has_shield`; `BulletTracer::pawn_hit` 4 now also a living bot's shield.
+- **`src/physics/bot_fire.hpp`:** `template_carries_shield` (the template's `ShieldClass`: `RiotCop` alone).
+  **`src/assets/upk_loader.cpp`** sets `has_shield` on a factory's bot by it; `ME_SHOT_BOT` and stage 24 too.
+- **`src/anim/anim_system.*`:** `riot_set_` (`AS_AI_RiotCop_OneHanded`) poses the riot archetype whatever he
+  holds; he never runs (a chase walks), his wind-up is `MeleeStart` alone (the set has no `SnatchFwd` to blend),
+  and the set is played in place: its root bone keeps the reference pose's translation (no 157 uu jump at
+  `MeleeEnd`, no 125 uu at `SnatchBack`); a name the set lacks falls back to the patrol cop's, as before.
+  `SK_WP_RiotShield` and its two textures are loaded; `riot_shield_vertices()` (shaded as a weapon, `u2`
+  2.0), `riot_shield_draw_indices()` (the frame and the plate, 920 triangles) and `riot_shield_collision()`
+  (all 1086, their box) are built once. `enemy_shield_frame` puts `Shield_Root` on `LeftWeapon` of
+  `SK_TKY_Cop_Riot` only (the socket's mesh); `EnemySwatDraw` carries `shield_model` and its box in the bot's
+  frame; `pose_enemy_bodies` fills `EnemyBodySet::shield` and widens the set's sphere round it;
+  `ME_SHOW_BODIES` draws its box in yellow.
+- **`src/physics/body_shapes.hpp`:** `EnemyShieldMesh`, `EnemyShield`, `kShieldPullBack` (4), `kShieldBone`;
+  `trace_enemy_shield` (the box first, then every triangle from either side); `trace_enemy_bodies` tests the
+  shield beside the bodies, drawn back 4 uu, the nearer winning (a triangle up to 4 uu past the line's end
+  counts, being within it once drawn back); `EnemyBodyHit::shield`.
+- **The four renderers** (`d3d11_renderer.cpp`, `opengl_renderer.cpp`, `vulkan_renderer.cpp`,
+  `metal_renderer.mm`): the shield's vertices and indices uploaded once (Metal: one triangle-list buffer of
+  its corners, as its enemies are drawn), its textures among the weapons' under `kRiotShieldTextures`;
+  `draw_enemy_shield` after the bot in the world pass (the shield's textures in the weapon's slots, his light
+  environment still bound), in the near sun cascade and in the dynamic objects' shadow cells, under the bot's
+  model matrix times `shield_model`; a bot's bounds take in the shield's box. No shader change.
+- **`src/physics/parkour_controller.*`:** `EnemyShotHit::shield`; a pull that stops on the shield takes
+  nothing, starts no stumble, kills nobody and shows no hit marker; its tracer is `pawn_hit` 4 (3 on a dead
+  bot), not a bot's (`hit_enemy` false). `m_disarmed_bot`: the bot a disarm is taking from loses
+  `has_shield` as her move ends. A bot's bullet stops on another's shield as on his body (`pawn_hit` 3).
+- **`src/game/impact_effects.hpp`:** the `pawn_hit` 4 branch serves the shield unchanged (its debug line no
+  longer says "helicopter" only).
+- **`src/main.cpp`:** `ME_SHOT_FIRE` says when a shot meets the shield and gives it `pawn_hit` 4 (3 dead);
+  stage 24 takes the game root, its pulls take any target (`pull_to`), and it has the `[Shield]` lines below.
+
+### 48.4 Checked (Windows, Direct3D 11 unless said, headless)
+- **Oracle stage 24** (`--verify-bodies`), its new and changed lines as printed:
+  ```
+  [Asset] OK: ... RiotCop 17 + a shield in 2480 of 2480, ...; furthest reach from where he stands over 27280 poses 308.00 uu (RiotCop, stagger with HitMeleeInAir_High; the first reject allows 360.00), by state: idle 184.86 walk 187.51 run 184.83 aim 184.86 windup 209.15 strike 187.27 stagger 308.00 (HitMeleeInAir_High) stumble 229.68 (HitHeavyHead) disarm 270.78 dead 308.00 (HitMeleeInAir_High); the riot shield in 2480 poses (0 of other templates), the corners of its box at most 308.00 uu from where he stands (stagger with HitMeleeInAir_High)
+  [Shield] OK: the asset: SK_WP_RiotShield 8 bones, 1174 vertices, 1086 triangles (M_RiotShield 754, M_RiotShield_Glass 166, M_RiotShield_Composite 166; drawn 920, all but the window); met by a bullet on a posed riot cop: 1174 vertices, 1086 triangles in (-21.10, -48.58, -5.57) .. (52.66, 79.38, 8.32) (the package's within 0.005); AS_AI_RiotCop_OneHanded 29 sequences with Stand, standfire, walkfwd, MeleeStart, MeleeEnd, SnatchBack: yes; made to carry one, the shield hangs on: RiotCop; a riot cop with none: none
+  [Shield] OK: its pose: Stand at its first key, the shield's box in his frame (34.79, -37.10, 1.05) .. (48.69, 36.68, 129.02) (within 0.047 of the research's), the plate's normal 0.000 degrees off straight ahead, its height 0.000 off upright; idling (33.60, -37.36, 3.06) .. (51.50, 37.10, 131.05)
+  [Shield] OK: a Colt at the plate's middle: the line meets his riot shield (Shield_Root) 253.09 uu off, the shield's triangle 257.09 uu off; damage 0, tracer pawn_hit 4 ends 253.09 uu off (0.000 from 4 uu short of the triangle), aimed at (45.79, 0.05, 37.56) in his frame; he is left with health 100, state 3, sequence '', not stunned, stumble 0 (a pull over his head leaves health 100, state 3, sequence '', not stunned, stumble 0); hit marker 0.00
+  [Shield] OK: an M95 at the plate's middle: the line meets his riot shield (Shield_Root) 253.17 uu off, the shield's triangle 257.17 uu off; damage 0, tracer pawn_hit 4 ends 253.17 uu off (a sniper's bullet on a body takes 99999)
+  [Shield] OK: a Colt at the window's middle: the line meets his riot shield (Shield_Root) 225.19 uu off, the shield's triangle 229.19 uu off; damage 0, tracer pawn_hit 4 ends 225.19 uu off; the triangle met is at (15.98, -30.07, 8.29) in the shield's space (the window: y -48.58 .. -9.58)
+  [Shield] OK: a Colt at his gun hand: the line meets body RightHand 237.30 uu off, the shield's triangle not on it; damage 33, tracer pawn_hit 1 ends 237.30 uu off (his armour 0.6 on the body, the hand's material the head's)
+  [Shield] OK: from behind, at his back: the line meets body Spine1 255.21 uu off, the shield's triangle 333.26 uu off; damage 16, tracer pawn_hit 1 ends 255.21 uu off
+  [Shield] OK: from behind, through him at the plate: the line meets body Hips 251.42 uu off, the shield's triangle 346.87 uu off; damage 16, tracer pawn_hit 1 ends 251.42 uu off
+  [Shield] OK: a riot cop shot dead: killed at the hand he keeps his shield; a dead one's (drawn at the end of HitMeleeRight): the line meets his riot shield (Shield_Root) 344.63 uu off, the shield's triangle 348.63 uu off; damage 0, tracer pawn_hit 3 ends 344.63 uu off
+  [Shield] OK: a disarm: her move begins from behind, 1.967 s long; half a second in he still has his shield; it ends after 120 steps and he has none; posed, his bodies are there and the shield is not
+  -> Stage 24 Result: PASS (Asset=OK, Lines=OK, Rays=OK, Shield=OK, a pose 10.143 us)
+  ```
+  The riot cop's furthest reach is his shield's, thrown with the patrol cop's left hand when he is kicked from
+  the air (`HitMeleeInAir_High`, his set has no such sequence): 308 uu, the first reject allows 360. The pose is the research's (`s7_pose.py`, the same rule
+  worked in Python) to 0.05 uu.
+- **`--verify-all`** from a scratch directory: all 27 stages pass; against `main`'s log (c6eb457, the same
+  machine) only stage 24's lines and the two load lines of the animation system differ.
+- **Pictures** (`--intro-shots Maps/SP01/Edge_p.me1` on the Prologue's roof, `ME_SHOT_STAND="-6350,-1950,5640"`,
+  `ME_SHOT_LOOK="-10,0"`, `ME_SHOT_BOT="AITemplate_RiotCop,<state>,250,SteyrTMP,<turn>,..."`, with and without
+  `ME_SHOW_BODIES=1`), each looked at: front on, the shield stands on the floor in front of him, "PK" and the
+  dog's head on the plate, his helmet above the plate seen through where the window is (not drawn), his TMP in
+  the right hand outside the shield's edge; side on (turn 90) he crouches behind it, one leg forward, the
+  shield upright with its bottom on the floor; from behind (180) the shield's back beyond him; walking,
+  winding up (`MeleeStart`, 0.2 s), striking (`MeleeEnd`, 0.4 s: in place, no jump forward) the shield stays
+  upright in front of him; being disarmed (`SnatchBack`, 0.8 s, from behind) he bends and the shield tilts with
+  his arm; dead (`HitMeleeRight`, the patrol cop's) he stands upright and the shield hangs by his left shoulder,
+  as the proposal expected of the fallback set. The yellow box frames the drawn shield in every one. The
+  OpenGL renderer's front and side pictures differ from Direct3D's by a mean of 0.23 and 0.24 of 255 (0.03 over
+  the shield). With the shield left out of the two shadow passes (a temporary switch, not kept) 1033 pixels
+  of the side picture are lighter by 26 on average: its shadow on the floor and on itself.
+- **Shots** (`ME_SHOT_FIRE=0`, `ME_IMPACT_DEBUG=1`, front on at 250 uu): three of five on the shield, 200 to
+  205 uu off, each `[Impact] on no person's material (a helicopter's box, a riot shield) ... effect
+  FX_ImpactEffects.Effects.PS_FX_Impact_Concrete_Light_01, sound Concrete.9mm_Concrete_Impact, no decal` (the
+  default material's), two past him on the level; 5 impact effects, 0 bullet holes, 5 sounds.
+- **Builds:** `mirrorsedge_windows`, `mirrorsedge_opengl` and the two Vulkan objects (`vulkan_renderer.cpp`,
+  `main.cpp`) compile; the Metal renderer's change was written from the Direct3D and OpenGL ones and not
+  compiled here.
+
+### 48.5 Not done
+- **The window** is not drawn (translucent, unlit, opacity 0.1, distortion on a bot's attachment); it stops
+  bullets.
+- **His AI** is the port's generic one: no shield wall, no walking-only gait (the chase moves him at its
+  220 uu/s while his walk plays), no shield push (`ShieldPushProperties`), no disarm-from-behind-only rule
+  (the port also disarms from the front when he is stunned or in his window); the levels' three riot cops
+  stand at their factories' points from the load.
+- **Root motion:** his set is played in place.
+- **What `AT_Cop` plays** where his set has no sequence (a blow's reactions, a bullet's `HitHeavy*`, death):
+  the patrol cop's, whose left arm is not a shield arm, so the shield swings off; a dead riot cop is drawn
+  upright, not as his ragdoll leaves the shield.
+- **The disarm** takes the shield as her move ends, not as his own `TdMove_Disarmed` sequence does.
+- **Faith's blows** against the shield were not followed. Each of these is in `TODO.md`.

@@ -765,6 +765,35 @@ end included, and a dead bot takes no damage. With no callback (`me_replay`, whi
 character assets a living bot is still his pawn's cylinder (48 round his axis, 180 high, the head from 150
 up), which retail never tests, and a dead one is met by nothing.
 
+A riot cop (`EnemyBot::has_shield`, from `AITemplate_RiotCop`'s `ShieldClass`, the one template that names
+one: `template_carries_shield` in `src/physics/bot_fire.hpp`) carries `WP_RiotShield.SK_WP_RiotShield` on the
+`LeftWeapon` bone of his mesh, `SK_TKY_Cop_Riot`, the one character mesh with a `ShieldSocket`. A vertex of the
+shield, in `Shield_Root`'s space (which is its raw space: every vertex is rigid on that bone, and it stands
+unturned at the origin), stands at the bone's place plus the bone's rotation of it, the rule a weapon is held
+by in the other hand (`AnimSystem::enemy_shield_frame`). That the socket's rotation (16384, 16384, 0) undoes
+the shield mesh's `RotOrigin` is a reading of stock Unreal Engine 3's attach chain, INFERRED, not read in the
+executable; posed by the riot cop's own `Stand` the rule stands the shield upright on the floor and square to
+his front, within 0.05 uu of the research's figures, which is the evidence for it. He is posed with his own
+set, `AS_AI_RiotCop_OneHanded` (`riot_set_`): he never runs, his wind-up is `MeleeStart` alone, and the set
+is played in place (its root bone keeps the reference pose's translation; retail plays the shield push with
+root motion, which moves the pawn instead, and the port's bot does not move by his animation); where the set
+has no sequence of the name (a blow's reactions, the deaths) the patrol cop's is played, as for the others,
+and the shield goes where that set's left hand takes it. Each renderer uploads the shield once (its 1174
+vertices, shaded as a weapon is, and the 920 triangles of the frame and the plate: the window,
+`M_RiotShield_Glass`, an unlit translucent material of opacity 0.1 with distortion, is left out) and draws it
+after the bot, under his model matrix times the shield's place in his frame (`EnemySwatDraw::shield_model`),
+with `T_RiotShield_D` and `T_RiotShield_S` in the world shader's weapon slots and in his light environment,
+in the world pass and in the near cascade's and the dynamic objects' shadow passes (`TdInv_Shield.Activate`:
+`SetLightEnvironment`, `SetShadowParent`). A bullet is tested against all 1086 of its triangles (the package's
+per-poly tree holds the window's too) beside his bodies (`trace_enemy_shield`, from either side, which is
+INFERRED of the stock check), and the hit is drawn back 4 uu along the line, as
+`USkeletalMeshComponent::LineCheck` draws back a per-poly hit (0xd53a52); the nearer of shield and body wins.
+A hit on the shield does nothing to him, whatever the weapon (`TdBotPawn.TakeDamage` returns first for the
+`RiotShield` component), and leaves the weapon's default impact effect and sound and no hole (`pawn_hit` 4:
+none of the shield's materials names a physical material); on a dead riot cop, nothing (3). He keeps it when
+he is shot dead, and a disarm takes it as it ends (here, as her move ends). `ME_SHOW_BODIES=1` draws the box
+round its triangles in yellow.
+
 What runs is sprite and mesh emitters with the module classes of the table: in the Prologue's opening area
 149 emitters of 95 systems, 38 of them mesh emitters, 1 left out; in Heat's 130 of 110 systems, 27 mesh
 emitters, 4 left out. Left out, each emitter whole: the PhysX type-data modules (`TypeDataMeshPhysX`),
@@ -773,9 +802,9 @@ the player (the game also asks whether the shooter was drawn lately); a bot's bo
 table of states poses him, not as retail's animation tree would, and a dead bot's where the sequence he died
 with ends, not as retail's death animation or ragdoll leaves him (he takes no bullet hole, and does not in the
 game: section 12); a story character playing a cutscene's sequence is drawn as far from where she is placed
-as the scene takes her, past the first reject's 360 uu, and a shot at her there goes through; the riot shield
-is not there, and the player's own bodies under a bot's fire are a stand-in in her reference pose
-(`TODO.md`); sprites are not sorted against other translucent surfaces. (The
+as the scene takes her, past the first reject's 360 uu, and a shot at her there goes through; the riot
+shield's window is not drawn, a dead riot cop's shield hangs where the patrol cop's sequences leave his left
+hand, and the player's own bodies under a bot's fire are a stand-in in her reference pose (`TODO.md`); sprites are not sorted against other translucent surfaces. (The
 glass panes' effects play when the pane is broken:
 [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
@@ -793,7 +822,7 @@ that is there.
 | `src/assets/level_lights.*` | The lights a light environment gathers; an actor's environment settings |
 | `src/assets/level_lensflares.*`, `level_decals.*`, `level_particles.*` | Lens-flare templates and sources; decals; particle templates and placements |
 | `src/assets/level_impacts.*`, `src/game/impact_effects.hpp` | The physical materials' impact effects, impact sounds and bullet-hole decals, the script's emitter factories; what a bullet leaves, on the level, a mover or a person |
-| `src/physics/body_shapes.hpp`, `src/anim/anim_system.*` (`pose_enemy_bodies`) | The bodies of the bots' physics asset as boxes and capsules, placed by the skeleton the drawn mesh is skinned by, and a bullet's line through them |
+| `src/physics/body_shapes.hpp`, `src/anim/anim_system.*` (`pose_enemy_bodies`) | The bodies of the bots' physics asset as boxes and capsules, placed by the skeleton the drawn mesh is skinned by, and a bullet's line through them; the riot shield's triangles beside them (`enemy_shield_frame`, `trace_enemy_shield`) |
 | `src/assets/level_intro.cpp` | The fades a level intro asks for (`LevelIntroSequence::fades`) |
 | `src/cutscene/screen_fade.hpp`, `src/game/screen_effects.hpp` | `TdHUD`'s fade state; `TdHudEffectManager`'s effects |
 | `src/renderer/post_process.hpp` | The constants of every pass, shared by the renderers: fog layers, haze, bloom taps, metering, exposure, tone mapping, motion blur; the scene block (fog, light environment, lens-flare quad) |
@@ -843,8 +872,8 @@ Options for looking at things:
 | `ME_MOVER_DEBUG=1` | With `--verify-movers`: each Matinee counted, by package, and the blocking actors nothing moves; in stage 29 the movers it checks |
 | `ME_SHOT_BODY=<units>` | With `ME_SHOT_FIRE`: the shots stop in a person that far ahead, not in the level |
 | `ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds[,sequence]]]]]]"` | With `--intro-shots`: the level's own enemies are put away and one bot stands on the floor that far ahead of the view (220 unless given), in the state named (`idle`, `walk`, `run`, `aim`, `windup`, `strike`, `stagger`, `disarm`, `dead`), with that weapon, turned by so many degrees from facing the view, so many seconds into a timed state, playing the sequence named where the state takes one from the controller; the shots of `ME_SHOT_FIRE` then meet his bodies and say which, e.g. `ME_SHOT_BOT="PatrolCop,run,170,Colt1911,70"`, `ME_SHOT_BOT="Assault_SWAT,dead,60,None,0,1,HitMeleeInAir_High"` |
-| `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every enemy it can meet (the living and the dead) within 3000 uu of the view, as lines: the head's material in the runner-vision red, the body's green; at start, lists the physics asset as read |
-| `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds); with the variable it also prints the bodies' reach by sequence, and what level lines meet across the bot it poses, front on and side on, by body |
+| `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every enemy it can meet (the living and the dead) within 3000 uu of the view, as lines: the head's material in the runner-vision red, the body's green, a riot shield's box yellow; at start, lists the physics asset as read |
+| `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds), the riot shield's lines (`[Shield]`) among them; with the variable it also prints the bodies' reach by sequence, and what level lines meet across the bot it poses, front on and side on, by body |
 | `ME_SHOT_HELI="distance[,height[,turn]]"` | With `--intro-shots`: the level's own helicopters are put away and one hangs that far ahead of the view (1500 unless given), its `Location` `height` units over the eye (-434, which puts its box level with the eye, unless given), turned by `turn` degrees from broadside. `ME_SHOT_FIRE`'s shots meet its box as the controller's do and say so; `ME_SHOW_BODIES=1` draws the box over the hull |
 | `--verify-botfire` | The oracle's stage 27 alone (twenty seconds): the bots' aim, their fire at her and its gate, her damage and theirs by difficulty, the helicopter's box, a bullet's stumble, and how long she lasts standing in front of one patrol cop |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
@@ -909,11 +938,11 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
   (section 10).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
-- **Bullets:** there is no riot shield; a bot's shot at the player is a line through a stand-in for her
-  bodies, in their reference pose, and whether it shows is judged by distance alone (section 13).
-- **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load may lie on meshes that
-  do not collide, which the game's query probably leaves out; a bullet hole on BSP is not kept to one node
-  (section 12).
+- **Bullets:** the riot shield's window is not drawn (it stops bullets all the same); a bot's shot at the
+  player is a line through a stand-in for her bodies, in their reference pose, and whether it shows is judged
+  by distance alone (section 13).
+- **Decals:** a decal's own vertex light map, per-decal bias; whether retail draws the 59 computed at load
+  that are left is not seen in any frame; a bullet hole on BSP is not kept to one node (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.
 - **Volumes and lights switched by Kismet** stay as they ship.
 - **The sky pass.** The procedural sky is still drawn first; every level's own sky dome now covers it.
