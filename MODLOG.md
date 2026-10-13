@@ -2625,3 +2625,243 @@ that an empty input of a random node stops the component. The mix groups' run-ti
 `SoundNodeOscillator` and `TdSoundNodeVelocity` nodes, the emitters outside the `*_Aud` sublevels, a tutorial
 message's `bPauseGame`, a cutscene's music under a pause and the pause of a level load are open. In
 `TODO.md`.
+
+---
+
+## 45. A bot's fire by his aim bot, a bot's armour, the helicopter's box, a bullet's stumble (agent/bot-fire-armour, 2026-10-11)
+
+Four items of `TODO.md`: "Faith's own bodies under a bot's fire", "Armour by the bone hit and by difficulty",
+"The helicopter under fire" and "A bot's hit reaction by bone". The rules are written out in
+`docs/TDGAME_CLASSES_AND_MOVES_RE.md`, "Combat between the player and the bots". The research, with a second
+reader's verdict on every claim, is in the main checkout's ignored `build/re/open2/botfire/` (`notes.md`,
+`verify.md`); what this branch read on top of it (the weapon classes' defaults, the burst and turn code of
+`TdBotPawn` and `TdAIManager`, the reference pose of her bodies, the sequences' lengths, the levels'
+`SeqAct_TdAIPerfectAim` values) is in the docs and in `src/physics/bot_fire.hpp`. The weapon classes'
+defaults of `kBotWeapons` were read from `TdSharedContent.u` and `TdGame.u` by `weapons_dump.py` and decoded
+by `weapons_decode.py`, both kept with their output (`weapons_decoded.txt`) in that same ignored
+`build/re/open2/botfire/`.
+
+### 45.1 What the game does (TdGame.u's bytecode, MirrorsEdge.exe, the ini files, the class defaults)
+- **A bot keeps an aim offset; he does not roll a die for each shot.** `UTdAimBot::UpdateDispersion`
+  (0x012537f0), every tick: `BaseOffset`, `BaseDispersion` and `BaseYOffset` go up by the one-shot penalty of
+  the move she has just changed to, down by `GetImprovementRate() * DeltaTime` while he sees her and is not
+  suppressed, and are clamped, `BaseOffset` to `[HorizontalOffset_Min, HorizontalOffset_Max[band]]`.
+  `GetImprovementRate` (0x01252610): the template's rate for the band and the difficulty, x
+  `MoveTowardMultiplier` at 200 uu/s or less; faster, by the cosine between her velocity and the way to the
+  bot (under 0.7 either way `MoveSidewaysMultiplier`, else away or toward), and, when the result is above
+  nothing, x the `AiAimPenalty` of the move she is in. The band (`ATdBotPawn::ClassifyAIFiringRange`,
+  0x01236340): far past the weapon's `CombatRange_Max`, near under 489.9 uu, else medium.
+- **The first shot throws the three values to their most** (`TdAimBot.StartBurst`), and, by the second reader's
+  correction, so does the first shot after every loss of line of fire: `TdAIController` vtbl[0x3f0]
+  (0x011ea200) sets `bFirstShot` whenever `bHasLineOfFire` is false, which is `EnemyVisible`, or within
+  `KeepFiringTime` (0.2 to 0.8 s, `TdAIController.EnemyNotVisible`) of losing sight of her.
+- **Where a shot goes.** `TdAimBot.PickPoint` and `GetNextLocation` aim it `BaseOffset` and up to
+  `BaseDispersion` more to her side and sweep it across her; `Weapon.AddSpread` adds the weapon's `Spread`;
+  the line runs from the bot's trigger finger through that point, with no extent, and can meet her only in
+  the bodies of `Faith3p_Physics` on her third-person mesh.
+- **A bullet that lands counts only at or under the template's `OffsetThreshold` for the band**
+  (`TdPlayerPawn.TakeDamage`'s first statement, `TdAimBot.IsHitRelevant`); sooner it does nothing and is not
+  heard. A sniper's bullet and the Training Area's partner's hits always count; whether one is heard is
+  `TdWeapon.PlayImpactEffects`' own test, the same rule asked of `TdDmgType_LowCaliber_Bullet` whatever the
+  weapon, so a sniper's bullet hurts her unheard while his offset is over the threshold.
+- **The Training Area's partner** (`TdAI_Tutorial`) fires nothing: its `SeePlayer` does nothing, so she is
+  never his `Enemy`, and its one combat state is `CombatTutorialMelee` (`TestCombatTransitions`, entered when
+  `CanAttack`: the level's `SeqAct_TdAiInitiateAttack`, the tutorial listener and her walking).
+- **The damage** is the weapon class's `InstantHitDamage` with its fall-off, x `AIDamageMultiplier`, to an
+  int, less her armour: 0.7 / 0.5 / 0.3 at Easy / Medium / Hard on every part of her.
+- **No move makes her immune.** 23 of her 63 moves write `AiAimPenalties` or `AiAimOneShotPenalties` (a wall
+  run 0.4 / 0.5 / 0.7 of the rate, a slide 0.7 / 0.8 / 0.9, a vault 50 uu, a swing or a zip line 200); the
+  skill roll and sprinting write none.
+- **Bursts.** `ATdBotPawn::SetAIFiringState` (0x01236380) copies the weapon's `AimedBurst_Near / _Mid / _Far`;
+  `TdBotPawn.StartNewBurst`, `CheckFire`, `WeaponFired`, `BurstOver` (0.03 s) and `PauseFiring` run the burst
+  and the pause; `TdAIManager` (`UseBurstControl` True, `MaxSimultaneousBursts` 2) gives two bots a turn at a
+  time and puts a bot she is looking at from under 1000 uu before one she is not (`PrioritizedOver`).
+- **A bot's armour** is his pawn class's `ArmorBullets{Head,Body,Legs}Settings` at the difficulty, chosen by
+  the bone hit (`TdPawn.AdjustDamage`), after the head material's doubling; the pawn class is the AI
+  template's `PawnClass`. The difficulty is the profile's `GameDifficulty` (1 with no profile, and in a race).
+- **The helicopter** collides through one box of its hidden placeholder mesh's physics asset (487.4 x 202.9 x
+  137.5 about (0, 0, 434) over its `Location`); the body names no material; it has 300 health and no
+  `TakeDamage` of its own, and what its death would be was not found.
+- **A bullet's hit on a bot** plays `TdMove_StumbleBot`'s sequence chosen by the damage type and by where the
+  shooter stands: a pistol's or a rifle's `WalkBwdStop` from in front and `WalkFwdStop` from behind, each
+  with a turn in 0.3 s; a shotgun's from in front `HitHeavyStomach`, or `HitHeavyHead` when the hit is more
+  than 145 uu up; a shotgun's from behind none. `HitMeleeLeft` / `Right` are a blow's alone.
+
+### 45.2 What was wrong
+- A bot fired one shot every 0.95 s (1.45 s with a shotgun) from in front of his chest at the middle of her,
+  whatever his weapon. It landed whenever the level left that line clear and she was not "evading": sliding,
+  rolling, wall running, in a disarm or faster than 540 uu/s made her immune. A hit took 10 at every
+  difficulty. The door gunner fired 0.85 s of every 2.2 s at a wobbling point for 4.5 a hit, with the same
+  kind of immunity.
+- A bot wore no armour, and there was no difficulty outside the menus. A bullet took the port's own number
+  for the weapon (the Colt 45 where its class has 42).
+- No bullet met a helicopter.
+- Every bullet's hit started a blow's `HitMeleeRight` or `HitMeleeLeft`, wherever she stood, again on every
+  further hit.
+- A level's bot was given a weapon by parts of his template's name, and the Colt when the name held none of
+  them: so the levels' 85 `AITemplate_Assault` cops (the SCAR-L), the patrol cops with the Remington, the
+  Glock and the "MiniUzi" (a Steyr TMP), the riot cops (the Steyr TMP) and Celeste (the Beretta M93R) all
+  carried Colts, and so did the pursuit cops, whose weapon is the taser. A factory that names no template
+  was a patrol cop; its class's default is `AITemplate_Default`.
+
+### 45.3 Changes
+- **`src/physics/bot_fire.hpp`** (new; on `types.hpp` and `body_shapes.hpp` alone): the 24 templates with
+  their parents' values written out, the 11 weapons as a bot fires them, the moves' penalties, her armour
+  and the 14 pawn classes' (`kAimTemplates`, `kBotWeapons`, `kMoveAimPenalties`, `kBotArmour`);
+  `find_aim_template` (the template by `EnemyBot::archetype`'s exact name, with the port's own names told
+  apart; the mesh resolver cannot serve: one mesh is several pawn classes); `TdAimBot` function by function
+  (`aim_update_dispersion`, `aim_improvement_rate`, `aim_pick_point`, `aim_start_burst`,
+  `aim_next_location`, `aim_hit_relevant`), `add_weapon_spread`, `aim_tick` (the sight of her,
+  `KeepFiringTime`, the band and its burst, `bFirstShot`); `weapon_damage_at`, `player_bullet_damage`,
+  `bot_bullet_damage`; her stand-in (`kPlayerBodies`, `pose_player_stand_in`); the helicopter's box;
+  `bullet_stumble_state` and `bullet_stumble_anim`.
+- **Her stand-in.** The 11 bodies of `Faith3p_Physics` that are fixed to the skeleton and do not hang on the
+  arms (12 shapes), as they stand in the asset's reference pose, at her feet and yaw, brought down in height
+  when her capsule is the low one. The arms' six bodies and the hair's four are left out.
+- **`src/math/types.hpp`:** `BotCombatState` (the aim bot's members, the controller's flags that feed it, the
+  burst, the stumble) on `EnemyBot` and, for the door gunner, on `HelicopterInstance`;
+  `BulletTracer::pawn_hit` 3 also for a hit on her that does not count yet, and 4 for a helicopter's box.
+- **`src/physics/parkour_controller.*`:** `update_ai_bots` runs `aim_tick` for every bot that has her for
+  his enemy and `ai_tick_fire` (the bursts, `TdAIManager`'s turns in `ai_ask_to_burst` and
+  `ai_update_bursts`); `ai_fire_shot` traces the shot through the level, the other bots' posed bodies (which
+  stop it and take nothing) and her stand-in, and applies the gate and the damage. The door gunner is the
+  same code with `AITemplate_Gunner` and the FN Minimi. `m_ai_aim_old_move` is `TdPawn.AIAimOldMovementState`.
+  The player's bullet: `bot_bullet_damage` (the class's damage with its fall-off, the head's doubling, the
+  armour of the bone), the stumble with its turn, not begun again while one runs and not on the shot that
+  kills, and `trace_helicopters`. `set_difficulty`, `set_ai_hold_fire` (for the checks that stand her in
+  front of a bot to look at something else), `pose_player_bodies`.
+- **`src/game/impact_effects.hpp`:** `pawn_hit` 4: the default material's effect and sound, no hole.
+- **`src/anim/anim_system.cpp`:** a bullet's stumble is played from its start for the sequence's length;
+  `ME_SHOW_BODIES=1` draws the helicopter's box.
+- **`src/assets/upk_loader.cpp`:** a level bot's weapon is his template's `MainWeaponClass` (a pursuit cop:
+  none); a factory that writes no `BotTemplate` has `AITemplate_Default`.
+- **`src/main.cpp`:** the difficulty from the front end's profile (`apply_difficulty`: `GameDifficulty`,
+  Medium in a speed run or a time trial), given on every action the front end reports, "Resume" from the
+  pause menu's options among them; oracle stage 27 (`oracle_bot_fire`), alone as `--verify-botfire`;
+  `ME_SHOT_HELI` for `--intro-shots`; stage 24 holds the bots' fire and expects the new damage.
+- **Second session** (the first was cut off by a usage limit after its first commit): a weapon's
+  `FireInterval` now holds across bursts (a bot's weapon fired at once whenever the trigger was pulled again,
+  so the Neostead, whose pause of 0.6 to 0.8 s is shorter than its interval of 1.1 s, fired faster than it
+  can); the check of the bursts in stage 27; the loader's fallback template; a helicopter's rider, whom the
+  level's factory leaves standing as a bot where it spawns him, fires nothing of his own
+  (`is_helicopter_rider`: with his template's weapon he would have fired a Minimi from there); the
+  documents.
+- **After the review:** `TdAIManager`'s turns (`m_ai_bursts`) were never let go of when the clock started over
+  (`reset`), so after a restart or a new level a turn stamped in the future blocked the bots' fire; they are
+  cleared there, a turn stamped after the clock is over, and a restart (`restart_level_at`) starts the
+  level's bots' fire over (bursts, timers, the aim bot's time stamps; a perfect aim and an improvement rate
+  the script set are kept). The Training Area's partner no longer fires (it did, and every hit counted: 21
+  of them at Medium in a test run). A bot's hit on her is heard by the sound's own test (above).
+
+### 45.4 Checked (Windows, Direct3D 11, headless; nothing was played or listened to)
+- **Oracle stage 27** (`--verify-botfire`, 20 s; the Training Area, the renderer's own skeletons). Each
+  expected number is worked in the check from the ini's values typed there apart from the table.
+  - *Aim, seconds from the first shot until a hit counts, she standing in his sight* (an Assault cop's
+    SCAR-L; measured / by the rule, a tick being a sixtieth): near (50 -> 40 uu) Easy 0.400 / 0.385, Medium
+    0.233 / 0.220, Hard 0.200 / 0.192; medium (90 -> 70) 0.783 / 0.769, 0.450 / 0.440, 0.400 / 0.385; far
+    (200 -> 130) 2.700 / 2.692, 1.550 / 1.538, 1.350 / 1.346.
+  - *A restart* (Medium, a patrol cop 600 uu off): first shot at 0.02 s with his offset at 90.0; at 3.5 s his
+    offset 51.3; after `restart_level_at` where she stood, first shot at 0.02 s at 90.0 again.
+  - *The reset* (Medium, medium range): offset 5.0 before any shot, 90.0 at the first, 5.0 after 3 s in his
+    sight; out of it 0.15 s he keeps his line of fire and the next shot is at 5.0; out of it 1 s
+    `bFirstShot` is set, the offset still 5.0, and the next shot is at 90.0 and no hit counts.
+  - *Her running and her moves* (Medium, medium range; 20 uu to lose): sprinting across his view 0.717 /
+    0.714, at him 0.450 / 0.440, away 3.817 / 3.810; in a skill roll across 0.717 / 0.714 (as sprinting);
+    sliding at him 0.550 / 0.549; wall running across at Easy 3.133 / 3.125, Medium 1.433 / 1.429, Hard 0.900
+    / 0.893; on a zip line across 7.150 / 7.143; from a Support cop, sprinting away, never in 60 s; the door
+    gunner, she standing: near 4.000 / 4.000, medium 4.800 / 4.800, far 8.000 / 8.000.
+  - *One-shot penalties on a settled aim* (5.0): entering a vault 54.242 (by the rule 54.242; hits go on
+    counting), entering a swing 90.0 (the band's most; none counts).
+  - *A bot's bullet before her armour and after it at Easy / Medium / Hard:* Colt at 300 uu 42 -> 12 / 21 /
+    29, at 2550 uu 21 -> 6 / 10 / 14, at 4500 uu 0; SCAR-L at 1500 uu 35 -> 10 / 17 / 24, at 5500 uu 14 -> 4
+    / 7 / 9; Steyr TMP 15.5 -> 4 / 7 / 10; a Remington's pellet 16 -> 4 / 8 / 11; Minimi 36 -> 10 / 18 / 25;
+    M95 at 15000 uu 80 -> 24 / 40 / 56.
+  - *Fire, a patrol cop (Colt) 600 uu off in the open, she standing:* his first shot at 0.02 s with his
+    offset at 90.0 at each difficulty; the first hit that counts at 3.67 s at Easy (not before 0.79), 2.97 s
+    at Medium (0.46) and Hard (0.40); 15 shots in 11.3 s with 9 on her and 9 counted for 12 each, 9 shots in
+    6.5 s with 5 and 5 for 21, 8 shots in 5.9 s with 4 and 4 for 29. The same cop moved behind the level from
+    3.0 to 4.5 s (Medium): he does not see her, fires nothing after 3.9 s, `bFirstShot` set, offset 5.0; back
+    in her sight his first shot at 4.52 s with his offset at 90.0, the first hit that counts at 8.80 s.
+  - *Bursts 272 uu off, 12 s each:* an MP5K 12 bursts of 6 shots 0.100 s apart with 0.37 to 0.55 s between
+    them (0.03 and a pause of 0.3 to 0.5); a Neostead 11 shots 1.100 s apart; three MP5K cops side by side:
+    2 triggers held at most, their shots 72, 75 and 72; a helicopter's rider left standing with his Minimi
+    fires nothing in 3 s.
+  - *Gate, a Colt's bullet from 272 uu that ends in her stand-in:* with his offset at 45.0 (over the near
+    band's 40) `pawn_hit` 3 and no health lost; at 30: 12 / 21 / 29 lost at Easy / Medium / Hard; a G36C at
+    Medium 15, a Minimi 18; a sniper's M95 with his offset at 100 (over 75) 40, unheard (`pawn_hit` 3).
+  - *Armour, her Colt (42) at head / hand / thigh at Easy, Medium, Hard:* `AITemplate_Assault` 67 / 67 / 33,
+    58 / 58 / 29, 42 / 42 / 21; `AITemplate_PatrolCop` 84 / 84 / 42, 84 / 84 / 42, 67 / 67 / 33;
+    `AITemplate_Support` 50 / 50 / 25, 42 / 42 / 21, 25 / 25 / 12 (the pulls go through
+    `ParkourController::step`; the bones met are `Neck`, `LeftHand`, `RightUpLeg`). By the rule alone: Celeste
+    at Medium head 67, a hand 33, body 16, foot 21; a riot cop's shin at Hard 8; `PatrolCop_MiniUzi` at
+    Medium 37; a sniper cop at Hard 25; a sniper's bullet 99999; the door gunner 42; with no bone 42.
+  - *Helicopter 900 uu off, broadside:* a Colt's bullet at the box's middle ends 862.74 uu from her eye, where
+    the line was worked to enter the box, 101.44 from its middle across it, `pawn_hit` 4, the face's normal;
+    a step later one effect (`PS_FX_Impact_Concrete_Light_01`), the sound `Concrete.9mm_Concrete_Impact` (the
+    default material's), no bullet hole; a bullet 220 uu over the box goes on (`pawn_hit` 0); the helicopter
+    is as it was.
+  - *Stumble:* the four sequences are in the sets the bots are drawn with (a pistol's and a rifle's); a
+    pistol from in front `WalkBwdStop` (14), from behind `WalkFwdStop` (16), a rifle from in front
+    `WalkBwdStop`, a shotgun from in front at a thigh `HitHeavyStomach` (17), at the head `HitHeavyHead` (18),
+    from behind nothing; a second bullet 0.35 s into a pistol's stumble hurts him and leaves it running;
+    0.33 s in he faces the way opposite her facing to 0.00 degrees; it is over at 0.68 s.
+- **The earlier stages.** `--verify-all`: ALL SYSTEMS PASS, stages 1 to 25 and 27. The result lines of stages 1 to 25 are
+  word for word those of `main` at `4aa350b` built here, but stage 24's timing of a pose. Stage 24's own
+  lines: the places every line and tracer meets him are the same to the last digit; its damages move, as they
+  must: the Colt's 45 was the port's number and is the class's 42 now, and his armour comes off (a SWAT bot at
+  Medium, 0.3): the head and a hand 90 -> 58, a thigh 45 -> 29; a Remington's pull at a bot who cannot die
+  198 -> 121 (a pellet 18 -> 16, 11 through his armour); the pull that is to kill a bot is at one with 60
+  left, since 100 now outlasts it; the tutorial's bot and the pulls with no poser (no bone, no armour) 45 ->
+  42 and 90 -> 84. It poses 27,280 poses where it posed 23,760: the four stumbles are added (reach 217.6 uu,
+  under the 303 that was the most). Of the 17 pictures 16 come out pixel for pixel as `main`'s; stage 7's
+  (`oracle_5_combat_disarm_reaction.png`; the tracked one is the new one) differs in her health bar, which
+  was 46 of its 154 pixels short and is full, and in the faint desaturation that goes with it: by the old
+  rule the three guards 487 to 608 uu off had hit her before the picture, and by the new one none of their
+  hits has counted by then (she is 0.75 s into a disarm, which puts 200 uu on every bot's offset).
+- **The helicopter's box against the drawn hull** (`ME_SHOT_HELI`, `ME_SHOW_BODIES=1`, the Prologue's roof;
+  two pictures looked at, broadside and nose on): the box is a slab on the cabin's roof round the rotor
+  mast, a little over half the cabin's width; the cabin, the nose and the tail are outside it. The hull's
+  rotor hub (`VH_Main`) is 404 over its mesh's origin, inside the box's 365 to 503. Shots at the box log `on a
+  helicopter .. effect PS_FX_Impact_Concrete_Light_01, sound Concrete.9mm_Concrete_Impact, no decal`; shots
+  at the cabin pass.
+- **Builds:** `mirrorsedge_windows`, `mirrorsedge_opengl`, `me_replay`, `me_anim`, `me_menu`, `me_glsl`; the
+  full build's 139 warnings are, file and message, the 139 it had. A clang front end (clang-tidy 19 of the Visual Studio build tools, `-std=c++20`, the MinGW headers) takes
+  `parkour_controller.cpp`, `anim_system.cpp` and `upk_loader.cpp` with no diagnostic, and `main.cpp` as
+  built for OpenGL with none in the port's sources (GCC's own intrinsics headers, which that file's includes
+  reach, do not parse with clang there; a probe shows it still reports an error of the port's own after them).
+- **Every chapter loads** with the templates' weapons (`--verify-respawn`): 202 places in 11 maps, 190 stand
+  where they are put, 7 in a lift's cab, 2 fall and live, 3 known, 0 failed, as in section 40.
+- **Not built:** the Metal renderer and the macOS app (no branch was pushed for it; the renderer interface is
+  untouched, so the three renderers changed by nothing). **Not run:** the windowed game. Nothing was played by
+  hand and no sound was listened to.
+
+### 45.5 How combat changes
+She stands still in the open, one patrol cop with a Colt 600 uu off (measured in the simulation, the same
+place for both): by the old rule she is dead at 9.65 s at any difficulty (10 hits of 10, one every 0.97 s,
+the first at 0.95 s). Now at 11.27 s at Easy (9 hits of 12), 6.52 s at Medium (5 of 21) and 5.85 s at Hard (4
+of 29), with nothing for the first 3 to 3.7 s while his aim comes in, and nothing again for about as long
+after she has been out of his sight for a second. Hits are fewer and heavier; rifles and the Minimi fire
+bursts of 3 to 25 shots that sweep over her. Sliding, rolling, wall running and sprinting no longer make her
+immune: a slide costs the bot a fifth of his rate at Medium, a wall run half, the roll and the sprint
+nothing beyond the direction she runs in (across his view 0.8 of the rate, away 0.15); what resets him is a
+vault, a dodge jump, a swing, a zip line, a disarm, or breaking his line of sight. Her own bullets do less
+to the armoured: at Medium an Assault cop takes 29 from a Colt where he took 45 (4 body hits where 3
+killed), a Support cop 21, a riot cop 16; a patrol cop 42. A hit staggers a bot for 0.7 s (a shotgun's for
+1 s) and turns him towards her, once, where every hit restarted 1.6 s of a blow's reel. The levels' Assault
+cops, 85 of their 257 factory bots, fire a SCAR-L's bursts (35 a bullet before her armour) where they fired
+a Colt, and the riot cops a Steyr TMP's; pursuit cops no longer shoot.
+
+### 45.6 Not done
+- **The by-bone physics flinch** (the upper body's bodies let go under an impulse, pulled back by motors) is
+  not reproduced and can not be without a rigid-body solver; recorded in `TODO.md` with what was read.
+- **The helicopter takes no damage:** by script it has 300 health, but its death, any Kismet that hears of
+  it and whether native code keeps it up were not found. That the placeholder's box is what stops a bullet
+  in play, and that the drawn hull stops none, is inferred from the components' flags.
+- **Her bodies are a stand-in** in the reference pose, without arms and hair; her real pose per move
+  (`AT_C3P`) is not known here.
+- Suppression and suppression fire, the snipers' own aim bot, the taser, the chase sets, `HandleDeath`, a
+  bot's attack angle, Kismet's `SeqAct_TdAIPerfectAim` and `SeqAct_AIHoldFire` run from the level, the door
+  gunner's seat, Celeste as a boss who fires, the fly-by sound's own rule, and the player's own weapon table
+  (fire interval, range, spread: still the port's numbers): each is in `TODO.md`.
+- Who a bot takes for his enemy and when he stands to fire are still the controller's own rules, and a
+  helicopter's riders still stand as bots where their factories spawn them (they no longer fire).

@@ -952,8 +952,11 @@ struct BulletTracer {
     float damage = 20.0f;      // what it does to the level actor it hits (the level's script hears of it)
     // The person it stopped in (TdWeapon.RegisterPendingImpact / PlayImpactEffects): 0 nobody;
     // 1 a bot the player shot, who gets his body's impact effect and sound; 2 the player, who
-    // gets the sound alone; 3 a bot that gets nothing (shot by another bot, dying or dead, or the
-    // tutorial's).
+    // gets the sound alone; 3 somebody who gets nothing (a bot shot by another bot, dying or dead,
+    // or the tutorial's; the player while the bot's aim is still off, TdAimBot.IsHitRelevant).
+    // 4 is no person: an actor that is no part of the level and whose body names no physical
+    // material (the helicopter's placeholder box), which gets the weapon's DefaultImpactMaterial
+    // effect and sound and no bullet hole.
     uint8_t pawn_hit = 0;
     // Where it went into him is end_pos; the surface there, as HitInfo has it: its normal (out of
     // the body; zero: not known) and its material.
@@ -986,8 +989,58 @@ enum class EEnemyAnimState : uint8_t {
     KnockedOut = 8
 };
 
+// A bot's fire at the player, and what her bullet's hit made of him (physics/bot_fire.hpp): the
+// members of his TdAimBot, the flags of his TdAIController that feed it, the burst his TdBotPawn
+// is firing, and the stumble a bullet put him in.
+struct BotCombatState {
+    // TdAimBot. The three Base values are in uu at her place: how far to her side the bullets are
+    // aimed, how much further at random, how far under her eyes.
+    float base_offset = 0.0f;         // BaseOffset
+    float base_dispersion = 0.0f;     // BaseDispersion
+    float base_y_offset = 0.0f;       // BaseYOffset
+    float current_x = 0.0f;           // CurrentX: the aim point beside her Location, across the line of fire
+    float current_y = 0.0f;           // CurrentY: ...and over it
+    float target_x = 0.0f;            // TargetX: where the sweep across her is going
+    float diff_x = 0.0f;              // DiffX
+    Vec3 current_location{0.0f, 0.0f, 0.0f};  // CurrentLocation: the last aim point
+    float time_of_last_shot = 0.0f;   // TimeOfLastShot
+    float improvement_override = 0.0f;  // OverriddenImprovementRate (SeqAct_TdAIPerfectAim with a rate)
+    bool perfect = false;             // TdAIController.AimBot is the TdAimBot_Perfect
+    // TdAIController
+    bool first_shot = true;           // bFirstShot: the next shot starts the aim over at its worst
+    bool has_enemy = false;           // Enemy != None
+    bool enemy_visible = false;       // EnemyVisible
+    float enemy_lost_time = -1.0e9f;  // EnemyNotVisibleTimeStamp
+    float keep_firing_time = 0.0f;    // KeepFiringTime
+    Vec3 last_seen{0.0f, 0.0f, 0.0f}; // LastActuallySeenLocation
+    // TdBotPawn
+    uint8_t firing_range = 1;         // FiringRange (AIFiringRange): 0 near, 1 medium, 2 far
+    bool range_known = false;         // SetAIFiringState has copied a burst pattern
+    int32_t burst_min = 1;            // CurrentBurstMin, CurrentBurstMax
+    int32_t burst_max = 1;
+    float burst_delay_min = 0.5f;     // BurstDelayMin, BurstDelayMax
+    float burst_delay_max = 1.0f;
+    bool wants_to_fire = false;       // bWantsToFire
+    bool burst_wait = false;          // bBurstWait
+    bool new_burst = false;           // bNewBurst
+    bool ok_to_burst = false;         // bOkToBurst
+    bool trigger = false;             // IsPressingWeaponTrigger
+    int32_t burst_length = 0;         // CurrentBurstLength
+    int32_t shot_count = 0;           // ShotCount
+    uint8_t timer = 0;                // which of his timers runs: 1 'PauseFiring', 2 'StartNewBurst'
+    float timer_left = 0.0f;
+    float refire = 0.0f;              // until the weapon can fire again (its FireInterval from the last shot)
+    uint32_t random = 0;              // his own FRand(), so that one bot's shots do not depend on another's
+    // TdMove_StumbleBot: the stumble a bullet's hit plays (0 none; 14, 16 a pistol's or a rifle's
+    // from in front and from behind; 17, 18 a shotgun's from in front, low and high) and the turn
+    // it starts (SetPreciseRotation).
+    uint8_t stumble = 0;
+    float turn_left = 0.0f;           // seconds of the turn still to go
+    float turn_to_yaw = 0.0f;
+};
+
 struct EnemyBot {
-    std::string archetype; // PatrolCop, PursuitCop, RiotCop, SWAT, Assault, Support, Celeste
+    std::string archetype; // the AI template he was made from (AITemplate_PatrolCop, ...), or one of the port's own names (Assault_SWAT)
     Vec3 position{0.0f, 0.0f, 0.0f};
     Vec3 home_position{0.0f, 0.0f, 0.0f};
     Vec3 velocity{0.0f, 0.0f, 0.0f};
@@ -1017,6 +1070,7 @@ struct EnemyBot {
     std::string cutscene_pkg_path;  // Full filesystem path to .me1 containing cutscene AnimSequence
     int32_t cutscene_anim_exp_1 = 0;// 1-based export index of cutscene AnimSequence (for parse_single_anim_sequence)
     float cutscene_start_sec = 0.0f;
+    BotCombatState combat;          // his aim at the player, his burst, the stumble a bullet put him in (physics/bot_fire.hpp)
 };
 
 // -----------------------------------------------------------------------------
@@ -1384,6 +1438,7 @@ struct HelicopterInstance {
     bool perfect_aim_active = false;
     bool just_spawned = false;
     bool just_fired = false;
+    BotCombatState gunner;           // the door gunner's aim and burst (AITemplate_Gunner, physics/bot_fire.hpp)
 };
 
 // -----------------------------------------------------------------------------

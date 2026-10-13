@@ -558,6 +558,7 @@ ParkourController::ParkourController(const MovementConfig& config)
 void ParkourController::reset(const Vec3& spawn_pos, float spawn_yaw) {
     m_telemetry.tick = 0;
     m_telemetry.sim_time = 0.0f;
+    m_ai_bursts.clear();  // TdAIManager's turns are stamped with the clock that starts over here
     m_telemetry.position = spawn_pos;
     m_telemetry.velocity = Vec3(0.0f, 0.0f, 0.0f);
     m_telemetry.speed_2d = 0.0f;
@@ -802,6 +803,18 @@ void ParkourController::settle_lifts_for_restart(LevelScene& scene, const Vec3& 
 void ParkourController::restart_level_at(const Vec3& start_location, float yaw_deg, LevelScene& scene) {
     settle_lifts_for_restart(scene, start_location);
     restart_at(start_location, yaw_deg, scene);
+    // The level's bots start their fire over with it: their bursts, timers and the aim bot's time
+    // stamps were on the clock the restart set back to 0. What the level's script set on them (a
+    // perfect aim, an improvement rate) and each one's own random numbers are kept.
+    const auto start_over = [](BotCombatState& s) {
+        BotCombatState fresh;
+        fresh.perfect = s.perfect;
+        fresh.improvement_override = s.improvement_override;
+        fresh.random = s.random;
+        s = fresh;
+    };
+    for (EnemyBot& bot : scene.enemies) start_over(bot.combat);
+    for (auto& heli : scene.helicopters) start_over(heli.gunner);
 }
 
 void ParkourController::restart_at(const Vec3& start_location, float yaw_deg, const LevelScene& scene) {
@@ -961,6 +974,9 @@ void ParkourController::equip_weapon(const std::string& weapon_name) {
 void ParkourController::step(const InputFrame& input, float dt, LevelScene& scene) {
     m_telemetry.sound_events.clear();
     if (dt <= 0.0f) return;
+    // TdPawn.Tick's first statement: AIAimOldMovementState = MovementState. The bots' aim, which
+    // ticks after her moves, takes a one-shot penalty when the two differ (update_ai_bots).
+    m_ai_aim_old_move = m_telemetry.move_state;
     m_telemetry.move_input = std::fabs(input.forward) > 0.01f || std::fabs(input.strafe) > 0.01f;
     if (m_telemetry.grounded) m_telemetry.ground_distance = -1.0f;
 
@@ -5573,6 +5589,36 @@ bool ParkourController::trace_enemies(const LevelScene& scene, const std::vector
     return out.enemy >= 0;
 }
 
+bool ParkourController::trace_helicopters(const LevelScene& scene, const Vec3& from, const Vec3& dir, float max_dist, HelicopterShotHit& out) const {
+    out = HelicopterShotHit{};
+    float best = max_dist;
+    for (size_t i = 0; i < scene.helicopters.size(); ++i) {
+        const HelicopterInstance& heli = scene.helicopters[i];
+        if (!helicopter_stops_bullets(heli)) continue;
+        // UPhysicsAsset::LineCheck on PA_Helicopter_Placeholder: its one body's one box.
+        const BodyShape box = helicopter_box(heli);
+        float distance = 0.0f;
+        Vec3 normal;
+        if (!trace_body_shape(box, from, dir, best, distance, normal)) continue;
+        if (out.helicopter >= 0 && distance >= best) continue;
+        best = distance;
+        out.helicopter = static_cast<int32_t>(i);
+        out.distance = distance;
+        out.location = from + dir * distance;
+        out.normal = normal;
+    }
+    return out.helicopter >= 0;
+}
+
+void ParkourController::pose_player_bodies(EnemyBodySet& out) const {
+    // The capsule is 122 high crouched, sliding, coiled or rolling, 180 otherwise (as the floor
+    // check in step() has it).
+    const EMovement state = m_telemetry.move_state;
+    const bool low = state == EMovement::MOVE_Crouch || state == EMovement::MOVE_Slide || state == EMovement::MOVE_MeleeSlide ||
+                     state == EMovement::MOVE_SkillRoll || state == EMovement::MOVE_Coil;
+    pose_player_stand_in(m_telemetry.position, m_pawn_yaw, low ? kCrouchHeight : kPawnHeight, out);
+}
+
 // -----------------------------------------------------------------------------
 // Combat, Firearms, Ballistics & Disarm Subsystem
 // (Reverse-engineered from TdGame.u TdMove_Melee*, TdMove_Disarm, TdWeapon & DefaultWeapons.ini)
@@ -5892,27 +5938,73 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                 best_bot_dist = shot.distance;
                 tracer_end = shot.location;
             }
+            // ...and against a helicopter's box, short of both: the bullet stops on it and nothing
+            // is taken from anything (bot_fire.hpp).
+            HelicopterShotHit on_helicopter;
+            if (trace_helicopters(scene, eye, ray_dir, best_bot_dist, on_helicopter)) {
+                hit_bot = nullptr;
+                tracer_end = on_helicopter.location;
+            }
 
             // TdBotPawn.TakeDamage: nothing for a bot already dead (an earlier pellet of this pull
             // killed him, or he lay there before it); the bullet stops in him all the same.
             if (hit_bot != nullptr && hit_bot->alive) {
                 any_hit = true;
-                // Distance damage falloff from DefaultWeapons.ini
-                float t_falloff = 0.0f;
-                if (best_bot_dist > ws.falloff_start && ws.falloff_end > ws.falloff_start) {
-                    t_falloff = std::clamp((best_bot_dist - ws.falloff_start) / (ws.falloff_end - ws.falloff_start), 0.0f, 1.0f);
+                const AimTemplate& bot_template = find_aim_template(hit_bot->archetype);
+                const BotWeapon* fired = find_bot_weapon(ws.name);
+                const EBulletKind kind = fired ? fired->kind : EBulletKind::LowCaliber;
+                // TdWeapon.GetInstantHitDamage: the weapon class's damage with its own fall-off (a
+                // weapon this table does not know keeps the controller's).
+                float dmg = 0.0f;
+                if (fired) {
+                    dmg = weapon_damage_at(*fired, best_bot_dist, false);
+                } else {
+                    float t_falloff = 0.0f;
+                    if (best_bot_dist > ws.falloff_start && ws.falloff_end > ws.falloff_start) {
+                        t_falloff = std::clamp((best_bot_dist - ws.falloff_start) / (ws.falloff_end - ws.falloff_start), 0.0f, 1.0f);
+                    }
+                    dmg = ws.damage + (ws.damage_far - ws.damage) * t_falloff;
                 }
-                float dmg = ws.damage + (ws.damage_far - ws.damage) * t_falloff;
                 // TdBotPawn.TakeDamage: Damage * DamageMultiplier_Head (2.0) when HitInfo.PhysMaterial
                 // is PM_Character_Head, the material of the head's body and of the hands'; the other
-                // bodies' DamageMultiplier_Body is 1.0.
-                if (shot.head) dmg *= 2.0f;
+                // bodies' DamageMultiplier_Body is 1.0. Then TdPawn.AdjustDamage: the armour of his
+                // pawn class at this difficulty for the bone that was hit (a sniper's bullet 99999).
+                const int taken = bot_bullet_damage(bot_template, dmg, kind, shot.head, shot.bone, shot.posed, m_difficulty);
 
-                hit_bot->health -= dmg;
-                hit_bot->stunned = true;
-                hit_bot->attack_timer = 0.0f;
-                hit_bot->anim_timer = 0.0f;
-                hit_bot->active_anim_seq = (p % 2 == 0) ? "HitMeleeRight" : "HitMeleeLeft";
+                hit_bot->health -= static_cast<float>(taken);
+                if (hit_bot->health <= 0.0f) {
+                    // (What the dead play is the death animation of the weapon's DeathAnimType in
+                    // the game; here still the sequence a blow's stagger had.)
+                    hit_bot->stunned = true;
+                    hit_bot->attack_timer = 0.0f;
+                    hit_bot->anim_timer = 0.0f;
+                    hit_bot->active_anim_seq = (p % 2 == 0) ? "HitMeleeRight" : "HitMeleeLeft";
+                    hit_bot->combat.stumble = 0;
+                    hit_bot->combat.turn_left = 0.0f;
+                } else if (!hit_bot->stunned) {
+                    // TdPawn.PlayPhysicsBodyImpact -> StumbleDamage: the stumble a bullet's hit plays
+                    // on a bot that lives through it, picked by the damage type and by where she
+                    // stands (TdMove_StumbleBase.GetStumbleState). A bot in a stumble already, a
+                    // bullet's or a blow's, does not begin another (MovementState != MOVE_Stumble),
+                    // and a shotgun's hit from behind plays none.
+                    const float hit_height = shot.location.z - (hit_bot->position.z + kBotSolesUnderCapsule);
+                    const uint8_t stumble = bullet_stumble_state(kind, m_telemetry.position, hit_bot->position, hit_bot->yaw_deg, hit_height);
+                    const StumbleAnim anim = bullet_stumble_anim(stumble);
+                    if (anim.length > 0.0f) {
+                        hit_bot->stunned = true;
+                        hit_bot->attack_timer = 0.0f;
+                        hit_bot->anim_timer = 0.0f;
+                        hit_bot->anim_duration = anim.length;
+                        hit_bot->active_anim_seq = anim.sequence;
+                        hit_bot->combat.stumble = stumble;
+                        if (stumble == 14 || stumble == 16) {
+                            // PlayStumbleAnimation: SetPreciseRotation(.., 0.3) to her Rotation (16),
+                            // or to her Rotation with its yaw turned half round (14).
+                            hit_bot->combat.turn_to_yaw = m_pawn_yaw + (stumble == 14 ? 180.0f : 0.0f);
+                            hit_bot->combat.turn_left = kStumbleTurnTime;
+                        }
+                    }
+                }
 
                 if (hit_bot->health <= 0.0f) {
                     bool is_trainer = (hit_bot->archetype.find("TutorialTrainer") != std::string::npos ||
@@ -5937,7 +6029,7 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
                             hit_bot->weapon_name = "None";
                         }
                     }
-                } else {
+                } else if (hit_bot->stunned) {
                     hit_bot->anim_state = EEnemyAnimState::HitStagger;
                 }
             }
@@ -5954,6 +6046,12 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
             tr.pawn_hit = hit_bot ? ((hit_bot->alive && !is_tutorial_bot(*hit_bot)) ? 1 : 3) : 0;
             tr.pawn_normal = shot.normal;
             tr.pawn_surface = shot.head ? ECharacterSurface::Head : ECharacterSurface::Body;
+            if (on_helicopter.helicopter >= 0) {
+                // The helicopter's box: the weapon's default impact effect and sound, no hole.
+                tr.pawn_hit = 4;
+                tr.pawn_normal = on_helicopter.normal;
+                tr.pawn_surface = ECharacterSurface::Body;
+            }
             tr.from_player = true;
             tr.ammo = pellets > 1 ? 3 : (ws.is_heavy ? 1 : 0);
             tr.damage = ws.damage;
@@ -6158,10 +6256,359 @@ void ParkourController::update_combat_and_weapons(const InputFrame& input, float
 }
 
 // -----------------------------------------------------------------------------
+// A bot's fire at her (bot_fire.hpp has the rules; here the level, the other bots and her)
+// -----------------------------------------------------------------------------
+namespace {
+
+// How far off a bot takes her for his enemy. The game's own perception was not read; this is the
+// controller's, as it was. Within it he fires as far as his weapon's WeaponRange reaches.
+constexpr float kBotEngageDistance = 1800.0f;
+// TdPawn's CollisionHeight: a pawn's Location over the bottom of its capsule.
+constexpr float kBotHalfHeight = 90.0f;
+// A bot's eyes over his soles (TdBotPawn.GetViewpointLocation is native: his mesh's EyeJoint as hers).
+constexpr float kBotEyeHeight = 166.0f;
+// TdAIManager: UseBurstControl True, MaxSimultaneousBursts 2 (its script defaults; UseBulletControl is off).
+constexpr int kMaxSimultaneousBursts = 2;
+// TdBotPawn.BurstOver: SetTimer(0.03, false, 'PauseFiring').
+constexpr float kBurstOverDelay = 0.03f;
+
+// TdBotPawn.StartNewBurst
+void ai_start_new_burst(BotCombatState& s) {
+    s.burst_length = static_cast<int32_t>(static_cast<float>(s.burst_min) + static_cast<float>(s.burst_max - s.burst_min) * bot_frand(s.random));
+    s.burst_wait = false;
+    s.new_burst = true;
+    s.timer = 0;
+    s.shot_count = 0;
+}
+
+// TdBotPawn.BurstOver
+void ai_burst_over(BotCombatState& s) {
+    s.timer = 1;
+    s.timer_left = kBurstOverDelay;
+}
+
+}  // namespace
+
+BotCombatState* ParkourController::ai_combat_state(LevelScene& scene, int32_t owner) const {
+    if (owner >= 0) return static_cast<size_t>(owner) < scene.enemies.size() ? &scene.enemies[static_cast<size_t>(owner)].combat : nullptr;
+    const size_t heli = static_cast<size_t>(-1 - owner);
+    return heli < scene.helicopters.size() ? &scene.helicopters[heli].gunner : nullptr;
+}
+
+Vec3 ParkourController::ai_owner_location(const LevelScene& scene, int32_t owner) const {
+    if (owner >= 0) {
+        if (static_cast<size_t>(owner) < scene.enemies.size()) {
+            return scene.enemies[static_cast<size_t>(owner)].position + Vec3(0.0f, 0.0f, kBotSolesUnderCapsule + kBotHalfHeight);
+        }
+        return m_telemetry.position;
+    }
+    const size_t heli = static_cast<size_t>(-1 - owner);
+    return heli < scene.helicopters.size() ? scene.helicopters[heli].position : m_telemetry.position;
+}
+
+void ParkourController::ai_remove_burst(int32_t owner) {
+    for (size_t i = 0; i < m_ai_bursts.size(); ++i) {
+        if (m_ai_bursts[i].owner == owner) {
+            m_ai_bursts.erase(m_ai_bursts.begin() + static_cast<std::ptrdiff_t>(i));
+            return;
+        }
+    }
+}
+
+// TdBotPawn.StopFiringWeapon: the trigger let go, the burst's turn given back.
+void ParkourController::ai_stop_firing(BotCombatState& s, int32_t owner) {
+    ai_remove_burst(owner);  // TdAIManager.ReportBurstFinished
+    s.trigger = false;
+    s.shot_count = 0;
+    if (s.timer == 2) s.timer = 0;  // ClearTimer('StartNewBurst')
+}
+
+// TdAIManager.AskToBurst: a turn at once while fewer than MaxSimultaneousBursts are firing; else
+// the turn of a bot he is put before (CheckBurstPriority), or a place in the line.
+bool ParkourController::ai_ask_to_burst(LevelScene& scene, int32_t owner, float duration) {
+    ai_remove_burst(owner);
+    AiBurst burst;
+    burst.owner = owner;
+    burst.start = m_telemetry.sim_time;
+    burst.duration = duration;
+    const auto active_count = [&]() { return static_cast<int>(std::count_if(m_ai_bursts.begin(), m_ai_bursts.end(), [](const AiBurst& b) { return b.active; })); };
+    burst.active = active_count() < kMaxSimultaneousBursts;
+    if (!burst.active) {
+        // TdAIManager.PrioritizedOver: a bot she is looking towards (PlayerLookingTowardsMeDot over
+        // 0.71) from under 1000 uu goes before one she is not, and before one she is by how nearly
+        // and how near.
+        const Vec3 eye = m_telemetry.position + Vec3(0.0f, 0.0f, m_telemetry.eye_height);
+        const Vec3 view = Rotator::from_degrees(m_telemetry.pitch_deg, m_telemetry.yaw_deg, 0.0f).forward();
+        const auto looked_at = [&](int32_t who, float& value) {
+            const Vec3 to = ai_owner_location(scene, who) - eye;
+            const float dot = view.dot(to.normalized()), distance = to.length_xy();
+            value = (dot - 0.71f) / (1.0f - 0.71f) + (1000.0f - distance) / 1000.0f;
+            return dot > 0.71f && distance < 1000.0f;
+        };
+        float mine = 0.0f;
+        if (looked_at(owner, mine)) {
+            for (size_t i = 0; i < m_ai_bursts.size(); ++i) {
+                if (!m_ai_bursts[i].active) continue;
+                float theirs = 0.0f;
+                if (looked_at(m_ai_bursts[i].owner, theirs) && !(mine > theirs)) continue;
+                // TdBotPawn.InterruptBurst: StopFiringWeapon, BurstOver.
+                const int32_t other = m_ai_bursts[i].owner;
+                if (BotCombatState* theirs_state = ai_combat_state(scene, other)) {
+                    ai_stop_firing(*theirs_state, other);
+                    ai_burst_over(*theirs_state);
+                } else {
+                    ai_remove_burst(other);
+                }
+                burst.active = true;
+                break;
+            }
+        }
+    }
+    m_ai_bursts.push_back(burst);
+    return burst.active;
+}
+
+// TdAIManager.UpdateBursts: a burst past its time is ended, and the bots that wait get the turns
+// that are free.
+void ParkourController::ai_update_bursts(LevelScene& scene) {
+    const float now = m_telemetry.sim_time;
+    int active = static_cast<int>(std::count_if(m_ai_bursts.begin(), m_ai_bursts.end(), [](const AiBurst& b) { return b.active; }));
+    for (size_t i = 0; i < m_ai_bursts.size();) {
+        AiBurst& b = m_ai_bursts[i];
+        BotCombatState* s = ai_combat_state(scene, b.owner);
+        const bool gone = s == nullptr || (b.owner >= 0 && !scene.enemies[static_cast<size_t>(b.owner)].alive);
+        // (A turn stamped after now is from before the clock was set back: over as well.)
+        if (gone || (b.active && (now - b.start > b.duration || now < b.start))) {
+            if (!gone) ai_burst_over(*s);
+            active -= b.active ? 1 : 0;
+            m_ai_bursts.erase(m_ai_bursts.begin() + static_cast<std::ptrdiff_t>(i));
+            continue;
+        }
+        if (!b.active && active < kMaxSimultaneousBursts) {
+            ++active;
+            b.active = true;
+            b.start = now;
+            s->ok_to_burst = true;  // TdBotPawn.NotifyOkToBurst
+        }
+        ++i;
+    }
+}
+
+void ParkourController::ai_begin_tick(LevelScene& scene) {
+    // Her, as TdAimBot reads her: Location is the middle of her capsule, the viewpoint her
+    // third-person mesh's EyeJoint (here her own eye), Rotation her body's.
+    const EMovement state = m_telemetry.move_state;
+    const bool low = state == EMovement::MOVE_Crouch || state == EMovement::MOVE_Slide || state == EMovement::MOVE_MeleeSlide ||
+                     state == EMovement::MOVE_SkillRoll || state == EMovement::MOVE_Coil;
+    m_aim_target.location = m_telemetry.position + Vec3(0.0f, 0.0f, 0.5f * (low ? kCrouchHeight : kPawnHeight));
+    m_aim_target.viewpoint = m_telemetry.position + Vec3(0.0f, 0.0f, m_telemetry.eye_height);
+    m_aim_target.velocity = m_telemetry.velocity;
+    m_aim_target.yaw_deg = m_pawn_yaw;
+    m_aim_target.max_speed = m_config.ground_speed;
+    m_aim_target.move = state;
+    m_aim_target.move_changed = state != m_ai_aim_old_move;
+    m_player_bodies_posed = false;
+    m_ai_bot_posed.assign(scene.enemies.size(), 0);
+    if (m_ai_bot_bodies.size() < scene.enemies.size()) m_ai_bot_bodies.resize(scene.enemies.size());
+    ai_update_bursts(scene);
+}
+
+const EnemyBodySet& ParkourController::ai_bot_bodies(const LevelScene& scene, size_t bot_index) {
+    EnemyBodySet& set = m_ai_bot_bodies[bot_index];
+    if (!m_ai_bot_posed[bot_index]) {
+        m_ai_bot_posed[bot_index] = 1;
+        set.valid = false;
+        if (m_enemy_body_poser) m_enemy_body_poser(scene.enemies[bot_index], m_telemetry.sim_time, m_telemetry.reaction_active, set);
+    }
+    return set;
+}
+
+Vec3 ParkourController::ai_bot_muzzle(const LevelScene& scene, size_t bot_index) {
+    const EnemyBot& bot = scene.enemies[bot_index];
+    const EnemyBodySet& set = ai_bot_bodies(scene, bot_index);
+    if (set.valid) {
+        for (const BodyShape& shape : set.shapes) {
+            if (shape.body < set.bodies.size() && set.bodies[shape.body].bone == "RightHand") return shape.centre;
+        }
+    }
+    const float yaw = bot.yaw_deg * DEG2RAD;
+    return bot.position + Vec3(std::cos(yaw) * 45.0f, std::sin(yaw) * 45.0f, 140.0f);
+}
+
+int ParkourController::ai_tick_fire(BotCombatState& s, int32_t owner, const AimTemplate& tpl, const BotWeapon& weapon, bool wants, bool can_fire,
+                                    const Vec3& pawn_location, const Vec3& gun, uint8_t tracer_ammo, float dt, LevelScene& scene) {
+    int shots = 0;
+    if (wants && !s.wants_to_fire) {
+        // TdBotPawn.FireWhenReady
+        s.wants_to_fire = true;
+        ai_start_new_burst(s);
+    } else if (!wants && s.wants_to_fire) {
+        // TdBotPawn.CeaseFire
+        s.wants_to_fire = false;
+        if (s.trigger) ai_stop_firing(s, owner);
+    }
+
+    // His timers: 'PauseFiring' 0.03 s after a burst's last shot, 'StartNewBurst' after the pause.
+    if (s.timer != 0) {
+        s.timer_left -= dt;
+        if (s.timer_left <= 0.0f) {
+            if (s.timer == 1) {
+                // TdBotPawn.PauseFiring
+                ai_stop_firing(s, owner);
+                s.burst_wait = true;
+                s.timer = 2;
+                s.timer_left = s.burst_delay_min + bot_frand(s.random) * (s.burst_delay_max - s.burst_delay_min);
+            } else {
+                ai_start_new_burst(s);
+            }
+        }
+    }
+
+    // TdBotPawn.Tick: CheckFire while he wants to fire.
+    if (s.wants_to_fire && !s.burst_wait) {
+        if (s.new_burst) {
+            s.ok_to_burst = ai_ask_to_burst(scene, owner, static_cast<float>(s.burst_length) * s.burst_delay_max);
+            s.new_burst = false;
+        } else {
+            const bool fire = s.ok_to_burst && can_fire && !m_ai_hold_fire;
+            if (fire && !s.trigger) {
+                s.trigger = true;  // StartFiringWeapon
+            } else if (!fire && s.trigger) {
+                ai_stop_firing(s, owner);
+            }
+        }
+    }
+
+    // The weapon while its trigger is held: a shot at once, and the next after FireInterval
+    // (Weapon.TimeWeaponFiring: 'RefireCheckTimer' every FireInterval). A burst's last shot ends it
+    // (TdBotPawn.WeaponFired: ShotCount >= CurrentBurstLength -> BurstOver). The interval runs on
+    // with the trigger let go, so a shotgun whose pause between bursts is shorter than its
+    // FireInterval (the Neostead's 0.6 to 0.8 s against 1.1) fires no sooner for it; that is the
+    // stock engine's firing state, whose own functions are not among those read.
+    if (s.trigger) {
+        s.refire -= dt;
+        for (int guard = 0; guard < 4 && s.trigger && s.refire <= 0.0f && s.timer != 1; ++guard) {
+            s.refire += weapon.fire_interval;
+            ai_fire_shot(s, owner, tpl, weapon, pawn_location, gun, tracer_ammo, scene);
+            ++shots;
+            if (++s.shot_count >= s.burst_length) ai_burst_over(s);
+        }
+    } else {
+        s.refire = std::max(0.0f, s.refire - dt);
+    }
+    return shots;
+}
+
+bool ParkourController::ai_fire_shot(BotCombatState& s, int32_t owner, const AimTemplate& tpl, const BotWeapon& weapon, const Vec3& pawn_location,
+                                     const Vec3& gun, uint8_t tracer_ammo, LevelScene& scene) {
+    // Instigator.GetWeaponStartTraceLocation: a bot's is read off his pose now that he fires.
+    const Vec3 muzzle = owner >= 0 ? ai_bot_muzzle(scene, static_cast<size_t>(owner)) : gun;
+    // TdAIController.GetAdjustedAimFor: rotator(AimBot.GetAimLocation(Enemy, bFirstShot) -
+    // GetWeaponStartTraceLocation()); Weapon.GetAdjustedAim adds the weapon's spread.
+    const Vec3 aim_point = aim_location(s, tpl, pawn_location, m_aim_target, m_telemetry.sim_time);
+    Vec3 aim = (aim_point - muzzle).normalized();
+    if (aim.length_sq() < 0.5f) return false;
+    aim = add_weapon_spread(aim, weapon.spread, s.random);
+
+    if (!m_player_bodies_posed) {
+        pose_player_bodies(m_player_bodies);
+        m_player_bodies_posed = true;
+    }
+    // Her eye, for the shot that passes her.
+    const Vec3 her_head = m_aim_target.viewpoint;
+    bool hurt = false, passed = false;
+    Vec3 passed_at = her_head;
+
+    // A shotgun's CustomFire: PelletCount lines, each with the spread again about the one aim.
+    const int pellets = std::max(1, weapon.pellets);
+    for (int p = 0; p < pellets; ++p) {
+        const Vec3 dir = pellets > 1 ? add_weapon_spread(aim, weapon.spread, s.random) : aim;
+        // Weapon.InstantFire: from the start trace location, WeaponRange long, through the level...
+        const TraceHit wall = trace_ray(muzzle, muzzle + dir * weapon.range, scene, COLL_BlockZeroExtent);
+        float max_dist = wall.hit ? muzzle.distance(wall.point) : weapon.range;
+        Vec3 end = wall.hit ? wall.point : muzzle + dir * std::min(weapon.range, 2500.0f);
+        uint8_t pawn_hit = 0;
+        Vec3 normal(0.0f, 0.0f, 0.0f);
+        ECharacterSurface surface = ECharacterSurface::Body;
+        // ...the other bots: the line stops in a bot's bodies as in anyone's, and nothing comes
+        // of it (TdBotPawn.TakeDamage wants the player behind the shot, and
+        // TdBotPawn.PreventWeaponImpactEffect answers true for a bot's). His own are not met.
+        if (m_enemy_body_poser) {
+            for (size_t j = 0; j < scene.enemies.size(); ++j) {
+                const EnemyBot& other = scene.enemies[j];
+                if (static_cast<int32_t>(j) == owner || !enemy_stops_bullets(other)) continue;
+                if (!line_near_point(muzzle, dir, max_dist, other.position, kEnemyBodyReach)) continue;
+                EnemyBodyHit h;
+                if (!trace_enemy_bodies(ai_bot_bodies(scene, j), muzzle, dir, max_dist, h)) continue;
+                max_dist = h.distance;
+                end = h.location;
+                normal = h.normal;
+                surface = h.surface;
+                pawn_hit = 3;
+            }
+        }
+        // ...and her: the bodies of her third-person mesh, here their stand-in.
+        EnemyBodyHit on_her;
+        if (m_telemetry.health > 0.0f && trace_enemy_bodies(m_player_bodies, muzzle, dir, max_dist, on_her)) {
+            max_dist = on_her.distance;
+            end = on_her.location;
+            normal = on_her.normal;
+            surface = on_her.surface;
+            // TdPlayerPawn.TakeDamage: a hit that is not relevant yet returns at once.
+            // TdWeapon.PlayImpactEffects leaves its sound out by the same test asked of a fixed
+            // class, TdDmgType_LowCaliber_Bullet: a sniper's bullet, which counts whatever his
+            // offset, is heard only once a pistol's would count.
+            if (aim_hit_relevant(s, tpl, weapon.kind)) {
+                const int damage = player_bullet_damage(weapon, on_her.distance, m_difficulty);
+                if (damage > 0) {
+                    apply_damage(static_cast<float>(damage), 0, muzzle - on_her.location);
+                    hurt = true;
+                }
+            }
+            pawn_hit = aim_hit_relevant(s, tpl, EBulletKind::LowCaliber) ? 2 : 3;
+        } else if (pawn_hit == 0) {
+            // Where the line is nearest her head, if it gets that far.
+            const float along = (her_head - muzzle).dot(dir);
+            if (along > 0.0f && along <= max_dist) {
+                passed = true;
+                passed_at = muzzle + dir * along;
+            }
+        }
+
+        // Of a bot's shotgun the first three pellets and those that end in a pawn are processed
+        // (CustomFire), so only they are seen and leave a mark.
+        if (pellets > 1 && p >= 3 && pawn_hit == 0) continue;
+        BulletTracer tr{};
+        tr.start_pos = muzzle;
+        tr.end_pos = end;
+        tr.timer = 0.085f;
+        tr.max_time = 0.085f;
+        tr.hit_enemy = false;
+        tr.from_player = false;
+        tr.pawn_hit = pawn_hit;
+        tr.pawn_normal = normal;
+        tr.pawn_surface = surface;
+        tr.ammo = tracer_ammo;
+        tr.damage = weapon.damage;
+        scene.active_tracers.push_back(tr);
+    }
+
+    // Emit 3D gunshot report from AI weapon muzzle (the helicopter's gun is sounded by the game
+    // loop, from HelicopterInstance::just_fired).
+    if (owner >= 0) emit_sound("BerettaM93R_Fire", muzzle, false);
+    // The bullet that goes by her (TdBotPawn.CheckForProximityShots is native and was not read:
+    // here every shot that reaches her and does her nothing is heard passing).
+    if (!hurt && passed) emit_sound("BulletBy.9mm_BulletBy", passed_at, false);
+    return hurt;
+}
+
+// -----------------------------------------------------------------------------
 // AI Bots Pursuit, Ranged Fire, Melee Windup & Disarm Window Simulation
 // -----------------------------------------------------------------------------
 void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
-    for (auto& bot : scene.enemies) {
+    ai_begin_tick(scene);
+    for (size_t bot_index = 0; bot_index < scene.enemies.size(); ++bot_index) {
+        EnemyBot& bot = scene.enemies[bot_index];
         if (bot.is_story_npc) continue;
         bot.anim_timer += dt;
         if (bot.muzzle_flash_timer > 0.0f) {
@@ -6182,12 +6629,60 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                            bot.archetype.find("Celeste") != std::string::npos ||
                            bot.weapon_name.find("TutorialTrainer") != std::string::npos);
 
+        float dist = bot.position.distance(m_telemetry.position);
+
+        // His fire at her (bot_fire.hpp). The aim ticks whatever he is doing; the trigger is his
+        // only while he stands (TdBotPawn.CheckFire: bIsWalkingOrStanding, not in a melee move, and
+        // a stumble stops his fire), which here is the ranged stance below, not the run at her.
+        {
+            const BotWeapon* weapon = find_bot_weapon(bot.weapon_name);
+            const AimTemplate& tpl = find_aim_template(bot.archetype);
+            // (A helicopter's rider has no fire of his own: the level's factory makes him a bot
+            // where it spawns him, and the game seats him in the helicopter, whose gun is below.
+            // Nor has the Training Area's partner, a TdAI_Tutorial: its SeePlayer does nothing, so
+            // she is never his Enemy, and its one combat state is CombatTutorialMelee.)
+            const bool engaged = weapon != nullptr && !is_trainer && !is_helicopter_rider(tpl) && !is_tutorial_template(tpl) && !m_telemetry.intro_active &&
+                                 m_telemetry.health > 0.0f && dist <= kBotEngageDistance;
+            const int32_t owner = static_cast<int32_t>(bot_index);
+            if (engaged) {
+                if (bot.combat.random == 0) bot.combat.random = 0x9E3779B9u * (static_cast<uint32_t>(bot_index) + 1u) | 1u;
+                const Vec3 pawn_location = bot.position + Vec3(0.0f, 0.0f, kBotSolesUnderCapsule + kBotHalfHeight);
+                const Vec3 eye = bot.position + Vec3(0.0f, 0.0f, kBotEyeHeight);
+                // EnemyVisible: the level leaves the line from his eyes to hers clear.
+                const bool visible = !trace_ray(eye, m_aim_target.viewpoint, scene, COLL_BlockZeroExtent).hit;
+                const bool wants = aim_tick(bot.combat, tpl, *weapon, m_difficulty, pawn_location, m_aim_target, visible,
+                                            bot.position.distance_xy(m_telemetry.position), m_telemetry.sim_time, dt);
+                const bool running = dist > 750.0f && bot.position.distance_xy(bot.home_position) < 450.0f;
+                const bool can_fire = !bot.stunned && dist > 220.0f && !running;
+                if (ai_tick_fire(bot.combat, owner, tpl, *weapon, wants, can_fire, pawn_location, pawn_location, weapon->tracer_ammo, dt, scene) > 0) {
+                    bot.muzzle_flash_timer = 0.08f;
+                }
+            } else if (bot.combat.has_enemy || bot.combat.wants_to_fire) {
+                // TdAIController.SetEnemy(None), TdBotPawn.CeaseFire
+                if (bot.combat.trigger) ai_stop_firing(bot.combat, owner);
+                bot.combat.wants_to_fire = false;
+                aim_lose_enemy(bot.combat);
+            }
+        }
+
         // Handle stunned / staggered / disarmed recovery
         if (bot.stunned) {
             bot.attack_timer += dt;
-            float stun_dur = is_trainer ? 2.2f : 1.6f;
+            // A bullet's stumble lasts as long as its sequence (TdMove_StumbleBot), and begins with
+            // the turn it asks for; a blow's and a disarm's as long as they did.
+            const StumbleAnim stumble = bullet_stumble_anim(bot.combat.stumble);
+            const float bullet_stumble = bot.active_anim_seq == stumble.sequence ? stumble.length : 0.0f;
+            if (bot.combat.turn_left > 0.0f) {
+                const float step = std::min(dt, bot.combat.turn_left);
+                const float diff = std::fmod(bot.combat.turn_to_yaw - bot.yaw_deg + 540.0f, 360.0f) - 180.0f;
+                bot.yaw_deg += diff * (step / bot.combat.turn_left);
+                bot.combat.turn_left -= step;
+            }
+            float stun_dur = bullet_stumble > 0.0f ? bullet_stumble : is_trainer ? 2.2f : 1.6f;
             if (bot.attack_timer >= stun_dur) {
                 bot.stunned = false;
+                bot.combat.stumble = 0;
+                bot.combat.turn_left = 0.0f;
                 bot.attack_timer = 0.0f;
                 bot.anim_timer = 0.0f;
                 bot.anim_state = is_trainer ? EEnemyAnimState::MeleeWindup : EEnemyAnimState::AimFire;
@@ -6198,7 +6693,6 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
             continue;
         }
 
-        float dist = bot.position.distance(m_telemetry.position);
         Vec3 dir_to_player = (m_telemetry.position - bot.position).normalized_xy();
         if (dir_to_player.length_sq() > 1e-4f) {
             bot.yaw_deg = std::atan2(dir_to_player.y, dir_to_player.x) * RAD2DEG;
@@ -6237,54 +6731,11 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
                 bot.anim_state = EEnemyAnimState::AimFire;
             }
 
-            // Fire weapon bursts at Faith
-            float fire_cadence = (bot.weapon_name.find("Remington") != std::string::npos ||
-                                  bot.weapon_name.find("Neostead") != std::string::npos) ? 1.45f : 0.95f;
-            if (bot.attack_timer >= fire_cadence) {
-                bot.attack_timer = 0.0f;
-                bot.muzzle_flash_timer = 0.08f;
-
-                Vec3 bot_muzzle = bot.position + Vec3(0, 0, 62.0f) + dir_to_player * 35.0f;
-                Vec3 target_pt = m_telemetry.position + Vec3(0, 0, m_telemetry.eye_height * 0.75f);
-
-                // Check line of sight so enemies don't shoot through solid walls
-                TraceHit los = trace_ray(bot_muzzle, target_pt, scene, COLL_BlockZeroExtent);
-                Vec3 tracer_end = los.hit ? los.point : target_pt;
-                // Whether the shot lands: not while she is evading or in a cutscene.
-                bool evading = (m_telemetry.intro_active ||
-                                m_telemetry.move_state == EMovement::MOVE_Slide ||
-                                m_telemetry.move_state == EMovement::MOVE_MeleeSlide ||
-                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
-                                m_telemetry.move_state == EMovement::MOVE_Snatch ||
-                                m_telemetry.speed_2d > 540.0f);
-
-                BulletTracer tr{};
-                tr.start_pos = bot_muzzle;
-                tr.end_pos = tracer_end;
-                tr.timer = 0.085f;
-                tr.max_time = 0.085f;
-                tr.hit_enemy = false;
-                tr.from_player = false;
-                tr.pawn_hit = (!los.hit && !evading) ? 2 : 0;  // it reaches her: PlayImpactEffects plays the sound alone
-                {
-                    const auto has = [&](const char* part) { return bot.weapon_name.find(part) != std::string::npos; };
-                    tr.ammo = (has("Remington") || has("Neostead")) ? 3
-                              : (has("G36") || has("SCAR") || has("Minimi") || has("M95") || has("Barret")) ? 1 : 0;
-                }
-                scene.active_tracers.push_back(tr);
-
-                // Emit 3D gunshot report from AI weapon muzzle
-                emit_sound("BerettaM93R_Fire", bot_muzzle, false);
-
-                // Deal damage if line-of-sight is clear and Faith isn't actively evading or in a cutscene
-                if (!los.hit && !evading) {
-                    apply_damage(10.0f, 0, bot_muzzle - target_pt);
-                } else if (!los.hit) {
-                    emit_sound("BulletBy.9mm_BulletBy", target_pt, false);
-                }
-            }
+            // (His fire is ai_tick_fire's, above. This clock was the fire's once; the blow's
+            // wind-up below still starts from wherever it stands when she comes close.)
+            const float melee_clock = (bot.weapon_name.find("Remington") != std::string::npos ||
+                                       bot.weapon_name.find("Neostead") != std::string::npos) ? 1.45f : 0.95f;
+            if (bot.attack_timer >= melee_clock) bot.attack_timer = 0.0f;
         } else {
             // Close-quarters melee range (< 220 units): wind up rifle/pistol butt strike and open Red Disarm Window!
             if (bot.attack_timer < 0.45f) {
@@ -6311,7 +6762,8 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
     // -------------------------------------------------------------------------
     // TdAI_HeliController + TdVehicle_Helicopter + SeqAct_TdDummyWeaponFire
     // -------------------------------------------------------------------------
-    for (auto& heli : scene.helicopters) {
+    for (size_t heli_index = 0; heli_index < scene.helicopters.size(); ++heli_index) {
+        HelicopterInstance& heli = scene.helicopters[heli_index];
         heli.just_spawned = false;
         heli.just_fired = false;
         heli.muzzle_flash_timer = std::max(0.0f, heli.muzzle_flash_timer - dt);
@@ -6404,56 +6856,37 @@ void ParkourController::update_ai_bots(float dt, LevelScene& scene) {
         heli.pitch_deg = std::clamp(-fwd_spd * 0.008f, -12.0f, 12.0f);
         heli.roll_deg = std::clamp(side_spd * 0.010f, -15.0f, 15.0f);
 
-        // Door gunner FNMinimi bursts when Engaging, in broadside door arc, and outside cutscenes
+        // The door gunner (AITemplate_Gunner, with the FN Minimi) is a bot as any other: his own aim
+        // bot and bursts (bot_fire.hpp), fired from the gun's place in the door. He has her for
+        // his enemy while the helicopter engages, she is in the broadside arc and within 6500 uu
+        // (the controller's own conditions, as they were).
         Vec3 heli_fwd(cy, sy, 0.0f);
         Vec3 dir_player_2d = Vec3(to_player.x, to_player.y, 0.0f).normalized();
         float nose_dot = std::abs(heli_fwd.dot(dir_player_2d));
-        float burst_cycle = std::fmod(heli.active_timer, 2.20f);
-        bool in_burst_window = (burst_cycle < 0.85f);
-        if (!m_telemetry.intro_active &&
-            heli.state == EHeliState::Engaging &&
-            in_burst_window &&
-            nose_dot < 0.82f &&
+        const BotWeapon* minimi = find_bot_weapon("FNMinimi");
+        const int32_t owner = -1 - static_cast<int32_t>(heli_index);
+        if (minimi != nullptr && !m_telemetry.intro_active && m_telemetry.health > 0.0f && heli.state == EHeliState::Engaging && nose_dot < 0.82f &&
             to_player.length() < 6500.0f) {
-            heli.burst_timer += dt;
-            if (heli.burst_timer >= 0.14f) {
-                heli.burst_timer = 0.0f;
+            const AimTemplate& gunner = find_aim_template("AITemplate_Gunner");
+            Vec3 right(-sy, cy, 0.0f);
+            float side_sign = (side_offset < 0.0f) ? 1.0f : -1.0f;
+            Vec3 gun_muzzle = heli.position + right * (side_sign * 165.0f) - Vec3(0.0f, 0.0f, 45.0f);
+            if (heli.gunner.random == 0) heli.gunner.random = 0x85EBCA6Bu * (static_cast<uint32_t>(heli_index) + 1u) | 1u;
+            // The level's SeqAct_TdAIPerfectAim (here the delay that stands for it) puts the
+            // TdAimBot_Perfect in his aim bot's place: he aims at her Location and every hit counts.
+            heli.gunner.perfect = heli.perfect_aim_active;
+            const bool visible = !trace_ray(gun_muzzle, m_aim_target.viewpoint, scene, COLL_BlockZeroExtent).hit;
+            const bool wants = aim_tick(heli.gunner, gunner, *minimi, m_difficulty, gun_muzzle, m_aim_target, visible, to_player.length_xy(),
+                                        m_telemetry.sim_time, dt);
+            // (TdWeapon_Heavy.GetSpecificImpactEffect: the gunner's bullets leave the HeliAmmo effect.)
+            if (ai_tick_fire(heli.gunner, owner, gunner, *minimi, wants, true, gun_muzzle, gun_muzzle, 2, dt, scene) > 0) {
                 heli.muzzle_flash_timer = 0.07f;
                 heli.just_fired = true;
-
-                Vec3 right(-sy, cy, 0.0f);
-                float side_sign = (side_offset < 0.0f) ? 1.0f : -1.0f;
-                Vec3 gun_muzzle = heli.position + right * (side_sign * 165.0f) - Vec3(0.0f, 0.0f, 45.0f);
-                float spread_scale = heli.perfect_aim_active ? 24.0f : 115.0f;
-                float phase = m_telemetry.sim_time * 13.7f;
-                Vec3 aim_pt = m_telemetry.position + Vec3(std::sin(phase) * spread_scale,
-                                                          std::cos(phase * 1.3f) * spread_scale,
-                                                          m_telemetry.eye_height * 0.65f);
-                TraceHit los = trace_ray(gun_muzzle, aim_pt, scene, COLL_BlockZeroExtent);
-                BulletTracer tr{};
-                tr.start_pos = gun_muzzle;
-                tr.end_pos = los.hit ? los.point : aim_pt;
-                tr.timer = 0.09f;
-                tr.max_time = 0.09f;
-                tr.hit_enemy = false;
-                tr.from_player = false;
-                tr.ammo = 2;  // the helicopter's gun
-                tr.damage = 25.0f;
-                scene.active_tracers.push_back(tr);
-
-                // SequenceFrame_30 [Reduce Gunner Accuracy During Slide] + high-speed parkour evasion
-                bool evading = !heli.perfect_aim_active &&
-                               (m_telemetry.move_state == EMovement::MOVE_Slide ||
-                                m_telemetry.move_state == EMovement::MOVE_SkillRoll ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningLeft ||
-                                m_telemetry.move_state == EMovement::MOVE_WallRunningRight ||
-                                m_telemetry.speed_2d > 480.0f);
-                if (!los.hit && !evading) {
-                    apply_damage(4.5f, 0, gun_muzzle - aim_pt);
-                } else if (!los.hit) {
-                    emit_sound("BulletBy.9mm_BulletBy", aim_pt, false);
-                }
             }
+        } else if (heli.gunner.has_enemy || heli.gunner.wants_to_fire) {
+            if (heli.gunner.trigger) ai_stop_firing(heli.gunner, owner);
+            heli.gunner.wants_to_fire = false;
+            aim_lose_enemy(heli.gunner);
         }
     }
 

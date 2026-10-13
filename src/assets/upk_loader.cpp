@@ -12,6 +12,7 @@
 #include "ue3_props.hpp"
 #include "../anim/anim_system.hpp"
 #include "../game/level_script.hpp"
+#include "../physics/bot_fire.hpp"
 #include "../physics/collision_world.hpp"
 #include "../platform/platform.hpp"
 #include <fstream>
@@ -5004,7 +5005,10 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
         } else if (out_enemies && cls == "SeqAct_TdActorFactory") {
             UPropertyList props;
             parse_export_properties(*this, idx, props);
-            std::string bot_template = "AITemplate_PatrolCop_Colt1911";
+            // A factory that writes no BotTemplate (12 of the levels' 269) has its class's default:
+            // Default__SeqAct_TdActorFactory.BotTemplate is AITemplate_Default, a TdBotPawn_Assault
+            // with the SCAR-L.
+            std::string bot_template = "AITemplate_Default";
             int32_t tpl_ref = prop_object(props, "BotTemplate");
             if (tpl_ref < 0 && -tpl_ref - 1 < static_cast<int32_t>(imports_.size())) {
                 const auto& imp = imports_[static_cast<size_t>(-tpl_ref - 1)];
@@ -5013,26 +5017,11 @@ void UPKPackage::extract_helicopter_encounters(std::vector<HeliAttackNode>& out_
                 bot_template = export_object_name(*this, tpl_ref);
             }
 
-            std::string weapon = "Colt1911";
-            std::string low_tpl = bot_template;
-            for (char& ch : low_tpl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (low_tpl.find("sniper") != std::string::npos || low_tpl.find("m95") != std::string::npos) {
-                weapon = "M95";
-            } else if (low_tpl.find("support") != std::string::npos || low_tpl.find("minimi") != std::string::npos) {
-                weapon = "FNMinimi";
-            } else if (low_tpl.find("g36") != std::string::npos) {
-                weapon = "G36C";
-            } else if (low_tpl.find("scar") != std::string::npos) {
-                weapon = "FNSCARL";
-            } else if (low_tpl.find("mp5") != std::string::npos) {
-                weapon = "MP5K";
-            } else if (low_tpl.find("tmp") != std::string::npos) {
-                weapon = "SteyrTMP";
-            } else if (low_tpl.find("shotgun") != std::string::npos || low_tpl.find("neostead") != std::string::npos) {
-                weapon = (low_tpl.find("patrol") != std::string::npos) ? "Remington870" : "Neostead";
-            } else if (low_tpl.find("m93") != std::string::npos) {
-                weapon = "BerettaM93R";
-            }
+            // What the template's bot carries: its MainWeaponClass (DefaultAITemplates.ini; the
+            // templates are in physics/bot_fire.hpp). The pursuit cop's is the taser, which the
+            // port does not have: he carries nothing here.
+            const AimTemplate& ai_template = find_aim_template(bot_template);
+            const std::string weapon = *ai_template.weapon ? ai_template.weapon : "None";
 
             if (const UProperty* vlinks = find_prop(props, "VariableLinks")) {
                 for (const auto& vl : vlinks->elements) {
