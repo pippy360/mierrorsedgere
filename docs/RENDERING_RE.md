@@ -655,8 +655,12 @@ afresh. Two things make systems while the game runs:
   the Prologue's 38); the others inherit.
   What the bullet stopped in decides what is played (`TdWeapon.RegisterPendingImpact`,
   `PlayImpactEffects`): a bot shot by another bot, or one that is dying, shows nothing
-  (`TdBotPawn.PreventWeaponImpactEffect`); the player, when a bot's shot reaches her, gets the sound alone;
-  everything else the effect, the decal and the sound. A bot's surface is a body of his physics asset
+  (`TdBotPawn.PreventWeaponImpactEffect`); the player, when a bot's shot reaches her, gets the sound alone,
+  and not even that while the bot's aim is still off (`TdAimBot.IsHitRelevant`:
+  [`TDGAME_CLASSES_AND_MOVES_RE.md`](TDGAME_CLASSES_AND_MOVES_RE.md), "Combat between the player and the
+  bots"); everything else the effect, the decal and the sound. A helicopter is met in the one box of its
+  hidden placeholder mesh's physics asset, whose body names no physical material: the effect and the sound
+  are the weapon's `DefaultImpactMaterial`'s, and a skeletal mesh takes no hole. A bot's surface is a body of his physics asset
   (`CH_TKY_Cop_SWAT.Male3p_Physics`, the only one the bots' packages import): `PM_Character_Body`, the neck
   and the hands `PM_Character_Head`, both with `PS_FX_Impact_Character_Body_Light_01` (a shotgun's pellet:
   `..._Body_Shotgun_01`), a pale puff of dust. `TdBotPawn_Tutorial.PreventWeaponImpactEffect` returns true:
@@ -722,7 +726,10 @@ through the tracer's end against the meshes' own triangles, which carry their me
 material (the BSP counts as the default material), the level's or those of a lift's part or a door. Its
 impact sound is handed to the game loop, which plays it at the hit when the player is within the cue's
 `MaxRadius`; the level load brings in the cue packages the materials name. The player gets the sound of a
-bot's shot that reaches her.
+bot's shot that lands on her and counts (`BulletTracer::pawn_hit` 2); one that lands while his aim is still
+off shows and sounds nothing (3). A bullet that stops on a helicopter's box (`pawn_hit` 4,
+`ParkourController::trace_helicopters`, the box in `src/physics/bot_fire.hpp`) leaves the default material's
+effect, pointed as from the box's face, and its sound, and no hole.
 
 A bot the player shoots is met in his bodies (`src/physics/body_shapes.hpp`). The animation system reads
 `Male3p_Physics` out of `CH_TKY_Cop_SWAT.upk` when it loads the meshes (`AnimSystem::load_enemy_bodies`: the
@@ -743,7 +750,8 @@ disarmed 271, standing, walking or aiming 185 to 188. It then sends every pellet
 nearest shape winning), so the pellets that come after the one that kills him end in him too. The body met
 gives the tracer its end, the surface's normal and its material (`BulletTracer::pawn_normal`,
 `pawn_surface`); the damage is doubled on `PM_Character_Head`, which each level loads beside
-`PM_Character_Body` (`LevelScene::character_head_physical`); the impact effect is made there, pointed as from
+`PM_Character_Body` (`LevelScene::character_head_physical`), and the armour of his pawn class for the bone
+hit comes off it (`bot_bullet_damage`); the impact effect is made there, pointed as from
 that surface, with the body's sound. A shot in a dead bot, the shot that kills one and any shot in the
 tutorial's bot show and sound nothing (`BulletTracer::pawn_hit` 3), the red burst the port draws at a tracer's
 end included, and a dead bot takes no damage. With no callback (`me_replay`, which has no renderer) or no
@@ -758,15 +766,16 @@ the player (the game also asks whether the shooter was drawn lately); a bot's bo
 table of states poses him, not as retail's animation tree would, and a dead bot's where the sequence he died
 with ends, not as retail's death animation or ragdoll leaves him (he takes no bullet hole, and does not in the
 game: section 12); a story character playing a cutscene's sequence is drawn as far from where she is placed
-as the scene takes her, past the first reject's 360 uu, and a shot at her there goes through; the armour that
-`TdPawn.AdjustDamage` takes off by the bone hit, the riot shield, the player's own bodies under a bot's fire
-and the helicopter are not there (`TODO.md`); sprites are not sorted against other translucent surfaces. (The
+as the scene takes her, past the first reject's 360 uu, and a shot at her there goes through; the riot shield
+is not there, and the player's own bodies under a bot's fire are a stand-in in her reference pose
+(`TODO.md`); sprites are not sorted against other translucent surfaces. (The
 glass panes' effects play when the pane is broken:
 [`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md) section 8.) The emitter
 tick's order is stock Unreal Engine 3's of that year, not read out of the executable. `ME_NO_PARTICLES=1`
 draws without them; `ME_PARTICLE_DEBUG=1` lists what was left out and why, and the physical materials;
 `ME_IMPACT_DEBUG=1` says what every bullet hit and what it left; `ME_SHOW_BODIES=1` draws, as lines over
-him, the bodies of every enemy a bullet can meet within 3000 uu of the view.
+him, the bodies of every enemy a bullet can meet within 3000 uu of the view, and the box of every helicopter
+that is there.
 
 ## 14. In the port
 
@@ -825,6 +834,8 @@ Options for looking at things:
 | `ME_SHOT_BOT="archetype[,state[,distance[,weapon[,turn[,seconds[,sequence]]]]]]"` | With `--intro-shots`: the level's own enemies are put away and one bot stands on the floor that far ahead of the view (220 unless given), in the state named (`idle`, `walk`, `run`, `aim`, `windup`, `strike`, `stagger`, `disarm`, `dead`), with that weapon, turned by so many degrees from facing the view, so many seconds into a timed state, playing the sequence named where the state takes one from the controller; the shots of `ME_SHOT_FIRE` then meet his bodies and say which, e.g. `ME_SHOT_BOT="PatrolCop,run,170,Colt1911,70"`, `ME_SHOT_BOT="Assault_SWAT,dead,60,None,0,1,HitMeleeInAir_High"` |
 | `ME_SHOW_BODIES=1` | Draws the bodies a bullet meets over every enemy it can meet (the living and the dead) within 3000 uu of the view, as lines: the head's material in the runner-vision red, the body's green; at start, lists the physics asset as read |
 | `--verify-bodies`, `ME_BODIES_DEBUG=1` | The oracle's stage of bullets against posed bodies alone (five seconds); with the variable it also prints the bodies' reach by sequence, and what level lines meet across the bot it poses, front on and side on, by body |
+| `ME_SHOT_HELI="distance[,height[,turn]]"` | With `--intro-shots`: the level's own helicopters are put away and one hangs that far ahead of the view (1500 unless given), its `Location` `height` units over the eye (-434, which puts its box level with the eye, unless given), turned by `turn` degrees from broadside. `ME_SHOT_FIRE`'s shots meet its box as the controller's do and say so; `ME_SHOW_BODIES=1` draws the box over the hull |
+| `--verify-botfire` | The oracle's stage 27 alone (twenty seconds): the bots' aim, their fire at her and its gate, her damage and theirs by difficulty, the helicopter's box, a bullet's stumble, and how long she lasts standing in front of one patrol cop |
 | `ME_NO_LENS_FLARES=1`, `ME_NO_DYNAMIC_SHADOWS=1`, `ME_NO_PARTICLES=1`, `ME_NO_COMPUTED_DECALS=1` | A picture without them |
 | `ME_PARTICLE_DEBUG=1` | Lists the particle emitters left out, and why; the physical materials |
 | `ME_IMPACT_DEBUG=1` | What every bullet hit, and the effect, the hole and the sound it left; at a level's load, whether every material's impact cue was found |
@@ -887,8 +898,8 @@ intro and were checked by themselves (`MODLOG.md` section 29).
 - **Dynamic shadows:** the player's is cast by the first-person body with a head and a torso standing in
   (section 10).
 - **Lens flares:** sources on moving bases, coverage from sight lines (section 11).
-- **Bullets:** a bot wears no armour and there is no riot shield; a bot's shot at the player is line of
-  sight, not a line through her bodies, and whether it shows is judged by distance alone (section 13).
+- **Bullets:** there is no riot shield; a bot's shot at the player is a line through a stand-in for her
+  bodies, in their reference pose, and whether it shows is judged by distance alone (section 13).
 - **Decals:** a decal's own vertex light map, per-decal bias; the ones computed at load lie on more than the
   game's do; a bullet hole on BSP is not kept to one node (section 12).
 - **Material effects** not driven: taser, explosion, flashbang, laser, scope, the slideshow.

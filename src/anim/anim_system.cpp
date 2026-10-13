@@ -2,6 +2,7 @@
 #include "fp_director.hpp"
 #include "fp_pose.hpp"
 #include "../assets/ue3_props.hpp"
+#include "../physics/bot_fire.hpp"
 #include <cstdlib>
 #include <mutex>
 #include <fstream>
@@ -2921,6 +2922,11 @@ bool AnimSystem::pose_enemy_skeleton(const EnemyBot& bot, float sim_time, bool r
         norm_time = (bot.anim_timer > 0.0f)
                         ? std::clamp(bot.anim_timer / std::max(0.25f, bot.anim_duration), 0.15f, 0.90f)
                         : 0.45f;
+        // A bullet's stumble (TdMove_StumbleBot.PlayStumbleAnimation: PlayMoveAnim at rate 1) is
+        // played from its start, for as long as the sequence is.
+        if (bot.combat.stumble != 0 && seq_a && seq_a->length > 0.0f && hseq == bullet_stumble_anim(bot.combat.stumble).sequence) {
+            norm_time = std::clamp(bot.anim_timer / seq_a->length, 0.0f, 0.9999f);
+        }
     } else if (bot.anim_state == EEnemyAnimState::MeleeWindup || (reaction_disarm && bot.disarm_window)) {
         seq_a = find_ai_seq("MeleeStart");
         seq_b = find_ai_seq("SnatchFwd");
@@ -3281,6 +3287,10 @@ void AnimSystem::evaluate_combat_world_fx(const LevelScene& scene, const Vec3& v
                 const bool head = s.body < set.bodies.size() && set.bodies[s.body].surface == ECharacterSurface::Head;
                 append_body_shape_wires(head ? out_rv_tris : out_world_tris, s, view_pos, kHalfWidth, head ? head_col : body_col);
             }
+        }
+        // ...and of each helicopter that is there, the one box a bullet meets (physics/bot_fire.hpp).
+        for (const HelicopterInstance& heli : scene.helicopters) {
+            if (helicopter_stops_bullets(heli)) append_body_shape_wires(out_world_tris, helicopter_box(heli), view_pos, 2.0f, body_col);
         }
     }
 

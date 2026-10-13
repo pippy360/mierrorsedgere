@@ -41,7 +41,8 @@
 //
 // A bot takes no decal, here as in the game. Where the bullet went into him, the surface's normal
 // there and its material come with the tracer (BulletTracer::pawn_normal, pawn_surface), from the
-// body of his that the controller's line met.
+// body of his that the controller's line met. A helicopter's box (physics/bot_fire.hpp) names no
+// material: the default material's effect and sound, and no hole (BulletTracer::pawn_hit 4).
 // -----------------------------------------------------------------------------
 
 #include "../math/types.hpp"
@@ -385,6 +386,28 @@ inline void update_impact_effects(LevelScene& scene, float dt, const Vec3& playe
         if (length < 1.0f) continue;
         ray = ray * (1.0f / length);
         const int ammo = std::min<int>(tracer.ammo, 3);
+
+        // An actor that is no part of the level and whose body names no physical material (the
+        // helicopter's placeholder box; HitInfo.PhysMaterial is the engine's default one, which
+        // has no impact properties): GetImpactEffect and GetImpactSound find nothing on it or up
+        // its parents and fall to the weapon's DefaultImpactMaterial. A skeletal mesh takes no hole.
+        if (tracer.pawn_hit == 4) {
+            if (physical.empty()) continue;
+            const std::string heard = play(-1, tracer.end_pos);
+            int32_t effect = -1;
+            if (tracer.from_player || (tracer.end_pos - player).length() <= kImpactEffectDistance) {
+                effect = effect_of(-1, ammo);
+                const Vec3 n = tracer.pawn_normal.length_sq() > 1.0e-6f ? tracer.pawn_normal : ray * -1.0f;
+                if (effect >= 0) spawn_effect(scene, effect, tracer.end_pos, reflected(ray, n), false);
+            }
+            if (debug) {
+                std::cout << "[Impact] on a helicopter at (" << tracer.end_pos.x << ", " << tracer.end_pos.y << ", " << tracer.end_pos.z
+                          << "), normal (" << tracer.pawn_normal.x << ", " << tracer.pawn_normal.y << ", " << tracer.pawn_normal.z << "): effect "
+                          << (effect >= 0 ? scene.particle_templates[static_cast<size_t>(effect)].path : std::string("none")) << ", sound " << heard
+                          << ", no decal" << std::endl;
+            }
+            continue;
+        }
 
         // A person: the player's shot leaves the body's effect and sound on a bot, a bot's shot
         // only the sound on the player, and nothing else leaves anything.

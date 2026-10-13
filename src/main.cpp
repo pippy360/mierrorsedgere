@@ -1830,6 +1830,9 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     };
     ParkourController controller(move_cfg);
     controller.set_enemy_body_poser(poser);
+    // What the bots fire back is stage 27's: here they hold their fire (it would kill her in a
+    // few seconds, at 272 uu).
+    controller.set_ai_hold_fire(true);
 
     // She stands at the terrace's checkpoint and the bot where the tutorial's partner does, facing
     // her (stage 7's ground): his forward is -Y, his right +X.
@@ -1896,7 +1899,7 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     asset_ok = asset_ok && worst_size < 0.001f;
     // Every archetype the port draws, in every state the controller puts a bot in and with every
     // sequence it names for him there (ParkourController writes EnemyBot::active_anim_seq: a blow's
-    // or a bullet's HitMelee*, the disarm's Snatch*; none is the state's own), with a light weapon's
+    // HitMelee*, a bullet's stumble, the disarm's Snatch*; none is the state's own), with a light weapon's
     // set of sequences and a heavy one's, at forty moments: the bodies found, and their reach. A
     // dead bot keeps the sequence he died with and is drawn, and met, at its end.
     static const char* const kArchetypes[] = {"Assault_SWAT", "PatrolCop", "Support", "RiotCop", "PursuitCop", "Celeste",
@@ -1905,6 +1908,9 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     static const char* const kBlows[] = {"",                    "HitMeleeRight",      "HitMeleeLeft",  "HitMeleeSoccerKick",
                                          "HitMeleeCrouchSweep", "HitMeleeInAir_High", "HitMeleeSlide", "HitMeleeWallrunRight"};
     static const char* const kSnatches[] = {"", "SnatchFwd", "SnatchBack"};
+    // A bullet's stumbles (TdMove_StumbleBot; physics/bot_fire.hpp), each played from its start.
+    static const char* const kStumbles[] = {"WalkBwdStop", "WalkFwdStop", "HitHeavyStomach", "HitHeavyHead"};
+    static const uint8_t kStumbleStates[] = {14, 16, 17, 18};
     static const char* const kDeaths[] = {"",                   "HitMeleeRight", "HitMeleeLeft",         "HitMeleeSoccerKick", "HitMeleeCrouchSweep",
                                           "HitMeleeInAir_High", "HitMeleeSlide", "HitMeleeWallrunRight", "SnatchFwd",          "SnatchBack"};
     struct Played {
@@ -1922,6 +1928,7 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
         {"windup", EEnemyAnimState::MeleeWindup, false, true, kOwn, std::size(kOwn)},
         {"strike", EEnemyAnimState::MeleeStrike, false, true, kOwn, std::size(kOwn)},
         {"stagger", EEnemyAnimState::HitStagger, true, true, kBlows, std::size(kBlows)},
+        {"stumble", EEnemyAnimState::HitStagger, true, true, kStumbles, std::size(kStumbles)},
         {"disarm", EEnemyAnimState::BeingDisarmed, true, true, kSnatches, std::size(kSnatches)},
         {"dead", EEnemyAnimState::KnockedOut, true, false, kDeaths, std::size(kDeaths)},
     };
@@ -1940,6 +1947,10 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
                     bot.stunned = played.stunned;
                     bot.active_anim_seq = played.sequences[q];
                     bot.anim_timer = static_cast<float>(k / 2) * 0.025f;
+                    if (played.sequences == kStumbles) {
+                        bot.combat.stumble = kStumbleStates[q];
+                        bot.anim_duration = bullet_stumble_anim(kStumbleStates[q]).length;
+                    }
                     EnemyBodySet s;
                     if (!renderer.pose_enemy_bodies(bot, static_cast<float>(k / 2) * 0.0437f, false, s)) continue;
                     ++poses;
@@ -2262,35 +2273,49 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
                (p.tracer.pawn_surface == ECharacterSurface::Head) == p.expected.head;
     };
     const std::vector<EnemyBot> swat = {make_bot("Assault_SWAT", "G36C")};
-    const float colt = controller.get_telemetry().weapon.damage;  // he is nearer than where its fall-off starts
+    // What the Colt's bullet takes from a bot (physics/bot_fire.hpp): the class's 42 (he is nearer
+    // than where its fall-off starts), twice that on the head's material, less the armour his pawn
+    // class has for the bone at this difficulty (TdBotPawn_Assault at Medium 0.3: 58 and 29), none
+    // where the hit has no bone. Stage 27 holds the rule against the numbers; here it says what
+    // each pull must have taken.
+    const BotWeapon& colt_row = *find_bot_weapon("Colt1911");
+    const float colt = colt_row.damage;
+    const auto colt_takes = [&](const EnemyBot& bot, const ParkourController::EnemyShotHit& hit) {
+        return static_cast<float>(bot_bullet_damage(find_aim_template(bot.archetype), weapon_damage_at(colt_row, hit.distance, false), colt_row.kind, hit.head,
+                                                    hit.bone, hit.posed, controller.get_difficulty()));
+    };
     for (int a = 0; a < kAims; ++a) {
         if (!kKnown[a].pulled) continue;
         const Pull p = pull(swat, a, false);
         const bool meets = kKnown[a].bone[0] != '\0';
         const bool ok = p.fired && p.posed == 1 &&
-                        (meets ? p.damage == colt * (kKnown[a].head ? 2.0f : 1.0f) && p.tracer.pawn_hit == 1 && as_asked(p) && p.expected.posed &&
+                        (meets ? p.damage == colt_takes(swat[0], p.expected) && p.damage == (kKnown[a].head ? 58.0f : 29.0f) && p.tracer.pawn_hit == 1 &&
+                                     as_asked(p) && p.expected.posed &&
                                      p.expected.bone == kKnown[a].bone && p.expected.head == kKnown[a].head
                                : p.damage == 0.0f && p.tracer.pawn_hit == 0 && !p.expected_met);
-        say(std::string("at ") + kKnown[a].name, ok, p, a == 0 ? " (the weapon's damage " + std::to_string(static_cast<int>(colt)) + ")" : std::string());
+        say(std::string("at ") + kKnown[a].name, ok, p, a == 0 ? " (the weapon's damage " + std::to_string(static_cast<int>(colt)) + ", his armour 0.3)" : std::string());
     }
 
     // A shotgun: every pellet of the pull meets the pose he had as the trigger was pulled, posed once,
-    // whatever the pellets before it made of him. The pull kills a bot of 100: the pellets that come
-    // after the one that does end in him as well, and show nothing. Each tracer's line is held
-    // against the bodies he had at the pull; and the same pull at a bot who cannot die.
+    // whatever the pellets before it made of him. The pull kills a bot with 60 left (a pellet's 16
+    // is 11 through his armour, 22 on a hand): the pellets that come after the one that does end in
+    // him as well, and show nothing. Each tracer's line is held against the bodies he had at the
+    // pull; and the same pull at a bot who cannot die.
     controller.equip_weapon("Remington870");
     const auto pellets = [](const Pull& q) {
         return ", " + std::to_string(q.tracers) + " pellets: " + std::to_string(q.bots_met) + " end in him, " + std::to_string(q.unshown) +
                " of them showing nothing; " + std::to_string(q.through_pose) + " lines go into the bodies he had at the pull, " +
                std::to_string(q.astray) + " at odds with them";
     };
-    Pull p = pull(swat, kAimBelly, true);
-    say("a shotgun at the belly", p.fired && p.tracers > 1 && p.posed == 1 && !p.alive && p.astray == 0 && p.unshown >= 2, p, pellets(p));
+    std::vector<EnemyBot> hurt = swat;
+    hurt[0].health = 60.0f;
+    Pull p = pull(hurt, kAimBelly, true);
+    say("a shotgun at the belly of one with 60 left", p.fired && p.tracers > 1 && p.posed == 1 && !p.alive && p.astray == 0 && p.unshown >= 2, p, pellets(p));
     std::vector<EnemyBot> tough = swat;
     tough[0].health = tough[0].max_health = 100000.0f;
     p = pull(tough, kAimBelly, true);
     say("a shotgun at the belly of one who cannot die",
-        p.fired && p.tracers > 1 && p.posed == 1 && p.alive && p.astray == 0 && p.bots_met > 1 && p.unshown == 0 && p.damage > 100.0f, p, pellets(p));
+        p.fired && p.tracers > 1 && p.posed == 1 && p.alive && p.astray == 0 && p.bots_met > 1 && p.unshown == 0 && p.damage >= 11.0f * static_cast<float>(p.bots_met), p, pellets(p));
     controller.equip_weapon("Colt1911");
 
     // A bot who lies dead is still met, in the bodies of the pose he is drawn in, and nothing comes
@@ -2319,17 +2344,21 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     three.push_back(make_bot("Support", "FNMinimi"));
     three.back().position = stand + fwd * 500.0f;
     p = pull(three, kAimBelly, false);
-    say("with a bot 400 uu aside and one 500 behind her", p.fired && p.damage == colt && p.posed == 1 && as_asked(p), p, "");
+    say("with a bot 400 uu aside and one 500 behind her", p.fired && p.damage == colt_takes(three[0], p.expected) && p.damage > 0.0f && p.posed == 1 && as_asked(p), p, "");
 
     // The tutorial's partner (TdBotPawn_Tutorial.PreventWeaponImpactEffect): hurt, and nothing shown.
     p = pull({make_bot("TutorialTrainer_Celeste", "Colt1911")}, kAimBelly, false);
-    say("at the tutorial's bot", p.fired && p.damage == colt && p.tracer.pawn_hit == 3 && p.expected_met && p.expected.posed, p, "");
+    say("at the tutorial's bot (TdBotPawn_Tutorial: no armour)",
+        p.fired && (p.damage == colt || p.damage == colt * 2.0f) && p.damage == (p.expected.head ? 2.0f : 1.0f) * colt && p.tracer.pawn_hit == 3 && p.expected_met &&
+            p.expected.posed,
+        p, "");
 
     // Nothing to pose them with (a tool with no renderer): his cylinder, and its rule of heights.
     controller.set_enemy_body_poser(EnemyBodyPoser());
     p = pull(swat, kAimShoulder, false);
     say("with no poser, just outside a shoulder",
-        p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && !p.expected.head && p.damage == colt && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
+        p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && !p.expected.head && p.damage == colt && p.tracer.pawn_hit == 1 && as_asked(p), p,
+        " (no bone, no armour)");
     p = pull(swat, kAimHead, false);
     say("with no poser, at the head",
         p.fired && p.posed == 0 && p.expected_met && !p.expected.posed && p.expected.head && p.damage == colt * 2.0f && p.tracer.pawn_hit == 1 && as_asked(p), p, "");
@@ -2352,6 +2381,977 @@ static bool oracle_enemy_bodies(me::Renderer& renderer, me::LevelScene& scene, c
     scene.enemies = enemies_before;
     scene.active_tracers = tracers_before;
     scene.dropped_weapons = dropped_before;
+    return pass;
+}
+
+// -----------------------------------------------------------------------------
+// A bot's fire at the player, a bot's armour, the helicopter's box and the stumble a bullet puts a
+// bot in (physics/bot_fire.hpp, ParkourController::update_ai_bots), on the Training Area with the
+// renderer's own skeletons. Oracle stage 27; --verify-botfire runs it alone.
+//   Aim         the aim bot by itself: how long after its first shot a hit begins to count at each
+//               range band and difficulty against (HorizontalOffset_Max - OffsetThreshold) /
+//               (rate x multiplier), the reset after a lost line of fire, what her running and her
+//               moves do to it
+//   Fire        the controller's bots: one cop in the open, his first shot and the time to his
+//               first hit that counts; the same cop moved behind something and back
+//   Gate        shots that land on her with his offset over the threshold and under it, and what
+//               the open ones take from her at each difficulty
+//   Armour      her own pulls at three templates' bots, head, hand and thigh, at each difficulty
+//   Helicopter  a pull at the box and one past it; the effect, the sound and no hole
+//   Stumble     the sequence a pistol's and a shotgun's hit starts, from in front and from behind
+//   Survival    how long she lasts standing in front of one patrol cop 600 uu off
+// -----------------------------------------------------------------------------
+static bool oracle_bot_fire(me::Renderer& renderer, me::LevelScene& scene, const me::MovementConfig& move_cfg) {
+    using namespace me;
+    constexpr float kDt = 1.0f / 60.0f;
+    const std::vector<EnemyBot> enemies_before = scene.enemies;
+    const std::vector<HelicopterInstance> helicopters_before = scene.helicopters;
+    const std::vector<BulletTracer> tracers_before = scene.active_tracers;
+    const std::vector<DroppedWeapon> dropped_before = scene.dropped_weapons;
+    const std::vector<SpawnedEffect> effects_before = scene.spawned_effects;
+    const std::vector<DynamicDecal> decals_before = scene.dynamic_decals;
+    static const char* const kLevels[3] = {"Easy", "Medium", "Hard"};
+    bool pass = true;
+    std::cout << std::fixed << std::setprecision(2);
+    const auto report = [&](const char* section, bool ok, const std::string& text) {
+        std::cout << "  [" << section << "] " << (ok ? "OK" : "FAIL") << ": " << text << std::endl;
+        pass = pass && ok;
+    };
+    const auto num = [](float v, int digits = 2) {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(digits) << v;
+        return o.str();
+    };
+
+    // --- Aim -------------------------------------------------------------------------------------
+    // The numbers of DefaultAITemplates.ini's AITemplate_Default, typed here apart from the table
+    // the controller reads: HorizontalOffset_Max, OffsetThreshold and ImprovementRates by band and
+    // difficulty, MoveTowardMultiplier 1.3, MoveSidewaysMultiplier 0.8, MoveAwayMultiplier 0.15.
+    static const float kOffsetMax[3] = {50.0f, 90.0f, 200.0f}, kThreshold[3] = {40.0f, 70.0f, 130.0f}, kRate[3] = {20.0f, 35.0f, 40.0f};
+    // An Assault cop's FN SCAR-L: CombatRange_Max 5000, so 300 uu is near, 1500 medium, 6000 far.
+    static const float kBandDistance[3] = {300.0f, 1500.0f, 6000.0f};
+    static const char* const kBandName[3] = {"near", "medium", "far"};
+    const AimTemplate& assault = find_aim_template("AITemplate_Assault");
+    const BotWeapon& scar = *find_bot_weapon("FNSCARL");
+    const Vec3 aim_bot(0.0f, 0.0f, 94.0f);
+    const auto target_at = [](float distance) {
+        AimTarget t;
+        t.location = Vec3(distance, 0.0f, 90.0f);
+        t.viewpoint = Vec3(distance, 0.0f, 166.0f);
+        return t;
+    };
+    // The time after the first shot at which a hit begins to count, the bot seeing her all along.
+    const auto gate_time = [&](const AimTemplate& tpl, const BotWeapon& weapon, int difficulty, const AimTarget& target, float distance, float limit,
+                               float* start_offset = nullptr) {
+        BotCombatState s;
+        s.random = 20081111u;
+        aim_tick(s, tpl, weapon, difficulty, aim_bot, target, true, distance, 0.0f, kDt);
+        aim_location(s, tpl, aim_bot, target, 0.0f);
+        if (start_offset) *start_offset = s.base_offset;
+        if (aim_hit_relevant(s, tpl, weapon.kind)) return 0.0f;
+        for (int f = 1; static_cast<float>(f) * kDt <= limit; ++f) {
+            const float now = static_cast<float>(f) * kDt;
+            aim_tick(s, tpl, weapon, difficulty, aim_bot, target, true, distance, now, kDt);
+            if (aim_hit_relevant(s, tpl, weapon.kind)) return now;
+        }
+        return -1.0f;
+    };
+    // (A tick is a sixtieth: the gate opens on the first tick at or past the time the rule gives.)
+    const auto on_time = [&](float measured, float expected) { return measured >= expected - 1.0e-3f && measured <= expected + kDt + 1.0e-3f; };
+    {
+        bool ok = true;
+        std::string text = "seconds from the first shot until a hit counts, she standing in his sight (measured / by the rule):";
+        for (int b = 0; b < 3; ++b) {
+            text += std::string(" ") + kBandName[b] + " (" + num(kOffsetMax[b], 0) + " -> " + num(kThreshold[b], 0) + " uu)";
+            for (int d = 0; d < 3; ++d) {
+                float start = 0.0f;
+                const float measured = gate_time(assault, scar, d, target_at(kBandDistance[b]), kBandDistance[b], 30.0f, &start);
+                const float expected = (kOffsetMax[b] - kThreshold[b]) / (kRate[d] * 1.3f);
+                ok = ok && start == kOffsetMax[b] && on_time(measured, expected);
+                text += std::string(" ") + kLevels[d] + " " + num(measured, 3) + " / " + num(expected, 3);
+            }
+            text += b < 2 ? ";" : "";
+        }
+        report("Aim", ok, text);
+    }
+    {
+        // The reset. Medium difficulty, medium range: his offset comes down to HorizontalOffset_Min
+        // (5) in (90 - 5) / 45.5 = 1.87 s. Out of his sight for 0.15 s (under the least
+        // KeepFiringTime, 0.2) he keeps his line of fire and his aim; out of it for 1 s (over the
+        // most, 0.8) his next shot starts at 90 again.
+        const float distance = kBandDistance[1];
+        const AimTarget target = target_at(distance);
+        BotCombatState s;
+        s.random = 20081111u;
+        float now = 0.0f;
+        const auto run = [&](float seconds, bool visible) {
+            for (int f = 0; f < static_cast<int>(std::lround(seconds / kDt)); ++f) {
+                now += kDt;
+                aim_tick(s, assault, scar, kDifficultyMedium, aim_bot, target, visible, distance, now, kDt);
+            }
+        };
+        aim_tick(s, assault, scar, kDifficultyMedium, aim_bot, target, true, distance, now, kDt);
+        const float before_any = s.base_offset;
+        aim_location(s, assault, aim_bot, target, now);
+        const float first = s.base_offset;
+        run(3.0f, true);
+        const float settled = s.base_offset;
+        run(0.15f, false);
+        const bool kept = !s.first_shot;
+        run(0.15f, true);
+        aim_location(s, assault, aim_bot, target, now);
+        const float after_short = s.base_offset;
+        run(1.0f, false);
+        const bool lost = s.first_shot;
+        const float while_lost = s.base_offset;
+        run(kDt, true);
+        aim_location(s, assault, aim_bot, target, now);
+        const float after_long = s.base_offset;
+        const bool closed_again = !aim_hit_relevant(s, assault, scar.kind);
+        const bool ok = before_any == 5.0f && first == 90.0f && settled == 5.0f && kept && after_short == 5.0f && lost && while_lost == 5.0f &&
+                        after_long == 90.0f && closed_again;
+        report("Aim", ok,
+               "the reset (Medium, medium range): offset " + num(before_any, 1) + " before any shot, " + num(first, 1) + " at the first, " + num(settled, 1) +
+                   " after 3 s in his sight; out of it 0.15 s: line of fire " + (kept ? "kept" : "LOST") + ", the next shot at " + num(after_short, 1) +
+                   "; out of it 1 s: bFirstShot " + (lost ? "set" : "NOT SET") + ", offset still " + num(while_lost, 1) + ", the next shot at " +
+                   num(after_long, 1) + (closed_again ? " and no hit counts" : " and a hit COUNTS"));
+    }
+    {
+        // Her running and her moves, Medium difficulty and medium range unless said: 20 uu to lose
+        // at 35 x multiplier x the move's AiAimPenalty.
+        const float distance = kBandDistance[1];
+        const auto moving = [&](const Vec3& velocity, EMovement move) {
+            AimTarget t = target_at(distance);
+            t.velocity = velocity;
+            t.move = move;
+            return t;
+        };
+        struct Case {
+            const char* name;
+            Vec3 velocity;
+            EMovement move;
+            int difficulty;
+            float expected;  // 20 / the rate
+        };
+        const Case cases[] = {
+            {"sprinting across his view", Vec3(0.0f, 600.0f, 0.0f), EMovement::MOVE_Walking, 1, 20.0f / (35.0f * 0.8f)},
+            {"sprinting at him", Vec3(-600.0f, 0.0f, 0.0f), EMovement::MOVE_Walking, 1, 20.0f / (35.0f * 1.3f)},
+            {"sprinting away", Vec3(600.0f, 0.0f, 0.0f), EMovement::MOVE_Walking, 1, 20.0f / (35.0f * 0.15f)},
+            {"in a skill roll at 400 uu/s across", Vec3(0.0f, 400.0f, 0.0f), EMovement::MOVE_SkillRoll, 1, 20.0f / (35.0f * 0.8f)},
+            {"sliding at him", Vec3(-500.0f, 0.0f, 0.0f), EMovement::MOVE_Slide, 1, 20.0f / (35.0f * 1.3f * 0.8f)},
+            {"wall running across, Easy", Vec3(0.0f, 600.0f, 0.0f), EMovement::MOVE_WallRunningLeft, 0, 20.0f / (20.0f * 0.8f * 0.4f)},
+            {"wall running across, Medium", Vec3(0.0f, 600.0f, 0.0f), EMovement::MOVE_WallRunningLeft, 1, 20.0f / (35.0f * 0.8f * 0.5f)},
+            {"wall running across, Hard", Vec3(0.0f, 600.0f, 0.0f), EMovement::MOVE_WallRunningLeft, 2, 20.0f / (40.0f * 0.8f * 0.7f)},
+            {"on a zip line across, Medium", Vec3(0.0f, 600.0f, 0.0f), EMovement::MOVE_ZipLine, 1, 20.0f / (35.0f * 0.8f * 0.1f)},
+        };
+        bool ok = true;
+        std::string text = "seconds until a hit counts, she moving (measured / by the rule):";
+        for (const Case& c : cases) {
+            const float measured = gate_time(assault, scar, c.difficulty, moving(c.velocity, c.move), distance, 60.0f);
+            ok = ok && on_time(measured, c.expected);
+            text += std::string(" ") + c.name + " " + num(measured, 3) + " / " + num(c.expected, 3) + ";";
+        }
+        // A Support cop (MoveAwayMultiplier -0.2): while she runs from him his offset grows.
+        const AimTemplate& support = find_aim_template("AITemplate_Support");
+        const BotWeapon& minimi = *find_bot_weapon("FNMinimi");
+        const float never = gate_time(support, minimi, kDifficultyMedium, moving(Vec3(600.0f, 0.0f, 0.0f), EMovement::MOVE_Walking), distance, 60.0f);
+        ok = ok && never < 0.0f;
+        text += std::string(" from a Support cop, sprinting away: ") + (never < 0.0f ? "never in 60 s" : num(never, 3));
+        // The door gunner's own rates (Medium difficulty): 30, 25 and 15 uu/s by band over 200 - 80.
+        const AimTemplate& gunner = find_aim_template("AITemplate_Gunner");
+        static const float kGunnerDistance[3] = {300.0f, 1500.0f, 16000.0f}, kGunnerRate[3] = {30.0f, 25.0f, 15.0f};
+        text += "; the door gunner, she standing:";
+        for (int b = 0; b < 3; ++b) {
+            const float measured = gate_time(gunner, minimi, kDifficultyMedium, target_at(kGunnerDistance[b]), kGunnerDistance[b], 60.0f);
+            ok = ok && on_time(measured, 120.0f / kGunnerRate[b]);
+            text += std::string(" ") + kBandName[b] + " " + num(measured, 3) + " / " + num(120.0f / kGunnerRate[b], 3);
+        }
+        report("Aim", ok, text);
+
+        // The one-shot penalties, on a bot whose aim has settled at 5: a vault adds 50, less the
+        // tick's own improvement (45.5 / 60), and hits go on counting (under 70); a swing adds 200,
+        // which the band's most (90) cuts off, and they stop.
+        BotCombatState s;
+        s.random = 20081111u;
+        AimTarget t = target_at(distance);
+        float now = 0.0f;
+        aim_tick(s, assault, scar, kDifficultyMedium, aim_bot, t, true, distance, now, kDt);
+        aim_location(s, assault, aim_bot, t, now);
+        for (int f = 0; f < 180; ++f) aim_tick(s, assault, scar, kDifficultyMedium, aim_bot, t, true, distance, now += kDt, kDt);
+        BotCombatState vault = s, swing = s;
+        t.move = EMovement::MOVE_SpeedVaulting;
+        t.move_changed = true;
+        aim_tick(vault, assault, scar, kDifficultyMedium, aim_bot, t, true, distance, now + kDt, kDt);
+        t.move = EMovement::MOVE_Swing;
+        aim_tick(swing, assault, scar, kDifficultyMedium, aim_bot, t, true, distance, now + kDt, kDt);
+        const float vault_expected = 5.0f + 50.0f - 35.0f * 1.3f * kDt;
+        const bool shots_ok = s.base_offset == 5.0f && std::abs(vault.base_offset - vault_expected) < 1.0e-3f && aim_hit_relevant(vault, assault, scar.kind) &&
+                              swing.base_offset == 90.0f && !aim_hit_relevant(swing, assault, scar.kind);
+        report("Aim", shots_ok,
+               "one-shot penalties on a settled aim (offset " + num(s.base_offset, 1) + "): entering a vault " + num(vault.base_offset, 3) + " (by the rule " +
+                   num(vault_expected, 3) + ", hits still count), entering a swing " + num(swing.base_offset, 1) + " (the band's most, no hit counts)");
+    }
+    {
+        // The weapons' damage with distance (TdWeapon.GetInstantHitDamage), fired by a bot, and what
+        // is left of it on her (TdPawn.AdjustDamage: 0.7, 0.5, 0.3 off by difficulty).
+        struct Case {
+            const char* weapon;
+            float distance, damage;  // the damage before her armour, worked by hand from the class's values
+            int on_her[3];
+        };
+        const Case cases[] = {
+            {"Colt1911", 300.0f, 42.0f, {12, 21, 29}},        // under FallOffDistance 600
+            {"Colt1911", 2550.0f, 21.0f, {6, 10, 14}},        // linear: half way from 600 to 4500
+            {"Colt1911", 4500.0f, 0.0f, {0, 0, 0}},           // WeaponRange
+            {"FNSCARL", 1500.0f, 35.0f, {10, 17, 24}},        // under 2000
+            {"FNSCARL", 5500.0f, 14.0f, {4, 7, 9}},           // inverse: 35 / (3 x 0.5 + 1)
+            {"SteyrTMP", 500.0f, 15.5f, {4, 7, 10}},          // int(15.5) = 15 goes to TakeDamage
+            {"Remington870", 1000.0f, 16.0f, {4, 8, 11}},     // a pellet
+            {"FNMinimi", 3000.0f, 36.0f, {10, 18, 25}},
+            {"M95", 15000.0f, 80.0f, {24, 40, 56}},           // AIDamageMultiplier 0.8, no fall-off before its range
+        };
+        bool ok = true;
+        std::string text = "a bot's bullet on her, before her armour and after it at Easy / Medium / Hard:";
+        for (const Case& c : cases) {
+            const BotWeapon& w = *find_bot_weapon(c.weapon);
+            const float damage = weapon_damage_at(w, c.distance, true);
+            ok = ok && std::abs(damage - c.damage) < 1.0e-3f;
+            text += std::string(" ") + c.weapon + " at " + num(c.distance, 0) + " uu " + num(damage, 1) + " ->";
+            for (int d = 0; d < 3; ++d) {
+                const int on_her = player_bullet_damage(w, c.distance, d);
+                ok = ok && on_her == c.on_her[d];
+                text += std::string(d ? " / " : " ") + std::to_string(on_her);
+            }
+            text += ";";
+        }
+        report("Aim", ok, text);
+    }
+
+    // --- The controller's bots ---------------------------------------------------------------------
+    const EnemyBodyPoser poser = [&](const EnemyBot& bot, float sim_time, bool reaction_disarm, EnemyBodySet& out) {
+        return renderer.pose_enemy_bodies(bot, sim_time, reaction_disarm, out);
+    };
+    // She stands at the terrace's checkpoint (stages 7 and 24's ground), looking along +Y.
+    const Vec3 stand(751.8f, -1591.7f, 4992.0f), bot_at(751.8f, -1320.0f, 4992.0f);
+    const Vec3 fwd(0.0f, -1.0f, 0.0f), right(1.0f, 0.0f, 0.0f), up(0.0f, 0.0f, 1.0f);
+    const auto make_bot = [&](const char* archetype, const char* weapon, const Vec3& at) {
+        EnemyBot bot;
+        bot.archetype = archetype;
+        bot.weapon_name = weapon;
+        bot.position = at;
+        bot.home_position = at;
+        const Vec3 to_her = (stand - at).normalized_xy();
+        bot.yaw_deg = std::atan2(to_her.y, to_her.x) * RAD2DEG;
+        bot.anim_state = EEnemyAnimState::AimFire;
+        return bot;
+    };
+    InputFrame idle{}, fire{};
+    fire.fire = true;
+    scene.enemies.clear();
+    scene.helicopters.clear();
+    scene.active_tracers.clear();
+
+    // Where she really stands there, and two places for a cop 600 uu from her on the same floor:
+    // one the level leaves in sight of her eyes, one it hides. Looked for round her, every 5 degrees.
+    Vec3 feet = stand;
+    {
+        ParkourController settle(move_cfg);
+        settle.reset(stand, 90.0f);
+        for (int i = 0; i < 60; ++i) settle.step(idle, kDt, scene);
+        feet = settle.get_position();
+    }
+    ParkourController probe(move_cfg);
+    const Vec3 her_eye = feet + Vec3(0.0f, 0.0f, 166.0f);
+    bool have_open = false, have_hidden = false;
+    Vec3 open_spot = bot_at, hidden_spot = bot_at;
+    for (int a = 0; a < 72 && !(have_open && have_hidden); ++a) {
+        const float angle = static_cast<float>(a) * 5.0f * DEG2RAD;
+        const Vec3 at = feet + Vec3(std::cos(angle), std::sin(angle), 0.0f) * 600.0f;
+        Vec3 hit, normal;
+        // A floor under the place within 40 of her own, and room over it.
+        if (!probe.leg_line_check(at + up * 150.0f, at - up * 60.0f, scene, hit, normal) || std::abs(hit.z - feet.z) > 40.0f || normal.z < 0.9f) continue;
+        const Vec3 spot(at.x, at.y, hit.z);
+        Vec3 h2, n2;
+        const bool sight = !probe.leg_line_check(spot + up * 166.0f, her_eye, scene, h2, n2);
+        if (sight && !have_open) {
+            // The whole of him in the open: his chest's and his hands' height too.
+            if (!probe.leg_line_check(spot + up * 120.0f, feet + up * 120.0f, scene, h2, n2) && !probe.leg_line_check(spot + up * 60.0f, feet + up * 60.0f, scene, h2, n2)) {
+                have_open = true;
+                open_spot = spot;
+            }
+        } else if (!sight && !have_hidden) {
+            have_hidden = true;
+            hidden_spot = spot;
+        }
+    }
+    report("Fire", have_open && have_hidden,
+           "she stands at (" + num(feet.x, 1) + ", " + num(feet.y, 1) + ", " + num(feet.z, 1) + "); a cop 600 uu off in her sight at (" + num(open_spot.x, 1) + ", " +
+               num(open_spot.y, 1) + ", " + num(open_spot.z, 1) + ")" + (have_open ? "" : " NOT FOUND") + ", one the level hides at (" + num(hidden_spot.x, 1) + ", " +
+               num(hidden_spot.y, 1) + ", " + num(hidden_spot.z, 1) + ")" + (have_hidden ? "" : " NOT FOUND"));
+
+    // One run of her standing still with one bot: what he fires and what comes of it.
+    struct Run {
+        float first_shot = -1.0f, first_counted = -1.0f, death = -1.0f;
+        float offset_at_first = 0.0f;
+        uint8_t range = 0;
+        int shots = 0, landed = 0, counted = 0;
+        float health = 100.0f;
+        std::vector<float> hits;  // what each counted hit took
+    };
+    // `seconds` of it, or until she dies; `between` is called before every step with the time.
+    const auto stand_under_fire = [&](const EnemyBot& bot, int difficulty, float seconds, const std::function<void(float, LevelScene&)>& between) {
+        ParkourController controller(move_cfg);
+        controller.set_enemy_body_poser(poser);
+        controller.set_difficulty(difficulty);
+        controller.reset(feet, 90.0f);
+        scene.enemies = {bot};
+        scene.active_tracers.clear();
+        Run r;
+        for (int f = 0; static_cast<float>(f) * kDt < seconds; ++f) {
+            const float now = static_cast<float>(f) * kDt;
+            if (between) between(now, scene);
+            const float health = controller.get_telemetry().health;
+            // (A tracer lives 0.085 s: those of this step are the ones not marked before it.)
+            for (BulletTracer& tr : scene.active_tracers) tr.max_time = 0.0f;
+            controller.step(idle, kDt, scene);
+            int fired = 0;
+            for (const BulletTracer& tr : scene.active_tracers) {
+                if (tr.from_player || tr.max_time == 0.0f) continue;
+                ++fired;
+                r.landed += tr.pawn_hit == 2 || tr.pawn_hit == 3 ? 1 : 0;
+                r.counted += tr.pawn_hit == 2 ? 1 : 0;
+            }
+            if (fired > 0 && r.first_shot < 0.0f) {
+                r.first_shot = now;
+                r.offset_at_first = scene.enemies[0].combat.base_offset;
+                r.range = scene.enemies[0].combat.firing_range;
+            }
+            r.shots += fired;
+            const float lost = health - controller.get_telemetry().health;
+            if (lost > 0.0f) {
+                if (r.first_counted < 0.0f) r.first_counted = now;
+                r.hits.push_back(lost);
+            }
+            r.health = controller.get_telemetry().health;
+            if (r.health <= 0.0f) {
+                r.death = now;
+                break;
+            }
+        }
+        return r;
+    };
+    const EnemyBot cop = make_bot("AITemplate_PatrolCop", "Colt1911", open_spot);
+
+    if (have_open) {
+        // A patrol cop's Colt (CombatRange_Max 2000): 600 uu is the medium band. His first shot
+        // throws his offset to 90 (less the improvement of the ticks since, at most two); no hit
+        // can count before (90 - 70) / (rate x 1.3) later, whatever lands.
+        bool ok = true;
+        std::string text = "a patrol cop 600 uu off, she standing: ";
+        for (int d = 0; d < 3; ++d) {
+            const Run r = stand_under_fire(cop, d, 12.0f, nullptr);
+            const float gate = 20.0f / (kRate[d] * 1.3f);
+            ok = ok && r.first_shot >= 0.0f && r.range == kFiringRangeMedium && r.offset_at_first <= 90.0f && r.offset_at_first > 90.0f - 3.0f * kRate[d] * 1.3f * kDt &&
+                 r.first_counted >= r.first_shot + gate - kDt && r.counted > 0;
+            // (The hit that kills her takes what she had left.)
+            for (size_t i = 0; i < r.hits.size(); ++i) {
+                if (r.death >= 0.0f && i + 1 == r.hits.size()) continue;
+                ok = ok && r.hits[i] == static_cast<float>(player_bullet_damage(*find_bot_weapon("Colt1911"), 500.0f, d));
+            }
+            text += std::string(d ? "; " : "") + kLevels[d] + ": first shot at " + num(r.first_shot, 2) + " s with his offset at " + num(r.offset_at_first, 1) +
+                    ", the first hit that counts at " + num(r.first_counted, 2) + " s (not before " + num(r.first_shot + gate, 2) + "), " + std::to_string(r.shots) +
+                    " shots in " + num(r.death >= 0.0f ? r.death : 12.0f, 1) + " s, " + std::to_string(r.landed) + " on her, " + std::to_string(r.counted) + " counted" +
+                    (r.hits.empty() ? "" : " for " + num(r.hits.front(), 0) + " each");
+        }
+        report("Fire", ok, text);
+
+        // A restart (the load of the last checkpoint) starts his fire over with the clock: his turn
+        // to burst, his timers and his aim (the first shot from 90 again, as soon as in a fresh run).
+        ParkourController controller(move_cfg);
+        controller.set_enemy_body_poser(poser);
+        controller.set_difficulty(kDifficultyMedium);
+        controller.reset(feet, 90.0f);
+        scene.enemies = {cop};
+        scene.active_tracers.clear();
+        const auto first_shot_within = [&](float seconds, float& offset_at_first) {
+            for (int f = 0; static_cast<float>(f) * kDt < seconds; ++f) {
+                for (BulletTracer& tr : scene.active_tracers) tr.max_time = 0.0f;
+                controller.step(idle, kDt, scene);
+                for (const BulletTracer& tr : scene.active_tracers) {
+                    if (tr.from_player || tr.max_time == 0.0f) continue;
+                    offset_at_first = scene.enemies[0].combat.base_offset;
+                    return static_cast<float>(f) * kDt;
+                }
+            }
+            return -1.0f;
+        };
+        float offset_before = 0.0f, offset_after = 0.0f, ignored = 0.0f;
+        const float shot_before = first_shot_within(1.0f, offset_before);
+        first_shot_within(2.5f, ignored);  // into his fire, his aim settling
+        const float settled = scene.enemies[0].combat.base_offset;
+        controller.restart_level_at(ParkourController::start_spot_over_feet(feet), 90.0f, scene);
+        const float shot_after = first_shot_within(1.0f, offset_after);
+        report("Restart",
+               shot_before >= 0.0f && settled < 60.0f && shot_after >= 0.0f && std::abs(shot_after - shot_before) <= kDt && std::abs(offset_after - offset_before) < 0.5f &&
+                   (controller.get_telemetry().position - feet).length() < 2.0f,
+               "a patrol cop at Medium: first shot at " + num(shot_before, 2) + " s with his offset at " + num(offset_before, 1) + "; at 3.5 s his offset " +
+                   num(settled, 1) + "; after a restart where she stood, first shot at " + num(shot_after, 2) + " s with his offset at " + num(offset_after, 1));
+    }
+    if (have_open && have_hidden) {
+        // The same cop, Medium: three seconds in her sight (his aim settles), then moved behind what
+        // the level has there for 1.5 s, then back. He sees nobody there and fires nothing once his
+        // KeepFiringTime (0.8 at most) is over; his first shot on coming back is from 90 again.
+        float settled = -1.0f, hidden_offset = -1.0f, back_offset = -1.0f, back_shot = -1.0f, back_counted = -1.0f;
+        bool unseen = false, first_shot_set = false;
+        int shots_hidden_late = 0, tracers_seen = 0;
+        ParkourController controller(move_cfg);
+        controller.set_enemy_body_poser(poser);
+        controller.set_difficulty(kDifficultyMedium);
+        controller.reset(feet, 90.0f);
+        controller.get_telemetry().health = 1.0e6f;  // what he does to her is not this case's to judge
+        scene.enemies = {cop};
+        scene.active_tracers.clear();
+        for (int f = 0; f < 60 * 14; ++f) {
+            const float now = static_cast<float>(f) * kDt;
+            EnemyBot& bot = scene.enemies[0];
+            const bool hide = now >= 3.0f && now < 4.5f;
+            bot.position = hide ? hidden_spot : open_spot;
+            bot.home_position = bot.position;
+            for (BulletTracer& tr : scene.active_tracers) tr.max_time = 0.0f;
+            const float health = controller.get_telemetry().health;
+            controller.step(idle, kDt, scene);
+            int fired = 0;
+            for (const BulletTracer& tr : scene.active_tracers) fired += !tr.from_player && tr.max_time != 0.0f ? 1 : 0;
+            tracers_seen += fired;
+            if (std::abs(now - 2.9f) < kDt * 0.5f) settled = bot.combat.base_offset;
+            if (hide && now >= 3.9f) {
+                shots_hidden_late += fired;
+                unseen = !bot.combat.enemy_visible;
+                first_shot_set = bot.combat.first_shot;
+                hidden_offset = bot.combat.base_offset;
+            }
+            if (now >= 4.5f && fired > 0 && back_shot < 0.0f) {
+                back_shot = now;
+                back_offset = bot.combat.base_offset;
+            }
+            if (now >= 4.5f && back_counted < 0.0f && controller.get_telemetry().health < health) back_counted = now;
+        }
+        const float gate = 20.0f / (35.0f * 1.3f);
+        const bool ok = settled == 5.0f && unseen && first_shot_set && shots_hidden_late == 0 && hidden_offset == 5.0f && back_shot >= 4.5f && back_offset <= 90.0f &&
+                        back_offset > 90.0f - 3.0f * 35.0f * 1.3f * kDt && back_counted >= back_shot + gate - kDt;
+        report("Fire", ok,
+               "the same cop, Medium: offset " + num(settled, 1) + " after 2.9 s in her sight; behind the level from 3.0 to 4.5 s: " +
+                   (unseen ? "he does not see her" : "HE SEES HER") + ", " + std::to_string(shots_hidden_late) + " shots after 3.9 s, bFirstShot " +
+                   (first_shot_set ? "set" : "NOT SET") + ", offset " + num(hidden_offset, 1) + "; back in her sight his first shot at " + num(back_shot, 2) +
+                   " s with his offset at " + num(back_offset, 1) + ", the first hit that counts at " + num(back_counted, 2) + " s (not before " +
+                   num(back_shot + gate, 2) + "); " + std::to_string(tracers_seen) + " shots in all");
+    }
+    {
+        // The bursts, 272 uu off (the near band: the weapon's AimedBurst_Near, ATdBotPawn::SetAIFiringState),
+        // with her health out of the question. An Assault cop's MP5K: six shots a tenth of a second
+        // apart, then PauseFiring's 0.03 s and a pause of 0.3 to 0.5 s. One with a Neostead: a shot a
+        // burst, and the pause (0.6 to 0.8 s) is shorter than the weapon's FireInterval, which is then
+        // what parts his shots: 1.1 s. Three MP5K cops side by side: no more than two hold their
+        // triggers at once (TdAIManager.MaxSimultaneousBursts 2), and each gets his turn.
+        const auto shot_times = [&](std::vector<EnemyBot> bots, float seconds, int& most_at_once) {
+            ParkourController controller(move_cfg);
+            controller.set_enemy_body_poser(poser);
+            controller.set_difficulty(kDifficultyMedium);
+            controller.reset(feet, 90.0f);
+            controller.get_telemetry().health = 1.0e6f;
+            scene.enemies = std::move(bots);
+            scene.active_tracers.clear();
+            std::vector<std::vector<float>> times(scene.enemies.size());
+            most_at_once = 0;
+            for (int f = 0; static_cast<float>(f) * kDt < seconds; ++f) {
+                controller.step(idle, kDt, scene);
+                scene.active_tracers.clear();
+                int held = 0;
+                for (size_t i = 0; i < scene.enemies.size(); ++i) {
+                    // (The flash is lit for 0.08 s by the step he fires in, and burns down from the next.)
+                    if (scene.enemies[i].muzzle_flash_timer == 0.08f) times[i].push_back(static_cast<float>(f) * kDt);
+                    held += scene.enemies[i].combat.trigger ? 1 : 0;
+                }
+                most_at_once = std::max(most_at_once, held);
+            }
+            return times;
+        };
+        // The shots of one bot as bursts: a gap of more than a quarter of a second begins a new one.
+        struct Bursts {
+            int count = 0, least = 1 << 30, most = 0;
+            float gap_min = 1.0e9f, gap_max = 0.0f;      // between the shots of a burst
+            float pause_min = 1.0e9f, pause_max = 0.0f;  // from a burst's last shot to the next one's first
+        };
+        const auto bursts_of = [](const std::vector<float>& times) {
+            Bursts b;
+            int in_burst = 0;
+            for (size_t i = 0; i < times.size(); ++i) {
+                const float gap = i ? times[i] - times[i - 1] : 0.0f;
+                if (i && gap <= 0.25f) {
+                    b.gap_min = std::min(b.gap_min, gap);
+                    b.gap_max = std::max(b.gap_max, gap);
+                    ++in_burst;
+                    continue;
+                }
+                if (i) {
+                    b.pause_min = std::min(b.pause_min, gap);
+                    b.pause_max = std::max(b.pause_max, gap);
+                    b.least = std::min(b.least, in_burst);
+                    b.most = std::max(b.most, in_burst);
+                    ++b.count;
+                }
+                in_burst = 1;
+            }
+            return b;  // (the last burst may have been cut short by the end of the run: not counted)
+        };
+        int at_once = 0;
+        const Bursts mp5k = bursts_of(shot_times({make_bot("AITemplate_Assault_MP5K", "MP5K", bot_at)}, 12.0f, at_once)[0]);
+        const Bursts neostead = bursts_of(shot_times({make_bot("AITemplate_Assault_Neostead", "Neostead", bot_at)}, 12.0f, at_once)[0]);
+        const std::vector<std::vector<float>> three = shot_times({make_bot("AITemplate_Assault_MP5K", "MP5K", bot_at - right * 130.0f),
+                                                                  make_bot("AITemplate_Assault_MP5K", "MP5K", bot_at),
+                                                                  make_bot("AITemplate_Assault_MP5K", "MP5K", bot_at + right * 130.0f)},
+                                                                 12.0f, at_once);
+        const bool mp5k_ok = mp5k.count >= 8 && mp5k.least == 6 && mp5k.most == 6 && mp5k.gap_min > 0.1f - 0.5f * kDt && mp5k.gap_max < 0.1f + 1.5f * kDt &&
+                             mp5k.pause_min >= 0.03f + 0.3f && mp5k.pause_max <= 0.03f + 0.5f + 5.0f * kDt;
+        const bool neostead_ok = neostead.count >= 8 && neostead.least == 1 && neostead.most == 1 && neostead.pause_min > 1.1f - 0.5f * kDt &&
+                                 neostead.pause_max < 1.1f + 1.5f * kDt;
+        const bool three_ok = at_once == 2 && three.size() == 3 && three[0].size() >= 6 && three[1].size() >= 6 && three[2].size() >= 6;
+        // A helicopter's rider, whom the level's factory leaves standing where it spawns him: his
+        // fire is the helicopter's gun's, and he has none of his own.
+        int rider_held = 0;
+        const size_t rider_shots = shot_times({make_bot("AITemplate_Gunner", "FNMinimi", bot_at)}, 3.0f, rider_held)[0].size();
+        report("Fire", mp5k_ok && neostead_ok && three_ok && rider_shots == 0 && rider_held == 0,
+               "bursts 272 uu off, 12 s each: an MP5K " + std::to_string(mp5k.count) + " bursts of " + std::to_string(mp5k.least) + " to " + std::to_string(mp5k.most) +
+                   " shots (6), " + num(mp5k.gap_min, 3) + " to " + num(mp5k.gap_max, 3) + " s apart (FireInterval 0.1), " + num(mp5k.pause_min, 2) + " to " +
+                   num(mp5k.pause_max, 2) + " s between bursts (0.03 and a pause of 0.3 to 0.5); a Neostead " + std::to_string(neostead.count + 1) + " shots, " +
+                   num(neostead.pause_min, 3) + " to " + num(neostead.pause_max, 3) + " s apart (its FireInterval 1.1, over its pause of 0.6 to 0.8); three MP5K cops: " +
+                   std::to_string(at_once) + " triggers held at most (2), their shots " + std::to_string(three.size() > 0 ? three[0].size() : 0) + ", " +
+                   std::to_string(three.size() > 1 ? three[1].size() : 0) + " and " + std::to_string(three.size() > 2 ? three[2].size() : 0) +
+                   "; a helicopter's rider left standing with his Minimi: " + std::to_string(rider_shots) + " shots in 3 s (0)");
+    }
+
+    // --- Gate --------------------------------------------------------------------------------------
+    // A cop on the terrace 272 uu in front of her (the near band: a hit counts at 40 or under), his
+    // aim set by hand on her middle (CurrentX 0.4 going to -0.4, which GetNextLocation leaves where
+    // it is; 45 over her Location, her chest) and held there by an overridden improvement rate of
+    // next to nothing (OverriddenImprovementRate, the level script's own way in). With his offset
+    // at 45 the bullet lands and nothing comes of it; at 30 it takes the weapon's damage less her
+    // armour.
+    const auto rigged_shot = [&](const char* archetype, const char* weapon, float offset, int difficulty, float& lost, uint8_t& pawn_hit, Vec3& end) {
+        ParkourController controller(move_cfg);
+        controller.set_enemy_body_poser(poser);
+        controller.set_difficulty(difficulty);
+        controller.reset(feet, 90.0f);
+        EnemyBot bot = make_bot(archetype, weapon, bot_at);
+        BotCombatState& s = bot.combat;
+        s.random = 20081111u;
+        s.first_shot = false;
+        s.has_enemy = true;
+        s.enemy_visible = true;
+        s.improvement_override = 1.0e-6f;
+        s.base_offset = offset;
+        s.base_dispersion = 10.0f;
+        s.base_y_offset = 10.0f;
+        s.current_x = 0.4f;
+        s.target_x = -0.4f;
+        s.diff_x = 0.8f;
+        s.current_y = 45.0f;
+        s.current_location = feet + Vec3(0.0f, 0.0f, 90.0f + 45.0f);
+        s.time_of_last_shot = 0.0f;
+        scene.enemies = {bot};
+        scene.active_tracers.clear();
+        lost = 0.0f;
+        pawn_hit = 255;
+        for (int f = 0; f < 240; ++f) {
+            const float health = controller.get_telemetry().health;
+            controller.step(idle, kDt, scene);
+            for (const BulletTracer& tr : scene.active_tracers) {
+                if (tr.from_player) continue;
+                pawn_hit = tr.pawn_hit;
+                end = tr.end_pos;
+                lost = health - controller.get_telemetry().health;
+                return scene.enemies[0].combat.base_offset;
+            }
+        }
+        return -1.0f;
+    };
+    {
+        bool ok = true;
+        std::string text;
+        float lost = 0.0f;
+        uint8_t pawn_hit = 0;
+        Vec3 end;
+        float offset = rigged_shot("AITemplate_PatrolCop", "Colt1911", 45.0f, kDifficultyMedium, lost, pawn_hit, end);
+        EnemyBodySet her;
+        pose_player_stand_in(feet, 90.0f, 180.0f, her);
+        const auto on_her = [&](const Vec3& p) {
+            // Within a unit of one of her stand-in's shapes' middles' reach: the tracer ends in her.
+            return (p - her.bound_centre).length() <= her.bound_radius + 0.5f && std::abs(p.x - feet.x) < 30.0f && p.z > feet.z + 100.0f && p.z < feet.z + 185.0f;
+        };
+        ok = ok && offset > 40.0f && pawn_hit == 3 && lost == 0.0f && on_her(end);
+        text += "a patrol cop's Colt at 272 uu, his offset " + num(offset, 1) + " (over 40): the bullet ends in her at (" + num(end.x, 1) + ", " + num(end.y, 1) + ", " +
+                num(end.z, 1) + "), pawn_hit " + std::to_string(pawn_hit) + ", health lost " + num(lost, 0) + "; his offset 30:";
+        static const int kColtOnHer[3] = {12, 21, 29};  // int(42 x 0.3), int(42 x 0.5), int(42 x 0.7)
+        for (int d = 0; d < 3; ++d) {
+            offset = rigged_shot("AITemplate_PatrolCop", "Colt1911", 30.0f, d, lost, pawn_hit, end);
+            ok = ok && offset <= 40.0f && pawn_hit == 2 && lost == static_cast<float>(kColtOnHer[d]) && on_her(end);
+            text += std::string(" ") + kLevels[d] + " " + num(lost, 0) + " (" + std::to_string(kColtOnHer[d]) + ")";
+        }
+        // An Assault cop's G36C (30) and a Support cop's Minimi (36), Medium: 15 and 18.
+        offset = rigged_shot("AITemplate_Assault_HKG36C", "G36C", 30.0f, kDifficultyMedium, lost, pawn_hit, end);
+        ok = ok && pawn_hit == 2 && lost == 15.0f;
+        text += "; a G36C at Medium " + num(lost, 0) + " (15)";
+        offset = rigged_shot("AITemplate_Support", "FNMinimi", 30.0f, kDifficultyMedium, lost, pawn_hit, end);
+        ok = ok && pawn_hit == 2 && lost == 18.0f;
+        text += ", a Minimi " + num(lost, 0) + " (18)";
+        // A sniper's bullet is no "bullet damage" to IsHitRelevant: it counts whatever his offset
+        // (100 is the most a sniper's template lets it be, over its threshold of 75), and is not
+        // heard while the offset is over it (PlayImpactEffects asks of TdDmgType_LowCaliber_Bullet).
+        offset = rigged_shot("AITemplate_SniperCop", "M95", 100.0f, kDifficultyMedium, lost, pawn_hit, end);
+        ok = ok && offset > 75.0f && pawn_hit == 3 && lost == 40.0f;
+        text += "; a sniper's M95 with his offset " + num(offset, 1) + " (over 75) " + num(lost, 0) + " (40: int(100 x 0.8) x 0.5)";
+        // The Training Area's partner's hits are never held back (TdAI_Tutorial.IsHitRelevant).
+        BotCombatState tutorial;
+        tutorial.base_offset = 50.0f;
+        tutorial.firing_range = kFiringRangeNear;
+        ok = ok && aim_hit_relevant(tutorial, find_aim_template("TutorialTrainer_Celeste"), EBulletKind::LowCaliber) &&
+             !aim_hit_relevant(tutorial, find_aim_template("AITemplate_PatrolCop"), EBulletKind::LowCaliber);
+        report("Gate", ok, text);
+    }
+
+    // --- Armour ------------------------------------------------------------------------------------
+    // Her own pulls (stage 24's way of pulling): a Colt that does not scatter, the view turned onto
+    // a point of the bot as he stands, one step with the trigger held. The bots hold their fire.
+    enum { kAimHead = 0, kAimHand, kAimThigh, kAimBelly, kAims };
+    const auto aim_at = [&](const EnemyBodySet& s, int which) {
+        const auto shape = [&](uint8_t body, EBodyShape kind) -> const BodyShape& {
+            for (const BodyShape& b : s.shapes) {
+                if (b.body == body && b.kind == kind) return b;
+            }
+            return s.shapes.front();
+        };
+        if (which == kAimHead) return shape(3, EBodyShape::Capsule).centre;
+        if (which == kAimHand) return shape(6, EBodyShape::Capsule).centre;
+        if (which == kAimThigh) return shape(13, EBodyShape::Box).centre;
+        return shape(1, EBodyShape::Box).centre;
+    };
+    ParkourController shooter(move_cfg);
+    shooter.set_enemy_body_poser(poser);
+    shooter.set_ai_hold_fire(true);
+    shooter.reset(feet, 90.0f);
+    for (int i = 0; i < 30; ++i) shooter.step(idle, kDt, scene);
+    struct Pull {
+        bool fired = false;
+        float damage = 0.0f;
+        BulletTracer tracer;
+        bool met = false;
+        ParkourController::EnemyShotHit expected;
+        EnemyBot after;
+    };
+    // One pull at the point `target` gives once the weapon is ready, the first of `bots` being the
+    // one looked at afterwards.
+    const auto pull_at = [&](const std::vector<EnemyBot>& bots, const std::function<Vec3()>& target, bool wait = true) {
+        for (int i = 0; wait && (i < 16 || (i < 240 && shooter.get_telemetry().weapon.cooldown > 0.0f)); ++i) shooter.step(idle, kDt, scene);
+        scene.enemies = bots;
+        scene.active_tracers.clear();
+        shooter.get_telemetry().weapon.spread_rad = 0.0f;
+        Pull p;
+        const Vec3 eye = shooter.get_position() + Vec3(0.0f, 0.0f, shooter.get_telemetry().eye_height);
+        const Vec3 dir = (target() - eye).normalized();
+        std::vector<EnemyBodySet> now;
+        shooter.pose_enemies_for_shot(scene, eye, dir, 4000.0f, 0.0f, now);
+        p.met = shooter.trace_enemies(scene, now, eye, dir, 4000.0f, p.expected);
+        shooter.set_rotation(std::atan2(dir.y, dir.x) * RAD2DEG, std::asin(std::clamp(dir.z, -1.0f, 1.0f)) * RAD2DEG, 0.0f);
+        const float health = scene.enemies.empty() ? 0.0f : scene.enemies[0].health;
+        shooter.step(fire, kDt, scene);
+        p.fired = shooter.get_telemetry().weapon.fired_this_tick;
+        if (!scene.enemies.empty()) {
+            p.damage = health - scene.enemies[0].health;
+            p.after = scene.enemies[0];
+        }
+        for (const BulletTracer& tr : scene.active_tracers) {
+            if (tr.from_player) p.tracer = tr;
+        }
+        return p;
+    };
+    const auto bot_point = [&](const EnemyBot& bot, int which) {
+        EnemyBodySet set;
+        renderer.pose_enemy_bodies(bot, shooter.get_telemetry().sim_time, false, set);
+        return set.valid ? aim_at(set, which) : bot.position + up * 120.0f;
+    };
+    // The same, as a point to be read when the trigger is pulled.
+    const auto at_bot = [&](const EnemyBot& bot, int which) { return std::function<Vec3()>([&bot_point, bot, which]() { return bot_point(bot, which); }); };
+    const auto at_point = [](const Vec3& point) { return std::function<Vec3()>([point]() { return point; }); };
+    {
+        // ArmorBullets*Settings of the three pawn classes at Easy / Medium / Hard, typed here apart
+        // from the table: TdBotPawn_Assault 0.2 / 0.3 / 0.5, TdBotPawn_PatrolCop 0 / 0 / 0.2,
+        // TdBotPawn_Support 0.4 / 0.5 / 0.7, the same on head, body and legs. The Colt's 42 at
+        // 272 uu: the head's body (bone Neck, PM_Character_Head) int(84 x (1 - A)), a hand's (the
+        // same material, the body's armour) the same, a thigh's int(42 x (1 - A)).
+        // (Each stands as stage 24's bot does, a rifle at his shoulder: the pose the points are read off.)
+        struct Row {
+            const char* archetype;
+            int head[3], thigh[3];
+        };
+        static const Row kRows[] = {
+            {"AITemplate_Assault", {67, 58, 42}, {33, 29, 21}},
+            {"AITemplate_PatrolCop", {84, 84, 67}, {42, 42, 33}},
+            {"AITemplate_Support", {50, 42, 25}, {25, 21, 12}},
+        };
+        shooter.equip_weapon("Colt1911");
+        bool ok = true;
+        std::string text = "a Colt's bullet (42) at head / hand / thigh, Easy, Medium, Hard:";
+        for (const Row& row : kRows) {
+            text += std::string(" ") + row.archetype + " (" + find_aim_template(row.archetype).name + ")";
+            for (int d = 0; d < 3; ++d) {
+                shooter.set_difficulty(d);
+                EnemyBot bot = make_bot(row.archetype, "G36C", bot_at);
+                bot.health = bot.max_health = 100000.0f;
+                shooter.equip_weapon("Colt1911");  // eight rounds
+                const Pull head = pull_at({bot}, at_bot(bot, kAimHead));
+                const Pull hand = pull_at({bot}, at_bot(bot, kAimHand));
+                const Pull thigh = pull_at({bot}, at_bot(bot, kAimThigh));
+                ok = ok && head.fired && head.met && head.expected.bone == "Neck" && head.expected.head && head.damage == static_cast<float>(row.head[d]) &&
+                     hand.met && hand.expected.bone == "LeftHand" && hand.expected.head && hand.damage == static_cast<float>(row.head[d]) && thigh.met &&
+                     thigh.expected.bone == "RightUpLeg" && !thigh.expected.head && thigh.damage == static_cast<float>(row.thigh[d]);
+                text += std::string(d ? ", " : " ") + num(head.damage, 0) + " / " + num(hand.damage, 0) + " / " + num(thigh.damage, 0);
+            }
+            text += ";";
+        }
+        shooter.set_difficulty(kDifficultyMedium);
+        // The rest of the table, by the rule alone: Celeste's parts, a sniper's bullet, the classes with none.
+        const AimTemplate& celeste = find_aim_template("AITemplate_Celeste");
+        const int c_head = bot_bullet_damage(celeste, 42.0f, EBulletKind::LowCaliber, true, "Neck", true, 1);
+        const int c_hand = bot_bullet_damage(celeste, 42.0f, EBulletKind::LowCaliber, true, "LeftHand", true, 1);
+        const int c_body = bot_bullet_damage(celeste, 42.0f, EBulletKind::LowCaliber, false, "Spine1", true, 1);
+        const int c_legs = bot_bullet_damage(celeste, 42.0f, EBulletKind::LowCaliber, false, "LeftFoot", true, 1);
+        const int riot = bot_bullet_damage(find_aim_template("AITemplate_RiotCop"), 42.0f, EBulletKind::LowCaliber, false, "RightLeg", true, 2);
+        const int steyr = bot_bullet_damage(find_aim_template("AITemplate_PatrolCop_MiniUzi"), 42.0f, EBulletKind::LowCaliber, false, "Hips", true, 1);
+        const int sniper = bot_bullet_damage(find_aim_template("AITemplate_SniperCop"), 42.0f, EBulletKind::LowCaliber, false, "Hips", true, 2);
+        const int by_sniper = bot_bullet_damage(find_aim_template("AITemplate_RiotCop"), 100.0f, EBulletKind::Sniper, false, "RightFoot", true, 2);
+        const int gunner = bot_bullet_damage(find_aim_template("AITemplate_Gunner"), 42.0f, EBulletKind::LowCaliber, false, "Hips", true, 2);
+        const int no_bone = bot_bullet_damage(find_aim_template("AITemplate_Support"), 42.0f, EBulletKind::LowCaliber, false, "", false, 2);
+        ok = ok && c_head == 67 && c_hand == 33 && c_body == 16 && c_legs == 21 && riot == 8 && steyr == 37 && sniper == 25 && by_sniper == 99999 && gunner == 42 && no_bone == 42;
+        text += " by the rule: Celeste at Medium head " + std::to_string(c_head) + ", a hand (the head's material, the body's armour) " + std::to_string(c_hand) + ", body " + std::to_string(c_body) + ", foot " + std::to_string(c_legs) +
+                "; a riot cop's shin at Hard " + std::to_string(riot) + "; PatrolCop_MiniUzi (a Steyr cop) at Medium " + std::to_string(steyr) +
+                "; a sniper cop at Hard " + std::to_string(sniper) + "; a sniper's bullet " + std::to_string(by_sniper) + "; the door gunner " +
+                std::to_string(gunner) + "; with no bone (his cylinder) " + std::to_string(no_bone);
+        report("Armour", ok, text);
+    }
+
+    // --- Helicopter --------------------------------------------------------------------------------
+    {
+        // A helicopter hung where the level leaves her a clear line to its box, broadside to her
+        // (its box is then 487 across and 137.5 high), not yet firing. A pull at the box's middle
+        // stops on its near face; one 150 uu over the box goes on. A step later the hit has its
+        // effect and its sound, the default material's, and no hole.
+        HelicopterInstance heli;
+        heli.state = EHeliState::Arriving;
+        heli.hold_fire_delay = 1.0e9f;
+        heli.perfect_aim_delay = 1.0e9f;
+        heli.yaw_deg = 0.0f;
+        bool placed = false;
+        const Vec3 eye = shooter.get_position() + Vec3(0.0f, 0.0f, shooter.get_telemetry().eye_height);
+        for (int a = 0; a < 36 && !placed; ++a) {
+            const float angle = (90.0f + static_cast<float>(a) * 10.0f) * DEG2RAD;
+            heli.position = feet + Vec3(std::cos(angle) * 900.0f, std::sin(angle) * 900.0f, 100.0f);
+            heli.yaw_deg = static_cast<float>(a) * 10.0f;  // broadside to her
+            const BodyShape box = helicopter_box(heli);
+            Vec3 h, n;
+            placed = !probe.leg_line_check(eye, box.centre, scene, h, n) && !probe.leg_line_check(eye, box.centre + up * 220.0f + (box.centre - eye).normalized() * 400.0f, scene, h, n);
+        }
+        heli.spawn_pos = heli.position;
+        const std::vector<EnemyBot> nobody;
+        scene.enemies.clear();
+        shooter.equip_weapon("Colt1911");
+        // (It is put there only once her weapon is ready, and so has not flown anywhere yet.)
+        for (int i = 0; i < 20; ++i) shooter.step(idle, kDt, scene);
+        scene.spawned_effects.clear();
+        scene.dynamic_decals.clear();
+        scene.helicopters = {heli};
+        const size_t effects = scene.spawned_effects.size(), decals = scene.dynamic_decals.size();
+        BodyShape box = helicopter_box(scene.helicopters[0]);
+        const Pull on = pull_at(nobody, at_point(box.centre), false);
+        // Where the line from her eye to the box's middle goes into the box, worked here.
+        float expected_distance = 0.0f;
+        Vec3 expected_normal;
+        const Vec3 line = (box.centre - eye).normalized();
+        const bool crosses = trace_body_shape(box, eye, line, 4000.0f, expected_distance, expected_normal);
+        const Vec3 expected_at = eye + line * expected_distance;
+        // In the box's own frame the place is on its near side face (y: 101.44 from the middle).
+        const Vec3 rel = on.tracer.end_pos - box.centre;
+        const float side = std::abs(rel.dot(box.axis[1]));
+        shooter.step(idle, kDt, scene);
+        const size_t effects_after = scene.spawned_effects.size(), decals_after = scene.dynamic_decals.size();
+        std::string heard;
+        const std::string want = scene.default_physical >= 0 && static_cast<size_t>(scene.default_physical) < scene.physical_materials.size()
+                                     ? scene.physical_materials[static_cast<size_t>(scene.default_physical)].impact_sound
+                                     : std::string();
+        for (const SimSoundEvent& ev : shooter.get_telemetry().sound_events) {
+            if (!ev.at_pawn && (ev.location - on.tracer.end_pos).length() < 1.0f) heard = ev.cue;
+        }
+        std::string effect_path;
+        if (effects_after > effects) {
+            const SpawnedEffect& e = scene.spawned_effects.back();
+            if (e.at.template_index >= 0 && static_cast<size_t>(e.at.template_index) < scene.particle_templates.size()) {
+                effect_path = scene.particle_templates[static_cast<size_t>(e.at.template_index)].path;
+            }
+        }
+        // The second pull, with the helicopter put back where it hung.
+        scene.helicopters.clear();
+        for (int i = 0; i < 20; ++i) shooter.step(idle, kDt, scene);
+        scene.helicopters = {heli};
+        box = helicopter_box(scene.helicopters[0]);
+        const Vec3 eye2 = shooter.get_position() + Vec3(0.0f, 0.0f, shooter.get_telemetry().eye_height);
+        const Pull over = pull_at(nobody, at_point(box.centre + up * 220.0f + (box.centre - eye2).normalized() * 400.0f), false);
+        const bool ok = placed && crosses && on.fired && on.tracer.pawn_hit == 4 && (on.tracer.end_pos - expected_at).length() < 0.05f && std::abs(side - 101.441f) < 0.05f &&
+                        (on.tracer.pawn_normal - expected_normal).length() < 0.01f && effects_after == effects + 1 && decals_after == decals && !want.empty() &&
+                        heard == want && over.fired && over.tracer.pawn_hit == 0 && scene.helicopters[0].state == EHeliState::Arriving;
+        report("Helicopter", ok,
+               std::string(placed ? "" : "NO CLEAR PLACE FOUND; ") + "a helicopter 900 uu off, its box's middle at (" + num(box.centre.x, 1) + ", " + num(box.centre.y, 1) + ", " +
+                   num(box.centre.z, 1) + "): a Colt's bullet at it ends " + num((on.tracer.end_pos - eye).length(), 2) + " uu from her eye (the box's face is at " +
+                   num(expected_distance, 2) + "), " + num(side, 2) + " from the box's middle across it (101.44), pawn_hit " + std::to_string(on.tracer.pawn_hit) +
+                   ", normal (" + num(on.tracer.pawn_normal.x, 2) + ", " + num(on.tracer.pawn_normal.y, 2) + ", " + num(on.tracer.pawn_normal.z, 2) + "); a step later " +
+                   std::to_string(effects_after - effects) + " effect (" + (effect_path.empty() ? "none" : effect_path) + "), sound " + (heard.empty() ? "none" : heard) +
+                   " (the default material's is " + want + "), " + std::to_string(decals_after - decals) + " bullet holes; a bullet 220 uu over the box: pawn_hit " +
+                   std::to_string(over.tracer.pawn_hit) + ", it ends " + num((over.tracer.end_pos - eye2).length(), 0) + " uu off");
+        scene.helicopters.clear();
+    }
+
+    // --- Stumble -----------------------------------------------------------------------------------
+    {
+        // The sequences are in the sets the bots are drawn with: a staggered bot posed with each
+        // stands differently from one posed with a name no set has (which falls back to HitHeavyHead).
+        static const char* const kSequences[] = {"WalkBwdStop", "WalkFwdStop", "HitHeavyStomach", "HitHeavyHead"};
+        bool have_all = true;
+        std::string have_text;
+        for (const char* weapon : {"Colt1911", "G36C"}) {
+            const auto posed_with = [&](const char* sequence) {
+                EnemyBot bot = make_bot("AITemplate_PatrolCop", weapon, bot_at);
+                bot.stunned = true;
+                bot.anim_state = EEnemyAnimState::HitStagger;
+                bot.active_anim_seq = sequence;
+                bot.anim_timer = 0.35f;
+                bot.anim_duration = 0.7f;
+                EnemyBodySet set;
+                renderer.pose_enemy_bodies(bot, 0.0f, false, set);
+                return set;
+            };
+            const EnemyBodySet fallback = posed_with("NoSuchSequence");
+            for (const char* sequence : kSequences) {
+                const EnemyBodySet set = posed_with(sequence);
+                float apart = 0.0f;
+                for (size_t i = 0; set.valid && fallback.valid && i < set.shapes.size() && i < fallback.shapes.size(); ++i) {
+                    apart = std::max(apart, (set.shapes[i].centre - fallback.shapes[i].centre).length());
+                }
+                const bool there = std::string(sequence) == "HitHeavyHead" ? set.valid : apart > 1.0f;
+                have_all = have_all && there;
+                have_text += std::string(" ") + sequence + (there ? "" : " MISSING");
+            }
+            have_text += std::string(" with a ") + weapon + ";";
+        }
+        report("Stumble", have_all, "the four sequences in the bots' sets:" + have_text);
+
+        struct Case {
+            const char* name;
+            const char* weapon;  // hers
+            float bot_turn;      // his yaw off facing her: 0 in front of her, 180 with his back to her
+            int aim;
+            uint8_t stumble;
+            const char* sequence;
+        };
+        static const Case kCases[] = {
+            {"a pistol from in front", "Colt1911", 0.0f, kAimBelly, 14, "WalkBwdStop"},
+            {"a pistol from behind", "Colt1911", 150.0f, kAimBelly, 16, "WalkFwdStop"},
+            {"a rifle from in front", "G36C", 0.0f, kAimBelly, 14, "WalkBwdStop"},
+            {"a shotgun from in front at a thigh", "Remington870", 0.0f, kAimThigh, 17, "HitHeavyStomach"},
+            {"a shotgun from in front at the head", "Remington870", 0.0f, kAimHead, 18, "HitHeavyHead"},
+            {"a shotgun from behind", "Remington870", 180.0f, kAimBelly, 0, ""},
+        };
+        bool ok = true;
+        std::string text;
+        for (const Case& c : kCases) {
+            shooter.equip_weapon(c.weapon);
+            EnemyBot bot = make_bot("AITemplate_Support", "FNMinimi", bot_at);
+            bot.health = bot.max_health = 100000.0f;
+            bot.yaw_deg += c.bot_turn;
+            const Pull p = pull_at({bot}, at_bot(bot, c.aim));
+            const float her_yaw = shooter.get_body_yaw();
+            const bool turn_ok = c.stumble == 14   ? std::abs(std::fmod(p.after.combat.turn_to_yaw - (her_yaw + 180.0f) + 540.0f, 360.0f) - 180.0f) < 0.01f
+                                 : c.stumble == 16 ? std::abs(std::fmod(p.after.combat.turn_to_yaw - her_yaw + 540.0f, 360.0f) - 180.0f) < 0.01f
+                                                   : p.after.combat.turn_left == 0.0f;
+            const bool case_ok = p.fired && p.damage > 0.0f && p.after.combat.stumble == c.stumble && p.after.active_anim_seq == c.sequence &&
+                                 p.after.stunned == (c.stumble != 0) && turn_ok;
+            ok = ok && case_ok;
+            text += std::string(text.empty() ? "" : "; ") + c.name + ": " + (p.after.active_anim_seq.empty() ? "no sequence" : p.after.active_anim_seq) + " (state " +
+                    std::to_string(p.after.combat.stumble) + (case_ok ? ")" : ") WRONG");
+        }
+        report("Stumble", ok, text);
+
+        // The stumble as it runs: a second bullet does not begin it again; he has turned to face
+        // the way opposite her facing after 0.3 s; it is over when the sequence is (0.7 s).
+        shooter.equip_weapon("Colt1911");
+        EnemyBot bot = make_bot("AITemplate_Support", "FNMinimi", bot_at);
+        bot.health = bot.max_health = 100000.0f;
+        bot.yaw_deg += 40.0f;  // not quite facing her
+        Pull p = pull_at({bot}, at_bot(bot, kAimBelly));
+        const float her_yaw = shooter.get_body_yaw();
+        float second_timer = -1.0f, yaw_error = 999.0f, ended_at = -1.0f;
+        bool second_kept = false;
+        float t = kDt;
+        for (int f = 0; f < 80; ++f, t += kDt) {
+            if (f == 20) {
+                // 0.35 s in: the same line again, with no wait (the Colt's interval is long over).
+                const float timer = scene.enemies[0].anim_timer;
+                const float health = scene.enemies[0].health;
+                const Vec3 eye = shooter.get_position() + Vec3(0.0f, 0.0f, shooter.get_telemetry().eye_height);
+                const Vec3 dir = (bot_point(scene.enemies[0], kAimBelly) - eye).normalized();
+                shooter.set_rotation(std::atan2(dir.y, dir.x) * RAD2DEG, std::asin(std::clamp(dir.z, -1.0f, 1.0f)) * RAD2DEG, 0.0f);
+                shooter.step(fire, kDt, scene);
+                second_timer = scene.enemies[0].anim_timer;
+                second_kept = scene.enemies[0].health < health && second_timer > timer && scene.enemies[0].combat.stumble == 14 &&
+                              scene.enemies[0].active_anim_seq == "WalkBwdStop";
+            } else {
+                shooter.step(idle, kDt, scene);
+            }
+            if (f == 19) yaw_error = std::abs(std::fmod(scene.enemies[0].yaw_deg - (her_yaw + 180.0f) + 540.0f, 360.0f) - 180.0f);
+            if (ended_at < 0.0f && !scene.enemies[0].stunned) ended_at = t;
+        }
+        const bool run_ok = p.after.combat.stumble == 14 && second_kept && yaw_error < 0.5f && ended_at > 0.7f - 2.0f * kDt && ended_at < 0.7f + 3.0f * kDt &&
+                            scene.enemies[0].combat.stumble == 0;
+        report("Stumble", run_ok,
+               "a pistol's stumble as it runs: a second bullet 0.35 s in " + std::string(second_kept ? "hurts him and leaves it running" : "BEGINS IT AGAIN") +
+                   " (its time " + num(second_timer, 2) + " s); 0.33 s in he is " + num(yaw_error, 2) + " degrees from the way opposite her facing; over at " +
+                   num(ended_at, 2) + " s (the sequence is 0.7)");
+    }
+
+    // --- Survival ----------------------------------------------------------------------------------
+    if (have_open) {
+        // She stands still in the open, one patrol cop 600 uu off: until she is dead.
+        std::string text = "she stands still, one patrol cop (Colt 1911) 600 uu off:";
+        bool ok = true;
+        float deaths[3] = {-1.0f, -1.0f, -1.0f};
+        for (int d = 0; d < 3; ++d) {
+            const Run r = stand_under_fire(cop, d, 120.0f, nullptr);
+            deaths[d] = r.death;
+            ok = ok && r.death > 0.0f;
+            text += std::string(d ? "; " : " ") + kLevels[d] + ": dead at " + num(r.death, 2) + " s after " + std::to_string(r.shots) + " shots, " + std::to_string(r.landed) +
+                    " on her, " + std::to_string(r.counted) + " counted (" + (r.hits.empty() ? std::string("none") : num(r.hits.front(), 0)) + " each), the first at " +
+                    num(r.first_counted, 2) + " s";
+        }
+        // The harder, the sooner.
+        ok = ok && deaths[0] > deaths[1] && deaths[1] >= deaths[2];
+        report("Survival", ok, text);
+    }
+
+    std::cout << std::defaultfloat << std::setprecision(6);
+    std::cout << "  -> Stage 27 Result: " << (pass ? "PASS" : "FAIL") << std::endl;
+    scene.enemies = enemies_before;
+    scene.helicopters = helicopters_before;
+    scene.active_tracers = tracers_before;
+    scene.dropped_weapons = dropped_before;
+    scene.spawned_effects = effects_before;
+    scene.dynamic_decals = decals_before;
     return pass;
 }
 
@@ -4366,9 +5366,14 @@ static int run_oracle_verification(const std::string& game_root, const std::stri
     std::cout << "[Oracle Stage 26] Testing the Paused Game's Sounds and the Level Emitters (layers, sources, rounds)..." << std::endl;
     const bool s26_pass = oracle_sound_pause_and_emitters(game_root);
 
+    // Stage 27: a bot's fire at her, a bot's armour, the helicopter's box, a bullet's stumble
+    // (oracle_bot_fire above).
+    std::cout << "[Oracle Stage 27] Testing the Bots' Fire at Her, their Armour, the Helicopter's Box and a Bullet's Stumble..." << std::endl;
+    const bool s27_pass = oracle_bot_fire(renderer, sim_scene, move_cfg);
+
     // Stages with pass/fail assertions: parkour stages 1-8, cutscene stage 11, door barging stage 12, pipe climb/balance stage 13, SP02 sprint stage 14, zipline/swing/ledge stage 15, camera stage 16, damage screen effects stage 17, pause menu stage 18, and electric fence stage 19
     // (stages 9 and 10 only render screenshots).
-    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass, s26_pass};
+    const bool stage_results[] = {s1_pass, s2_pass, s3_pass, s4_pass, s5_pass, s6_pass, s7_pass, s8_pass, s11_pass, s12_pass, s13_pass, s14_pass, s15_pass, s16_pass, s17_pass, s18_pass, s19_pass, s20_pass, s21_pass, s22_pass, s23_pass, s24_pass, s25_pass, s26_pass, s27_pass};
     int stages_failed = 0;
     for (bool ok : stage_results) stages_failed += ok ? 0 : 1;
     std::cout << "\n============================================================" << std::endl;
@@ -4566,6 +5571,27 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
         std::cout << "[Shots] bot " << bot.archetype << ", state " << static_cast<int>(bot.anim_state) << ", " << bot_distance
                   << " ahead, weapon " << bot.weapon_name << ", turned " << bot_turn << std::endl;
     }
+    // ME_SHOT_HELI="distance[,height[,turn]]": the level's own helicopters are put away and one hangs
+    // `distance` units ahead of the view (1500 unless given), its Location `height` units over the
+    // eye (-434, which puts its box level with the eye, unless given), turned by `turn` degrees from
+    // broadside. The shots of ME_SHOT_FIRE then meet its box as the controller's do, and
+    // ME_SHOW_BODIES=1 draws the box over the hull.
+    bool shot_heli = false;
+    float heli_distance = 1500.0f, heli_height = -434.0f, heli_turn = 0.0f;
+    if (const char* heli_spec = std::getenv("ME_SHOT_HELI")) {
+        std::vector<std::string> field;
+        std::stringstream fields(heli_spec);
+        for (std::string item; std::getline(fields, item, ',');) field.push_back(item);
+        if (field.size() > 0 && !field[0].empty()) heli_distance = static_cast<float>(std::atof(field[0].c_str()));
+        if (field.size() > 1 && !field[1].empty()) heli_height = static_cast<float>(std::atof(field[1].c_str()));
+        if (field.size() > 2 && !field[2].empty()) heli_turn = static_cast<float>(std::atof(field[2].c_str()));
+        HelicopterInstance heli;
+        heli.state = EHeliState::Arriving;
+        scene.helicopters.clear();
+        scene.helicopters.push_back(heli);
+        shot_heli = true;
+        std::cout << "[Shots] a helicopter " << heli_distance << " ahead, its Location " << heli_height << " over the eye, turned " << heli_turn << std::endl;
+    }
     if (movers) {
         for (size_t d = 0; d < scene.barge_doors.size(); ++d) {
             const BargeDoorInstance& door = scene.barge_doors[d];
@@ -4607,6 +5633,16 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
             bot.home_position = bot.position;
             bot.yaw_deg = std::atan2(-ahead.y, -ahead.x) * RAD2DEG + bot_turn;
         }
+        if (shot_heli && !scene.helicopters.empty()) {
+            // The helicopter, ahead of the view and broadside to it.
+            Vec3 eye;
+            Rotator rot;
+            renderer.player_camera(tel, eye, rot);
+            const Vec3 ahead = Vec3(rot.forward().x, rot.forward().y, 0.0f).normalized_xy();
+            HelicopterInstance& heli = scene.helicopters.front();
+            heli.position = Vec3(eye.x + ahead.x * heli_distance, eye.y + ahead.y * heli_distance, eye.z + heli_height);
+            heli.yaw_deg = std::atan2(ahead.y, ahead.x) * RAD2DEG + 90.0f + heli_turn;
+        }
         if (fire_ammo >= 0 && fire_at >= 0.0f && now + dt >= fire_at && scene.collision) {
             fire_at = -1.0f;
             Vec3 eye;
@@ -4637,12 +5673,29 @@ static int run_intro_shots(const std::string& game_root, const std::string& map_
                         std::cout << "past the bot" << std::endl;
                     }
                 }
-                if (!hit.hit && body_at <= 0.0f && !met) continue;
+                // With a helicopter (ME_SHOT_HELI): its box, short of the level and of a bot.
+                ParkourController::HelicopterShotHit on_heli;
+                const bool heli_met = shot_heli && controller.trace_helicopters(scene, eye, dir, met ? shot.distance : hit.hit ? (hit.location - eye).length() : 8000.0f, on_heli);
+                if (shot_heli) {
+                    std::cout << "[Shots] a shot " << s[0] << " across, " << s[1] << " up: ";
+                    if (heli_met) {
+                        std::cout << "the helicopter's box, " << on_heli.distance << " uu off at (" << on_heli.location.x << ", " << on_heli.location.y << ", "
+                                  << on_heli.location.z << "), normal (" << on_heli.normal.x << ", " << on_heli.normal.y << ", " << on_heli.normal.z << ")" << std::endl;
+                    } else {
+                        std::cout << "past the helicopter's box" << std::endl;
+                    }
+                }
+                if (!hit.hit && body_at <= 0.0f && !met && !heli_met) continue;
                 BulletTracer tr;
                 tr.start_pos = eye + dir * 30.0f;
                 tr.end_pos = hit.location;
                 tr.ammo = static_cast<uint8_t>(fire_ammo);
-                if (met) {
+                if (heli_met) {
+                    tr.end_pos = on_heli.location;
+                    tr.from_player = true;
+                    tr.pawn_hit = 4;  // the weapon's default impact effect and sound, no hole
+                    tr.pawn_normal = on_heli.normal;
+                } else if (met) {
                     tr.end_pos = shot.location;
                     tr.from_player = true;
                     tr.hit_enemy = true;
@@ -5378,6 +6431,16 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
         frontend_active = false;
         renderer.set_frontend_frame(nullptr, 0, 0);
     };
+    // The difficulty the game is played at (TdPlayerController.GetDifficultyLevel): the profile's
+    // GameDifficulty, which the NEW GAME and the options screens write (0 Easy, 1 Medium, 2 Hard);
+    // Medium with no profile, and always Medium in a race (TdSPLevelRace: a speed run, a time
+    // trial). Given to the controller whenever the front end reports an action, so a change on the
+    // options screen holds at once for every bot there is (TdPlayerController.SetNewDifficulty).
+    bool race_game = false;
+    auto apply_difficulty = [&]() {
+        controller.set_difficulty(race_game || !frontend ? me::kDifficultyMedium : frontend->settings().get("GameDifficulty", me::kDifficultyMedium));
+    };
+    apply_difficulty();
 
     // Interactive Loop
     bool running = true;
@@ -5598,6 +6661,15 @@ static int run_interactive_app(const std::string& game_root, int initial_chapter
             }
 
             std::string action = frontend->take_action();
+            if (!action.empty()) {
+                // A level begun any other way than as a race is the story's again.
+                if (action.rfind("SpeedRun ", 0) == 0 || action.rfind("TimeTrial ", 0) == 0) {
+                    race_game = true;
+                } else if (action == "NewGame" || action == "SkipTutorial" || action == "QuitToMainMenu" || action.rfind("StartLevel ", 0) == 0) {
+                    race_game = false;
+                }
+                apply_difficulty();
+            }
             // SPEED RUN starts a chapter at its first checkpoint ("SpeedRun edge_p?LoadCheckpoint=Edge_Start"),
             // TIME TRIAL a course map of its own ("TimeTrial tt_TutorialA01_p"). The race itself (the
             // clock, the checkpoints, the ghost) is not in the port: the map is loaded to be run.
@@ -6698,6 +7770,7 @@ int main(int argc, char* argv[]) {
     bool verify_script = false;  // the level script's stage of the oracle, alone
     bool verify_sound = false;   // and the two sound stages
     bool verify_bodies = false;  // the enemies' bodies stage of the oracle, alone
+    bool verify_botfire = false; // the bots' fire, armour, helicopter and stumble stage of the oracle, alone
     bool verify_respawn = false; // a restart at every checkpoint of every chapter
     std::string shots_map, shots_times, shots_dir;
     std::string handover_map;  // --handover-check <map>
@@ -6744,6 +7817,8 @@ int main(int argc, char* argv[]) {
             verify_sound = true;
         } else if (arg == "--verify-bodies") {
             verify_bodies = true;
+        } else if (arg == "--verify-botfire") {
+            verify_botfire = true;
         } else if (arg == "--verify-respawn") {
             verify_respawn = true;
         } else if (arg == "--verify-all") {
@@ -6786,6 +7861,7 @@ int main(int argc, char* argv[]) {
                       << "  --verify-script          Run only its level-script stage (glass, emitter factories, toggles)\n"
                       << "  --verify-sound           Run only its sound stages (gain and low pass with distance, pause, emitters)\n"
                       << "  --verify-bodies          Run only its stage of bullets against the enemies' posed bodies\n"
+                      << "  --verify-botfire         Run only its stage of the bots' fire at her, their armour, the helicopter, a bullet's stumble\n"
                       << "  --verify-respawn         Restart at every checkpoint of every chapter and see where she ends up\n"
                       << "  --handover-check <map>   Print the camera around the end of the level's intro, headless\n"
                       << "  --intro-shots <map> <t,t,..> <dir>  Render the level's intro at those Matinee times, headless\n"
@@ -6845,6 +7921,17 @@ int main(int argc, char* argv[]) {
         if (!me::load_level_scene(game_root, "Maps/SP00/Tutorial_p.me1", scene)) return 1;
         std::cout << "[Oracle Stage 24] Testing the Player's Bullets against an Enemy's Posed Bodies (Male3p_Physics)..." << std::endl;
         return oracle_enemy_bodies(renderer, scene, move_cfg) ? 0 : 1;
+    }
+    if (verify_botfire) {
+        me::Renderer renderer;
+        renderer.set_game_root(game_root);
+        if (!renderer.init_headless(1280, 720)) return 1;
+        me::MovementConfig move_cfg;
+        me::load_movement_config_from_ini(me::get_config_path(game_root, "DefaultPawnMovement.ini"), move_cfg);
+        me::LevelScene scene;
+        if (!me::load_level_scene(game_root, "Maps/SP00/Tutorial_p.me1", scene)) return 1;
+        std::cout << "[Oracle Stage 27] Testing the Bots' Fire at Her, their Armour, the Helicopter's Box and a Bullet's Stumble..." << std::endl;
+        return oracle_bot_fire(renderer, scene, move_cfg) ? 0 : 1;
     }
     if (verify_script) {
         // ME_SCRIPT_SHOTS=<dir>: with pictures of the pane it breaks.

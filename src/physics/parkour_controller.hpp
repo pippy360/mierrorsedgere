@@ -2,6 +2,7 @@
 
 #include "../math/types.hpp"
 #include "body_shapes.hpp"
+#include "bot_fire.hpp"
 #include "collision_world.hpp"
 #include <cstdint>
 #include <functional>
@@ -186,6 +187,27 @@ public:
     bool trace_enemies(const LevelScene& scene, const std::vector<EnemyBodySet>& posed, const Vec3& from, const Vec3& dir,
                        float max_dist, EnemyShotHit& out) const;
 
+    // One bullet's line against the helicopters that are there (bot_fire.hpp: the placeholder's one
+    // box): the nearest it goes into within `max_dist`.
+    struct HelicopterShotHit {
+        int32_t helicopter = -1;  // LevelScene::helicopters
+        float distance = 0.0f;
+        Vec3 location{0.0f, 0.0f, 0.0f};
+        Vec3 normal{0.0f, 0.0f, 0.0f};
+    };
+    bool trace_helicopters(const LevelScene& scene, const Vec3& from, const Vec3& dir, float max_dist, HelicopterShotHit& out) const;
+
+    // The difficulty the game is played at (TdPlayerController.SetDifficultyLevel: 0 Easy, 1 Medium,
+    // 2 Hard), which the bots' aim, their armour and hers are read by. It holds at once for every
+    // bot there is, as the game's does. Medium until it is set, as with no profile.
+    void set_difficulty(int level) { m_difficulty = clamp_difficulty(level); }
+    [[nodiscard]] int get_difficulty() const { return m_difficulty; }
+    // SeqAct_AIHoldFire on every bot and gunner (TdBotPawn.OnAIHoldFire): their aim goes on, no
+    // trigger is pulled. For the checks that stand her in front of a bot to look at something else.
+    void set_ai_hold_fire(bool hold) { m_ai_hold_fire = hold; }
+    // Her stand-in for a bot's bullets as it stands now (bot_fire.hpp, pose_player_stand_in).
+    void pose_player_bodies(EnemyBodySet& out) const;
+
 private:
     // Core Subsystems
     void update_camera_and_inputs(const InputFrame& input, float dt, const LevelScene& scene);
@@ -203,6 +225,33 @@ private:
     void update_reaction_time(const InputFrame& input, float dt, float& effective_dt);
     void update_combat_and_weapons(const InputFrame& input, float dt, LevelScene& scene);
     void update_ai_bots(float dt, LevelScene& scene);
+    // A bot's fire at her (bot_fire.hpp). An `owner` is who fires: a bot by his place in
+    // LevelScene::enemies, a helicopter's gunner by -1 less the helicopter's place.
+    // ai_begin_tick: her as the aim bots read her this tick, and TdAIManager.UpdateBursts.
+    // ai_tick_fire: TdBotPawn.FireWhenReady / CeaseFire as `wants` changes, his timers, CheckFire
+    // (the trigger is pressed while he has a burst and `can_fire`) and the weapon's shots; how many
+    // it fired.
+    // ai_fire_shot: one shot: the aim bot's point, the weapon's spread, the line through the level,
+    // the other bots and her stand-in, and what comes of it. `gun` is where a helicopter's gun
+    // fires from; a bot's bullets start at his hand (ai_bot_muzzle).
+    void ai_begin_tick(LevelScene& scene);
+    int ai_tick_fire(BotCombatState& s, int32_t owner, const AimTemplate& tpl, const BotWeapon& weapon, bool wants, bool can_fire,
+                     const Vec3& pawn_location, const Vec3& gun, uint8_t tracer_ammo, float dt, LevelScene& scene);
+    bool ai_fire_shot(BotCombatState& s, int32_t owner, const AimTemplate& tpl, const BotWeapon& weapon, const Vec3& pawn_location,
+                      const Vec3& gun, uint8_t tracer_ammo, LevelScene& scene);
+    // TdAIManager.AskToBurst, RemoveBurst (ReportBurstFinished), UpdateBursts and TdBotPawn.StopFiringWeapon.
+    bool ai_ask_to_burst(LevelScene& scene, int32_t owner, float duration);
+    void ai_remove_burst(int32_t owner);
+    void ai_update_bursts(LevelScene& scene);
+    void ai_stop_firing(BotCombatState& s, int32_t owner);
+    [[nodiscard]] BotCombatState* ai_combat_state(LevelScene& scene, int32_t owner) const;
+    [[nodiscard]] Vec3 ai_owner_location(const LevelScene& scene, int32_t owner) const;
+    // Where a bot's bullets start: TdBotPawn.GetWeaponStartTraceLocation is his trigger finger's
+    // bone (RightHandIndex2); here the middle of his right hand's body as he is posed, or, with
+    // nothing to pose him, a place in front of his chest.
+    [[nodiscard]] Vec3 ai_bot_muzzle(const LevelScene& scene, size_t bot_index);
+    // The bodies of bot `bot_index` this tick, posed once however many shots ask.
+    const EnemyBodySet& ai_bot_bodies(const LevelScene& scene, size_t bot_index);
     void update_health_and_regen(float dt);
     void update_checkpoints_and_volumes(LevelScene& scene);
     void update_elevators(const InputFrame& input, float dt, LevelScene& scene);
@@ -602,6 +651,25 @@ private:
     // The enemies' bodies: who poses them (set_enemy_body_poser), and the current pull's.
     EnemyBodyPoser m_enemy_body_poser;
     std::vector<EnemyBodySet> m_shot_bodies;
+
+    // The bots' fire at her (bot_fire.hpp).
+    int m_difficulty = kDifficultyMedium;      // TdPlayerController.GetDifficultyLevel
+    bool m_ai_hold_fire = false;
+    EMovement m_ai_aim_old_move = EMovement::MOVE_Walking;  // TdPawn.AIAimOldMovementState: her move as this step began
+    AimTarget m_aim_target;                    // her, as the aim bots read her this tick
+    EnemyBodySet m_player_bodies;              // her stand-in, posed for this tick's shots
+    bool m_player_bodies_posed = false;
+    std::vector<EnemyBodySet> m_ai_bot_bodies; // the bots' bodies a bot's shot asked for this tick
+    std::vector<uint8_t> m_ai_bot_posed;       // ...and whether each has been asked for
+    // TdAIManager.Bursts: who may fire a burst now, and who waits for a turn (UseBurstControl,
+    // MaxSimultaneousBursts 2).
+    struct AiBurst {
+        int32_t owner = 0;
+        float start = 0.0f;     // StartTime
+        float duration = 0.0f;  // Duration: the burst's length x BurstDelayMax
+        bool active = false;    // bActive
+    };
+    std::vector<AiBurst> m_ai_bursts;
 
     // Spawn / Respawn tracking
     Vec3 m_last_checkpoint_pos{0.0f, 0.0f, 100.0f};

@@ -225,7 +225,7 @@ Faith has a regenerating health pool managed in `TdPawn` and `TdPlayerPawn`:
 - **Stun Recovery Rate**: `10.0 units/s`
 - **Taser Recovery Rate**: `50.0 units/s`
 - **Falling Damage Threshold**: `FallingUncontrolledHeight = 1000.0 units`. Falls beyond this without skill roll result in fatal impact. Performing `TdMove_SkillRoll` replaces the landing: `StartMove` zeroes Velocity and Acceleration and the pawn rolls on `fallinglandroll`'s root motion (313.5 uu forward over 1.27 s), leaving at the animation's ~233 uu/s exit speed.
-- **Armor Damage Scaling**: Headshots take `1.5x` damage, body hits `1.0x`, limbs `0.75x`.
+- **Armour** (`TdPawn.AdjustDamage`): a bullet's damage on her is `Max(0, int(Damage * (1 - Armor)))` with `ArmorBulletsHeadSettings` = `...BodySettings` = `...LegsSettings` = 0.7 / 0.5 / 0.3 at Easy / Medium / Hard (`DefaultGame.ini`, `[TdGame.TdPlayerPawn]`): which part of her is hit changes nothing. A bot's armour, the head's doubling on a bot and what a bot's bullet is before her armour are in "Combat between the player and the bots" below.
 
 ---
 
@@ -256,19 +256,21 @@ Weapon definitions in `TdSharedContent.u` derive from `TdWeapon_Light` or `TdWea
 
 | Weapon Class | Real-World Model | Category | Ammo | Equip (s) | Reload (s) | Range (u) | Recoil | Damage |
 | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `TdWeapon_Pistol_Colt1911` | Colt M1911 .45 ACP | Light | 8 | 0.75 | 2.0 | 4,500 | 2.0 | 35 |
-| `TdWeapon_Pistol_Glock18c` | Glock 18C 9mm Auto | Light | 19 | 0.60 | 1.8 | 3,800 | 1.8 | 20 |
-| `TdWeapon_Pistol_BerettaM93R` | Beretta 93R Burst | Light | 15 | 0.65 | 1.9 | 4,000 | 2.2 | 22 |
-| `TdWeapon_Pistol_DE05` | Desert Eagle .50 AE | Light | 7 | 0.85 | 2.2 | 5,000 | 4.5 | 70 |
-| `TdWeapon_Pistol_TaserContent` | Taser X26 | Light | 1 | 0.70 | 2.5 | 1,200 | 0.5 | Stun |
-| `TdWeapon_AssaultRifle_MP5K` | H&K MP5K 9mm | Heavy | 30 | 0.90 | 2.4 | 4,200 | 2.8 | 22 |
-| `TdWeapon_SMG_SteyrTMP` | Steyr TMP 9mm | Light | 30 | 0.70 | 2.0 | 3,600 | 2.5 | 18 |
-| `TdWeapon_AssaultRifle_HKG36` | H&K G36C 5.56mm | Heavy | 30 | 1.00 | 2.5 | 6,000 | 3.2 | 30 |
-| `TdWeapon_AssaultRifle_FNSCARL`| FN SCAR-L 5.56mm | Heavy | 30 | 1.00 | 2.6 | 6,500 | 3.0 | 32 |
-| `TdWeapon_Shotgun_Remington870`| Remington 870 12ga | Heavy | 8 | 1.10 | 3.5 | 2,500 | 5.5 | 8x18 |
-| `TdWeapon_Shotgun_Neostead` | Neostead 2000 12ga | Heavy | 12 | 1.15 | 3.8 | 2,800 | 5.2 | 8x18 |
-| `TdWeapon_Sniper_BarretM95` | Barrett M95 .50 BMG | Heavy | 5 | 1.40 | 4.0 | 15,000 | 8.0 | 150 |
-| `TdWeapon_Machinegun_FNMinimi` | FN Minimi 5.56mm LMG | Heavy | 100 | 1.50 | 5.0 | 7,000 | 3.8 | 28 |
+| `TdWeapon_Pistol_Colt1911` | Colt M1911 .45 ACP | Light | 8 | 0.75 | 2.0 | 4,500 | 2.0 | 42 |
+| `TdWeapon_Pistol_Glock18c` | Glock 18C 9mm Auto | Light | 33 | 0.60 | 1.8 | 4,500 | 1.8 | 17 |
+| `TdWeapon_Pistol_BerettaM93R` | Beretta 93R Burst | Light | 21 | 0.65 | 1.9 | 4,500 | 2.2 | 19 |
+| `TdWeapon_Pistol_DE05` | Desert Eagle .50 AE | Light | 12 | 0.85 | 2.2 | 12,000 | 4.5 | 90 |
+| `TdWeapon_Pistol_TaserContent` | Taser X26 | Light | 10 | 0.70 | 2.5 | 1,000 | 0.5 | 10 (`TdDmgType_Taser`) |
+| `TdWeapon_AssaultRifle_MP5K` | H&K MP5K 9mm | Heavy | 30 | 0.90 | 2.4 | 8,000 | 2.8 | 25 |
+| `TdWeapon_SMG_SteyrTMP` | Steyr TMP 9mm | Light | 30 | 0.70 | 2.0 | 3,000 | 2.5 | 15.5 |
+| `TdWeapon_AssaultRifle_HKG36` | H&K G36C 5.56mm | Heavy | 30 | 1.00 | 2.5 | 9,000 | 3.2 | 30 |
+| `TdWeapon_AssaultRifle_FNSCARL`| FN SCAR-L 5.56mm | Heavy | 30 | 1.00 | 2.6 | 9,000 | 3.0 | 35 |
+| `TdWeapon_Shotgun_Remington870`| Remington 870 12ga | Heavy | 7 | 1.10 | 3.5 | 6,000 | 5.5 | 10x16 |
+| `TdWeapon_Shotgun_Neostead` | Neostead 2000 12ga | Heavy | 12 | 1.15 | 3.8 | 6,000 | 5.2 | 10x16 |
+| `TdWeapon_Sniper_BarretM95` | Barrett M95 .50 BMG | Heavy | 20 | 1.40 | 4.0 | 20,000 | 8.0 | 100 |
+| `TdWeapon_Machinegun_FNMinimi` | FN Minimi 5.56mm LMG | Heavy | 99 | 1.50 | 5.0 | 20,000 | 3.8 | 36 |
+
+The Ammo, Range and Damage columns are the classes' own defaults as read out of `TdSharedContent.u` (`MaxAmmo`, `WeaponRange`, `InstantHitDamage` in single player; a value a class does not write is `TdWeapon`'s: 33 rounds, 12,000 uu). `DefaultWeapons.ini`'s `Damages`, `FallOffDistances` and `Ranges` by difficulty are all 0, which `TdWeapon.SetDifficultyLevel` takes as "the class's own". The other columns were not read again. What a bot does with each weapon (its fall-off, spread, bursts) is in "Combat between the player and the bots" below.
 
 ### Combat Mechanics:
 - **Speed Penalty**: Carrying light weapons scales speed to 0.9x (`SpeedCurve_LightWeapon`); heavy weapons scale speed to 0.7x (`SpeedCurve_HeavyWeapon`) and disable wallruns and vertical climbs.
@@ -280,14 +282,130 @@ Weapon definitions in `TdSharedContent.u` derive from `TdWeapon_Light` or `TdWea
 
 `TdBotPawn` and `TdAIController` drive enemies with tactical squad roles:
 
-1. **Patrol Cop (`TdBotPawn_PatrolCop`)**: Light armor, armed with Colt 1911 or Steyr TMP. Short engagement range (1200–1500 units), vulnerable to frontal slide-kick and instant disarm.
+1. **Patrol Cop (`TdBotPawn_PatrolCop`, `_PatrolCop_Steyr`, `_PatrolCop_Remington`)**: Light armor, armed with the Colt 1911 (`AITemplate_PatrolCop`, `PatrolCop2`, `PatrolCop3`), the Glock 18c, the Steyr TMP or the Remington 870 by template. Vulnerable to frontal slide-kick and instant disarm.
 2. **Pursuit Cop (`TdBotPawn_PursuitCop`)**: Agile runner cops capable of parkour (`TdMove_BotMelee`, `TdMove_BotRoll`, `TdMove_BotJump`). Cannot be outrun in straight line; must be countered with slide kicks or environment traps.
-3. **Riot Cop (`TdBotPawn_RiotCop`)**: Wears impact armor and riot helmet. Armed with Remington 870. Immune to frontal melee until stunned from behind or kicked off ledge.
-4. **SWAT / Assault (`TdBotPawn_Assault`)**: Armed with G36C or MP5K. Uses squad cover tactics (`SeqAct_SetCoverGroup`) and bounding fire.
+3. **Riot Cop (`TdBotPawn_RiotCop`)**: Wears impact armor and riot helmet. Armed with the Steyr TMP (`AITemplate_RiotCop`'s `MainWeaponClass`). Immune to frontal melee until stunned from behind or kicked off ledge.
+4. **SWAT / Assault (`TdBotPawn_Assault`)**: Armed with the FN SCAR-L (`AITemplate_Assault`), the MP5K, the G36 or the Neostead by template. Uses squad cover tactics (`SeqAct_SetCoverGroup`) and bounding fire.
 5. **Heavy / Support (`TdBotPawn_Support`)**: Wears full explosive armor, armed with FN Minimi LMG. Slow turn rate; vulnerable only from behind.
 6. **Bosses**:
    - **Celeste (`TdBotPawn_Celeste`)**: Fast runner boss with exclusive counter-moves (`TdMove_Melee_BossCeleste`, `TdMove_HeadButtedByCeleste`, `SeqEvt_TdCelesteBossFight`).
    - **Jackknife (`TdBotPawn_JKSniper`)**: Sniper boss encounter with blind aiming spot mechanics (`SeqAct_AISetSniperBlindAimSpot`).
+
+---
+
+## Combat between the player and the bots
+
+Read out of `TdGame.u`'s bytecode, `MirrorsEdge.exe` (the addresses below), `DefaultAITemplates.ini`, `DefaultWeapons.ini`, `DefaultGame.ini`, `DefaultAI.ini` and the class defaults of `TdSharedContent.u`, `TdSpContent.u` and `TdSpBossContent.u`. The research, with a second reader's verdict on every claim, is in the main checkout's ignored `build/re/open2/botfire/` (`notes.md`, `verify.md`). In the port every rule and table of this section is in `src/physics/bot_fire.hpp`; `ParkourController::update_ai_bots` and `update_combat_and_weapons` apply them; `MODLOG.md` section 45 has what was checked.
+
+### 1. A bot's shot at the player: the aim bot
+
+A bot does not roll a die for each shot. His controller owns a `TdAimBot` that keeps an aim offset, in uu at her place, and the offset shrinks while he sees her.
+
+- **The three values.** `BaseOffset` (how far to her side the bullets are aimed), `BaseDispersion` (how much further, at random) and `BaseYOffset` (how far under her eyes). `UTdAimBot::UpdateDispersion` (0x012537f0), every tick: with an enemy, each goes up by the one-shot penalty of the move she has just changed to (`ATdPawn` vtbl[0x458]: `Moves[MovementState].AiAimOneShotPenalty` on the tick `MovementState` is not `AIAimOldMovementState`); while `EnemyVisible` and the bot is not suppressed (`Suppression >= 0`, 0x011e7f90) each goes down by `GetImprovementRate() * DeltaTime`; then each is clamped: `BaseOffset` to `[HorizontalOffset_Min, HorizontalOffset_Max[band]]`, `BaseDispersion` to `[Dispersion_Min, Dispersion_Max]`, `BaseYOffset` to `[VerticalOffset_Min, VerticalOffset_Max]`. It improves whether or not he is firing, and nothing makes it worse with time: out of his sight it stops.
+- **The rate** (`UTdAimBot::GetImprovementRate`, 0x01252610): the template's `ImprovementRates_Near / _Medium / _Far` for the band at the difficulty, times `MoveTowardMultiplier` while her speed on the level is 200 uu/s or less; faster, by the cosine `d` between her velocity and the direction from her to the bot: `|d| < 0.7` `MoveSidewaysMultiplier`, else `d < 0` `MoveAwayMultiplier`, else `MoveTowardMultiplier`; and, when the result is above nothing, times the `AiAimPenalty` of the move she is in (vtbl[0x454]). An overridden rate (`OverriddenImprovementRate`, set by Kismet's `SeqAct_TdAIPerfectAim` with an `AccuracyImprovementRate` other than 0) replaces all of it.
+- **The band** (`ATdBotPawn::ClassifyAIFiringRange`, 0x01236340): far when the distance is over the weapon's `CombatRange_Max`, near under 489.9 uu (240000 squared), else medium. `CombatRange_Min` is read by nothing.
+- **Where a shot is aimed** (`TdAIController.GetAdjustedAimFor` -> `TdAimBot.GetAimLocation(Enemy, bFirstShot)`). On the first shot `StartBurst`: the three values are thrown to their most (`BaseOffset = HorizontalOffset_Max[band]`) and `PickPoint` picks `CurrentX = Offset + sign(Offset) * BaseDispersion * FRand()` to her side and `CurrentY = (her eyes' height over her Location) - FRand() * BaseYOffset`, to one side or the other at random when she stands still, with `TargetX = -CurrentX`. `Offset` (`GetDispersionOffset`) is `BaseOffset`, more by `HorizontalOffset_Max * speed / top speed` when she crosses his view at 200 uu/s or more, to the side her yaw says. On every later shot `GetNextLocation` moves the point across her by `MovementRate_Horizontal * (CurrentX - TargetX) * (time since the last shot)`, a quarter more or less at random, and up at `MovementRate_Vertical` towards her eyes; across and far enough out, a new `PickPoint`. The point is `X` uu to the side of the line from the bot to her and `Y` over her `Location` (`GetOffsetPoint`). So a stream of bullets sweeps over her from one side to the other, and most of the early ones pass her.
+- **`bFirstShot` is set again whenever the bot has no line of fire** (`TdAIController` vtbl[0x3f0], 0x011ea200: `bHasLineOfFire = EnemyVisible || KeepFiringTime + EnemyNotVisibleTimeStamp > now || suppression fire`; `TdAIController.EnemyNotVisible` draws `KeepFiringTime` between the weapon's `MinKeepFiringTime` 0.2 and `MaxKeepFiringTime` 0.8). Breaking his line of sight for longer than that gives her his worst aim back.
+- **The line** (`Weapon.InstantFire`): from `TdBotPawn.GetWeaponStartTraceLocation` (the bone `RightHandIndex2`) through the aim point, with the weapon's `Spread` on top (`Weapon.AddSpread`), `WeaponRange` long, with no extent. It can meet her only in the bodies of `CH_TKY_Crim_Fixer.Faith3p_Physics` on her third-person mesh (21 bodies: 17 fixed to the skeleton, 4 of her hair that hang free; her cylinders and her first-person mesh stop no such line), and it stops in another bot's bodies with nothing coming of it (`TdBotPawn.TakeDamage` wants the player behind the shot).
+- **The gate** (`TdPlayerPawn.TakeDamage`'s first statement -> `TdAimBot.IsHitRelevant`): a pistol's, a rifle's or a shotgun's bullet that landed on her does nothing, and is not heard, while `BaseOffset > OffsetThreshold[band]`. A sniper's bullet and a taser always count; so do the Training Area's partner's hits (`TdAI_Tutorial.IsHitRelevant`) and those of a bot whose aim bot is the `TdAimBot_Perfect` (`SeqAct_TdAIPerfectAim` with a rate of 0), which also aims at her `Location` itself. Whether a hit on her is heard is `TdWeapon.PlayImpactEffects`' own test: `IsHitRelevant(TdDmgType_LowCaliber_Bullet)`, a fixed class, so a sniper's bullet that counts is not heard while his `BaseOffset` is over the threshold. The partner (`TdAI_Tutorial`) fires nothing at her in the first place: its `SeePlayer` does nothing, so she is never his `Enemy`, and its one combat state is `CombatTutorialMelee` (entered from `TestCombatTransitions` when `CanAttack`: `bAttackInitiated`, set by the level's `SeqAct_TdAiInitiateAttack`, the tutorial listener's `CanAttack` and her in `MOVE_Walking`).
+- **The damage** (`TdWeapon.GetInstantHitDamage`, `TdPawn.AdjustDamage`): `InstantHitDamage`, between `FallOffDistance` and `WeaponRange` lessened by the weapon's kind of fall-off (`t` the part of that stretch covered: linear `* (1 - t)`, inverse `/ (3t + 1)`), nothing from `WeaponRange` on, times `AIDamageMultiplier`, to an int; then her armour: `int(that * (1 - 0.7 / 0.5 / 0.3))` at Easy / Medium / Hard. Her health comes back at 25 a second from 5 s after the last damage.
+- **No move makes her immune.** A move slows the aim or throws it back:
+
+| Her move | `AiAimPenalty` (Easy / Medium / Hard; multiplies the rate) | `AiAimOneShotPenalty` (uu, on entering it) |
+|---|---|---|
+| Wall run, wall climb | 0.4 / 0.5 / 0.7 | 0 |
+| Springboard | 0.3 / 0.4 / 0.6 | 75 |
+| Speed vault, vault over | 1 | 50 |
+| Jump | 0.7 / 0.8 / 1.0 | 0 |
+| Wall-run jump, dodge jump, wall-run and wall-climb dodge jumps, grab transfer | 1 | 75 |
+| Slide | 0.7 / 0.8 / 0.9 | 0 |
+| Disarm (`MOVE_Snatch`) | 0.01 / 0.08 / 0.3 | 200 |
+| Zip line | 0.01 / 0.1 / 0.3 | 200 |
+| Balance | 1 | 50 |
+| Rump slide | 0.01 / 0.04 / 0.1 | 200 |
+| Wall-climb 180 turn jump | 0.3 / 0.4 / 0.6 | 100 |
+| Swing | 0.1 / 0.2 / 0.4 | 200 |
+| Swing jump | 0.2 / 0.3 / 0.5 | 200 |
+
+  Every other move, walking, sprinting, falling, crouching, landing and the skill roll among them, leaves the aim alone (rate x 1, no one-shot). The one-shot is clamped with the offset: 200 always puts the bot back at his worst.
+
+The templates' aim values (`DefaultAITemplates.ini`; a key a section does not write is its parent class's, and every class reaches `AITemplate_Default`):
+
+| Template | `HorizontalOffset_Max` near / medium / far | `OffsetThreshold` | Sideways / away / toward | Rates (Easy / Medium / Hard, uu/s) |
+|---|---|---|---|---|
+| `Default`, `Assault`, `Assault_MP5K`, `Assault_HKG36C`, `PatrolCop` and its `1`/`2`/`3`, `_Glock`, `_SteyrTMP`, `_MiniUzi`, `RiotCop`, `Tutorial` | 50 / 90 / 200 | 40 / 70 / 130 | 0.8 / 0.15 / 1.3 | 20 / 35 / 40 in every band |
+| `Assault_Neostead`, `PatrolCop_Remington` | 15 / 40 / 200 | 10 / 20 / 130 | as above | as above |
+| `Support` | 60 / 140 / 200 | 40 / 70 / 120 | 1.0 / -0.2 / 2.0 | as above |
+| `Gunner` (the helicopter's door gunner) | 200 / 200 / 200 | 80 / 80 / 80 | 0.55 / -0.2 / 1.0 | near 15 / 30 / 35, medium 10 / 25 / 30, far 5 / 15 / 25 |
+| `Celeste` | 50 / 50 / 50 | 45 / 45 / 45 | 0.5 / 0.1 / 1.0 | near 15 / 30 / 25, medium 10 / 15 / 20, far 5 / 10 / 15 |
+| `SniperCop`, `SniperCeleste` | 100 / 100 / 100 | 75 / 75 / 75 | as `Default` | as `Default` (they fire through `TdAimBotSniper`, not read) |
+| `HeliSniper` | as `Default` | as `Default` | 0.5 / 0.15 / 0.5 | as `Default` |
+
+Common to all but `PursuitCop` (the taser; every offset 1) and `Celeste` (`Dispersion_Min` 25): `Dispersion_Max` 35, `Dispersion_Min` 10 (the snipers 0 and 0), `HorizontalOffset_Min` 5, `VerticalOffset_Max` 40, `VerticalOffset_Min` 10, `MovementRate_Horizontal` 0.9, `MovementRate_Vertical` 25. A negative `MoveAwayMultiplier` makes the offset grow while she runs from the bot (and her move's penalty is not applied to a rate under nothing): a Support cop or a door gunner whose offset is over his threshold never hits her as long as she runs away. `AITemplate_PatrolCop_MiniUzi` has no ini section and writes no property: it is `PatrolCop_SteyrTMP`, its parent. A `SeqAct_TdActorFactory` that names no `BotTemplate` (12 of the levels' 269) has `AITemplate_Default`: a `TdBotPawn_Assault` with the SCAR-L.
+
+The weapons as a bot fires them (class defaults; `DefaultWeapons.ini` for `CombatRange_Max` and the bursts; `ATdBotPawn::SetAIFiringState`, 0x01236380, copies the burst of the band whenever the band changes):
+
+| Weapon | Damage | Fall-off from / range, kind | `Spread` | `FireInterval` | `CombatRange_Max` | Burst near | medium | far (shots @ pause, s) |
+|---|---|---|---|---|---|---|---|---|
+| Colt 1911 | 42 | 600 / 4500, linear | 0.03 | 0.2 | 2000 | 1 @ 0.3..0.5 | 1 @ 0.5..1.0 | 1 @ 1.0..1.5 |
+| Glock 18c | 17 | 600 / 4500, linear | 0.03 | 0.1 | 2500 | 3 @ 0.5..1.0 | 2..3 @ 1.0..1.2 | 1..2 @ 1.0..1.5 |
+| Beretta M93R | 19 | 600 / 4500, linear | 0.03 | 0.1 | 2500 | 6 @ 0.5..1.0 | 3..5 @ 1.0..1.2 | 2..4 @ 1.0..1.5 |
+| Steyr TMP | 15.5 | 800 / 3000, linear | 0.008 | 0.06 | 3000 | 6 @ 0.5..1.0 | 3..5 @ 0.5..1.0 | 2..5 @ 1.0..2.0 |
+| MP5K | 25 | 2000 / 8000, inverse | 0.04 | 0.1 | 4000 | 6 @ 0.3..0.5 | 3..6 @ 0.8..1.2 | 2..5 @ 1.0..2.0 |
+| HK G36 | 30 | 2000 / 9000, inverse | 0.03 | 0.085 | 5000 | 6..9 @ 0.3..0.8 | 3..6 @ 0.5..1.0 | 2..4 @ 1.0..2.0 |
+| FN SCAR-L | 35 | 2000 / 9000, inverse | 0.02 | 0.11 | 5000 | 6..9 @ 0.3..0.8 | 3..6 @ 0.5..1.0 | 2..4 @ 1.0..2.0 |
+| Remington 870 | 10 x 16 | 1500 / 6000, linear | 0.12 | 1.2 | 2000 | 1 @ 0.8..1.2 | 1 @ 1.0..1.5 | 1 @ 1.5..2.5 |
+| Neostead | 10 x 16 | 1500 / 6000, linear | 0.1 | 1.1 | 4000 | 1 @ 0.6..0.8 | 1 @ 0.8..1.2 | 1 @ 1.5..2.0 |
+| FN Minimi | 36 | 6000 / 20000, inverse | 0.04 | 0.12 | 15000 | 15..25 @ 1.5..2.0 | 15..25 @ 1.5..2.0 | 20..30 @ 1.5..2.0 |
+| Barrett M95 | 100 x 0.8 for a bot | none before its range of 20000 | 0.001 | 1.7 | 20000 | 1 @ 2.5 | 1 @ 2.5 | 1 @ 2.5 |
+
+A burst (`TdBotPawn`): `FireWhenReady` -> `StartNewBurst` draws `CurrentBurstLength` between the band's two lengths; `CheckFire` asks `TdAIManager.AskToBurst(self, length * BurstDelayMax)` and then holds the trigger while `bOkToBurst`, not waiting for damage, not in a melee move, walking or standing; `WeaponFired` counts the shots and at the length calls `BurstOver`, which 0.03 s later runs `PauseFiring`: the trigger is let go, the turn given back, and `StartNewBurst` follows after a pause drawn between `BurstDelayMin` and `BurstDelayMax`. `TdAIManager` (`UseBurstControl` True, `MaxSimultaneousBursts` 2) lets two bots fire at a time; a third waits for a turn (`UpdateBursts`), or takes that of a bot she is not looking at when she is looking at him from under 1000 uu (`PrioritizedOver`: `PlayerLookingTowardsMeDot > 0.71`). A turn ends by itself after its length times `BurstDelayMax`.
+
+### 2. A bot's armour
+
+`TdBotPawn.TakeDamage` multiplies a bullet's damage by `DamageMultiplier_Head` (2.0) when the body hit has the material `PM_Character_Head` (the `Neck` body round the head, and the two hands) and by `DamageMultiplier_Body` (1.0) otherwise, to an int. `TdBotPawn.AdjustDamage` makes a sniper's bullet 99999 wherever it lands; anything else goes to `TdPawn.AdjustDamage`: `Max(0, int(Damage * (1 - Armor)))`, the armour chosen by `HitInfo.BoneName` (`Neck` the head's; `LeftUpLeg`, `RightUpLeg` and the bones under them the legs'; anything else, the hands too, the body's), and only when the hit is in his skeletal mesh. The armour is the pawn class's `ArmorBullets{Head,Body,Legs}Settings` at the difficulty (`TdPlayerController.GetDifficultyLevel`: the profile's `GameDifficulty`, 0 Easy, 1 Medium, 2 Hard; 1 with no profile, and always 1 in a race, `TdSPLevelRace`). The pawn class is the AI template's `PawnClass`:
+
+| AI template | Pawn class | Bullet armour, Easy / Medium / Hard |
+|---|---|---|
+| `Default`, `Assault`, `Assault_MP5K`, `Assault_HKG36C`, `Assault_Neostead` | `TdBotPawn_Assault` | 0.2 / 0.3 / 0.5 |
+| `PatrolCop`, `PatrolCop1`, `2`, `3`, `PatrolCop_Glock` | `TdBotPawn_PatrolCop` | 0 / 0 / 0.2 |
+| `PatrolCop_SteyrTMP`, `PatrolCop_MiniUzi` | `TdBotPawn_PatrolCop_Steyr` | 0 / 0.1 / 0.3 |
+| `PatrolCop_Remington` | `TdBotPawn_PatrolCop_Remington` | 0 / 0.1 / 0.3 |
+| `Support` | `TdBotPawn_Support` | 0.4 / 0.5 / 0.7 |
+| `RiotCop` | `TdBotPawn_RiotCop` | 0.5 / 0.6 / 0.8 |
+| `PursuitCop` | `TdBotPawn_PursuitCop` | 0.1 / 0.2 / 0.4 |
+| `SniperCop` | `TdBotPawn_SniperCop` | 0.1 / 0.2 / 0.4 |
+| `Celeste`, `SniperCeleste` | `TdBotPawn_Celeste`, `_SniperCeleste` | head 0.2, body 0.6, legs 0.5 at all three |
+| `Gunner`, `HeliSniper`, `Tutorial`, the dummies | `TdBotPawn_SupportHelicopterGunner`, `_JKSniper`, `_Tutorial`, `_Dummy` | none |
+
+Head, body and legs are the same number in every row but Celeste's. In a chase (`bChaseAI`) the `_CHASE` sets are read: the same numbers for every class that writes one; Celeste then has PursuitCop's on every part and SniperCeleste none. A Colt's bullet (42) on an Assault cop at Medium is 29, on his head or a hand 58; on a patrol cop 42 and 84.
+
+### 3. What a bullet's hit plays on a bot
+
+`TdPawn.TakeDamage` -> `PlayPhysicsBodyImpact` -> `StumbleDamage` -> `TdMove_StumbleBot`, for a bot that lives through the hit and is not in a stumble already. `TdMove_StumbleBase.GetStumbleState` picks by the damage type and by where the shooter stands (`HitSide = Normal2D(InstigatorLocation - Location) dot vector(Rotation)`), not by the bone, and `TdMove_StumbleBot.PlayStumbleAnimation` plays:
+
+| Hit | State | Sequence | Also |
+|---|---|---|---|
+| A pistol's or a rifle's bullet, the shooter in front | 14 | `WalkBwdStop` (0.7 s) | he turns in 0.3 s to face the way opposite the shooter's facing |
+| ...the shooter behind | 16 | `WalkFwdStop` (0.7 s) | he turns in 0.3 s to the shooter's own facing |
+| A shotgun's, from in front, the hit 145 uu or less over the bottom of his capsule | 17 | `HitHeavyStomach` (1 s) | |
+| ...more than 145 uu over it | 18 | `HitHeavyHead` (1 s) | |
+| A shotgun's from behind | none | none | `TdMove_StumbleBot.CanDoMove`: the reaction is discarded |
+
+`HitMeleeLeft`, `HitMeleeRight` and `HitMeleeBack` are a blow's alone. A crouching bot stands up and plays nothing for states 14 and 16. He does not fire while he stumbles. On top of the sequence the game lets the bodies of his upper half go for a moment under an impulse along the bullet when the bone hit is one of `Spine1`, `Spine2`, `Neck`, the arms, forearms and hands (`DamageType.PhysicsBodyImpactBoneList`, `KDamageImpulse` 50000, motors of strength 20000 pulling back to the animation): a result of the rigid-body solver that has no rule to copy.
+
+### 4. The helicopter under the player's fire
+
+`TdVehicle_Helicopter` (`SVehicle`, `Health` 300) collides through its hidden `SVehicleMesh`, `VH_Common.SK_Helicopter_Placeholder`, whose physics asset `PA_Helicopter_Placeholder` is one body on the root bone `Chassis` with one box, 487.4 x 202.9 x 137.5 about (0, 0, 434): 243.7 fore and aft, 101.4 to each side, from 365.25 to 502.75 over the actor's `Location`. In the frame of the hull that is drawn (`SK_SWAT_Blackhawk_01`, whose rotor hub `VH_Main` is 404 over its origin) that is a slab round the rotor mast on the cabin's roof; the cabin, the nose and the tail are outside it. The body names no physical material, so a bullet that stops on it leaves the effect and the sound of the weapon's `DefaultImpactMaterial`, and a skeletal mesh takes no hole. The class has no `TakeDamage` of its own: by script the hit takes the weapon's damage from its 300 health (`Vehicle.TakeDamage` -> `Pawn.TakeDamage`), and what its death would be was not found. Its riders are seated with their collision off (`TdPawn.SetAsGunner`: `SetCollision(false, false)`) and can not be hit. Inferred, not read: that the drawn hull has no collision of its own (its component writes no collision flag) and that the placeholder is attached and colliding in play.
+
+### 5. In the port
+
+`ParkourController::update_ai_bots` runs each bot's `BotCombatState` (`EnemyBot::combat`: the aim bot's members, the controller's flags that feed it, the burst) through `aim_tick` and `ai_tick_fire`, and fires each shot with `ai_fire_shot`: the aim point, the spread, a line through the level, the other bots' posed bodies and her stand-in. The helicopter's door gunner is the same code with `AITemplate_Gunner` and the FN Minimi. The player's bullet takes the armour of the bot's pawn class (`find_aim_template(EnemyBot::archetype)`, by the exact name of the template the level's factory names), starts the stumble above and stops on a helicopter's box (`trace_helicopters`). The difficulty is the front end's profile setting (`ParkourController::set_difficulty`, from `src/main.cpp`). Where the port is not the game:
+
+- **Her bodies are a stand-in.** The port has no third-person mesh of hers and not the tree that poses it (`AT_C3P`). The line is tested against the 11 bodies of `Faith3p_Physics` that are fixed to the skeleton and do not hang on what the arms do (hips, spine, neck, head, thighs, shins, feet; 12 shapes), standing in the asset's reference pose at her feet and turned to her yaw, brought down in height when her capsule is the low one. Left out: the six bodies of the arms and the four of the hair. The cost: her arms and hair cannot be hit (they widen her by up to some 15 uu a side in a running pose), and a slide, a roll or a lean is an upright target of the capsule's height, not the long low one her animation would make. Which body is hit changes no damage, so only hit or miss is at stake. Whether the game animates the hidden mesh in first person at all is not known.
+- **Who a bot takes for his enemy** is the controller's own rule (within 1800 uu; he sees her when the level leaves the line between their eyes clear), and he pulls his trigger only standing: not while he runs at her, stumbles or is within the 220 uu of his blow.
+- **A bullet starts** at the middle of his right hand's body as he is posed, not at the bone `RightHandIndex2`; the door gunner's where the port had his gun (165 uu out to the side she is on, 45 under the helicopter's `Location`), not at his seat's socket. Every bot whose name holds `Celeste` is still the Training Area's partner to the controller and fires nothing, the boss (`AITemplate_Celeste`, the Beretta M93R) included. A helicopter's rider (`AITemplate_Gunner`, `AITemplate_HeliSniper`) still stands as a bot where the level's factory spawns him, which the game does not leave him doing; he fires nothing of his own (`is_helicopter_rider`).
+- Not there: suppression (a bot's aim never stops improving for it), suppression fire, the snipers' own aim bot (`TdAimBotSniper`; a sniper aims as the others do, with his template's values), the taser (a pursuit cop carries nothing and fires nothing), `Moves[MovementState].HandleDeath` on a hit that would kill her, the chase sets, the helicopter's health, the by-bone physics flinch, and Kismet's `SeqAct_TdAIPerfectAim` as the levels wire it (the helicopter's gunner gets the perfect aim bot after the delay that stood for it). The bullet that passes her is heard on every shot that reaches her and does nothing (`TdBotPawn.CheckForProximityShots` is native and was not read). All of these are in `TODO.md`.
 
 ---
 
