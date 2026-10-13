@@ -2978,3 +2978,59 @@ reader's verdicts (`verify.md` overrides `notes.md`), is in the main checkout's 
   run; skeletal mesh actors a track names are not moved; a based pawn's view does not turn with its base.
 - The lifts keep the port's machine and `settle_lifts_for_restart`; in retail the script's Matinees move
   them too.
+
+---
+
+## 47. A decal computed at load lies on what collides in its own level only (agent/decal-own-level, 2026-10-13)
+
+`TODO.md`'s "Decals, remaining differences": the decals with no stored receiver (440 in the chapters) were
+clipped at load onto the static meshes and BSP of every loaded package. The research is in the main
+checkout's ignored `build/re/open2/decalcheck/notes.md` (and `build/re/impacts/research/moverdecals/` N3 for
+the rule).
+
+### 47.1 What the game does
+- `UDecalComponent::ComputeReceivers` (`0x00fc73f0`) asks the collision hash for what lies in the decal's box
+  and offers each component to `0x00fc72a0`, which, for a decal placed in a level, wants the receiver's owner's
+  `Outer` to be the decal actor's (`+0x28`, read at `0x00fc766f`; that the field is `Outer`, so the same level,
+  is inferred). A decal on the floor of a streamed level next door is not drawn.
+- Retail pictures stand behind it: The Boat's `Boat_Cont` `DecalActor_10`, 500 x 500 on the yard's ground of
+  another package, is in none of five retail intro frames that show that ground, while the port drew it
+  (decalcheck F6); and the Scraper lobby's two on another package's BSP (47.3).
+- The collision hash holds the components that collide (`CollideActors`), so a mesh that does not is never
+  offered: inferred from the data (none of 6,771 stored mesh receivers is non-colliding), and now seen (47.3).
+
+### 47.2 Changes
+- `src/assets/upk_loader.*`: `BspRenderBin` carries its package, and a package's BSP is binned apart from the
+  others' (drawn as before: `emit_bsp` merges the bins by material and light map); `clip_onto_level` offers a
+  computed decal only the BSP bins and the static meshes of its own package (`LevelActor::source_package`
+  against `LevelDecal::package`) whose actor and component both have `CollideActors`
+  (`LevelActor::collide_actors`, new). Stored receivers are as before.
+
+### 47.3 Checked (Windows, Direct3D 11, headless)
+- Computed decals that put triangles down, `main` before / this branch, from the load's `[Level]` line of
+  `--handover-check` in every chapter with any: Tutorial_p 5 / 3, Escape_p 53 / 24, Stormdrain_p 21 / 11,
+  Cranes_p 69 / 48, Subway_p 61 / 2, Factory_p 2 / 2, The Boat 19 / 0, Convoy_p 3 / 2, Scraper_p 3 / 0: 236 /
+  92, so 144 went, the 134 the research finds only on another package's meshes and the 10 only on another
+  package's BSP. What is left is, chapter by chapter, the research's own-package classes (non-colliding
+  meshes 3, 24, 1, 0, 1, 2, 0, 2, 0; colliding meshes and own BSP in Stormdrain and Cranes) to within one
+  decal in Cranes (48 for 47) and Subway (2 for 1). With the colliding rule as well: Tutorial_p 0, Escape_p 0,
+  Stormdrain_p 10, Cranes_p 48, Subway_p 1, the others 0: 59, the 33 on meshes that do not collide gone too.
+- **Retail pictures** (taken for this branch; the main checkout's ignored `build/re/open2/decalcheck/notes.md`,
+  "Retail captures (2026-10-13)", with side-by-sides of retail, `main`, `main` without computed decals and
+  this branch under `retail/A` and `retail/C`):
+  - *A, the Factory, booted at `Conveyor_puzzle`:* `Factory_Facto`'s `MD_A1_01` and `MD_A2_01` on the garage
+    door `StaticMeshActor_433` (`CollideActors` False), seen from both sides 215 to 330 uu away: a bare door
+    in retail; `main` drew the "A1" and "A2" plates, and so did this branch before the colliding rule.
+  - *C, the Scraper lobby:* `Scraper_Lobby`'s `MD_RoomText_01` and `MD_Logo` on the BSP of
+    `Scraper_Deck-Lobby_Slc`, where that package stores twins of both: the lettering stands out of the wall by
+    +13.0 and +16.3 in retail, +12.2 and +15.3 with one copy, +45.8 and +59.5 with `main`'s two; a matched filter
+    for the second copy scores retail +0.05 (`main` 1, one copy 0). A sign with stored decals only is as strong
+    in retail as in the port (1.93 against 2.01), so a second copy would have shown.
+  - Every computed decal looked at in retail is absent (these four and The Boat's): that retail draws no
+    computed decal at all fits as well as the rules. One picture of one of the 59 left would tell them apart
+    (`TODO.md`).
+- `--verify-all`: ALL SYSTEMS PASS, stages 1 to 27 and 29, on `main` at `d590693` with both rules.
+
+### 47.4 Not done
+- A decal's own `FLightMap1D` and depth bias, as before; whether the 59 computed decals left are drawn in retail
+  (above).

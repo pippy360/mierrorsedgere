@@ -1521,6 +1521,7 @@ std::vector<LevelActor> UPKPackage::extract_actors() const {
                           ((actor_block && comp_block && comp_block_nonzero) ||
                            (low_class == "kactor" && comp_block_rb));
         a.blocks_traces = actor_collide && actor_block && comp_collide && comp_block_zero;
+        a.collide_actors = actor_collide && comp_collide;
 
         // TdTutorialStart.BelongToChallenge: array of EMovementChallenge names.
         if (low_class == "tdtutorialstart") {
@@ -3994,7 +3995,9 @@ void build_level_geometry(std::vector<LevelActor>& actors,
         // level. UDecalComponent's receiver test (moverdecals N3, MirrorsEdge.exe 0x00fc766f) asks
         // Receiver.Owner.Outer == DecalActor.Outer: a decal on the floor of a streamed level next door
         // is not drawn (Boat_Cont's DecalActor_10 on the yard's ground of another package: in five
-        // intro frames retail draws nothing there).
+        // intro frames retail draws nothing there). And what the query offers is in the collision
+        // hash, which holds the components that collide (CollideActors) only: the Factory's bay
+        // labels MD_A1_01 / MD_A2_01, on a garage door that does not, are not in retail's frames.
         // (`apart`: what lies on an actor the script shows and hides goes to that actor's own buffer.)
         const auto clip_onto_level = [&](const LevelDecal& decal, std::map<int32_t, std::vector<Vertex>>& bins, AABB& box,
                                          bool apart = false) {
@@ -4010,7 +4013,7 @@ void build_level_geometry(std::vector<LevelActor>& actors,
             if (decal.project_on_static_meshes) {
                 for (const LevelActor& a : actors) {
                     if (a.is_hidden || a.dynamic_class || a.elevator >= 0 || a.barge_door >= 0 || a.mover >= 0 || !a.accepts_decals ||
-                        a.source_package != decal.package || !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
+                        !a.collide_actors || a.source_package != decal.package || !valid_box(a.world_bounds) || !overlaps(a.world_bounds)) {
                         continue;
                     }
                     const StaticMeshAsset* sm = find_mesh(mesh_lib, a);

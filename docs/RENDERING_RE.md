@@ -566,14 +566,17 @@ a lift or a door where that is now (`find_impact_surface`). A hole in a mover is
 the level has the mover in, and its triangles are carried to where the mover is each frame they are drawn, a
 lift's part by its offset and a door about its hinge (`dynamic_decal_vertices`). Not as the game: on BSP a
 hole lies on all the BSP in its box, not on the one node; a bullet hole does not fade, it goes. A computed
-decal is clipped onto the static meshes and BSP of its own level only, as the game asks (the owner test
-above; each `BspRenderBin` carries its package): in the chapters 144 of the 236 the port computed went, the
-134 that lie only on another package's meshes and the 10 only on another package's BSP, and 92 are left
-(The Boat's `Boat_Cont` `DecalActor_10`, on the yard's ground of another package, is not in five retail intro
-frames). Not as the game, perhaps: a computed decal still lies on any mesh of its level that has a collision
-tree, where the game's query is inferred to give colliding components only; 33 decals lie only on meshes
-that do not collide (the Factory's bay labels `MD_A1_01` and `MD_A2_01` on a garage door are a place to
-look). The door
+decal is clipped onto the BSP and the colliding static meshes (`CollideActors` on the actor and on its
+component: what the collision hash holds) of its own level only, as the game asks (the owner test above; each
+`BspRenderBin` carries its package). In the chapters 177 of the 236 the port computed went: the 134 that lie
+only on another package's meshes, the 10 only on another package's BSP, and the 33 only on meshes that do
+not collide. Retail pictures agree for each kind: The Boat's `Boat_Cont` `DecalActor_10` (on the yard's ground
+of another package) is in none of five intro frames; the Factory's bay labels `MD_A1_01` and `MD_A2_01` (on a
+garage door that does not collide) are not on the door from either side, and the Scraper lobby's
+`MD_RoomText_01` and `MD_Logo` of `Scraper_Lobby` (on the BSP of `Scraper_Deck-Lobby_Slc`) are not drawn a
+second time over their stored twins (the main checkout's ignored `build/re/open2/decalcheck/notes.md`,
+"Retail captures"). No retail picture yet shows one of the 59 left (on its own level's colliding meshes or
+BSP) drawn: that retail draws no computed decal at all fits the frames as well. The door
 with the stripes opens by its Matinee and its decals go with it ([`GAMEPLAY_SCRIPTING_RE.md`](GAMEPLAY_SCRIPTING_RE.md)
 section 9). Not done: a decal's own `FLightMap1D`, per-decal bias. `ME_NO_COMPUTED_DECALS=1` leaves the computed ones out.
 
